@@ -1,0 +1,70 @@
+# Dev override: bind-mount the repo into the "dev" image (tools + Go + Node)
+# and run the Go server plus the Vite dev server inside the container, so the
+# host never needs Go and never runs a different ffmpeg.
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml up --build
+#     UI  (Vite, hot reload)  → http://localhost:5173   (proxies /api and /out to :8080)
+#     API (go build + serve)  → http://localhost:8080   (also serves web/dist if built)
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml run --rm app go test ./...
+#   docker compose -f compose.yaml -f compose.dev.yaml run --rm app bash scripts/discord-testkit.sh /output/testkit   # → ./output-dev/testkit
+#   docker compose -f compose.yaml -f compose.dev.yaml run --rm app bash scripts/testkit-test.sh
+#   docker compose -f compose.yaml -f compose.dev.yaml run --rm -e EZLG_START_SERVER=1 app bash scripts/integration-test.sh
+#
+# The Go server is not auto-restarted on edits: `docker compose ... restart app`
+# (or run everything by hand in `... run --rm --service-ports app bash`, see
+# README.md "Development loop").
+#
+# The dev container runs as root, so on Linux / WSL-distro hosts everything it
+# writes into a bind mount is root-owned. That is why /data and /output get
+# their own volume / folder below instead of the runtime's ezlg-data / ./output.
+
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    image: ezlg-dev:local
+    container_name: ezlg-dev
+    restart: "no"
+    # PID 1 is docker-init (tini): it reaps the orphaned Vite process and
+    # forwards SIGTERM. The command below `exec`s the server binary so it is
+    # tini's direct child and gets the SIGTERM from `docker compose stop` /
+    # Ctrl-C (`go run` would not forward it: the server would be SIGKILLed with
+    # the container instead of draining — see cmd/ezlg/main.go).
+    init: true
+    working_dir: /src
+    ports:
+      - "8080:8080"
+      - "5173:5173"
+    volumes:
+      - .:/src
+      - ezlg-gomod:/go/pkg/mod
+      - ezlg-gocache:/root/.cache/go-build
+      - ezlg-webnode:/src/web/node_modules
+      # Own data volume: the dev image runs as root, the runtime image as uid
+      # 1000 — sharing ezlg-data would leave root-owned dirs the production
+      # container cannot write to (ezlg refuses to start in that case).
+      - ezlg-data-dev:/data
+      # Own output folder for the same reason: a root dev-stack testkit run
+      # would leave root-owned ./output/testkit that the uid-1000 runtime
+      # container can no longer reuse. (Add /output-dev/ to .gitignore if it
+      # is not there yet; it is excluded from the build context via .dockerignore.)
+      - ./output-dev:/output
+    environment:
+      EZLG_DATA: /data
+      EZLG_SCRATCH: /dev/shm/ezl
+      GOFLAGS: -buildvcs=false
+    # (folded scalar: keep these lines at the same indentation so they join into one line)
+    # The binary is built to /tmp (inside the container, not the bind mount) and
+    # exec'd — see `init:` above for why not `go run`.
+    command: >-
+      sh -c "cd web && npm ci
+      && (npm run dev -- --host 0.0.0.0 --port 5173 &)
+      && cd .. && go build -o /tmp/ezlg ./cmd/ezlg && exec /tmp/ezlg serve"
+
+volumes:
+  ezlg-gomod:
+  ezlg-gocache:
+  ezlg-webnode:
+  ezlg-data-dev:

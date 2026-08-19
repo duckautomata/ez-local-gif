@@ -1,0 +1,16 @@
+.git
+.gitignore
+data
+input
+output
+output-dev
+bin
+tmp
+web/node_modules
+web/dist
+web/.svelte-kit
+docs
+*.md
+!README.md
+.vscode
+.idea

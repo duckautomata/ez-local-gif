@@ -1,0 +1,465 @@
+/* ez-local-gif — hand-rolled dark theme. Global styles for layout and the
+   shared form controls; component-specific rules live in the components. */
+
+:root {
+  color-scheme: dark;
+  --bg: #1e1f22;
+  --panel: #2b2d31;
+  --panel-2: #313338;
+  --panel-3: #383a40;
+  --border: #3f4147;
+  --border-strong: #4e5058;
+  --text: #dbdee1;
+  --muted: #949ba4;
+  --faint: #6d6f78;
+  --accent: #5865f2;
+  --accent-hover: #4752c4;
+  --green: #23a559;
+  --red: #f23f43;
+  --amber: #f0b232;
+  --blue: #00a8fc;
+  --radius: 8px;
+  --radius-sm: 5px;
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, 'Cascadia Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--blue);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+kbd,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+kbd {
+  background: var(--panel-3);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ---- layout ---------------------------------------------------------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 16px;
+  padding: 16px;
+  max-width: 1800px;
+  margin: 0 auto;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+@media (max-width: 1000px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- cards ----------------------------------------------------------- */
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.card > h2,
+.card-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.muted {
+  color: var(--muted);
+}
+.faint {
+  color: var(--faint);
+}
+.small {
+  font-size: 12px;
+}
+.ok {
+  color: var(--green);
+}
+.bad {
+  color: var(--red);
+}
+.warn {
+  color: var(--amber);
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.note {
+  font-size: 12px;
+  border-left: 3px solid var(--amber);
+  background: rgba(240, 178, 50, 0.08);
+  padding: 6px 10px;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  color: var(--text);
+}
+.note.info {
+  border-color: var(--blue);
+  background: rgba(0, 168, 252, 0.08);
+}
+.note.error {
+  border-color: var(--red);
+  background: rgba(242, 63, 67, 0.1);
+}
+
+/* ---- form controls --------------------------------------------------- */
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+.row + .row {
+  margin-top: 8px;
+}
+
+.field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.field > span,
+label.inline > span {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+label.inline > span {
+  font-size: 13px;
+  color: var(--text);
+}
+
+input[type='number'],
+input[type='text'],
+select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 7px;
+  font: inherit;
+  font-size: 13px;
+  min-height: 30px;
+}
+input[type='number'] {
+  width: 84px;
+}
+input[type='number'].w-sm {
+  width: 68px;
+}
+input[type='number']:disabled,
+select:disabled,
+input[type='text']:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+input:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  margin: 0;
+  cursor: pointer;
+}
+
+input[type='range'] {
+  accent-color: var(--accent);
+  width: 160px;
+  cursor: pointer;
+}
+input[type='range'].wide {
+  width: 100%;
+}
+
+input[type='color'] {
+  width: 34px;
+  height: 30px;
+  padding: 0 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  cursor: pointer;
+}
+
+button,
+.btn {
+  background: var(--panel-3);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.3;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+button:hover:not(:disabled),
+.btn:hover {
+  background: var(--border-strong);
+  text-decoration: none;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.primary,
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+button.primary:hover:not(:disabled),
+.btn.primary:hover {
+  background: var(--accent-hover);
+}
+button.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+button.ghost:hover:not(:disabled) {
+  background: var(--panel-3);
+  color: var(--text);
+}
+button.sm,
+.btn.sm {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+/* chip / segmented control */
+.chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.chip {
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 11px;
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+}
+.chip:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-3);
+}
+.chip[aria-pressed='true'],
+.chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.seg > button {
+  border: 0;
+  border-radius: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  padding: 3px 9px;
+  font-size: 12px;
+}
+.seg > button + button {
+  border-left: 1px solid var(--border-strong);
+}
+.seg > button[aria-pressed='true'] {
+  background: var(--panel-3);
+  color: var(--text);
+}
+
+/* badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.badge.ok {
+  border-color: var(--green);
+  color: var(--green);
+}
+.badge.bad {
+  border-color: var(--red);
+  color: var(--red);
+}
+.badge.warn {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.badge b {
+  font-weight: 600;
+}
+
+/* progress */
+.progress {
+  height: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+.progress.indeterminate > div {
+  width: 30% !important;
+  animation: slide 1.1s ease-in-out infinite;
+}
+@keyframes slide {
+  0% {
+    margin-left: -30%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+
+/* backdrops for transparency judgement */
+.backdrop-checker {
+  background-color: #8a8a8a;
+  background-image:
+    linear-gradient(45deg, #5a5a5a 25%, transparent 25%),
+    linear-gradient(-45deg, #5a5a5a 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #5a5a5a 75%),
+    linear-gradient(-45deg, transparent 75%, #5a5a5a 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+}
+.backdrop-dark {
+  background: #313338;
+}
+.backdrop-white {
+  background: #ffffff;
+}
+
+/* utility */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+hr.sep {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
+}

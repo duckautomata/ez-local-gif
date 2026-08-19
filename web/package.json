@@ -1,0 +1,27 @@
+{
+  "name": "ez-local-gif-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Svelte 5 single-page UI for ez-local-gif (embedded into the Go binary from web/dist)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tsconfig/svelte": "^5.0.8",
+    "@types/node": "^22.20.1",
+    "svelte": "^5.56.9",
+    "svelte-check": "^4.7.6",
+    "typescript": "^6.0.3",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.11"
+  }
+}

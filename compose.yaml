@@ -1,0 +1,64 @@
+# ez-local-gif — production-ish compose file (LAN only: no auth, no TLS).
+#
+#   docker compose up -d --build        # build + run, then open http://localhost:8080
+#   docker compose logs -f app
+#   docker compose down                 # keeps the ezlg-data volume; add -v to wipe it
+#
+# Dev loop (bind-mounted source, go run + vite dev inside the container):
+#   docker compose -f compose.yaml -f compose.dev.yaml up --build
+#
+# See README.md for WSL2 notes and docs/DESIGN.md §2.1 / §6 / §9.9 for sizing.
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+      # args:
+      #   VERSION: v0.1.0            # baked into `ezlg version` and /api/capabilities
+    image: ezlg:local
+    container_name: ezlg
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Blobs, results and scratch fallback. Keep this on the Linux/WSL ext4
+      # filesystem (a named volume does), never under /mnt/c on WSL2 (slow 9P).
+      - ezlg-data:/data
+      # "Save to /output" target (also where the Discord test kit writes). Bind to
+      # any host folder you like. The container runs as uid 1000, so on Linux /
+      # inside a WSL distro create the folder BEFORE the first `up` — a bind the
+      # Docker daemon auto-creates is root:root 0755 and the app cannot write to it:
+      #     mkdir -p output && sudo chown 1000:1000 output
+      # (an existing root-owned one:  docker compose run --rm --user root --entrypoint chown app -R 1000:1000 /output).
+      # Docker Desktop on Windows/macOS needs neither (binds appear world-writable).
+      - ./output:/output
+      # Optional read-only source folder for the in-app /input picker
+      # (skips the upload). Examples:
+      # - ./input:/input:ro
+      # - /mnt/c/Users/you/Videos/Resolve Exports:/input:ro   # WSL2 → Windows folder
+      # - C:/Users/you/Videos/Resolve Exports:/input:ro       # Docker Desktop on Windows
+    # The RGBA frame master lives on /dev/shm (1080p RGBA = 8.3 MB/frame). Docker's
+    # default 64 MB is far too small. On WSL2 raise `.wslconfig` [wsl2] memory= too.
+    shm_size: "4gb"
+    environment:
+      # All optional — defaults shown (see cmd/ezlg/main.go and README.md).
+      EZLG_TTL_HOURS: "24"             # delete blobs/results older than this (0 = never)
+      EZLG_MAX_BYTES: "21474836480"    # cap on /data (20 GiB; 0 = none)
+      EZLG_MAX_UPLOAD_MB: "2048"       # max upload size
+      # EZLG_CONCURRENCY: "8"          # concurrent renders (default NumCPU/2)
+      # EZLG_ADDR: ":8080"             # listen address (also change ports: and the healthcheck)
+      # NVIDIA_DRIVER_CAPABILITIES: compute,video,utility   # with the gpu block below
+    # -- GPU (not used in v1; see docs/DESIGN.md §6). Uncomment for NVDEC/NVENC/rembg later,
+    #    together with NVIDIA_DRIVER_CAPABILITIES above (needs nvidia-container-toolkit,
+    #    host driver >= 610 for the prebuilt FFmpeg 9 NVENC).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  ezlg-data:

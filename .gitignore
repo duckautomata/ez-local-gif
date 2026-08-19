@@ -1,0 +1,27 @@
+# Go
+/bin/
+*.test
+*.out
+
+# Frontend
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+web/.svelte-kit/
+web/*.local
+
+# Runtime data
+/data/
+/input/
+/output/
+/output-dev/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Scratch
+/tmp/

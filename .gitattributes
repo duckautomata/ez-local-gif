@@ -1,0 +1,18 @@
+# Normalise line endings: the container runs bash scripts, Dockerfiles and
+# compose files straight from the checkout (bind mounts in the dev loop), so
+# they must stay LF even on Windows clones with core.autocrlf=true.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Binary fixtures
+*.gif binary
+*.webp binary
+*.png binary
+*.mov binary
+*.mp4 binary
+*.webm binary
+*.avif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
