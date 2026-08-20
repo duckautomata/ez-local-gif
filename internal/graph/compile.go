@@ -36,12 +36,26 @@ const (
 	MaxMasterBytes = 8 << 30
 )
 
+// Image-sequence frame delays (the "delay" op and recipe.SequenceInfo.DelayMS),
+// in milliseconds.
+const (
+	// MinDelayMS and MaxDelayMS bound a per-frame delay (1 ms .. 60 s).
+	MinDelayMS = 1
+	MaxDelayMS = 60000
+	// DefaultDelayMS applies when neither the delay op nor the probe gives a
+	// delay (the GIF-maker convention of 100 ms per frame).
+	DefaultDelayMS = 100
+)
+
 // Fit modes shared by the resize op and Output.Fit.
 const (
 	fitContain = "contain"
 	fitCover   = "cover"
 	fitExact   = "exact"
 )
+
+// mainInput is the link label every single-stream graph starts from.
+const mainInput = "[0:v]"
 
 // errorf builds a "graph: ..." error. (The inner fmt.Errorf keeps this a
 // vet-recognised printf wrapper and supports %w.)
@@ -85,6 +99,8 @@ func decodeOps(ops []recipe.Op) ([]decodedOp, error) {
 			params = new(recipe.FlipParams)
 		case recipe.OpRotate:
 			params = new(recipe.RotateParams)
+		case recipe.OpDelay:
+			params = new(recipe.DelayParams)
 		case recipe.OpUnpremultiply:
 			// no params
 		default:
@@ -106,12 +122,26 @@ func decodeOps(ops []recipe.Op) ([]decodedOp, error) {
 type compiler struct {
 	src recipe.ProbeInfo
 	out recipe.Output
+	seq *sequence // set for image-sequence sources
 
 	w, h     int  // current frame size
-	hasAlpha bool // current frame carries alpha (source alpha or transparent padding)
+	hasAlpha bool // current frame carries alpha (source alpha, a merged alpha stream or transparent padding)
+	srcAlpha bool // the source pixels carry alpha (in the main stream or a merged alpha stream)
+	// depth is the bit depth of the frames reaching the hoisted unpremultiply:
+	// the source's (src.Bits), or 8 once a head has converted them to rgba.
+	depth int
 
+	// input is the filter text the stage chain is appended to: mainInput
+	// ("[0:v]") or the alpha-stream merge head (which already ends in ",").
+	input  string
 	stages []string // filter stages, joined with ","
 	plan   Plan
+}
+
+// sequence holds the resolved facts of an image-sequence source.
+type sequence struct {
+	count int     // frame count (0 = unknown)
+	rate  float64 // 1000/delay ms rounded to 3 decimals; the image2 -framerate
 }
 
 func newCompiler(src recipe.ProbeInfo, out recipe.Output) *compiler {
@@ -121,6 +151,9 @@ func newCompiler(src recipe.ProbeInfo, out recipe.Output) *compiler {
 		w:        src.Width,
 		h:        src.Height,
 		hasAlpha: src.HasAlpha,
+		srcAlpha: src.HasAlpha,
+		depth:    src.Bits,
+		input:    mainInput,
 		plan:     Plan{OutLabel: outLabel, Speed: 1},
 	}
 }
@@ -129,13 +162,190 @@ func (c *compiler) emit(stage string) {
 	c.stages = append(c.stages, stage)
 }
 
+// singleFrame reports whether the source yields exactly one frame (a still,
+// or an image sequence of one frame): no fps filter (it would emit nothing),
+// no trim, Frames 1.
+func (c *compiler) singleFrame() bool {
+	return c.src.IsStill || (c.seq != nil && c.seq.count == 1)
+}
+
+// sourceFPS is the frame rate the source is decoded at: the image2
+// -framerate for sequences, else the probed rate (0 = unknown).
+func (c *compiler) sourceFPS() float64 {
+	if c.seq != nil {
+		return c.seq.rate
+	}
+	if c.src.FPS > 0 && !math.IsInf(c.src.FPS, 0) {
+		return c.src.FPS
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Source heads: image sequences (input args + mixed-size normalisation) and
+// separate alpha streams (alphamerge). Both run before every other stage.
+// ---------------------------------------------------------------------------
+
+// source resolves how the main input is read. It fills InputArgs /
+// InputPattern / SourceFPS for image sequences and the merge head for sources
+// whose alpha lives in a separate stream.
+func (c *compiler) source(ops []decodedOp) error {
+	if c.src.AlphaStream < 0 {
+		return errorf("source alpha stream index must be >= 0 (got %d)", c.src.AlphaStream)
+	}
+	if c.src.ColorStream < 0 {
+		return errorf("source colour stream index must be >= 0 (got %d)", c.src.ColorStream)
+	}
+	if c.src.AlphaStream > 0 && c.src.AlphaStream == c.src.ColorStream {
+		return errorf("source alpha stream and colour stream are both v:%d", c.src.AlphaStream)
+	}
+	if c.src.Kind == recipe.KindSequence {
+		return c.sequenceSource(ops)
+	}
+	switch {
+	case c.src.AlphaStream > 0:
+		c.alphaStreamHead()
+	case c.src.ColorStream > 0:
+		// Animated AVIF without alpha: the animation track is not the first
+		// video stream (the one-frame primary item is), so address it.
+		c.input = fmt.Sprintf("[0:v:%d]", c.src.ColorStream)
+	}
+	return nil
+}
+
+// sequenceSource handles recipe.KindSequence: the image2 demuxer reads the
+// frames at -framerate 1000/delay (the hoisted delay op wins over
+// SequenceInfo.DelayMS, which wins over DefaultDelayMS) from -start_number 1,
+// so the frames are CFR at that rate and every later stage (trim seeks, speed,
+// fps, geometry) works as for a video. Every sequence runs with
+// -reinit_filter 0 behind the guarding head (sequenceHead): uploaded frames
+// are stored as-is and may differ per frame in pixel format or size, either
+// of which makes fftools rebuild the filtergraph and lose frames.
+func (c *compiler) sequenceSource(ops []decodedOp) error {
+	info := c.src.Sequence
+	if info == nil {
+		return errorf("image sequence source has no sequence info")
+	}
+	if !strings.Contains(info.Pattern, "%") {
+		return errorf("image sequence pattern %q is not an image2 pattern (want e.g. %%06d.png)", info.Pattern)
+	}
+	if c.src.AlphaStream != 0 {
+		return errorf("image sequence sources cannot carry a separate alpha stream")
+	}
+	delay := info.DelayMS
+	switch {
+	case delay <= 0:
+		delay = DefaultDelayMS
+	case delay > MaxDelayMS:
+		return errorf("sequence delay %d ms exceeds the %d ms maximum", delay, MaxDelayMS)
+	}
+	for _, d := range ops { // hoisted, last one wins
+		p, ok := d.params.(*recipe.DelayParams)
+		if !ok {
+			continue
+		}
+		if p.MS < MinDelayMS || p.MS > MaxDelayMS {
+			return opErrorf(d, "ms must be between %d and %d (got %d)", MinDelayMS, MaxDelayMS, p.MS)
+		}
+		delay = p.MS
+	}
+	count := info.Count
+	if count <= 0 {
+		count = c.src.Frames
+	}
+	c.seq = &sequence{count: count, rate: SequenceFPS(delay)}
+	c.plan.InputPattern = info.Pattern
+	c.plan.SourceFPS = c.seq.rate
+	// Arg order is fixed: "-f image2" first (force the demuxer explicitly, so
+	// the render opens the frames exactly like the probe's "-f image2" read —
+	// extension-based demuxer guessing fails for patterns ffmpeg does not
+	// recognise), then the image2 options, then the fftools per-input option.
+	c.plan.InputArgs = append(c.plan.InputArgs, "-f", "image2", "-framerate", fnum(c.seq.rate), "-start_number", "1", "-reinit_filter", "0")
+	c.sequenceHead(info.Mixed)
+	return nil
+}
+
+// sequenceHead guards every image-sequence source against per-frame decode
+// parameter changes; for mixed-size sequences it also normalises the size:
+// each frame is scaled to fit W x H (the largest frame, keeping aspect) and
+// centred on a transparent W x H canvas, so every later stage sees one
+// constant size.
+//
+// Sequences are special for fftools: by default it rebuilds the whole
+// filtergraph whenever ANY decoded frame parameter changes — not just the
+// size but also the pixel format or colour range (rgba vs rgb24 PNGs, one
+// indexed PNG-8 among RGBA frames, yuvj420p vs yuvj444p JPEGs) — and the
+// rebuild loses the frame the fps filter holds at every change (verified on
+// FFmpeg 9.0.1: six mixed frames came out as six copies of the last one).
+// probe.SequenceInfo.Mixed only reflects sampled *size* differences, so
+// format mixes (and unsampled size changes) arrive with Mixed=false;
+// sequenceSource therefore always sets -reinit_filter 0 to keep one graph,
+// and this head must cope with the changing parameters itself:
+//
+//   - scale reconfigures itself per frame and converts each frame to the
+//     format negotiated with the next stage; for frames already W x H in that
+//     format it is a pixel-exact pass-through (verified byte-identical on a
+//     uniform rgba sequence), so well-behaved sequences are unchanged. A bare
+//     format=rgba would NOT do: under -reinit_filter 0 the format filter is
+//     only a negotiation constraint, not a converter, so a mid-sequence
+//     rgb24 frame reaches the next stage reinterpreted as rgba bytes
+//     (garbage; verified on FFmpeg 9.0.1).
+//   - pad (mixed sizes only) needs eval=frame: its centring offsets are
+//     otherwise fixed at the first frame's size and the uncovered canvas is
+//     left uninitialised.
+//   - premultiply/unpremultiply do not cope at all (they read the configured
+//     size and silently corrupt), so the scale here runs on straight alpha
+//     and the hoisted unpremultiply, which comes right after, sees the
+//     constant parameters. For premultiplied sources this is the
+//     premultiplied-scale order anyway (scale, then divide the alpha out).
+func (c *compiler) sequenceHead(mixed bool) {
+	w, h := c.src.Width, c.src.Height
+	c.emit(fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos", w, h))
+	if !mixed {
+		return
+	}
+	c.emit("format=rgba")
+	c.emit(fmt.Sprintf("pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000:eval=frame", w, h))
+	c.hasAlpha = true // transparent padding
+	c.depth = 8
+}
+
+// alphaStreamHead merges a separate single-plane alpha stream (ffmpeg's mov
+// demuxer exposes AVIF alpha as stream AlphaStream next to the colour stream
+// ColorStream — v:0 for a still AVIF, the animation track (typically v:2,
+// alpha v:3) for an animated one, because the one-frame primary item comes
+// first) into the main stream before every other stage:
+//
+//	[0:v:C]format=rgba[c];[0:v:N]format=gray[a];[c][a]alphamerge,
+//
+// alphamerge takes 8-bit inputs only, so the merged frames are 8-bit rgba
+// with straight alpha; a hoisted unpremultiply follows at gbrap.
+func (c *compiler) alphaStreamHead() {
+	c.input = fmt.Sprintf("[0:v:%d]format=rgba[c];[0:v:%d]format=gray[a];[c][a]alphamerge,", c.src.ColorStream, c.src.AlphaStream)
+	c.hasAlpha, c.srcAlpha = true, true
+	c.depth = 8
+}
+
+// SequenceFPS returns the image2 frame rate for a per-frame delay in
+// milliseconds: 1000/delayMS rounded to 3 decimals (what "-framerate" is
+// given, so callers computing durations agree with ffmpeg). delayMS <= 0
+// means DefaultDelayMS.
+func SequenceFPS(delayMS int) float64 {
+	if delayMS <= 0 {
+		delayMS = DefaultDelayMS
+	}
+	return round3(1000 / float64(delayMS))
+}
+
 // ---------------------------------------------------------------------------
 // Temporal stages: unpremultiply (hoisted), trim (input args), speed, fps.
 // ---------------------------------------------------------------------------
 
 func (c *compiler) temporal(ops []decodedOp) error {
 	c.unpremultiply(ops)
-	c.plan.InputArgs = append(c.plan.InputArgs, decoderArgs(c.src)...)
+	if c.seq == nil {
+		c.plan.InputArgs = append(c.plan.InputArgs, decoderArgs(c.src)...)
+	}
 	if err := c.trim(ops); err != nil {
 		return err
 	}
@@ -145,10 +355,10 @@ func (c *compiler) temporal(ops []decodedOp) error {
 	return c.fps(ops)
 }
 
-// unpremultiply hoists the unpremultiply op to run right after decode, at
-// the source's native bit depth so 10/12-bit ProRes alpha edges are not
-// truncated to 8 bits before the division. It is a no-op for sources
-// without alpha.
+// unpremultiply hoists the unpremultiply op to run right after decode (or
+// right after the alpha-stream merge / sequence head), at the frames'
+// native bit depth so 10/12-bit ProRes alpha edges are not truncated to 8
+// bits before the division. It is a no-op for sources without alpha.
 //
 // FFmpeg >= 8 negotiates AVFrame.alpha_mode across filter links:
 // unpremultiply declares its input premultiplied, while decoders (ProRes,
@@ -160,7 +370,7 @@ func (c *compiler) temporal(ops []decodedOp) error {
 // relative to the format stage does not matter (the auto-inserted format
 // conversion passes alpha_mode through); it sits next to its consumer.
 func (c *compiler) unpremultiply(ops []decodedOp) {
-	if !c.src.HasAlpha {
+	if !c.srcAlpha {
 		return
 	}
 	for _, d := range ops {
@@ -168,7 +378,7 @@ func (c *compiler) unpremultiply(ops []decodedOp) {
 			continue
 		}
 		format := "gbrap"
-		switch c.src.Bits {
+		switch c.depth {
 		case 10:
 			format = "gbrap10le"
 		case 12:
@@ -223,6 +433,9 @@ func (c *compiler) trim(ops []decodedOp) error {
 		}
 		if c.src.IsStill {
 			return opErrorf(d, "the source is a still image and cannot be trimmed")
+		}
+		if c.singleFrame() {
+			return opErrorf(d, "the source has a single frame and cannot be trimmed")
 		}
 		trimmed = true
 		start = math.Max(start, s)
@@ -284,7 +497,9 @@ func (c *compiler) speed(ops []decodedOp) error {
 
 // fps resolves the requested frame rate (fps op → Output.FPS → source fps →
 // defaultFPS), snaps it for the output format and always emits an fps
-// filter so the master is constant-frame-rate.
+// filter so the master is constant-frame-rate. For image sequences the
+// source fps is the image2 -framerate (from the delay), so by default the
+// master keeps one frame per image.
 func (c *compiler) fps(ops []decodedOp) error {
 	requested, origin := 0.0, ""
 	for _, d := range ops { // last fps op wins
@@ -303,8 +518,8 @@ func (c *compiler) fps(ops []decodedOp) error {
 		return errorf("output fps must be >= 0 (got %s)", fexact(c.out.FPS))
 	case c.out.FPS > 0:
 		requested, origin = c.out.FPS, "output fps"
-	case c.src.FPS > 0 && !math.IsInf(c.src.FPS, 0):
-		requested, origin = c.src.FPS, "source fps"
+	case c.sourceFPS() > 0:
+		requested, origin = c.sourceFPS(), "source fps"
 	default:
 		requested, origin = defaultFPS, "default fps"
 	}
@@ -318,12 +533,21 @@ func (c *compiler) fps(ops []decodedOp) error {
 	c.plan.FPS = snapped
 	// A single still frame has no second timestamp for the fps filter to
 	// work with: on a one-image input ffmpeg's fps filter emits zero frames
-	// (verified with FFmpeg 7.1 and 9.0). Stills therefore keep the nominal
-	// rate for the rawvideo master (-r) but skip the filter itself.
-	if c.src.IsStill {
+	// (verified with FFmpeg 7.1 and 9.0; a one-frame image2 sequence does
+	// the same once setpts is in front). Single-frame sources therefore keep
+	// the nominal rate for the rawvideo master (-r) but skip the filter.
+	if c.singleFrame() {
 		return nil
 	}
-	c.emit("fps=" + fnum(snapped))
+	// round=down: the filter floors the input's end time onto the output
+	// grid, so an fps drop never lengthens the clip past the (trimmed)
+	// source. The default rounding (near, half away from zero) rounds the
+	// end time up and appends a frame: an exactly-5.0 s clip at 16.7 fps
+	// became 84 x 59.9 ms = 5.03 s, breaking the Discord sticker 5 s cap.
+	// Verified against ffmpeg in TestFPSDropNeverLengthensClip
+	// (gif_timing_ffmpeg_test.go) and enc's TestVariantFramesMatchFFmpeg
+	// (the same floor model).
+	c.emit("fps=" + fnum(snapped) + ":round=down")
 	return nil
 }
 
@@ -444,6 +668,23 @@ func (c *compiler) rotate(d decodedOp, p *recipe.RotateParams) error {
 // Output fit and finish.
 // ---------------------------------------------------------------------------
 
+// validateOutput checks the Output knobs the graph does not otherwise
+// consume but that every plan must agree on: FrameFormat (frames export) and
+// FitBytes (fit-to-size budget). Format itself is not restricted here: every
+// Format* constant compiles to the same RGBA master (static formats take its
+// first frame), and the encoders decide what they can write.
+func validateOutput(out recipe.Output) error {
+	switch out.FrameFormat {
+	case "", recipe.FormatPNG, recipe.FormatJPEG, recipe.FormatWebP:
+	default:
+		return errorf("output: frame format %q must be one of png, jpeg, webp", out.FrameFormat)
+	}
+	if out.FitBytes < 0 {
+		return errorf("output: fitBytes must be >= 0 (got %d)", out.FitBytes)
+	}
+	return nil
+}
+
 // outputFit applies Output.Width/Height/Fit exactly like resize+canvas:
 // contain scales to fit and pads transparent to WxH (both given), cover
 // scales to cover and centre-crops, exact stretches. With only one of
@@ -489,14 +730,12 @@ func (c *compiler) finish() (*Plan, error) {
 	}
 	c.emit("format=rgba")
 	p := &c.plan
-	p.Filter = "[0:v]" + strings.Join(c.stages, ",") + outLabel
+	p.Filter = c.input + strings.Join(c.stages, ",") + outLabel
 	p.Width, p.Height = c.w, c.h
 	p.HasAlpha = c.hasAlpha
-	if c.src.FPS > 0 && !math.IsInf(c.src.FPS, 0) {
-		p.SourceFPS = c.src.FPS
-	}
+	p.SourceFPS = c.sourceFPS()
 	switch {
-	case c.src.IsStill:
+	case c.singleFrame():
 		p.Duration, p.Frames = 0, 1
 	default:
 		dur := c.sourceDuration()
@@ -508,7 +747,10 @@ func (c *compiler) finish() (*Plan, error) {
 			end = dur
 		}
 		p.Duration = math.Max(end-p.TrimStart, 0) / p.Speed
-		p.Frames = max(1, int(math.Round(p.Duration*p.FPS)))
+		// floor, matching the fps stage's round=down (the 1e-9 absorbs float
+		// error when Duration*FPS is exact); >= 1 so a sub-frame clip still
+		// plans a frame.
+		p.Frames = max(1, int(math.Floor(p.Duration*p.FPS+1e-9)))
 	}
 	if bytes := float64(p.Width) * float64(p.Height) * 4 * float64(p.Frames); bytes > MaxMasterBytes {
 		return nil, errorf("expected master (%dx%d x %d frames = %.1f GiB) exceeds the %d GiB limit; trim, lower the fps or resize",
@@ -527,8 +769,16 @@ func checkFrame(w, h int) error {
 }
 
 // sourceDuration returns the probed duration, falling back to
-// frames/fps when only those are known; 0 = unknown.
+// frames/fps when only those are known; 0 = unknown. An image sequence
+// lasts count/rate (the rate follows the effective delay, so the probed
+// duration — computed at the default delay — does not apply).
 func (c *compiler) sourceDuration() float64 {
+	if c.seq != nil {
+		if c.seq.count > 0 {
+			return float64(c.seq.count) / c.seq.rate
+		}
+		return 0
+	}
 	if c.src.Duration > 0 {
 		return c.src.Duration
 	}

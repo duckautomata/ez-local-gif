@@ -53,9 +53,10 @@ type gifLinter struct {
 // — TargetNone keeps the file's own count; comment / plain-text /
 // non-NETSCAPE application extensions stripped). Unfixable violations
 // (disposal 3, interlaced frames, local colour tables, no free palette
-// slot, over byte limit, wrong sticker size/duration) are reported as
-// failed checks so the caller can fall back to a re-encode. The returned
-// bytes equal data when fix is false or nothing changed.
+// slot, over byte limit, sticker duration/frame/fps limits, and — as a
+// warning — a sticker side over 320 px) are reported as failed checks so
+// the caller can fall back to a re-encode. The returned bytes equal data
+// when fix is false or nothing changed.
 func LintGIF(data []byte, target Target, fix bool) (Report, []byte, error) {
 	g, err := parseGIF(data)
 	if err != nil {
@@ -767,14 +768,17 @@ func (l *gifLinter) ruleSizeLimit(rule string, size int) {
 }
 
 // ruleTargetShape applies the sticker / emote geometry and timing rules.
+// Sticker dimensions only warn when a side exceeds 320 px: Discord shrinks
+// larger stickers and accepts smaller or non-square ones (user-verified
+// 2026-08-19), so they are not an error.
 func (l *gifLinter) ruleTargetShape() {
 	w, h := int(l.g.width), int(l.g.height)
 	switch l.target {
 	case TargetSticker:
-		if w == 320 && h == 320 {
-			l.checks.pass(RuleGIFStickerDims, LevelError, "320x320")
+		if dims := stickerDimsDetail(w, h); dims != "" {
+			l.checks.fail(RuleGIFStickerDims, LevelWarn, dims)
 		} else {
-			l.checks.fail(RuleGIFStickerDims, LevelError, fmt.Sprintf("%dx%d; stickers must be exactly 320x320", w, h))
+			l.checks.pass(RuleGIFStickerDims, LevelWarn, fmt.Sprintf("%dx%d fits %dx%d", w, h, stickerMaxSide, stickerMaxSide))
 		}
 		frames, _ := l.g.frames()
 		duration, _ := gifTiming(frames)
@@ -788,22 +792,39 @@ func (l *gifLinter) ruleTargetShape() {
 	}
 }
 
-// stickerDurationCheck evaluates the animated-sticker timing limits:
-// <= 5 s, <= 1000 frames, <= 60 fps.
+// Animated-sticker timing limits (DESIGN.md §5.1).
+const (
+	stickerMaxDurationMS = 5000
+	stickerMaxFrames     = 1000
+	stickerMaxFPS        = 60
+)
+
+// stickerDurationCheck evaluates the animated-sticker timing limits
+// (<= 5 s, <= 1000 frames, <= 60 fps) for a duration given in whole
+// milliseconds (GIF centisecond delays).
 func stickerDurationCheck(rule string, frames, durationMS int) Check {
+	return stickerLimitsCheck(rule, frames, int64(durationMS)*1000)
+}
+
+// stickerLimitsCheck evaluates the animated-sticker timing limits for a
+// duration in microseconds. Microsecond precision matters for APNG: a 60 fps
+// file has 1/60 s delays, which round to 17 ms per frame and would read as
+// 58.8 fps (or 62.5 fps truncated) when summed in whole milliseconds.
+func stickerLimitsCheck(rule string, frames int, durationUS int64) Check {
+	durationMS := roundUSToMS(durationUS)
 	var problems []string
-	if durationMS > 5000 {
-		problems = append(problems, fmt.Sprintf("duration %d ms exceeds 5000 ms", durationMS))
+	if durationMS > stickerMaxDurationMS {
+		problems = append(problems, fmt.Sprintf("duration %d ms exceeds %d ms", durationMS, stickerMaxDurationMS))
 	}
-	if frames > 1000 {
-		problems = append(problems, fmt.Sprintf("%d frames exceeds 1000", frames))
+	if frames > stickerMaxFrames {
+		problems = append(problems, fmt.Sprintf("%d frames exceeds %d", frames, stickerMaxFrames))
 	}
 	fps := 0.0
 	switch {
-	case durationMS > 0:
-		fps = float64(frames) * 1000 / float64(durationMS)
-		if fps > 60 {
-			problems = append(problems, fmt.Sprintf("%.1f fps exceeds 60 fps", fps))
+	case durationUS > 0:
+		fps = float64(frames) * 1e6 / float64(durationUS)
+		if fps > stickerMaxFPS {
+			problems = append(problems, fmt.Sprintf("%.1f fps exceeds %d fps", fps, stickerMaxFPS))
 		}
 	case frames > 1:
 		problems = append(problems, "total duration is 0 ms (frame rate undefined)")

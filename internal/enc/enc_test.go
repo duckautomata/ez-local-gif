@@ -165,12 +165,14 @@ func TestStillArgs(t *testing.T) {
 			want: append([]string{"-ss", "1.5"}, stillTail(stillFilter(planFilter, "1", "0", alphaScale480))...),
 		},
 		{
-			// Target clamps to 3.999 (slot 62, the last of 63); seek 3.859 snaps
-			// to 3.82 (slot 58) → slot 4 after the seek. The frames from 3.82 on
-			// exist, and tpad holds the last one if the input ends first.
+			// Target clamps to 3.999 (slot 62, capped at 61 — the render's fps
+			// stage runs round=down, so floor(2.5*25) = 62 slots end at 61);
+			// seek 3.859 snaps to 3.82 (slot 58) → slot 3 after the seek. The
+			// frames from 3.82 on exist, and tpad holds the last one if the
+			// input ends first.
 			name: "t past the trim end clamps to just inside TrimEnd",
 			t:    99, maxW: 480,
-			want: append([]string{"-ss", "3.82"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
+			want: append([]string{"-ss", "3.82"}, stillTail(stillFilter(planFilter, "1.12", "0.1", alphaScale480))...),
 		},
 		{
 			// Source 3.5; slots are 0.08 s of source: back 0.18 → 3.32 snaps to
@@ -218,22 +220,24 @@ func TestStillArgs(t *testing.T) {
 		},
 		{
 			// TrimEnd 0 but Duration 2.5: the source ends at 2.5, so t is clamped
-			// to 2.499 (slot 62) and the seek to 2.32 (slot 58).
+			// to 2.499 (slot 62, capped at the render's last slot 61) and the
+			// seek to 2.32 (slot 58).
 			name: "no trim, known duration: t is clamped to just inside the source",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
 				p.TrimStart, p.TrimEnd = 0, 0
 			},
 			t: 12.25, maxW: 480,
-			want: append([]string{"-ss", "2.32"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
+			want: append([]string{"-ss", "2.32"}, stillTail(stillFilter(planFilter, "1.12", "0.1", alphaScale480))...),
 		},
 		{
 			// Duration 4 s at 30 fps, plan at 33.333 fps (an fps op of 100/3;
 			// gif no longer snaps to it, but any fractional rate exercises the
 			// same arithmetic): t = Duration (the scrubber's maximum) clamps to
-			// 3.999 = slot 133; back is 0.1 + 1/33.333, the seek snaps to slot
-			// 128 = 3.840038 s, and the wanted slot is 5 after it. Six-decimal
-			// seek/threshold text.
+			// 3.999 = slot 133, capped at the render's last slot 132
+			// (floor(4*33.333) = 133 slots, round=down); back is 0.1 + 1/33.333,
+			// the seek snaps to slot 128 = 3.840038 s, and the wanted slot is 4
+			// after it. Six-decimal seek/threshold text.
 			name: "t = Duration on a CFR clip at a fractional rate seeks before the last frames",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
@@ -242,7 +246,7 @@ func TestStillArgs(t *testing.T) {
 			},
 			t: 4, maxW: 480,
 			want: append([]string{"-ss", "3.840038"},
-				stillTail(stillFilter("[0:v]fps=33.333,format=rgba[out]", "1.150002", "0.135001", alphaScale480))...),
+				stillTail(stillFilter("[0:v]fps=33.333,format=rgba[out]", "1.120001", "0.105001", alphaScale480))...),
 		},
 		{
 			// A 4 fps plan needs a whole 0.25 s slot of input after the seek
@@ -363,12 +367,13 @@ func TestStillArgsFromStart(t *testing.T) {
 	})
 
 	t.Run("t beyond the duration still clamps", func(t *testing.T) {
-		// Duration 2.5 → 2.499 → slot 62: threshold 61.5/25 = 2.46, pad 3.48.
+		// Duration 2.5 → 2.499 → slot 62, capped at the render's last slot 61
+		// (round=down): threshold 60.5/25 = 2.42, pad 61/25 + 1 = 3.44.
 		p := testPlan()
 		p.InputArgs = nil
 		p.TrimStart, p.TrimEnd = 0, 0
 		got := StillArgsFromStart(src, p, 99, 0)
-		want := stillTail(stillFilter(planFilter, "3.48", "2.46", ""))
+		want := stillTail(stillFilter(planFilter, "3.44", "2.42", ""))
 		assertArgs(t, got, want)
 	})
 
@@ -430,8 +435,20 @@ func TestStillSeekInvariants(t *testing.T) {
 					t.Errorf("t=%v: start %v is not on the slot grid (%v slots)", tt, s.start, slots)
 				}
 				// The wanted slot (relative to the seek) is between the threshold
-				// and threshold + one slot, and the pad reaches it.
-				want := math.Floor((target-trimStart)/speed*p.FPS+stillSlotEpsilon) - math.Round(slots)
+				// and threshold + one slot, and the pad reaches it. The absolute
+				// slot is capped at the render's last slot: the fps stage runs
+				// round=down, so slots end at floor(Duration*FPS) - 1.
+				abs := math.Floor((target-trimStart)/speed*p.FPS + stillSlotEpsilon)
+				durOut := p.Duration
+				if durOut <= 0 && p.TrimEnd > 0 {
+					durOut = (p.TrimEnd - trimStart) / speed
+				}
+				if durOut > 0 {
+					if last := math.Floor(durOut*p.FPS+stillSlotEpsilon) - 1; last >= 0 && abs > last {
+						abs = last
+					}
+				}
+				want := abs - math.Round(slots)
 				if want < 0 {
 					want = 0
 				}

@@ -116,6 +116,7 @@ if have "$ffmpeg" && have "$ffprobe" && have "$gifsicle"; then
     for f in a_gif_ffmpeg-palette_gifsicle-O2.gif e_webp_lossy_yuva420p_q80.webp e2_webp_lossy_bgra_q80.webp f_webp_lossless_bgra.webp g_apng_rgba.png h1_emote128_gif.gif h2_emote128_webp.webp i1_sticker320_gif.gif i2_sticker320_apng-rgba.png i3_sticker320_apng-indexed.png; do
       if [ -s "$out25/$f" ]; then ok "produced $f"; else fail "missing $f"; fi
     done
+    # shellcheck disable=SC2016  # markdown backticks
     if grep -q '^| `e2_webp_lossy_bgra_q80.webp` |' "$out25/README.md"; then ok "README lists e2 (lossy bgra)"; else fail "README lacks the e2 row"; fi
     # The synthetic ProRes 4444 decodes as yuva444p12le (10-bit for plain 4444
     # exports); either way the kit must unpremultiply at that depth, not gbrap.

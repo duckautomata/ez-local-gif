@@ -47,6 +47,31 @@ type ProbeInfo struct {
 	// the UI shows this as the "premultiplied source" toggle whose value is
 	// then expressed as the "unpremultiply" op.
 	Premultiplied bool `json:"premultiplied"`
+
+	// ColorStream is the video-stream index ("v:N") of the colour stream the
+	// graph must read. 0 for almost every source; > 0 for animated AVIF,
+	// where ffmpeg's mov demuxer lists the one-frame primary item first and
+	// the animation track after it (typically v:2, with its alpha at v:3).
+	ColorStream int `json:"colorStream,omitempty"`
+
+	// AlphaStream is the video-stream index ("v:N") of a separate
+	// single-plane alpha stream belonging to ColorStream (ffmpeg's mov
+	// demuxer exposes AVIF alpha this way). 0 = the alpha, if any, is in the
+	// colour stream's pix_fmt. When > 0 the graph merges it with alphamerge
+	// before any other stage.
+	AlphaStream int `json:"alphaStream,omitempty"`
+
+	// Sequence is set for image-sequence sources (Kind == KindSequence): the
+	// blob is a directory of frames named by Pattern.
+	Sequence *SequenceInfo `json:"sequence,omitempty"`
+}
+
+// SequenceInfo describes an uploaded image sequence (Phase 2).
+type SequenceInfo struct {
+	Count   int    `json:"count"`   // number of frames
+	Pattern string `json:"pattern"` // file name pattern inside the blob dir, e.g. "%06d.png" (ffmpeg image2 demuxer)
+	DelayMS int    `json:"delayMs"` // default per-frame duration in ms (100 unless the client said otherwise); the "delay" op overrides it per recipe
+	Mixed   bool   `json:"mixed"`   // frames differ in size; the graph scales/pads them to Width x Height (the largest frame)
 }
 
 // Source is an uploaded blob plus its probe info, as returned by the API.
@@ -78,6 +103,19 @@ const (
 	OpRotate        = "rotate"        // RotateParams
 	OpUnpremultiply = "unpremultiply" // no params
 )
+
+// Op kinds added in Phase 2.
+const (
+	// OpDelay sets the per-frame duration of an image-sequence source
+	// (DelayParams); ignored for other sources. Like OpUnpremultiply it is
+	// hoisted by the compiler (it becomes the image2 demuxer's -framerate).
+	OpDelay = "delay"
+)
+
+// DelayParams: frame duration in milliseconds for image sequences (1..60000).
+type DelayParams struct {
+	MS int `json:"ms"`
+}
 
 // TrimParams selects a time range of the source, in seconds. End <= 0 means
 // "to the end".
@@ -135,10 +173,42 @@ type RotateParams struct {
 	Degrees int `json:"degrees"`
 }
 
+// Output formats. Animated formats encode the whole master (a single-frame
+// master yields a still in the same container); static formats encode the
+// master's first frame; FormatFrames exports every frame as an image file
+// plus a zip.
+const (
+	FormatGIF    = "gif"
+	FormatWebP   = "webp"
+	FormatAPNG   = "apng"   // Phase 2
+	FormatAVIF   = "avif"   // Phase 2 (animated or still)
+	FormatPNG    = "png"    // Phase 2, static
+	FormatJPEG   = "jpeg"   // Phase 2, static (flattened onto Matte)
+	FormatFrames = "frames" // Phase 2, frame extraction (FrameFormat per frame + frames.zip)
+)
+
+// IsAnimatedFormat reports whether f can hold more than one frame.
+func IsAnimatedFormat(f string) bool {
+	switch f {
+	case FormatGIF, FormatWebP, FormatAPNG, FormatAVIF:
+		return true
+	}
+	return false
+}
+
+// IsStaticFormat reports whether f always encodes a single image.
+func IsStaticFormat(f string) bool {
+	switch f {
+	case FormatPNG, FormatJPEG:
+		return true
+	}
+	return false
+}
+
 // Output describes what to encode. Zero values mean "default"; the effective
 // defaults are documented per field and applied by the encoders.
 type Output struct {
-	Format string `json:"format"` // "gif" | "webp"  (Phase 2: "apng" | "avif" | "mp4" | "webm" | "png" | "frames")
+	Format string `json:"format"` // one of the Format* constants ("mp4"/"webm" arrive in Phase 4)
 
 	// Final canvas. 0 = as produced by the op stack. Fit says how to reach
 	// Width x Height from the op-stack result: "contain" (default: scale to
@@ -160,11 +230,26 @@ type Output struct {
 	Matte          string `json:"matte,omitempty"`          // gif: hex RRGGBB blended under semi-transparent pixels (0 = "313338", Discord dark)
 	Loop           int    `json:"loop,omitempty"`           // 0 = loop forever, N = play N+1 times (gif semantics)
 
-	FitBytes int64 `json:"fitBytes,omitempty"` // Phase 2: search knobs so the file is <= FitBytes
+	// Fit-to-size (Phase 2). FitBytes > 0 runs the ladder + secant search of
+	// DESIGN.md §5.4 so the primary file is <= FitBytes (1-2 % margin is
+	// applied by the engine); the other knobs above are the starting point.
+	// FitKeepSize forbids the downscale rungs, FitKeepFPS the fps rungs
+	// ("compress to X KiB" without changing the look). For Discord targets
+	// the engine also decides the format rung order (sticker: indexed APNG →
+	// GIF) unless Format is set explicitly by the user.
+	FitBytes    int64 `json:"fitBytes,omitempty"`
+	FitKeepSize bool  `json:"fitKeepSize,omitempty"`
+	FitKeepFPS  bool  `json:"fitKeepFps,omitempty"`
+
+	// FrameFormat applies to FormatFrames: "png" (default, RGBA), "jpeg"
+	// (flattened onto Matte, Quality), "webp" (lossless).
+	FrameFormat string `json:"frameFormat,omitempty"`
 
 	// Preset is informational for the UI ("emote", "sticker", "chat-gif",
-	// "chat-webp", "custom"). Target selects which Discord rules and byte
-	// limit the linter enforces: "emote" | "sticker" | "attachment" | "" (none).
+	// "chat-webp", "chat-avif", "optimize", "frames", "custom"); "optimize"
+	// additionally selects the no-decode GIF→GIF pipeline in jobs. Target
+	// selects which Discord rules and byte limit the linter enforces:
+	// "emote" | "sticker" | "attachment" | "" (none).
 	Preset string `json:"preset,omitempty"`
 	Target string `json:"target,omitempty"`
 }

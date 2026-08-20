@@ -26,6 +26,36 @@ var ErrNotImplemented = errors.New("probe: not implemented")
 // ErrNoVideo is returned when ffprobe finds no video stream in the file.
 var ErrNoVideo = errors.New("probe: no video stream")
 
+// ErrNotImplementedSequence is kept for API compatibility with the Phase-2
+// stub; ProbeSequence no longer returns it.
+var ErrNotImplementedSequence = errors.New("probe: sequence probing not implemented")
+
+// ProbeSequence (Phase 2) describes an image-sequence blob directory
+// (store.PutSequence layout: 000001.<ext> … N.<ext>, one extension):
+//   - Kind KindSequence, IsStill false, Codec/PixFmt/Bits from ffprobe of the
+//     first frame, Format "image2".
+//   - Width/Height = the largest frame (stdlib image.DecodeConfig for
+//     png/jpeg/gif, ffprobe over the image2 pattern for other formats,
+//     sampling at most 200 frames and assuming uniform beyond);
+//     Sequence.Mixed when any sampled frame differs. A sequence whose
+//     frames neither the stdlib nor ffprobe's image2 read is an error (the
+//     render opens the same pattern, so every job would fail), one the
+//     server classifies as an unreadable source.
+//   - Frames = count, FPS = 1000/delayMS (delayMS <= 0 → 100), Duration =
+//     Frames/FPS, Sequence = {Count, Pattern "%06d.<ext>", DelayMS, Mixed}.
+//   - HasAlpha: an alpha scan (enc.AlphaScanArgs on individual files) of a
+//     few frames sampled from those whose header can carry transparency
+//     ffmpeg would decode — NRGBA/translucent-palette models, every GIF
+//     frame (the transparent index hides in each frame's GCE), PNG
+//     truecolour/gray with a tRNS colour key, or the first frame when its
+//     ffprobe pix_fmt admits alpha.
+//   - Premultiplied false.
+//
+// The implementation lives in sequence.go.
+func ProbeSequence(ctx context.Context, tools ffrun.Tools, dir string, delayMS int) (recipe.ProbeInfo, error) {
+	return probeSequence(ctx, tools, dir, delayMS)
+}
+
 // DefaultScanFrames is the alpha-scan frame budget when maxScanFrames <= 0.
 const DefaultScanFrames = 60
 
@@ -64,6 +94,18 @@ var ffmpegPrefix = []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "erro
 //     Codec+HasAlpha).
 //   - Premultiplied: true when Codec == "prores" && HasAlpha (Resolve
 //     exports premultiplied); false otherwise.
+//   - AVIF (mov demuxer, brand avif/avis): libavif writes the primary
+//     image item(s) and, for animations, separate tracks, so ffprobe lists
+//     [colour item, (alpha item,) colour track, (alpha track)]. The main
+//     stream is the video stream with the most frames (the track for an
+//     animation, the item for a still); AlphaStream is the video-stream
+//     index ("v:N") of the matching single-plane (gray) stream with the
+//     same size and frame count, 0 when the file has no alpha. HasAlpha
+//     follows from that (the colour stream's own pix_fmt is opaque).
+//     Monochrome (yuv400) AVIFs report gray for every stream, colour ones
+//     included; there the most-frames rule runs over the streams not
+//     titled "Alpha" (ties to the first, the colour track precedes its
+//     alpha track), so a gray animation is still described by its track.
 //
 // maxScanFrames <= 0 means 60.
 func Probe(ctx context.Context, tools ffrun.Tools, path string, maxScanFrames int) (recipe.ProbeInfo, error) {
@@ -281,7 +323,11 @@ func classifyContainer(out ffOutput) container {
 
 // derive computes everything that does not need another process.
 func derive(out ffOutput) (derived, error) {
+	cont := classifyContainer(out)
 	vs := pickVideoStream(out.Streams)
+	if cont == cAVIF || cont == cAVIS {
+		vs = pickAVIFColorStream(out.Streams)
+	}
 	if vs == nil {
 		return derived{}, ErrNoVideo
 	}
@@ -311,8 +357,6 @@ func derive(out ffOutput) (derived, error) {
 			break
 		}
 	}
-
-	cont := classifyContainer(out)
 
 	// Frame rate.
 	rFPS := parseRate(vs.RFrameRate)
@@ -369,9 +413,14 @@ func derive(out ffOutput) (derived, error) {
 	case vs.CodecName == "vp8" || vs.CodecName == "vp9":
 		info.HasAlpha = strings.TrimSpace(vs.Tags["alpha_mode"]) == "1"
 	case cont == cAVIF || cont == cAVIS:
-		// The mov demuxer exposes AVIF alpha as an auxiliary second video
-		// stream; the colour stream itself reports an opaque pix_fmt.
-		info.HasAlpha = class == alphaYes || countVideoStreams(out.Streams) > 1
+		// The mov demuxer exposes AVIF alpha as an auxiliary single-plane
+		// video stream next to the colour stream, which itself reports an
+		// opaque pix_fmt. For animations the colour track is not the first
+		// video stream (the one-frame primary item is), so record its v:N
+		// index for the graph.
+		info.ColorStream = videoStreamIndex(out.Streams, vs)
+		info.AlphaStream = avifAlphaStream(out.Streams, vs)
+		info.HasAlpha = class == alphaYes || info.AlphaStream > 0
 	case class == alphaNone:
 		info.HasAlpha = false
 	case class == alphaMaybe:
@@ -413,14 +462,102 @@ func pickVideoStream(streams []ffStream) *ffStream {
 	return first
 }
 
-func countVideoStreams(streams []ffStream) int {
-	n := 0
+// pickAVIFColorStream returns the AVIF colour stream: among the video
+// streams that are not single-plane alpha, the one with the most frames
+// (libavif writes the primary still item before the animation track, so
+// the first video stream of an animated AVIF holds one frame), ties going
+// to the first. nil when there is no video stream.
+func pickAVIFColorStream(streams []ffStream) *ffStream {
+	best := mostFrames(streams, func(s *ffStream) bool { return !isAlphaPlane(s) })
+	if best == nil {
+		// Monochrome (yuv400) AVIF: every stream is gray, so pix_fmt cannot
+		// tell colour from alpha. Most frames still wins (primary item = 1
+		// frame, animation track = N); an "Alpha"-titled item never wins and
+		// ties go to the first stream (libavif and ffmpeg's avif muxer both
+		// write the colour track before its alpha track — the alpha TRACK of
+		// an animation carries no title and default=1, so position is the
+		// only tell).
+		best = mostFrames(streams, func(s *ffStream) bool { return !hasAlphaTitle(s) })
+	}
+	if best == nil {
+		return pickVideoStream(streams)
+	}
+	return best
+}
+
+// mostFrames returns the video stream with the highest nb_frames among those
+// ok accepts, ties going to the first; nil when none is accepted.
+func mostFrames(streams []ffStream, ok func(*ffStream) bool) *ffStream {
+	var best *ffStream
+	bestFrames := -1
 	for i := range streams {
-		if streams[i].CodecType == "video" {
-			n++
+		s := &streams[i]
+		if s.CodecType != "video" || !ok(s) {
+			continue
+		}
+		if n := parseIntFlex(string(s.NbFrames)); n > bestFrames {
+			best, bestFrames = s, n
 		}
 	}
-	return n
+	return best
+}
+
+// videoStreamIndex returns the "v:N" index of s among the video streams (0
+// when s is the first video stream or not found).
+func videoStreamIndex(streams []ffStream, s *ffStream) int {
+	vIndex := -1
+	for i := range streams {
+		if streams[i].CodecType != "video" {
+			continue
+		}
+		vIndex++
+		if &streams[i] == s {
+			return vIndex
+		}
+	}
+	return 0
+}
+
+// avifAlphaStream returns the video-stream index ("v:N") of the alpha plane
+// that belongs to the colour stream main: a single-plane stream of the same
+// size and frame count; 0 when there is none. The alpha item/track follows
+// its colour stream in libavif's layout, but any matching stream is
+// accepted.
+func avifAlphaStream(streams []ffStream, main *ffStream) int {
+	mainFrames := parseIntFlex(string(main.NbFrames))
+	vIndex := -1
+	for i := range streams {
+		s := &streams[i]
+		if s.CodecType != "video" {
+			continue
+		}
+		vIndex++
+		if s == main || !isAlphaPlane(s) {
+			continue
+		}
+		if s.Width != main.Width || s.Height != main.Height {
+			continue
+		}
+		if n := parseIntFlex(string(s.NbFrames)); n > 0 && mainFrames > 0 && n != mainFrames {
+			continue
+		}
+		return vIndex
+	}
+	return 0
+}
+
+// isAlphaPlane reports whether a stream looks like an AVIF auxiliary alpha
+// plane: a gray pix_fmt, or the "Alpha" title the mov demuxer copies from
+// the HEIF item name.
+func isAlphaPlane(s *ffStream) bool {
+	p := strings.ToLower(strings.TrimSpace(s.PixFmt))
+	return strings.HasPrefix(p, "gray") || hasAlphaTitle(s)
+}
+
+// hasAlphaTitle reports the "Alpha" title the mov demuxer copies from the
+// HEIF item name (alpha TRACKS of animations carry no title).
+func hasAlphaTitle(s *ffStream) bool {
+	return strings.EqualFold(strings.TrimSpace(s.Tags["title"]), "alpha")
 }
 
 // parseRate parses "num/den" (or a plain number) into fps; 0 when invalid.

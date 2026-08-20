@@ -53,12 +53,33 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"version":        s.cfg.Version,
 		"concurrency":    conc,
 		"maxUploadBytes": s.cfg.MaxUploadBytes,
-		"formats":        []string{"gif", "webp"},
+		"formats":        outputFormats(),
+		"features":       features(),
 	})
+}
+
+// outputFormats lists the recipe.Output formats this build renders, in the
+// order the UI offers them.
+func outputFormats() []string {
+	return []string{
+		recipe.FormatGIF, recipe.FormatWebP, recipe.FormatAPNG, recipe.FormatAVIF,
+		recipe.FormatPNG, recipe.FormatJPEG, recipe.FormatFrames,
+	}
+}
+
+// features flags the Phase 2 capabilities the SPA gates its UI on: fit-to-
+// size (Output.FitBytes), image-sequence uploads (several "file" parts) and
+// the GIF→GIF optimiser path.
+func features() map[string]bool {
+	return map[string]bool{"fit": true, "sequence": true, "optimize": true}
 }
 
 // ---- upload / sources ---------------------------------------------------------
 
+// handleUpload streams the multipart body (see upload.go): one "file" part
+// becomes a blob source, several become an image-sequence source. The
+// rules for several parts are enforced while reading, so a rejected upload
+// stops early and leaves nothing behind.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > s.cfg.MaxUploadBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds the %d byte limit", s.cfg.MaxUploadBytes))
@@ -71,39 +92,81 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var blob *store.Blob
-	for blob == nil {
-		part, err := mr.NextPart()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			s.uploadReadError(w, err)
+	up, err := s.readUpload(mr)
+	defer up.close()
+	if err != nil {
+		var ue *uploadError
+		if errors.As(err, &ue) {
+			writeError(w, ue.Status, ue.Msg)
 			return
 		}
-		if part.FormName() != "file" {
-			continue // NextPart discards the rest of this part
-		}
-		blob, err = s.st.PutBlob(part, part.FileName())
-		if err != nil {
-			s.uploadReadError(w, err)
-			return
-		}
+		s.uploadReadError(w, err)
+		return
 	}
-	if blob == nil {
+	if !up.hasFirst {
 		writeError(w, http.StatusBadRequest, "multipart body has no \"file\" field")
 		return
 	}
-	if blob.Size == 0 {
-		s.discardBlob(blob.Hash)
+	if up.isSequence() {
+		s.finishSequenceUpload(w, r, up)
+		return
+	}
+	if up.firstSize == 0 {
 		writeError(w, http.StatusBadRequest, "uploaded file is empty")
 		return
 	}
+	blob, err := s.storeFirstPart(up)
+	if err != nil {
+		log.Printf("server: store upload: %v", err)
+		writeError(w, http.StatusInternalServerError, "upload failed: "+errText(err))
+		return
+	}
+	s.answerSource(w, r, blob, s.probeFile)
+}
 
+// finishSequenceUpload turns the staged parts of a multi-file upload into a
+// sequence blob, probes it at the requested delay and answers with the
+// source. The staged files (the first part included) never entered the blob
+// store, so nothing has to be deleted from it on any path.
+func (s *Server) finishSequenceUpload(w http.ResponseWriter, r *http.Request, up *upload) {
+	parts, closeParts, err := up.sequenceParts()
+	if err != nil {
+		log.Printf("server: upload sequence: %v", err)
+		writeError(w, http.StatusInternalServerError, "upload failed: "+errText(err))
+		return
+	}
+	blob, err := s.st.PutSequence(parts)
+	closeParts()
+	if err != nil {
+		if errors.Is(err, store.ErrMixedSequence) {
+			writeError(w, http.StatusBadRequest, errText(err))
+			return
+		}
+		log.Printf("server: store image sequence: %v", err)
+		writeError(w, http.StatusInternalServerError, "storing the image sequence failed: "+errText(err))
+		return
+	}
+	s.answerSource(w, r, blob, func(ctx context.Context, b *store.Blob) (recipe.ProbeInfo, error) {
+		return probe.ProbeSequence(ctx, s.tools, b.Path, up.delayMS)
+	})
+}
+
+// prober describes one blob (a file or a sequence dir) for answerSource.
+type prober func(ctx context.Context, b *store.Blob) (recipe.ProbeInfo, error)
+
+// probeFile is the prober for ordinary (single-file) blobs.
+func (s *Server) probeFile(ctx context.Context, b *store.Blob) (recipe.ProbeInfo, error) {
+	return probe.Probe(ctx, s.tools, b.Path, probeScanFrames)
+}
+
+// answerSource completes every path that makes a blob a source: a blob
+// without probe info is probed (under probeTimeout) and the info stored,
+// then the source is written. Probe failures go through probeFailed.
+func (s *Server) answerSource(w http.ResponseWriter, r *http.Request, blob *store.Blob, pr prober) {
 	if blob.Info == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
 		defer cancel()
-		info, err := probe.Probe(ctx, s.tools, blob.Path, probeScanFrames)
+		info, err := pr(ctx, blob)
 		if err != nil {
 			s.probeFailed(w, r, blob.Hash, err)
 			return
@@ -144,8 +207,10 @@ func (s *Server) probeFailed(w http.ResponseWriter, r *http.Request, hash string
 
 // unreadableSource reports whether a probe error means "ffprobe ran and
 // could not read this file" — it exited non-zero on the file, its output
-// was not the JSON it prints for anything it can open, or it found no video
-// stream — as opposed to ffprobe itself failing to run.
+// was not the JSON it prints for anything it can open, it found no video
+// stream, or the stream it found has no dimensions (garbage behind an image
+// extension: the image2 demuxer trusts the name and the decoder gives up) —
+// as opposed to ffprobe itself failing to run.
 func unreadableSource(err error) bool {
 	var (
 		exit   *exec.ExitError
@@ -155,8 +220,14 @@ func unreadableSource(err error) bool {
 	return errors.Is(err, probe.ErrNoVideo) ||
 		errors.As(err, &exit) ||
 		errors.As(err, &syntax) ||
-		errors.As(err, &typ)
+		errors.As(err, &typ) ||
+		strings.Contains(err.Error(), noDimensionsMarker)
 }
+
+// noDimensionsMarker is the phrase package probe uses for a video stream
+// whose width or height is 0 ("video stream has no dimensions (0x0)",
+// "frame 1 has no dimensions (0x0)"); it has no sentinel of its own.
+const noDimensionsMarker = "has no dimensions"
 
 // warmStill pre-renders the first preview frame in the background
 // (DESIGN.md §8: still pre-warmed the moment the upload lands) so the UI's
@@ -238,6 +309,87 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sourceOf(blob))
+}
+
+// fromResultRequest is the body of POST /api/sources/from-result.
+type fromResultRequest struct {
+	RecipeHash string `json:"recipeHash"`
+	Name       string `json:"name"`
+}
+
+// handleSourceFromResult makes a rendered result file a source of its own
+// ("edit as source"): the named file of the result — one the manifest lists,
+// not the manifest or report — is copied into the blob store under its
+// result file name, probed like an upload and answered as a recipe.Source.
+// A file that is already a blob dedupes, so chaining is free.
+func (s *Server) handleSourceFromResult(w http.ResponseWriter, r *http.Request) {
+	var req fromResultRequest
+	if !decodeJSON(w, r, &req, "from-result request") {
+		return
+	}
+	if !recipe.IsHash(req.RecipeHash) {
+		writeError(w, http.StatusBadRequest, "recipeHash must be a recipe hash")
+		return
+	}
+	if !validResultName(req.Name) {
+		writeError(w, http.StatusBadRequest, "name must be a plain result file name")
+		return
+	}
+	res, err := s.jm.LoadResult(req.RecipeHash)
+	if err != nil {
+		if errors.Is(err, jobs.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "no result for this recipe")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, errText(err))
+		return
+	}
+	file := resultFile(res, req.Name)
+	if file == nil {
+		writeError(w, http.StatusNotFound, "no such file in this result")
+		return
+	}
+	if file.Kind == jobs.FileKindArchive || strings.EqualFold(path.Ext(req.Name), ".zip") {
+		writeError(w, http.StatusBadRequest, "an archive cannot be used as a source; pick a frame or an output file")
+		return
+	}
+	full := filepath.Join(s.st.ResultDir(req.RecipeHash), req.Name)
+	f, err := os.Open(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "result file is missing")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, errText(err))
+		return
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		writeError(w, http.StatusNotFound, "result file is missing")
+		return
+	}
+	blob, err := s.st.PutBlob(f, req.Name)
+	if err != nil {
+		log.Printf("server: from-result %s/%s: %v", req.RecipeHash, req.Name, err)
+		writeError(w, http.StatusInternalServerError, "copying the result into the store failed: "+errText(err))
+		return
+	}
+	if blob.Size == 0 {
+		s.discardBlob(blob.Hash)
+		writeError(w, http.StatusUnprocessableEntity, "result file is empty")
+		return
+	}
+	s.answerSource(w, r, blob, s.probeFile)
+}
+
+// resultFile returns the manifest entry named name, or nil.
+func resultFile(res *jobs.Result, name string) *jobs.File {
+	for i := range res.Files {
+		if res.Files[i].Name == name {
+			return &res.Files[i]
+		}
+	}
+	return nil
 }
 
 // ---- still --------------------------------------------------------------------
@@ -512,14 +664,46 @@ func (s *Server) handleOutFile(w http.ResponseWriter, r *http.Request) {
 	}
 	h := w.Header()
 	h.Set("Cache-Control", "public, max-age=31536000, immutable")
+	if ct := resultContentType(name); ct != "" {
+		h.Set("Content-Type", ct)
+	}
 	if r.URL.Query().Get("dl") == "1" {
 		h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": s.downloadName(hash, name)}))
 	}
 	http.ServeFile(w, r, full)
 }
 
+// resultContentTypes pins the Content-Type of every kind of result file
+// rather than leaving it to the host's mime tables (Windows calls a zip
+// "application/x-zip-compressed", a slim container image has no
+// /etc/mime.types and Go's built-in table knows neither .zip nor .apng).
+var resultContentTypes = map[string]string{
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".png":  "image/png",
+	".apng": "image/apng",
+	".avif": "image/avif",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".zip":  "application/zip",
+	".json": "application/json; charset=utf-8",
+}
+
+// resultContentType returns the Content-Type for a result file name, or ""
+// when the extension is not one the pipeline writes (http.ServeFile then
+// decides).
+func resultContentType(name string) string {
+	return resultContentTypes[strings.ToLower(path.Ext(name))]
+}
+
 // downloadName derives a friendly attachment name from the recipe's main
-// source ("myclip.gif"); falls back to the stored file name.
+// source. Only the primary output is named after the source alone
+// ("myclip.gif"); every other file keeps its own stem behind the source so
+// sibling downloads stay distinct: "myclip-f00012.png" for an extracted
+// frame, "myclip-alt1.gif" for a fit-search alternative, "myclip-frames.zip"
+// for the frame archive and "myclip-delays.json" / "myclip-report.json" for
+// sidecars the manifest does not list. Falls back to the stored file name
+// when the source is unknown.
 func (s *Server) downloadName(hash, name string) string {
 	res, err := s.jm.LoadResult(hash)
 	if err != nil || len(res.Recipe.Sources) == 0 {
@@ -534,5 +718,13 @@ func (s *Server) downloadName(hash, name string) string {
 	if base == "" {
 		return name
 	}
-	return base + path.Ext(name)
+	for _, f := range res.Files {
+		if f.Name == name {
+			if f.Kind == "" || f.Kind == jobs.FileKindOutput {
+				return base + path.Ext(name)
+			}
+			break
+		}
+	}
+	return base + "-" + name
 }

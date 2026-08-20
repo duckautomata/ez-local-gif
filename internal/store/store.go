@@ -1,6 +1,7 @@
 // Package store owns the on-disk layout (DESIGN.md §3):
 //
 //	<Root>/blobs/<sha256>.<ext>        uploaded files, content-addressed
+//	<Root>/blobs/<sha256>.seq/         uploaded image sequences (directory blobs, see sequence.go)
 //	<Root>/blobs/<sha256>.json         Blob metadata (name, size, uploaded, probe info)
 //	<Root>/results/<recipeHash>/       encoded outputs + manifest.json
 //	<Root>/tmp/                        upload staging (same filesystem as blobs)
@@ -55,7 +56,16 @@ const ManifestName = "manifest.json"
 //	3:        any source with an established frame count of 1 (a one-frame
 //	          ProRes/H.264 MOV) is a still (IsStill, Kind image, FPS 0), not
 //	          a video that the fps filter would render to nothing
-const InfoVersion = 3
+//	4:        AVIF is described by its animation track (not the one-frame
+//	          primary item libavif writes first) and carries AlphaStream;
+//	          image sequences (Kind sequence, Info.Sequence) are new
+//	5:        sequence HasAlpha considers GIF frames and colour-keyed
+//	          (RGB/gray + tRNS) PNG frames whose stdlib colour model looks
+//	          opaque; monochrome (yuv400/gray) AVIF animations are described
+//	          by their track, not the one-frame primary item; sequences
+//	          whose frames ffmpeg cannot read via the image2 pattern are
+//	          rejected at probe time
+const InfoVersion = 5
 
 // MinScratchBytes is the smallest scratch filesystem New accepts quietly.
 // Docker's default /dev/shm is 64 MiB, which holds about 160 frames of
@@ -81,6 +91,10 @@ const (
 	metaExt = "json"
 	// jsonBlobExt is what SanitizeExt returns for an uploaded .json file.
 	jsonBlobExt = "jsonfile"
+	// seqBlobExt is what SanitizeExt returns for an uploaded .seq file. Ext
+	// "seq" (SeqExt, sequence.go) means "Path is the frame directory"; a
+	// plain file blob must never carry it, or Blob.IsSequence would lie.
+	seqBlobExt = "seqfile"
 	// defaultName is used when the client file name is empty after sanitising.
 	defaultName = "upload"
 
@@ -105,7 +119,7 @@ type Blob struct {
 	// meta files that predate the field). Readers only ever see Info when it
 	// matches the current InfoVersion.
 	InfoVersion int    `json:"infoVersion,omitempty"`
-	Path        string `json:"-"` // absolute path of the blob file
+	Path        string `json:"-"` // absolute path of the blob file (the frame directory for Ext "seq")
 }
 
 // Store is safe for concurrent use.
@@ -355,11 +369,20 @@ func (s *Store) getBlobLocked(hash string) (*Blob, error) {
 	// so the missing payload surfaces as ErrNotFound and gets re-uploaded.
 	b.Ext = normalizeExt(b.Ext)
 	b.Path = s.blobPath(hash, b.Ext)
-	if _, err := os.Stat(b.Path); err != nil {
+	st, err := os.Stat(b.Path)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("store: stat blob %s: %w", hash, err)
+	}
+	// Ext "seq" promises that Path is the frame directory (sequence.go). A
+	// meta whose ext and payload shape disagree — a legacy plain-file upload
+	// named "*.seq" from before SanitizeExt reserved the extension, or a
+	// stray directory where a file should be — must not surface as the wrong
+	// kind: report it missing so the upload path stores it again truthfully.
+	if st.IsDir() != b.IsSequence() {
+		return nil, ErrNotFound
 	}
 	if b.Info != nil && b.InfoVersion != InfoVersion {
 		// Probed under older semantics (e.g. pre-autorotate dimensions):
@@ -407,8 +430,8 @@ func (s *Store) TouchBlob(hash string) error {
 	return nil
 }
 
-// DeleteBlob removes a blob and its meta file. Unknown hashes are not an
-// error (idempotent).
+// DeleteBlob removes a blob (file or sequence directory) and its meta file.
+// Unknown hashes are not an error (idempotent).
 func (s *Store) DeleteBlob(hash string) error {
 	if !recipe.IsHash(hash) {
 		return nil
@@ -417,7 +440,7 @@ func (s *Store) DeleteBlob(hash string) error {
 	defer s.metaMu.Unlock()
 	var errs []error
 	if b, err := s.getBlobLocked(hash); err == nil {
-		if err := os.Remove(b.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.RemoveAll(b.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
@@ -603,8 +626,9 @@ func (s *Store) ScratchDir(id string) (string, func(), error) {
 // pass), then oldest results — and, if still over, blobs older than an hour —
 // until total size <= maxBytes (0 = no cap). It never deletes a result dir
 // that is being written (no manifest yet and mtime < 1 h ago); abandoned
-// upload temp files and manifest-less result dirs older than an hour are
-// removed as junk.
+// upload temp files, manifest-less result dirs older than an hour, and blob
+// payloads whose meta file is missing (unreachable orphans from a crash or
+// partial delete) older than blobGrace are removed as junk whatever ttl says.
 //
 // A blob's age is the newer of its payload and meta mtimes: TouchBlob
 // (render / still) refreshes the payload, PutBlob / SetBlobInfo the meta. A
@@ -650,6 +674,15 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 	for _, b := range blobs {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// A payload without its meta file is unreachable (getBlobLocked
+		// needs the meta) and, once past blobGrace (an in-flight upload
+		// writes payload and meta back-to-back under metaMu), junk whatever
+		// ttl says — left behind, it would also block PutSequence re-uploads
+		// of the same frames until reclaimed.
+		if b.metaMtime.IsZero() && now.Sub(b.mtime) > blobGrace {
+			note(s.removeOrphanBlob(b))
+			continue
 		}
 		if ttl > 0 && now.Sub(b.mtime) > ttl && !b.metaFresh(now) {
 			note(s.removeBlobFiles(b))
@@ -799,7 +832,7 @@ func dirSize(dir string) int64 {
 
 type blobEntry struct {
 	hash      string
-	files     []string  // blob file + meta file (whichever exist)
+	files     []string  // blob file (or sequence dir) + meta file (whichever exist)
 	mtime     time.Time // newest of the files (last upload / probe / use)
 	metaMtime time.Time // the meta file's own mtime (zero when absent)
 	size      int64
@@ -811,7 +844,10 @@ func (b blobEntry) metaFresh(now time.Time) bool {
 	return !b.metaMtime.IsZero() && now.Sub(b.metaMtime) < blobGrace
 }
 
-// listBlobs groups blob and meta files by hash.
+// listBlobs groups blob payloads (files, or <hash>.seq directories for image
+// sequences) and meta files by hash. A sequence dir counts with the total
+// size of its frames and its own mtime (TouchBlob refreshes that, as it does
+// a file's; the frames inside are never touched after the upload).
 func (s *Store) listBlobs() ([]blobEntry, error) {
 	root := filepath.Join(s.Root, blobsDir)
 	entries, err := os.ReadDir(root)
@@ -820,9 +856,6 @@ func (s *Store) listBlobs() ([]blobEntry, error) {
 	}
 	byHash := map[string]*blobEntry{}
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
 		name := e.Name()
 		dot := strings.IndexByte(name, '.')
 		hash, ext := name, ""
@@ -830,6 +863,9 @@ func (s *Store) listBlobs() ([]blobEntry, error) {
 			hash, ext = name[:dot], name[dot+1:]
 		}
 		if !recipe.IsHash(hash) {
+			continue
+		}
+		if e.IsDir() && ext != SeqExt {
 			continue
 		}
 		info, err := e.Info()
@@ -841,8 +877,13 @@ func (s *Store) listBlobs() ([]blobEntry, error) {
 			be = &blobEntry{hash: hash}
 			byHash[hash] = be
 		}
-		be.files = append(be.files, filepath.Join(root, name))
-		be.size += info.Size()
+		full := filepath.Join(root, name)
+		be.files = append(be.files, full)
+		if e.IsDir() {
+			be.size += dirSize(full)
+		} else {
+			be.size += info.Size()
+		}
 		if info.ModTime().After(be.mtime) {
 			be.mtime = info.ModTime()
 		}
@@ -858,12 +899,32 @@ func (s *Store) listBlobs() ([]blobEntry, error) {
 	return out, nil
 }
 
+// removeOrphanBlob deletes a payload that was listed without a meta file,
+// re-checking under metaMu that no meta appeared meanwhile (a concurrent
+// PutSequence/PutBlob may have just reclaimed and legitimised the path).
+func (s *Store) removeOrphanBlob(b blobEntry) error {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	if _, err := os.Stat(s.metaPath(b.hash)); err == nil {
+		return nil
+	}
+	var errs []error
+	for _, f := range b.files {
+		if err := os.RemoveAll(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// removeBlobFiles deletes every path of the entry (a sequence dir with its
+// frames included).
 func (s *Store) removeBlobFiles(b blobEntry) error {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
 	var errs []error
 	for _, f := range b.files {
-		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.RemoveAll(f); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
@@ -874,7 +935,9 @@ func (s *Store) removeBlobFiles(b blobEntry) error {
 // lowercase, alphanumeric only, at most 8 characters; "bin" when nothing
 // usable remains. It never returns "json" — that is the meta file's
 // extension, so an uploaded .json file is stored as <hash>.jsonfile and its
-// payload and meta stay separate.
+// payload and meta stay separate — and never "seq", which is reserved for
+// sequence directory blobs (sequence.go), so an uploaded .seq file is stored
+// as <hash>.seqfile and Blob.IsSequence stays truthful.
 func SanitizeExt(name string) string {
 	base := lastPathElement(name)
 	dot := strings.LastIndexByte(base, '.')
@@ -890,6 +953,11 @@ func SanitizeExt(name string) string {
 	ext := b.String()
 	if ext == "" || len(ext) > maxExtLen {
 		return defaultExt
+	}
+	if ext == SeqExt {
+		// Only PutSequence may mint Ext "seq" (getBlobLocked keeps it for
+		// genuine sequence metas, so the remap cannot live in normalizeExt).
+		return seqBlobExt
 	}
 	return normalizeExt(ext)
 }

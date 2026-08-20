@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { isAbortError, messageOf, upload, type UploadHandle } from '../lib/api';
-  import { fmtBytes } from '../lib/format';
+  import { planDrop, sequenceDelayOverride, sequenceFps } from '../lib/files';
+  import { fmtBytes, fmtNum } from '../lib/format';
   import { resetRender } from '../lib/render.svelte';
-  import { app, setSource } from '../lib/state.svelte';
+  import { app, DEFAULT_DELAY_MS, setSource } from '../lib/state.svelte';
   import { toast } from '../lib/toast.svelte';
+  import NumField from './NumField.svelte';
 
   const ACCEPT =
     '.gif,.webp,.apng,.png,.avif,.mp4,.mkv,.mov,.webm,.jpg,.jpeg,image/*,video/*,video/quicktime,video/x-matroska';
@@ -16,23 +18,31 @@
   let currentName = $state('');
   let handle: UploadHandle | null = null;
   let fileInput = $state<HTMLInputElement | null>(null);
+  /** per-frame delay for image sequences (ms), sent with multi-file uploads */
+  let delayMs = $state(DEFAULT_DELAY_MS);
 
   const percent = $derived(total > 0 ? Math.min(100, (loaded / total) * 100) : 0);
   const compact = $derived(app.source !== null && !uploading);
+  const seqFps = $derived(sequenceFps(delayMs));
 
-  async function send(file: File) {
+  async function send(files: File[]) {
     if (uploading) {
       toast.info('An upload is already in progress');
       return;
     }
+    if (files.length === 0) return;
     uploading = true;
     loaded = 0;
-    total = file.size;
-    currentName = file.name;
-    handle = upload(file, (l, t) => {
-      loaded = l;
-      total = t;
-    });
+    total = files.reduce((n, f) => n + f.size, 0);
+    currentName = files.length === 1 ? files[0].name : `${files.length} images as a sequence (${fmtNum(delayMs, 0)} ms / frame)`;
+    handle = upload(
+      files,
+      (l, t) => {
+        loaded = l;
+        total = t;
+      },
+      { delayMs },
+    );
     try {
       const src = await handle.promise;
       // A new source replaces the old one: drop the previous job/result (and
@@ -41,13 +51,35 @@
       // remounts (App.svelte).
       resetRender();
       setSource(src);
-      toast.success(`Uploaded ${src.name} (${fmtBytes(src.size)})`);
+      const seq = src.info.sequence;
+      const what = seq ? `sequence of ${seq.count} frames` : src.name;
+      // The store dedupes identical frame sets and keeps the delay they were
+      // first stored with, so a re-upload can come back with a different delay
+      // than the one requested. Honour the request with the "delay" op (the
+      // documented override) instead of silently keeping the stored timing.
+      const override = sequenceDelayOverride(seq, files.length, delayMs);
+      if (override > 0 && seq) {
+        app.ops.delay = { enabled: true, ms: override };
+        toast.success(
+          `Uploaded ${what} (${fmtBytes(src.size)}) — the frames were already stored at ${seq.delayMs} ms / frame, so the Delay op now applies your ${override} ms`,
+        );
+      } else {
+        toast.success(`Uploaded ${what} (${fmtBytes(src.size)})`);
+      }
     } catch (e) {
       if (!isAbortError(e)) toast.error(`Upload failed: ${messageOf(e)}`);
     } finally {
       uploading = false;
       handle = null;
     }
+  }
+
+  /** accept turns a dropped/picked/pasted file list into one upload. */
+  function accept(list: FileList | File[] | null | undefined) {
+    const plan = planDrop(list ? Array.from(list) : []);
+    if (plan.note) toast.info(plan.note);
+    if (plan.kind === 'single') void send([plan.file]);
+    else if (plan.kind === 'sequence') void send(plan.files);
   }
 
   function cancel() {
@@ -58,18 +90,10 @@
     if (!uploading) fileInput?.click();
   }
 
-  function pickFirst(list: FileList | File[] | null | undefined): File | null {
-    if (!list || list.length === 0) return null;
-    // Phase 1: one file per source (image sequences arrive in Phase 2).
-    if (list.length > 1) toast.info(`Using the first of ${list.length} files — sequences arrive in Phase 2`);
-    return list[0] ?? null;
-  }
-
   function onDrop(e: DragEvent) {
     e.preventDefault();
     dragging = false;
-    const f = pickFirst(e.dataTransfer?.files);
-    if (f) void send(f);
+    accept(e.dataTransfer?.files);
   }
 
   function onDragOver(e: DragEvent) {
@@ -80,9 +104,9 @@
 
   function onPick(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
-    const f = pickFirst(input.files);
+    const files = input.files ? Array.from(input.files) : [];
     input.value = '';
-    if (f) void send(f);
+    accept(files);
   }
 
   // Ctrl+V of a file (e.g. copied from Explorer) or an image bitmap.
@@ -101,12 +125,10 @@
         }
       }
       if (files.length === 0 && e.clipboardData?.files.length) files.push(...e.clipboardData.files);
-      const f = pickFirst(files);
-      if (!f) return;
+      if (files.length === 0) return;
       e.preventDefault();
       // Pasted bitmaps come in as "image.png" — give them a timestamped name.
-      const named = f.name ? f : new File([f], `pasted-${Date.now()}.png`, { type: f.type });
-      void send(named);
+      accept(files.map((f) => (f.name ? f : new File([f], `pasted-${Date.now()}.png`, { type: f.type }))));
     };
     window.addEventListener('paste', onPaste);
     return () => window.removeEventListener('paste', onPaste);
@@ -132,7 +154,7 @@
   ondragleave={() => (dragging = false)}
   ondrop={onDrop}
 >
-  <input bind:this={fileInput} type="file" accept={ACCEPT} hidden onchange={onPick} />
+  <input bind:this={fileInput} type="file" accept={ACCEPT} multiple hidden onchange={onPick} />
   {#if uploading}
     <div class="up">
       <div class="row between">
@@ -144,8 +166,17 @@
     </div>
   {:else if compact}
     <div class="row between">
-      <span class="muted small">Drop or paste (<kbd>Ctrl</kbd>+<kbd>V</kbd>) another file here to replace the source, or</span>
-      <button type="button" class="sm" onclick={openPicker}>Choose file…</button>
+      <span class="muted small">
+        Drop or paste (<kbd>Ctrl</kbd>+<kbd>V</kbd>) another file — or several png/jpeg/webp/bmp/tiff images for a sequence — to
+        replace the source, or
+      </span>
+      <span class="row tight">
+        <label class="seq small" title="Per-frame delay used when several images are uploaded as a sequence">
+          <span class="muted">sequence delay</span>
+          <NumField bind:value={delayMs} min={1} max={60000} small /><span class="muted">ms</span>
+        </label>
+        <button type="button" class="sm" onclick={openPicker}>Choose file(s)…</button>
+      </span>
     </div>
   {:else}
     <div class="big">
@@ -156,9 +187,14 @@
           </svg>
         </span>
         <span class="title">Drop a file here, paste it, or</span>
-        <span class="btn primary">Choose file…</span>
+        <span class="btn primary">Choose file(s)…</span>
       </button>
-      <p class="hint">GIF · WebP · APNG · AVIF · PNG · MP4 · MKV · MOV (ProRes 4444 alpha) · WebM</p>
+      <p class="hint">GIF · WebP · APNG · AVIF · PNG · JPEG · MP4 · MKV · MOV (ProRes 4444 alpha) · WebM</p>
+      <label class="seq hint" title="Per-frame delay used when several images are uploaded as a sequence">
+        <span>Several images (PNG / JPEG / WebP / BMP / TIFF) = one sequence · frame delay</span>
+        <NumField bind:value={delayMs} min={1} max={60000} small />
+        <span>ms{#if seqFps > 0}&nbsp;= {fmtNum(seqFps)} fps{/if} (changeable later in the Delay card)</span>
+      </label>
     </div>
   {/if}
 </div>
@@ -226,6 +262,17 @@
   .row.between {
     justify-content: space-between;
     width: 100%;
+  }
+  .row.tight {
+    gap: 8px;
+    flex-wrap: nowrap;
+  }
+  .seq {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
   }
   .up {
     display: flex;

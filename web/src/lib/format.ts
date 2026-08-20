@@ -51,6 +51,92 @@ export function fmtNum(v: number, decimals = 2): string {
   return Number(v.toFixed(decimals)).toString();
 }
 
+/**
+ * fmtTimecode renders seconds Resolve-style as MM:SS.cc (centiseconds):
+ * 1.12 → "00:01.12", 72.5 → "01:12.50"; an hour or more adds H:.
+ * Negative / non-finite values render as 00:00.00.
+ */
+export function fmtTimecode(s: number): string {
+  if (!Number.isFinite(s) || s < 0) s = 0;
+  // Work in whole centiseconds so 1.005 does not render as 00:01.00 + carry bugs.
+  let cs = Math.round(s * 100);
+  const h = Math.floor(cs / 360_000);
+  cs -= h * 360_000;
+  const m = Math.floor(cs / 6000);
+  cs -= m * 6000;
+  const sec = Math.floor(cs / 100);
+  cs -= sec * 100;
+  const pad = (v: number) => (v < 10 ? '0' : '') + v;
+  const core = `${pad(m)}:${pad(sec)}.${pad(cs)}`;
+  return h > 0 ? `${h}:${core}` : core;
+}
+
+/**
+ * frameCount is the number of frames a clip of `duration` seconds has at
+ * `fps` (the plan's frame grid): max(1, floor(duration × fps)); 0 when the
+ * rate is unknown. Floor, not round: the render's fps stage runs
+ * `round=down` so an fps drop never lengthens the clip (graph.Plan.Frames
+ * uses the same model).
+ */
+export function frameCount(duration: number, fps: number): number {
+  if (!(fps > 0) || !Number.isFinite(duration)) return 0;
+  return Math.max(1, Math.floor(Math.max(0, duration) * fps + 1e-9));
+}
+
+/**
+ * frameAt maps a time to its 1-based frame number on the fps grid, clamped
+ * to [1, count] (count ≤ 0 = unclamped). A small epsilon absorbs the
+ * floating-point error of k/fps so the frame boundary itself belongs to
+ * frame k+1, not k.
+ */
+export function frameAt(t: number, fps: number, count = 0): number {
+  if (!(fps > 0)) return 1;
+  let f = Math.floor(Math.max(0, t) * fps + 1e-6) + 1;
+  if (count > 0) f = Math.min(f, count);
+  return Math.max(1, f);
+}
+
+/**
+ * ceilMs rounds a time up to whole milliseconds (with a tiny tolerance so an
+ * exact millisecond stays put). Still requests are keyed on milliseconds
+ * server-side and map t to frame floor(t × fps), so rounding *up* keeps a
+ * frame-start time inside its own frame (rounding down would show the
+ * previous frame at 23.976 fps, where 2/23.976 = 0.08342 → 0.083 → frame 2).
+ */
+export function ceilMs(t: number): number {
+  if (!Number.isFinite(t) || t <= 0) return 0;
+  return Math.ceil(t * 1000 - 1e-6) / 1000;
+}
+
+/** frameTime is the start time of 1-based frame f on the fps grid, ceiled to ms (see ceilMs). */
+export function frameTime(f: number, fps: number): number {
+  if (!(fps > 0)) return 0;
+  return ceilMs(Math.max(0, f - 1) / fps);
+}
+
+/**
+ * dropRates lists the frame rates the gifsicle-only optimiser can reach from
+ * a source at srcFps: it drops every Nth frame (N = 2..4, merging the dropped
+ * delay into the previous frame), so the rate becomes srcFps × (N−1)/N —
+ * 1/2, 2/3 or 3/4 of the source — which jobs/optimize.go (dropEveryN) maps
+ * back onto N within 5 %. Ordered mildest first: keep all (n 0), every 4th,
+ * every 3rd, every 2nd. `fps` is what the recipe carries (0 = keep all).
+ * Empty for no rate.
+ */
+export function dropRates(srcFps: number): { n: number; fps: number; label: string }[] {
+  if (!(srcFps > 0)) return [];
+  const out = [{ n: 0, fps: 0, label: `keep all frames (${fmtNum(srcFps)} fps)` }];
+  for (const n of [4, 3, 2]) {
+    const fps = round((srcFps * (n - 1)) / n, 3);
+    out.push({ n, fps, label: `drop every ${ordinal(n)} frame (${fmtNum(fps)} fps)` });
+  }
+  return out;
+}
+
+function ordinal(n: number): string {
+  return n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`;
+}
+
 /** GIF fps cap: delays are whole centiseconds and browsers clamp <= 10 ms to 100 ms, so 2 cs is the floor. */
 export const GIF_MAX_FPS = 50;
 /** fps cap for the other animated formats (WebP, APNG). */

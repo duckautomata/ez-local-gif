@@ -85,6 +85,43 @@ func renderGIF(t *testing.T, ff, src string, p *graph.Plan) *gif.GIF {
 	return g
 }
 
+// TestFPSDropNeverLengthensClip is the J2 regression: an exactly-5.0 s
+// source rendered through the master pipeline at the sticker ladder's
+// fractional rates (16.7, 12.5 fps) must not come out longer than 5.0 s.
+// The fps stage's round=down floors the frame count (83, 62) where the
+// filter's default rounding rounded the end time up (84, 63 frames =
+// 5.03/5.04 s) and silently broke the Discord sticker 5 s cap.
+func TestFPSDropNeverLengthensClip(t *testing.T) {
+	ff := ffmpegOrSkip(t)
+	dir := t.TempDir()
+	clip, info := testsrcClip(t, ff, dir, 25, 5)
+	for _, tc := range []struct {
+		fps    float64
+		frames int
+	}{
+		{16.7, 83},
+		{12.5, 62},
+	} {
+		p := compile(t, info, nil, recipe.Output{Format: "apng", FPS: tc.fps})
+		if p.Frames != tc.frames {
+			t.Errorf("%v fps: plan Frames = %d, want %d", tc.fps, p.Frames, tc.frames)
+		}
+		masterPath := filepath.Join(t.TempDir(), "frames.rgba")
+		runFF(t, ff, enc.MasterArgs(clip, p, masterPath))
+		data, err := os.ReadFile(masterPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := len(data) / (p.Width * p.Height * 4)
+		if got != tc.frames {
+			t.Errorf("%v fps: master has %d frames, plan predicted %d", tc.fps, got, tc.frames)
+		}
+		if dur := float64(got) / p.FPS; dur > 5.0+1e-9 {
+			t.Errorf("%v fps: master plays %.3f s (> 5.0 s)", tc.fps, dur)
+		}
+	}
+}
+
 func TestGIFDelaysAtCappedRates(t *testing.T) {
 	ff := ffmpegOrSkip(t)
 	dir := t.TempDir()

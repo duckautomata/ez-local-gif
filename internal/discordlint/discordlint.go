@@ -17,10 +17,16 @@
 // ANMF frames (offset, size, duration, blend/dispose, ALPH/VP8/VP8L payload
 // to detect per-frame alpha), EXIF/XMP/ICCP presence.
 //
-// Rule ids are the Rule* constants in gif.go and webp.go; every rule is
-// reported (passing or not) so the UI can show a stable checklist, except
-// target-specific rules (sticker/emote), the byte limit when the target has
-// none, and gif.first-frame-visible when frame 0 cannot be decoded.
+// APNG is parsed at chunk level (IHDR, PLTE, tRNS, acTL, fcTL, fdAT, IDAT,
+// IEND; CRCs are not verified): frame rectangles, delays, loop count,
+// colour type / palette. Static images (PNG, JPEG, WebP, AVIF) only have
+// their header read for dimensions and alpha.
+//
+// Rule ids are the Rule* constants in gif.go, webp.go, apng.go and
+// static.go; every rule is reported (passing or not) so the UI can show a
+// stable checklist, except target-specific rules (sticker/emote/attachment),
+// the byte limit when the target has none, and gif.first-frame-visible when
+// frame 0 cannot be decoded.
 //
 // Loop counts (gif.netscape-loop / webp.loop-forever) depend on the target:
 // Discord targets require "loop forever" (GIF NETSCAPE2.0 count 0 — the
@@ -49,7 +55,7 @@ type Target string
 const (
 	TargetNone       Target = ""           // generic (structural rules only, no byte limit)
 	TargetEmote      Target = "emote"      // 262,144 B, 128x128 recommended
-	TargetSticker    Target = "sticker"    // 524,288 B, exactly 320x320, <= 5 s, <= 1000 frames, <= 60 fps
+	TargetSticker    Target = "sticker"    // 524,288 B, 320x320 recommended (larger is shrunk by Discord — a warning), <= 5 s, <= 1000 frames, <= 60 fps
 	TargetAttachment Target = "attachment" // 20 MB (free tier)
 )
 
@@ -87,7 +93,7 @@ type Check struct {
 // Report summarises a lint run.
 type Report struct {
 	RulesVersion string  `json:"rulesVersion"` // bump when rules change; stamped into results
-	Format       string  `json:"format"`       // "gif" | "webp" | "apng" | "png"
+	Format       string  `json:"format"`       // "gif" | "webp" | "apng" | "png" (LintAPNG: plain PNG; LintStatic) | "jpeg" | "avif"
 	Target       Target  `json:"target"`
 	Bytes        int64   `json:"bytes"`
 	Limit        int64   `json:"limit"` // from Limit(Target); 0 = none
@@ -103,10 +109,28 @@ type Report struct {
 }
 
 // RulesVersion identifies the rule set implemented by this build.
-const RulesVersion = "2026-08-18.2"
+//
+//	2026-08-18.2  GIF + WebP rules (Phase 1).
+//	2026-08-19.1  APNG (apng.*) and static-image (static.*) rules; gif.sticker-dims
+//	              is a warning only when a side exceeds 320 px (Discord shrinks
+//	              larger stickers and accepts smaller / non-square ones).
+//	2026-08-19.2  apng.indexed OK now means colour type 3 + PLTE + tRNS (the
+//	              indexed 8-bit-alpha APNG of the sticker default rung); RGBA
+//	              and opaque-indexed files fail the check at LevelInfo, which
+//	              does not affect Report.OK.
+//	2026-08-19.3  apng.min-delay tiered like webp.min-delay: <= 10 ms warns
+//	              (browsers show 100 ms), 11-19 ms is an info note recommending
+//	              >= 20 ms (a Discord-legal 60 fps sticker now passes with only
+//	              the note), >= 20 ms is clean; apng.container now rejects
+//	              out-of-range fcTL dispose_op/blend_op (libpng rejects such
+//	              files) and tRNS-before-PLTE for indexed colour (the palette
+//	              alpha is silently discarded), and caps the listed unknown
+//	              chunk types at 32 ("and N more types").
+const RulesVersion = "2026-08-19.3"
 
 // ErrNotImplemented was returned by the pre-implementation stubs. It is
-// kept for API compatibility; LintGIF and LintWebP no longer return it.
+// kept for API compatibility; no linter returns it any more.
 var ErrNotImplemented = errors.New("discordlint: not implemented")
 
-// LintGIF is implemented in gif.go and LintWebP in webp.go.
+// LintGIF is implemented in gif.go, LintWebP in webp.go, LintAPNG in apng.go
+// (PNG chunk parser in png.go) and LintStatic in static.go.

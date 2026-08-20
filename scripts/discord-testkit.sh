@@ -17,9 +17,13 @@
 #   g  APNG  rgba, -pred mixed, -plays 0 (+ oxipng -o2 --strip safe)
 #   h  Emote   128×128 variants of (a) and (e), fitted under 256 KiB
 #   i  Sticker 320×320 variants of (a) and (g), ≤ 5 s, fitted under 512 KiB:
-#            i1 GIF, i2 RGBA APNG (fps ladder), i3 indexed 8-bit-alpha APNG
-#            (tile → pngquant → untile → apng pal8, DESIGN.md §4.2 rung B)
-#   j  AVIF  avifenc from PNG frames, alpha, infinite repetition (experimental)
+#            i3 indexed 8-bit-alpha APNG (tile → pngquant → untile → apng pal8,
+#            DESIGN.md §4.2 rung B — the sticker default, user-verified best),
+#            i1 GIF (fallback), i2 RGBA APNG (fps ladder, probe rung)
+#   j  AVIF  avifenc from PNG frames, alpha, infinite repetition
+#
+# Results of the 2026-08-19 run: docs/discord-testkit-results.md (summary and
+# the encoder consequences in docs/DESIGN.md §9a).
 #
 # Without SRC a synthetic 3 s 320×320 premultiplied ProRes 4444 clip is made
 # with make-test-clip.sh (same directory as this script) at the master rate
@@ -54,7 +58,7 @@ set -euo pipefail
 # ----------------------------------------------------------------------------
 # args / tools
 # ----------------------------------------------------------------------------
-usage() { sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 premult=auto
 fps=25
@@ -439,9 +443,9 @@ variants=(
   g_apng_rgba.png
   h1_emote128_gif.gif
   h2_emote128_webp.webp
+  i3_sticker320_apng-indexed.png   # sticker default (user-verified best) — listed first
   i1_sticker320_gif.gif
   i2_sticker320_apng-rgba.png
-  i3_sticker320_apng-indexed.png
   j_avif_alpha.avif
 )
 rm -f -- "${variants[@]}"
@@ -473,13 +477,13 @@ m128=$(make_master_size "$EMOTE_PX" "$EMOTE_PX")
 fit_gif  "$m128" "$EMOTE_PX" "$EMOTE_PX" h1_emote128_gif.gif  "$EMOTE_AIM"
 fit_webp "$m128" "$EMOTE_PX" "$EMOTE_PX" h2_emote128_webp.webp "$EMOTE_AIM"
 
-log "i: sticker ${STICKER_PX}x${STICKER_PX} (≤ ${STICKER_LIMIT} B, ≤ ${STICKER_MAX_S} s)"
+log "i: sticker ${STICKER_PX}x${STICKER_PX} (≤ ${STICKER_LIMIT} B, ≤ ${STICKER_MAX_S} s) — indexed APNG first (the default rung)"
 m320=$(make_master_size "$STICKER_PX" "$STICKER_PX")
+fit_apng_indexed "$m320" "$STICKER_PX" "$STICKER_PX" i3_sticker320_apng-indexed.png "$STICKER_AIM" "$STICKER_MAX_S"
 fit_gif          "$m320" "$STICKER_PX" "$STICKER_PX" i1_sticker320_gif.gif          "$STICKER_AIM" "$STICKER_MAX_S"
 fit_apng_rgba    "$m320" "$STICKER_PX" "$STICKER_PX" i2_sticker320_apng-rgba.png    "$STICKER_AIM" "$STICKER_MAX_S"
-fit_apng_indexed "$m320" "$STICKER_PX" "$STICKER_PX" i3_sticker320_apng-indexed.png "$STICKER_AIM" "$STICKER_MAX_S"
 
-log "j: animated AVIF (experimental)"
+log "j: animated AVIF with alpha"
 if have "$avifenc"; then
   [ -d "$scratch/frames" ] || png_frames "$master_full" "$W" "$H" "$scratch/frames"
   if ! "$avifenc" -j all -s 8 -q 60 --qalpha 90 -y 420 --fps "$fps" --repetition-count infinite \
@@ -573,6 +577,16 @@ Every file below is one encoder path from \`docs/DESIGN.md\` §4.2 / §9. Upload
 soft-edged circle orbiting the centre, an opaque block top-left and a 50 %-alpha block
 top-right (GIF thresholds it to opaque-on-matte; WebP/APNG/AVIF should show it translucent).
 
+## Results so far
+
+This matrix was uploaded and checked on 2026-08-19; the per-file outcomes live in the repo at
+\`docs/discord-testkit-results.md\` and their consequences for the encoders in \`docs/DESIGN.md\`
+§9a. In short: the palette GIF paths (a, b, d), lossy and lossless WebP (e, e2, f) and both emote
+variants (h1, h2) render correctly; gifski's per-frame palettes (c) do **not** (dark background,
+ghosting); APNG animates only as a server sticker, where the indexed 8-bit-alpha APNG (i3) at
+25 fps is the best sticker and the GIF (i1) the fallback; animated AVIF with alpha (j) works as an
+attachment. Re-run this checklist after an encoder or linter change and update that file.
+
 ## Files
 
 | File | What it tests | Upload as | Expect |
@@ -587,12 +601,13 @@ top-right (GIF thresholds it to opaque-on-matte; WebP/APNG/AVIF should show it t
 | \`g_apng_rgba.png\` | APNG RGBA \`-plays 0\` (Discord shows only frame 0 for APNG *attachments*) | chat attachment (expect still) | still first frame is a known limitation, not a bug |
 | \`h1_emote128_gif.gif\` | Emote GIF 128×128 fitted under 256 KiB (${RUNG[h1_emote128_gif.gif]:-n/a}) | Server Settings › Emoji | animates at ~22 px, transparent, keeps looping |
 | \`h2_emote128_webp.webp\` | Emote animated WebP 128×128 (${RUNG[h2_emote128_webp.webp]:-n/a}) | Server Settings › Emoji | accepted, animates, soft alpha kept |
-| \`i1_sticker320_gif.gif\` | Sticker GIF exactly 320×320, ≤ 5 s (${RUNG[i1_sticker320_gif.gif]:-n/a}) | Server Settings › Stickers | accepted, animates in the picker and in chat |
-| \`i2_sticker320_apng-rgba.png\` | Sticker APNG exactly 320×320, ≤ 5 s, RGBA 8-bit alpha (${RUNG[i2_sticker320_apng-rgba.png]:-n/a}) | Server Settings › Stickers | animates, soft alpha, no "frame rate too small/large" error |
-| \`i3_sticker320_apng-indexed.png\` | Sticker APNG, indexed colour with 8-bit alpha (PLTE + tRNS, one shared palette; ${RUNG[i3_sticker320_apng-indexed.png]:-n/a}) — the usual fit winner | Server Settings › Stickers | same as (i2); confirms Discord accepts pal8 APNG with tRNS |
+| \`i3_sticker320_apng-indexed.png\` | **Sticker default:** APNG 320×320, ≤ 5 s, indexed colour with 8-bit alpha (PLTE + tRNS, one shared palette; ${RUNG[i3_sticker320_apng-indexed.png]:-n/a}) — user-verified best sticker (animates at 25 fps, soft alpha) | Server Settings › Stickers | animates in the picker and in chat, soft alpha, no "frame rate too small/large" error |
+| \`i1_sticker320_gif.gif\` | Sticker GIF exactly 320×320, ≤ 5 s (${RUNG[i1_sticker320_gif.gif]:-n/a}) — the fallback rung when no indexed APNG fits | Server Settings › Stickers | accepted, animates in the picker and in chat (1-bit alpha) |
+| \`i2_sticker320_apng-rgba.png\` | Sticker APNG exactly 320×320, ≤ 5 s, RGBA 8-bit alpha (${RUNG[i2_sticker320_apng-rgba.png]:-n/a}) — probe rung, usually fits only at a low fps | Server Settings › Stickers | same as (i3) at whatever fps it fitted |
 EOF
   if [ -f j_avif_alpha.avif ]; then
-    echo '| `j_avif_alpha.avif` | Animated AVIF with alpha (avifenc, repetition infinite) — experimental; Discord transcodes AVIF→WebP | chat attachment | animates with alpha (or document that it does not) |'
+    # shellcheck disable=SC2016  # markdown backticks, nothing to expand
+    echo '| `j_avif_alpha.avif` | Animated AVIF with alpha (avifenc, repetition infinite); Discord transcodes AVIF→WebP — verified 2026-08-19: animates with soft alpha | chat attachment | animates with alpha |'
   fi
   cat <<'EOF'
 
@@ -637,6 +652,7 @@ preview and in-chat (160 px).
 EOF
   for f in $(outputs); do
     b=$(budget_of "$f")
+    # shellcheck disable=SC2016  # markdown backticks
     printf '| `%s` | %s | %s | %s | %s |\n' "$f" "$(fsize "$f")" "$(kib "$(fsize "$f")")" "${b:-—}" "$(status_of "$f" "$b")"
   done
   cat <<'EOF'
@@ -647,12 +663,14 @@ EOF
 |---|---|
 EOF
   for f in $(outputs); do
+    # shellcheck disable=SC2016  # markdown backticks
     printf '| `%s` | %s |\n' "$f" "$(verify_line "$f")"
   done
   cat <<'EOF'
 
-Record results in `docs/DESIGN.md` §9 (or an issue) with client + version, theme, autoplay
-setting and a screenshot of anything that renders wrong.
+Record results in `docs/discord-testkit-results.md` (one row per file: attachment / sticker /
+emote outcome + notes) and their consequences in `docs/DESIGN.md` §9a, with client + version,
+theme, autoplay setting and a screenshot of anything that renders wrong.
 EOF
 } > README.md
 

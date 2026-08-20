@@ -131,9 +131,11 @@ RUN set -eu; cd /tmp; \
     chmod 755 /usr/local/bin/gifski /usr/local/bin/oxipng; \
     rm -f gifski.tar.xz oxipng.tar.gz
 
-# Helper scripts (Phase 1 testkit + tool self-check) and the build-time
-# sanity check: every tool must run, and ffmpeg must have the encoders,
-# filters and demuxers the pipeline relies on — a broken download fails here.
+# Helper scripts (Discord testkit, test-clip generator, tool self-check) and
+# the build-time sanity check: every tool must run, and ffmpeg must have the
+# encoders, filters and demuxers the pipeline relies on — a broken download
+# fails here. Phase 2 adds no tools: avifenc/avifdec, pngquant, oxipng and
+# the libwebp CLIs were already part of this stage.
 COPY scripts/check-tools.sh scripts/make-test-clip.sh scripts/discord-testkit.sh /usr/local/share/ezlg/
 # (sed: survive a CRLF checkout on Windows hosts with core.autocrlf=true)
 RUN sed -i 's/\r$//' /usr/local/share/ezlg/*.sh \
@@ -168,8 +170,10 @@ ARG GO_URL
 ARG GO_SHA256
 ARG NODE_URL
 ARG NODE_SHA256
+# git/jq/procps for the dev loop; unzip so scripts/integration-test.sh can
+# extract the frames.zip it downloads (it falls back to a header check without).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git jq procps \
+ && apt-get install -y --no-install-recommends git jq procps unzip \
  && rm -rf /var/lib/apt/lists/*
 RUN set -eu; cd /tmp; \
     curl -fsSL --retry 5 --retry-delay 3 -o go.tar.gz "${GO_URL}"; \

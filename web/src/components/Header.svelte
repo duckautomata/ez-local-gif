@@ -28,7 +28,7 @@
     <span class="logo" aria-hidden="true">GIF</span>
     <div>
       <h1>ez-local-gif</h1>
-      <p class="tag">Discord-safe GIF / WebP from ProRes, video and animations — rendered locally</p>
+      <p class="tag">Discord-safe GIF / WebP / APNG / AVIF from ProRes, video, animations and image sequences — rendered locally</p>
     </div>
   </div>
   <div class="status" title={online === null ? 'Checking server…' : online ? 'Server reachable' : 'Server unreachable'}>

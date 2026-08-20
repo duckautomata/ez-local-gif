@@ -483,14 +483,6 @@ func TestLintGIFNetscapeLoop(t *testing.T) {
 		if c.Level != LevelError || !strings.Contains(c.Detail, "loop count 3 (plays 4 times)") || before.LoopForever || before.OK {
 			t.Errorf("%s before: %+v loop=%v ok=%v", target, c, before.LoopForever, before.OK)
 		}
-		if target == TargetSticker { // 16x16 fails the sticker dims, so no clean re-lint
-			after, out := lintFix(t, data, target)
-			expectCheck(t, after, RuleGIFNetscapeLoop, true, true)
-			if !bytes.Equal(out, encodeFx(t, opaqueAnim())) || !after.LoopForever {
-				t.Errorf("%s: fixed bytes/LoopForever=%v wrong", target, after.LoopForever)
-			}
-			continue
-		}
 		out = assertFixed(t, data, target, RuleGIFNetscapeLoop)
 		if !bytes.Equal(out, encodeFx(t, opaqueAnim())) {
 			t.Errorf("%s: loop count fix should restore the LoopCount 0 encoding", target)
@@ -951,13 +943,14 @@ func TestLintGIFSizeLimit(t *testing.T) {
 }
 
 func TestLintGIFStickerRules(t *testing.T) {
+	// Smaller than 320x320 is accepted by Discord (user-verified): no error.
 	small := encodeFx(t, opaqueAnim()) // 16x16, 3 frames, 300 ms
 	r, _ := lintFix(t, small, TargetSticker)
-	if c := expectCheck(t, r, RuleGIFStickerDims, false, false); !strings.Contains(c.Detail, "16x16") {
-		t.Errorf("detail: %s", c.Detail)
+	if c := expectCheck(t, r, RuleGIFStickerDims, true, false); c.Level != LevelWarn || !strings.Contains(c.Detail, "16x16 fits 320x320") {
+		t.Errorf("detail: %+v", c)
 	}
 	expectCheck(t, r, RuleGIFStickerDuration, true, false)
-	if r.OK || hasCheck(r, RuleGIFEmoteDims) {
+	if !r.OK || hasCheck(r, RuleGIFEmoteDims) {
 		t.Errorf("sticker report: ok=%v rules=%v", r.OK, ruleIDs(r))
 	}
 
@@ -1001,6 +994,59 @@ func TestLintGIFStickerRules(t *testing.T) {
 	}
 	if c = stickerDurationCheck(RuleGIFStickerDuration, 1, 0); !c.OK {
 		t.Errorf("single frame: %+v", c)
+	}
+}
+
+// sizedGIF builds a single-frame w x h GIF with the fixture palette.
+func sizedGIF(t *testing.T, w, h int) []byte {
+	t.Helper()
+	pm := image.NewPaletted(image.Rect(0, 0, w, h), fxPalette)
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, &gif.GIF{Image: []*image.Paletted{pm}, Delay: []int{10}, Disposal: []byte{1}, LoopCount: 0, Config: image.Config{ColorModel: fxPalette, Width: w, Height: h}}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// gif.sticker-dims is a warning only when a side exceeds 320 px (Discord
+// shrinks larger stickers and accepts smaller / non-square ones — the
+// frontend-review bug); the exact check is pinned golden-style.
+func TestLintGIFStickerDimsMatrix(t *testing.T) {
+	cases := []struct {
+		w, h int
+		want Check
+	}{
+		{320, 320, Check{Rule: RuleGIFStickerDims, Level: LevelWarn, OK: true, Detail: "320x320 fits 320x320"}},
+		{320, 200, Check{Rule: RuleGIFStickerDims, Level: LevelWarn, OK: true, Detail: "320x200 fits 320x320"}},
+		{400, 400, Check{Rule: RuleGIFStickerDims, Level: LevelWarn, OK: false, Detail: "400x400 is larger than 320x320; Discord shrinks stickers to 320x320"}},
+		{321, 320, Check{Rule: RuleGIFStickerDims, Level: LevelWarn, OK: false, Detail: "321x320 is larger than 320x320; Discord shrinks stickers to 320x320"}},
+		{320, 321, Check{Rule: RuleGIFStickerDims, Level: LevelWarn, OK: false, Detail: "320x321 is larger than 320x320; Discord shrinks stickers to 320x320"}},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%dx%d", tc.w, tc.h), func(t *testing.T) {
+			r, _ := lintFix(t, sizedGIF(t, tc.w, tc.h), TargetSticker) // fix adds the NETSCAPE block image/gif omits
+			if got := findCheck(t, r, RuleGIFStickerDims); got != tc.want {
+				t.Errorf("check = %+v, want %+v", got, tc.want)
+			}
+			// Never an error: the report stays OK whatever the size.
+			if !r.OK {
+				t.Errorf("report not OK: %v", r.Checks)
+			}
+		})
+	}
+
+	// Golden check on a real encoder fixture (64x64 ffmpeg GIF).
+	r := lintOnly(t, readFixture(t, "ff_alpha.gif"), TargetSticker)
+	want := Check{Rule: RuleGIFStickerDims, Level: LevelWarn, OK: true, Detail: "64x64 fits 320x320"}
+	if got := findCheck(t, r, RuleGIFStickerDims); got != want {
+		t.Errorf("ff_alpha.gif: check = %+v, want %+v", got, want)
+	}
+	if !r.OK {
+		t.Errorf("ff_alpha.gif as sticker: report not OK: %v", r.Checks)
+	}
+	// The 1 s / 10-frame fixture is well inside the timing limits too.
+	if c := expectCheck(t, r, RuleGIFStickerDuration, true, false); c.Detail != "10 frames, 1000 ms, 10.0 fps" {
+		t.Errorf("duration detail: %s", c.Detail)
 	}
 }
 

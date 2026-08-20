@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Check, Report } from '../lib/api';
   import { TARGET_LABEL } from '../lib/presets';
+  import { ruleLabel } from '../lib/rules';
 
   interface Props {
     report: Report;
@@ -43,9 +44,10 @@
     <ul>
       {#each checks as c, i (`${i}:${c.rule}`)}
         {@const ic = icon(c)}
-        <li class:failed={!c.ok}>
+        <li class:failed={!c.ok} class:errored={!c.ok && c.level === 'error'} class:warned={!c.ok && c.level === 'warn'}>
           <span class="ic {ic.cls}" title={ic.label} aria-label={ic.label}>{ic.glyph}</span>
           <span class="body">
+            <span class="label" title={c.rule}>{ruleLabel(c.rule)}</span>
             <span class="rule mono">{c.rule}</span>
             {#if c.fixed}<span class="tag">fixed</span>{/if}
             {#if c.detail}<span class="detail">{c.detail}</span>{/if}
@@ -89,6 +91,12 @@
   li.failed {
     background: rgba(255, 255, 255, 0.03);
   }
+  li.errored {
+    background: rgba(242, 63, 67, 0.08);
+  }
+  li.warned {
+    background: rgba(240, 178, 50, 0.08);
+  }
   .ic {
     flex: none;
     width: 14px;
@@ -103,10 +111,18 @@
     flex-wrap: wrap;
     gap: 2px 8px;
     min-width: 0;
+    align-items: baseline;
+  }
+  .label {
+    color: var(--text);
+    font-weight: 500;
+  }
+  li.failed .label {
+    font-weight: 600;
   }
   .rule {
-    color: var(--muted);
-    font-size: 11.5px;
+    color: var(--faint);
+    font-size: 11px;
   }
   .detail {
     color: var(--text);

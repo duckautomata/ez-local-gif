@@ -4,6 +4,19 @@
 //
 //	POST /api/upload                multipart/form-data, field "file" (one file)
 //	                                → 200 recipe.Source (blob is probed; info stored)
+//	                                Several "file" parts that are all still images the image2 demuxer can
+//	                                read (png/jpeg/webp/bmp/tiff by extension, or by content when the name
+//	                                has no recognised extension — sniffed frames are stored under the
+//	                                sniffed extension; gif and avif upload one at a time) → one
+//	                                image-sequence source (store.PutSequence; frames sorted naturally by
+//	                                file name, "frame2" before "frame10"; optional form field "delayMs"
+//	                                1..60000, default 100, → ProbeInfo.Sequence.DelayMS of a new
+//	                                sequence). Several parts where one is not a sequence-readable image,
+//	                                or not all share one effective extension → 400.
+//	POST /api/sources/from-result   {"recipeHash": "...", "name": "out.gif"} → copies that result file (one
+//	                                the manifest lists; not frames.zip) into the blob store under its
+//	                                name, probes it, → 200 recipe.Source ("edit as source"); 404 when the
+//	                                result or the file does not exist
 //	GET  /api/sources/{hash}        → recipe.Source
 //	POST /api/still                 {"src": hash, "ops": [...], "output": {...}, "t": 1.5, "maxW": 480}
 //	                                → image/png (Cache-Control: private, max-age=3600)
@@ -13,31 +26,44 @@
 //	GET  /api/jobs/{id}/events      text/event-stream of jobs.Event ("event: progress|done|error",
 //	                                "data: <json>"); closes after done/error
 //	GET  /api/results/{recipeHash}  → jobs.Result (manifest)
-//	GET  /out/{recipeHash}/{name}   result file; ?dl=1 adds Content-Disposition: attachment;
+//	GET  /out/{recipeHash}/{name}   result file (Content-Type pinned per extension: frames.zip is
+//	                                application/zip, .apng image/apng, …); ?dl=1 adds Content-Disposition:
+//	                                attachment named after the source — the primary alone ("clip.gif"),
+//	                                everything else keeps its stem ("clip-f00001.png", "clip-alt1.gif",
+//	                                "clip-frames.zip");
 //	                                Cache-Control: public, max-age=31536000, immutable
 //	GET  /api/capabilities          {"tools": {name: version}, "limits": {"emote","sticker","attachment"},
 //	                                "rulesVersion": "...", "version": "...", "concurrency": N,
-//	                                "maxUploadBytes": N, "formats": ["gif","webp"]}
+//	                                "maxUploadBytes": N,
+//	                                "formats": ["gif","webp","apng","avif","png","jpeg","frames"],
+//	                                "features": {"fit": true, "sequence": true, "optimize": true}}
 //	GET  /healthz                   "ok"
 //	GET  /*                         embedded SPA: real files as-is; extension-less paths fall back
 //	                                to index.html (client routes); paths with a file extension or
 //	                                under /assets/ that do not exist are 404; a plain "frontend
 //	                                not built" notice when index.html is not embedded
 //
-// Uploads are streamed to the store (never buffered in memory) and capped
-// at Config.MaxUploadBytes (413). A file ffprobe ran on but could not read
-// (non-zero exit, unparsable output, no video stream) is a 422 and is not
-// kept; when ffprobe itself could not run the upload is a 500 (504 when
-// probing timed out) and the blob is kept, so a re-upload dedupes and
-// re-probes it. Unknown /api paths are JSON 404s. Result files are served
-// with strict name validation; ?dl=1 names the download after the source.
+// Uploads are streamed to disk (never buffered in memory) and capped
+// at Config.MaxUploadBytes (413) — the cap covers the whole body, so it
+// bounds an image sequence as a whole; a sequence may hold at most
+// store.MaxSequenceFrames files. File parts are staged under the store's
+// tmp dir while the body is read and enter the blob store only once the
+// whole upload has been read and validated, so a rejected upload never
+// deletes a stored blob a concurrent request may have deduped onto; the
+// staging dir is removed with the request. A file ffprobe
+// ran on but could not read (non-zero exit, unparsable output, no video
+// stream) is a 422 and is not kept; when ffprobe itself could not run the
+// upload is a 500 (504 when probing timed out) and the blob is kept, so a
+// re-upload dedupes and re-probes it. Unknown /api paths are JSON 404s.
+// Result files are served with strict name validation; ?dl=1 names the
+// download after the source.
 //
 // Cross-site protection: state-changing requests (POST/DELETE) that a
 // browser marks as coming from another site — Sec-Fetch-Site: cross-site,
 // or an Origin whose host is not this server's — are refused with 403, and
-// the JSON endpoints (/api/still, /api/jobs) require Content-Type
-// application/json (415 otherwise). The SPA's own requests and header-less
-// clients such as curl are unaffected.
+// the JSON endpoints (/api/still, /api/jobs, /api/sources/from-result)
+// require Content-Type application/json (415 otherwise). The SPA's own
+// requests and header-less clients such as curl are unaffected.
 //
 // Lifecycle: NewServer returns a *Server whose Shutdown cancels every render
 // accepted through POST /api/jobs (and any preview pre-warming), ends open
@@ -201,6 +227,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/capabilities", s.handleCapabilities)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
+	mux.HandleFunc("POST /api/sources/from-result", s.handleSourceFromResult)
 	mux.HandleFunc("GET /api/sources/{hash}", s.handleGetSource)
 	mux.HandleFunc("POST /api/still", s.handleStill)
 	mux.HandleFunc("POST /api/jobs", s.handleCreateJob)

@@ -237,6 +237,7 @@ func TestCapabilities(t *testing.T) {
 		Concurrency    int               `json:"concurrency"`
 		MaxUploadBytes int64             `json:"maxUploadBytes"`
 		Formats        []string          `json:"formats"`
+		Features       map[string]bool   `json:"features"`
 	}
 	if err := json.Unmarshal(body, &caps); err != nil {
 		t.Fatalf("decode: %v: %s", err, body)
@@ -250,8 +251,16 @@ func TestCapabilities(t *testing.T) {
 	if caps.RulesVersion != discordlint.RulesVersion || caps.Version != "v9" || caps.Concurrency != 1 || caps.MaxUploadBytes != 12345 {
 		t.Errorf("caps = %+v", caps)
 	}
-	if strings.Join(caps.Formats, ",") != "gif,webp" {
+	if strings.Join(caps.Formats, ",") != "gif,webp,apng,avif,png,jpeg,frames" {
 		t.Errorf("formats = %v", caps.Formats)
+	}
+	for _, f := range caps.Formats {
+		if !recipe.IsAnimatedFormat(f) && !recipe.IsStaticFormat(f) && f != recipe.FormatFrames {
+			t.Errorf("format %q is not a recipe.Format* constant", f)
+		}
+	}
+	if len(caps.Features) != 3 || !caps.Features["fit"] || !caps.Features["sequence"] || !caps.Features["optimize"] {
+		t.Errorf("features = %v, want fit/sequence/optimize all true", caps.Features)
 	}
 }
 
@@ -493,6 +502,24 @@ func TestUploadProbeFailures(t *testing.T) {
 			t.Error("unreadable blob was kept")
 		}
 	})
+	t.Run("real ffprobe on garbage behind an image extension", func(t *testing.T) {
+		// The image2 demuxer trusts the .png name, so ffprobe exits 0 with a
+		// video stream of no dimensions: still the file's fault.
+		tools := hostTools()
+		if tools.FFprobe == "" {
+			t.Skip("ffprobe not on PATH")
+		}
+		e := newEnvWithTools(t, Config{}, nil, tools)
+		junk := []byte("definitely not a png, just text\n")
+		resp, out := e.uploadFile(t, "notes.png", junk)
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("status %d %s, want 422", resp.StatusCode, out)
+		}
+		jsum := sha256.Sum256(junk)
+		if _, err := e.st.GetBlob(hex.EncodeToString(jsum[:])); err == nil {
+			t.Error("unreadable blob was kept")
+		}
+	})
 	t.Run("probe times out", func(t *testing.T) {
 		tools, marker := fakeFFprobe(t, "") // blocks like a slow probe
 		e := newEnvWithTools(t, Config{}, nil, tools)
@@ -603,9 +630,9 @@ func TestCreateJobValidation(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("unprobed source: %d %s", resp.StatusCode, body)
 	}
-	// Unsupported format → 400 from the manager.
+	// Unsupported format (mp4 arrives in Phase 4) → 400 from the manager.
 	h := putProbedSource(t, e, "a.gif", tinyGIF(t))
-	resp, body = e.postJSON(t, "/api/jobs", recipe.Recipe{Sources: []string{h}, Output: recipe.Output{Format: "avif"}})
+	resp, body = e.postJSON(t, "/api/jobs", recipe.Recipe{Sources: []string{h}, Output: recipe.Output{Format: "mp4"}})
 	if resp.StatusCode != 400 {
 		t.Errorf("unsupported format: %d %s", resp.StatusCode, body)
 	}
@@ -996,8 +1023,9 @@ func TestSameOriginGuard(t *testing.T) {
 	const evil = "http://evil.example"
 
 	// Requests that reach the handler get its own answer (400: `{}` is not
-	// a recipe; 404: unknown job; 400: not multipart) — never 403.
-	pass := map[string]int{"POST /api/jobs": 400, "DELETE /api/jobs/unknown": 404, "POST /api/upload": 400, "POST /api/still": 400}
+	// a recipe / not a from-result request; 404: unknown job; 400: not
+	// multipart) — never 403.
+	pass := map[string]int{"POST /api/jobs": 400, "DELETE /api/jobs/unknown": 404, "POST /api/upload": 400, "POST /api/still": 400, "POST /api/sources/from-result": 400}
 	cases := []struct {
 		name string
 		hdr  map[string]string
@@ -1105,9 +1133,13 @@ func TestJSONContentType(t *testing.T) {
 		if status, body := e.send(t, "POST", "/api/jobs", ct, `{}`, nil); status != 400 {
 			t.Errorf("jobs with %q = %d %s, want 400 (empty recipe, past the content-type check)", ct, status, body)
 		}
+		if status, body := e.send(t, "POST", "/api/sources/from-result", ct, `{}`, nil); status != 400 {
+			t.Errorf("from-result with %q = %d %s, want 400 (no hash, past the content-type check)", ct, status, body)
+		}
 	}
+	fromResult := `{"recipeHash":"` + strings.Repeat("a", 64) + `","name":"out.gif"}`
 	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "text/json", "application/json-patch+json"} {
-		for _, ep := range []struct{ p, body string }{{"/api/still", still}, {"/api/jobs", string(rec)}} {
+		for _, ep := range []struct{ p, body string }{{"/api/still", still}, {"/api/jobs", string(rec)}, {"/api/sources/from-result", fromResult}} {
 			status, body := e.send(t, "POST", ep.p, ct, ep.body, nil)
 			if status != http.StatusUnsupportedMediaType {
 				t.Errorf("%s with content-type %q = %d %s, want 415", ep.p, ct, status, body)

@@ -10,11 +10,32 @@
 //     main input).
 //   - Plan.Filter is a complete filter_complex string ending in Plan.OutLabel
 //     ("[out]") whose frames are format=rgba, at Plan.Width x Plan.Height,
-//     Plan.FPS frames per second (constant frame rate).
+//     Plan.FPS frames per second (constant frame rate). It is a single chain
+//     from "[0:v]" except for sources with a separate alpha stream
+//     (recipe.ProbeInfo.AlphaStream > 0, e.g. AVIF): those start with
+//     "[0:v:0]format=rgba[c];[0:v:N]format=gray[a];[c][a]alphamerge," and
+//     the chain follows; consumers that append to the filter (";[out]…")
+//     work either way.
+//   - Image sequences (recipe.KindSequence, ProbeInfo.Sequence set) are read
+//     by the image2 demuxer: InputArgs carry "-f image2 -framerate F
+//     -start_number 1 -reinit_filter 0" (the demuxer is forced explicitly so
+//     the render opens the frames exactly like the probe, independent of the
+//     pattern's extension; F = 1000/delay ms, the hoisted "delay" op overriding
+//     SequenceInfo.DelayMS, default 100 ms; see SequenceFPS), Plan.InputPattern
+//     is the file pattern and Plan.SourceFPS is F. Every sequence chain starts
+//     with a guarding scale-to-fit head (a pixel-exact pass-through for
+//     uniform sequences) because frames may differ per frame in pixel format
+//     or size, which would otherwise rebuild the filtergraph and lose frames;
+//     mixed-size sequences add the normalising tail (format=rgba, transparent
+//     pad to the largest frame, pad=…:eval=frame). See sequenceHead. The
+//     frames are then CFR at F and everything below applies unchanged.
 //   - Stage order in the filter text: unpremultiply (hoisted, at native
 //     depth, preceded by setparams=alpha_mode=premultiplied so FFmpeg >= 8's
-//     alpha_mode negotiation does not auto-insert a cancelling premultiply)
-//     → speed (setpts) → fps (always present, so the output is CFR) →
+//     alpha_mode negotiation does not auto-insert a cancelling premultiply;
+//     right after the alpha merge / mixed head when there is one)
+//     → speed (setpts) → fps (always present, so the output is CFR; emitted
+//     as "fps=F:round=down" so the frame count is floor(Duration*F) and an
+//     fps drop never lengthens the clip past the trimmed source) →
 //     the geometry ops in the order given (crop, premultiplied lanczos
 //     scale, canvas pad, flip/rotate; each sees the frame size produced by
 //     the previous one) → output fit (Output.Width/Height/Fit) →
@@ -24,7 +45,10 @@
 //     the result but keeps the frame count low before scaling.
 //   - Output.FPS (or the fps op) is capped with SnapFPS(out.Format, fps): 50
 //     for GIF, 60 otherwise; no other snapping (see SnapFPS for why 30 fps
-//     GIFs need none).
+//     GIFs need none). Every recipe.Format* compiles to the same RGBA master
+//     (the static formats and frame exports take what they need from it);
+//     Output.FrameFormat must be "", png, jpeg or webp and Output.FitBytes
+//     >= 0.
 //   - Sizes are bounded: resize/canvas/Output dimensions and every resulting
 //     frame must be <= 8192 px per side and <= 32 megapixels, the speed factor
 //     must lie in [0.05, 100] and the expected RGBA master (W*H*4*Frames, when
@@ -65,8 +89,21 @@ type Plan struct {
 	// SourceFPS is the probed frame rate of the source (recipe.ProbeInfo.FPS
 	// as given, not snapped; 0 = unknown, e.g. stills). The still renderer
 	// uses it to decide how far before the wanted frame it must seek so that
-	// at least one decodable source frame precedes the target.
+	// at least one decodable source frame precedes the target. For image
+	// sequences it is the image2 -framerate (1000/delay ms, 3 decimals).
 	SourceFPS float64
+
+	// InputPattern (Phase 2) is set for image-sequence sources: the image2
+	// demuxer pattern relative to the blob directory (e.g. "%06d.png", from
+	// recipe.SequenceInfo.Pattern). enc.MasterArgs/StillArgs/ProxyArgs then
+	// pass "-i <blobDir>/<pattern>" instead of "-i <blobPath>", and InputArgs
+	// carry "-f image2 -framerate F -start_number 1 -reinit_filter 0"
+	// (-f image2 so the open never depends on the pattern's extension;
+	// F = 1000/delayMs; the hoisted "delay" op overrides
+	// SequenceInfo.DelayMS; -reinit_filter 0 because frames may differ per
+	// frame in pixel format or size, see sequenceHead). Empty for other
+	// sources.
+	InputPattern string
 }
 
 // ErrNotImplemented is kept for API compatibility with the Phase-1 stubs.
@@ -84,11 +121,17 @@ func Compile(src recipe.ProbeInfo, ops []recipe.Op, out recipe.Output) (*Plan, e
 	if src.Width <= 0 || src.Height <= 0 {
 		return nil, errorf("source has no usable frame size (%dx%d)", src.Width, src.Height)
 	}
+	if err := validateOutput(out); err != nil {
+		return nil, err
+	}
 	decoded, err := decodeOps(ops)
 	if err != nil {
 		return nil, err
 	}
 	c := newCompiler(src, out)
+	if err := c.source(decoded); err != nil {
+		return nil, err
+	}
 	if err := c.temporal(decoded); err != nil {
 		return nil, err
 	}

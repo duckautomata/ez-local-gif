@@ -2,7 +2,12 @@ package probe
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/gif"
@@ -10,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -347,12 +354,142 @@ func TestDeriveAVIFWithAlphaStream(t *testing.T) {
 	if !d.info.HasAlpha || d.alpha != alphaDecided {
 		t.Errorf("avif with auxiliary alpha stream: %+v", d.info)
 	}
+	if d.info.AlphaStream != 1 {
+		t.Errorf("still avif alpha stream = %d, want v:1 (%+v)", d.info.AlphaStream, d.info)
+	}
+	if !d.info.IsStill || d.info.Frames != 1 {
+		t.Errorf("still avif: %+v", d.info)
+	}
 	// Animated AVIF (avis) with duration → animation.
 	d = mustDerive(t, `{"streams":[
 	  {"codec_name":"av1","codec_type":"video","width":32,"height":32,"pix_fmt":"yuv420p","r_frame_rate":"10/1","avg_frame_rate":"10/1","duration":"2.0","nb_frames":"20"}],
 	  "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"2.0","tags":{"major_brand":"avis","compatible_brands":"avifmif1miafmsf1iso8"}}}`)
-	if d.info.Kind != recipe.KindAnimation || d.info.Frames != 20 || d.info.HasAlpha {
+	if d.info.Kind != recipe.KindAnimation || d.info.Frames != 20 || d.info.HasAlpha || d.info.AlphaStream != 0 {
 		t.Errorf("avis: %+v", d.info)
+	}
+}
+
+// avifenc 1.2.1 writes an animated AVIF as a primary still item (+ its alpha
+// item) followed by the colour/alpha tracks; ffprobe 9.0.1 reports them as
+// [Color item 1 frame, Alpha item 1 frame, colour track, alpha track] (see
+// TestProbeAVIFIntegration for the real file). The probe must describe the
+// track, not the one-frame item, and name the track's alpha stream.
+const avifencAnimJSON = `{"streams":[
+  {"index":0,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"1/1","avg_frame_rate":"1/1","nb_frames":"1","disposition":{"default":1},"tags":{"title":"Color"}},
+  {"index":1,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"gray","r_frame_rate":"1/1","avg_frame_rate":"1/1","nb_frames":"1","disposition":{"default":0},"tags":{"title":"Alpha"}},
+  {"index":2,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"10/1","avg_frame_rate":"10/1","duration":"1.000000","nb_frames":"10","disposition":{"default":1}},
+  {"index":3,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"gray","r_frame_rate":"10/1","avg_frame_rate":"10/1","duration":"1.000000","nb_frames":"10","disposition":{"default":1}}],
+  "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000","tags":{"major_brand":"avis","compatible_brands":"avifavismsf1iso8mif1miafMA1B"}}}`
+
+func TestDeriveAVIFLayouts(t *testing.T) {
+	d := mustDerive(t, avifencAnimJSON)
+	in := d.info
+	if in.Kind != recipe.KindAnimation || in.IsStill || in.Frames != 10 || in.FPS != 10 || in.Duration != 1 {
+		t.Errorf("animated avif must be described by its track: %+v", in)
+	}
+	if !in.HasAlpha || in.AlphaStream != 3 || d.alpha != alphaDecided {
+		t.Errorf("animated avif alpha: has=%v stream=%d mode=%v", in.HasAlpha, in.AlphaStream, d.alpha)
+	}
+	if in.ColorStream != 2 {
+		t.Errorf("animated avif colour track must be v:2 (the one-frame primary item is v:0), got %d", in.ColorStream)
+	}
+	if in.Width != 64 || in.Height != 48 || in.Codec != "av1" {
+		t.Errorf("animated avif facts: %+v", in)
+	}
+
+	// Opaque animated AVIF: [Color item, colour track] → no alpha stream.
+	d = mustDerive(t, `{"streams":[
+	  {"index":0,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"1/1","avg_frame_rate":"1/1","nb_frames":"1","tags":{"title":"Color"}},
+	  {"index":1,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"10/1","avg_frame_rate":"10/1","duration":"1.000000","nb_frames":"10"}],
+	  "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000","tags":{"major_brand":"avis","compatible_brands":"avifavismsf1iso8mif1miafMA1B"}}}`)
+	if d.info.HasAlpha || d.info.AlphaStream != 0 {
+		t.Errorf("opaque animated avif reported alpha: %+v", d.info)
+	}
+	if d.info.Kind != recipe.KindAnimation || d.info.Frames != 10 || d.info.ColorStream != 1 {
+		t.Errorf("opaque animated avif (colour track v:1): %+v", d.info)
+	}
+
+	// Opaque still: one stream.
+	d = mustDerive(t, `{"streams":[
+	  {"index":0,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"1/1","avg_frame_rate":"1/1","nb_frames":"1","tags":{"title":"Color"}}],
+	  "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","tags":{"major_brand":"avif","compatible_brands":"avifmif1miaf"}}}`)
+	if d.info.HasAlpha || d.info.AlphaStream != 0 || !d.info.IsStill {
+		t.Errorf("opaque still avif: %+v", d.info)
+	}
+
+	// An alpha plane of another size or frame count does not belong to the
+	// colour stream; a 10-bit gray plane does.
+	d = mustDerive(t, `{"streams":[
+	  {"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p10le","nb_frames":"1"},
+	  {"codec_name":"av1","codec_type":"video","width":32,"height":24,"pix_fmt":"gray","nb_frames":"1"},
+	  {"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"gray10le","nb_frames":"1"}],
+	  "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","tags":{"major_brand":"avif"}}}`)
+	if !d.info.HasAlpha || d.info.AlphaStream != 2 || d.info.Bits != 10 {
+		t.Errorf("alpha plane matching: %+v", d.info)
+	}
+	// Non-AVIF containers never set AlphaStream.
+	if d := mustDerive(t, proresJSON); d.info.AlphaStream != 0 {
+		t.Errorf("prores AlphaStream = %d", d.info.AlphaStream)
+	}
+}
+
+// TestDeriveMonochromeAVIF: monochrome (yuv400) AVIFs report a gray pix_fmt
+// for every stream, colour ones included, so pix_fmt alone cannot tell
+// colour from alpha. The most-frames rule must still describe an animation
+// by its track (excluding only "Alpha"-titled items — the alpha TRACK of an
+// animation carries default=1 and no title, so only position separates it,
+// and ties go to the first stream: libavif and ffmpeg's avif muxer write
+// the colour track before its alpha track).
+func TestDeriveMonochromeAVIF(t *testing.T) {
+	grayStream := func(index int, nb string, extra string) string {
+		return `{"index":` + strconv.Itoa(index) + `,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"gray",
+		  "r_frame_rate":"10/1","avg_frame_rate":"10/1","nb_frames":"` + nb + `"` + extra + `}`
+	}
+	avis := func(streams ...string) string {
+		return `{"streams":[` + strings.Join(streams, ",") + `],
+		  "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000","tags":{"major_brand":"avis","compatible_brands":"avifavismsf1iso8mif1miaf"}}}`
+	}
+
+	// Opaque gray animation: [gray Color item 1f, gray track 10f] → the
+	// track (v:1), 10 frames, no alpha — not a 1-frame still of the item.
+	d := mustDerive(t, avis(
+		grayStream(0, "1", `,"disposition":{"default":1},"tags":{"title":"Color"}`),
+		grayStream(1, "10", `,"duration":"1.000000","disposition":{"default":1}`)))
+	if d.info.Kind != recipe.KindAnimation || d.info.IsStill || d.info.Frames != 10 || d.info.FPS != 10 {
+		t.Errorf("gray animated avif must be described by its track: %+v", d.info)
+	}
+	if d.info.ColorStream != 1 || d.info.AlphaStream != 0 || d.info.HasAlpha {
+		t.Errorf("gray animated avif streams: colour v:%d alpha v:%d has=%v", d.info.ColorStream, d.info.AlphaStream, d.info.HasAlpha)
+	}
+
+	// Gray animation with alpha: [gray Color item, gray Alpha item, gray
+	// track, gray alpha track (default=1, no title)] → colour track v:2
+	// (first of the 10-frame tie), alpha track v:3.
+	d = mustDerive(t, avis(
+		grayStream(0, "1", `,"disposition":{"default":1},"tags":{"title":"Color"}`),
+		grayStream(1, "1", `,"disposition":{"default":0},"tags":{"title":"Alpha"}`),
+		grayStream(2, "10", `,"duration":"1.000000","disposition":{"default":1}`),
+		grayStream(3, "10", `,"duration":"1.000000","disposition":{"default":1}`)))
+	if d.info.Kind != recipe.KindAnimation || d.info.Frames != 10 || d.info.ColorStream != 2 || d.info.AlphaStream != 3 || !d.info.HasAlpha {
+		t.Errorf("gray animated avif with alpha: %+v", d.info)
+	}
+
+	// Gray still with an alpha item: [gray Color 1f, gray Alpha 1f] → v:0
+	// colour, v:1 alpha, still.
+	d = mustDerive(t, `{"streams":[`+
+		grayStream(0, "1", `,"disposition":{"default":1},"tags":{"title":"Color"}`)+","+
+		grayStream(1, "1", `,"disposition":{"default":0},"tags":{"title":"Alpha"}`)+
+		`],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","tags":{"major_brand":"avif","compatible_brands":"avifmif1miaf"}}}`)
+	if !d.info.IsStill || d.info.Frames != 1 || d.info.ColorStream != 0 || d.info.AlphaStream != 1 || !d.info.HasAlpha {
+		t.Errorf("gray still avif with alpha: %+v", d.info)
+	}
+
+	// Gray still without alpha: the single item wins.
+	d = mustDerive(t, `{"streams":[`+
+		grayStream(0, "1", `,"tags":{"title":"Color"}`)+
+		`],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","tags":{"major_brand":"avif","compatible_brands":"avifmif1miaf"}}}`)
+	if !d.info.IsStill || d.info.ColorStream != 0 || d.info.AlphaStream != 0 || d.info.HasAlpha {
+		t.Errorf("gray still avif: %+v", d.info)
 	}
 }
 
@@ -730,6 +867,543 @@ func TestProbeGIFIntegration(t *testing.T) {
 	}
 	if !info.HasAlpha {
 		t.Errorf("gif with transparent pixels: HasAlpha false: %+v", info)
+	}
+}
+
+// TestProbeAVIFIntegration builds animated and still AVIFs and checks the
+// probe describes the animation track (not the one-frame primary item
+// libavif and ffmpeg's avif muxer both write first) and finds the alpha
+// stream. With avifenc on PATH (the tools image) the files carry alpha;
+// otherwise ffmpeg's own avif muxer provides the opaque layout.
+func TestProbeAVIFIntegration(t *testing.T) {
+	tools := toolsOrSkip(t)
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	avifenc, _ := exec.LookPath("avifenc")
+	anim, still := filepath.Join(dir, "anim.avif"), filepath.Join(dir, "still.avif")
+	wantAlpha := false
+	if avifenc != "" {
+		// Half-transparent RGBA frames → avifenc (alpha as a separate plane).
+		if out, err := exec.CommandContext(ctx, tools.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10:duration=1,format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=if(lt(X\\,32)\\,255\\,128)",
+			"-c:v", "png", filepath.Join(dir, "f%03d.png")).CombinedOutput(); err != nil {
+			t.Fatalf("frames: %v\n%s", err, out)
+		}
+		frames, _ := filepath.Glob(filepath.Join(dir, "f*.png"))
+		args := append([]string{"-j", "all", "-s", "8", "-q", "60", "--qalpha", "90", "-y", "420", "--fps", "10", "--repetition-count", "infinite"}, frames...)
+		if out, err := exec.CommandContext(ctx, avifenc, append(args, anim)...).CombinedOutput(); err != nil {
+			t.Skipf("avifenc cannot build an animated avif: %v\n%s", err, out)
+		}
+		if out, err := exec.CommandContext(ctx, avifenc, "-j", "all", "-s", "6", "-q", "60", "--qalpha", "90", "-y", "420", frames[0], still).CombinedOutput(); err != nil {
+			t.Skipf("avifenc cannot build a still avif: %v\n%s", err, out)
+		}
+		wantAlpha = true
+	} else {
+		if out, err := exec.CommandContext(ctx, tools.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10:duration=1", "-c:v", "libaom-av1", "-cpu-used", "8", "-crf", "30", "-f", "avif", anim).CombinedOutput(); err != nil {
+			t.Skipf("ffmpeg cannot build an animated avif (no libaom?): %v\n%s", err, out)
+		}
+		if out, err := exec.CommandContext(ctx, tools.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10:duration=1", "-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", "8", "-crf", "30", "-f", "avif", still).CombinedOutput(); err != nil {
+			t.Skipf("ffmpeg cannot build a still avif: %v\n%s", err, out)
+		}
+	}
+
+	info, err := Probe(ctx, tools, anim, 0)
+	if err != nil {
+		t.Fatalf("Probe anim: %v", err)
+	}
+	t.Logf("animated avif (alpha=%v): %+v", wantAlpha, info)
+	if info.Kind != recipe.KindAnimation || info.IsStill || info.Frames != 10 || info.FPS != 10 {
+		t.Errorf("animated avif must be described by its 10-frame track: %+v", info)
+	}
+	if info.Width != 64 || info.Height != 48 || info.Codec != "av1" {
+		t.Errorf("animated avif facts: %+v", info)
+	}
+	if info.HasAlpha != wantAlpha || (wantAlpha && info.AlphaStream == 0) || (!wantAlpha && info.AlphaStream != 0) {
+		t.Errorf("animated avif alpha: has=%v stream=%d, want alpha=%v", info.HasAlpha, info.AlphaStream, wantAlpha)
+	}
+	if wantAlpha && info.AlphaStream != 3 {
+		t.Errorf("avifenc layout: alpha track is v:3, got %d", info.AlphaStream)
+	}
+
+	info, err = Probe(ctx, tools, still, 0)
+	if err != nil {
+		t.Fatalf("Probe still: %v", err)
+	}
+	t.Logf("still avif (alpha=%v): %+v", wantAlpha, info)
+	if !info.IsStill || info.Kind != recipe.KindImage || info.Frames != 1 || info.FPS != 0 {
+		t.Errorf("still avif: %+v", info)
+	}
+	if info.HasAlpha != wantAlpha || (wantAlpha && info.AlphaStream != 1) || (!wantAlpha && info.AlphaStream != 0) {
+		t.Errorf("still avif alpha: has=%v stream=%d, want alpha=%v", info.HasAlpha, info.AlphaStream, wantAlpha)
+	}
+}
+
+// TestProbeMonochromeAVIFIntegration builds a monochrome (yuv400) animated
+// AVIF — ffmpeg's avif muxer writes [gray Color item (1 frame), gray track]
+// — and checks the probe describes the 10-frame track, not a 1-frame still
+// of the primary item (pix_fmt gray must not disqualify every stream as an
+// alpha plane).
+func TestProbeMonochromeAVIFIntegration(t *testing.T) {
+	tools := toolsOrSkip(t)
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	anim := filepath.Join(dir, "gray.avif")
+	if out, err := exec.CommandContext(ctx, tools.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10:duration=1", "-vf", "format=gray",
+		"-c:v", "libaom-av1", "-cpu-used", "8", "-crf", "30", "-pix_fmt", "gray", "-f", "avif", anim).CombinedOutput(); err != nil {
+		t.Skipf("ffmpeg cannot build a monochrome animated avif (no libaom / no monochrome?): %v\n%s", err, out)
+	}
+	info, err := Probe(ctx, tools, anim, 0)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	t.Logf("monochrome animated avif: %+v", info)
+	if info.Kind != recipe.KindAnimation || info.IsStill || info.Frames != 10 || info.FPS != 10 {
+		t.Errorf("monochrome animated avif reduced to a still of the primary item: %+v", info)
+	}
+	if info.ColorStream != 1 || info.AlphaStream != 0 || info.HasAlpha {
+		t.Errorf("monochrome avif streams: colour v:%d alpha v:%d has=%v", info.ColorStream, info.AlphaStream, info.HasAlpha)
+	}
+	if info.Width != 64 || info.Height != 48 || info.Codec != "av1" {
+		t.Errorf("monochrome avif facts: %+v", info)
+	}
+}
+
+// writeSeqPNG writes a w x h opaque (or one-pixel-transparent) PNG as
+// sequence frame n of dir.
+func writeSeqPNG(t *testing.T, dir string, n, w, h int, transparent bool) string {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.NRGBA{R: uint8(40 * n), G: 90, B: 160, A: 255})
+		}
+	}
+	if transparent {
+		img.Set(0, 0, color.NRGBA{A: 0})
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, fmt.Sprintf("%06d.png", n))
+	if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestProbeSequenceIntegration probes real PNG sequences: a uniform opaque
+// one, one with a transparent pixel in a late frame, and one whose frames
+// differ in size (Mixed, largest frame wins).
+func TestProbeSequenceIntegration(t *testing.T) {
+	tools := toolsOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Uniform, opaque, 5 frames at the default delay.
+	uni := t.TempDir()
+	for n := 1; n <= 5; n++ {
+		writeSeqPNG(t, uni, n, 16, 12, false)
+	}
+	info, err := ProbeSequence(ctx, tools, uni, 0)
+	if err != nil {
+		t.Fatalf("ProbeSequence: %v", err)
+	}
+	t.Logf("uniform: %+v seq=%+v", info, info.Sequence)
+	if info.Kind != recipe.KindSequence || info.IsStill || info.Format != "image2" || info.Codec != "png" {
+		t.Errorf("kind/format: %+v", info)
+	}
+	if info.Width != 16 || info.Height != 12 || info.Frames != 5 || info.FPS != 10 || info.Duration != 0.5 {
+		t.Errorf("geometry/timing: %+v", info)
+	}
+	if info.Sequence == nil || info.Sequence.Count != 5 || info.Sequence.Pattern != "%06d.png" || info.Sequence.DelayMS != 100 || info.Sequence.Mixed {
+		t.Errorf("sequence info: %+v", info.Sequence)
+	}
+	if info.HasAlpha || info.Premultiplied || info.HasAudio {
+		t.Errorf("opaque NRGBA frames: %+v", info)
+	}
+	if info.PixFmt == "" || info.Bits != 8 {
+		t.Errorf("pix facts: %+v", info)
+	}
+
+	// Custom delay, transparent pixel only in the last frame (sampled).
+	alpha := t.TempDir()
+	for n := 1; n <= 4; n++ {
+		writeSeqPNG(t, alpha, n, 16, 12, n == 4)
+	}
+	info, err = ProbeSequence(ctx, tools, alpha, 40)
+	if err != nil {
+		t.Fatalf("ProbeSequence alpha: %v", err)
+	}
+	if !info.HasAlpha {
+		t.Errorf("transparent last frame not found: %+v", info)
+	}
+	if info.FPS != 25 || info.Duration != 0.16 || info.Sequence.DelayMS != 40 {
+		t.Errorf("delay 40 ms: fps=%v dur=%v seq=%+v", info.FPS, info.Duration, info.Sequence)
+	}
+
+	// Mixed sizes: the largest frame sets Width/Height.
+	mixed := t.TempDir()
+	writeSeqPNG(t, mixed, 1, 16, 12, false)
+	writeSeqPNG(t, mixed, 2, 24, 10, false)
+	writeSeqPNG(t, mixed, 3, 8, 30, false)
+	info, err = ProbeSequence(ctx, tools, mixed, 0)
+	if err != nil {
+		t.Fatalf("ProbeSequence mixed: %v", err)
+	}
+	if info.Width != 24 || info.Height != 30 || !info.Sequence.Mixed || info.Frames != 3 {
+		t.Errorf("mixed: %+v seq=%+v", info, info.Sequence)
+	}
+
+	// A stray file in the dir is ignored; an empty dir is an error.
+	os.WriteFile(filepath.Join(uni, "notes.txt"), []byte("x"), 0o644)
+	if info, err := ProbeSequence(ctx, tools, uni, 0); err != nil || info.Frames != 5 {
+		t.Errorf("stray file: %+v %v", info, err)
+	}
+	if _, err := ProbeSequence(ctx, tools, t.TempDir(), 0); err == nil {
+		t.Error("empty dir accepted")
+	}
+}
+
+// TestProbeSequenceFFprobeDims covers the non-stdlib path (ffprobe over the
+// image2 pattern) with a BMP sequence.
+func TestProbeSequenceFFprobeDims(t *testing.T) {
+	tools := toolsOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	build := func(n, w, h int) {
+		t.Helper()
+		out, err := exec.CommandContext(ctx, tools.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", fmt.Sprintf("color=c=blue:s=%dx%d:r=1:d=1", w, h), "-frames:v", "1",
+			"-c:v", "bmp", filepath.Join(dir, fmt.Sprintf("%06d.bmp", n))).CombinedOutput()
+		if err != nil {
+			t.Skipf("cannot build a bmp: %v\n%s", err, out)
+		}
+	}
+	build(1, 20, 10)
+	build(2, 20, 10)
+	build(3, 30, 8)
+	info, err := ProbeSequence(ctx, tools, dir, 50)
+	if err != nil {
+		t.Fatalf("ProbeSequence bmp: %v", err)
+	}
+	t.Logf("bmp: %+v seq=%+v", info, info.Sequence)
+	if info.Codec != "bmp" || info.Width != 30 || info.Height != 10 || !info.Sequence.Mixed || info.Frames != 3 || info.FPS != 20 {
+		t.Errorf("bmp sequence: %+v seq=%+v", info, info.Sequence)
+	}
+	if info.HasAlpha {
+		t.Errorf("bmp has no alpha: %+v", info)
+	}
+}
+
+// pngChunk appends one PNG chunk (length, type, data, CRC) to buf.
+func pngChunk(buf *bytes.Buffer, typ string, data []byte) {
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data)))
+	copy(hdr[4:], typ)
+	buf.Write(hdr[:])
+	buf.Write(data)
+	crc := crc32.NewIEEE()
+	crc.Write([]byte(typ))
+	crc.Write(data)
+	var tail [4]byte
+	binary.BigEndian.PutUint32(tail[:], crc.Sum32())
+	buf.Write(tail[:])
+}
+
+// writeRGBTrnsPNG writes a truecolour (colour type 2) PNG with a tRNS colour
+// key — a layout Go's encoder never produces and whose DecodeConfig model is
+// the opaque RGBAModel (the config decode stops at IHDR). keyUsed paints
+// pixel (0,0) in the key colour, which ffmpeg decodes as transparent.
+func writeRGBTrnsPNG(t *testing.T, path string, w, h int, keyUsed bool) {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], uint32(w))
+	binary.BigEndian.PutUint32(ihdr[4:8], uint32(h))
+	ihdr[8] = 8 // bit depth
+	ihdr[9] = 2 // colour type: truecolour
+	pngChunk(&buf, "IHDR", ihdr)
+	// Colour key (255, 0, 255), one 16-bit sample per channel.
+	pngChunk(&buf, "tRNS", []byte{0, 255, 0, 0, 0, 255})
+	var raw bytes.Buffer
+	for y := 0; y < h; y++ {
+		raw.WriteByte(0) // filter: none
+		for x := 0; x < w; x++ {
+			if keyUsed && x == 0 && y == 0 {
+				raw.Write([]byte{255, 0, 255})
+			} else {
+				raw.Write([]byte{10, 20, 200})
+			}
+		}
+	}
+	var idat bytes.Buffer
+	zw := zlib.NewWriter(&idat)
+	if _, err := zw.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pngChunk(&buf, "IDAT", idat.Bytes())
+	pngChunk(&buf, "IEND", nil)
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeSeqGIF writes one single-frame GIF file as sequence frame n of dir.
+// When transparent, the palette carries a fully transparent entry used by
+// pixel (0,0), so the encoder writes the GCE transparency flag — which a
+// config-only decode never sees (the global colour table is opaque either
+// way).
+func writeSeqGIF(t *testing.T, dir string, n int, transparent bool) {
+	t.Helper()
+	pal := color.Palette{color.RGBA{0, 0, 0, 255}, color.RGBA{200, 30, 30, 255}}
+	if transparent {
+		pal = append(pal, color.RGBA{})
+	}
+	fr := image.NewPaletted(image.Rect(0, 0, 16, 12), pal)
+	for y := 0; y < 12; y++ {
+		for x := 0; x < 16; x++ {
+			fr.SetColorIndex(x, y, 1)
+		}
+	}
+	if transparent {
+		fr.SetColorIndex(0, 0, 2)
+	}
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, fr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%06d.gif", n)), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHeaderAlphaFacts pins the format-aware alpha-candidate decision on
+// real files: GIF frames and colour-keyed truecolour PNGs must be scan
+// candidates even though their stdlib colour models look opaque.
+func TestHeaderAlphaFacts(t *testing.T) {
+	dir := t.TempDir()
+
+	keyed := filepath.Join(dir, "keyed.png")
+	writeRGBTrnsPNG(t, keyed, 8, 6, false)
+	if !pngHasTRNS(keyed) {
+		t.Error("tRNS chunk missed")
+	}
+	if ff, err := stdlibFrameFacts(keyed); err != nil || !ff.alphaP || ff.w != 8 || ff.h != 6 {
+		t.Errorf("colour-keyed png facts = %+v (%v)", ff, err)
+	}
+
+	// Plain opaque truecolour PNG (Go writes colour type 2 for an opaque
+	// RGBA image): no tRNS, not a candidate.
+	plain := filepath.Join(dir, "plain.png")
+	img := image.NewRGBA(image.Rect(0, 0, 8, 6))
+	for y := 0; y < 6; y++ {
+		for x := 0; x < 8; x++ {
+			img.Set(x, y, color.RGBA{10, 20, 200, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plain, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pngHasTRNS(plain) {
+		t.Error("plain truecolour png reported tRNS")
+	}
+	if ff, err := stdlibFrameFacts(plain); err != nil || ff.alphaP {
+		t.Errorf("plain truecolour png must not be a candidate: %+v (%v)", ff, err)
+	}
+
+	// Every GIF frame is a candidate: the transparent index lives in the
+	// frame's GCE, invisible to DecodeConfig.
+	writeSeqGIF(t, dir, 1, false)
+	if ff, err := stdlibFrameFacts(filepath.Join(dir, "000001.gif")); err != nil || !ff.alphaP {
+		t.Errorf("gif frame must be an alpha candidate: %+v (%v)", ff, err)
+	}
+
+	// jpeg can never carry alpha; unknown formats fall back to the model.
+	if headerAdmitsAlpha("nope", "jpeg", color.YCbCrModel) {
+		t.Error("jpeg admits alpha")
+	}
+	if !headerAdmitsAlpha("nope", "bmp", color.NRGBAModel) {
+		t.Error("NRGBA model must stay a candidate for any format")
+	}
+	if pngHasTRNS(filepath.Join(dir, "missing.png")) {
+		t.Error("missing file has tRNS")
+	}
+}
+
+// TestProbeSequenceLateAlphaIntegration: transparency that only later frames
+// carry must be found — GIF frames hide the transparent index in each
+// frame's GCE and truecolour PNGs in a tRNS colour key, both invisible to
+// the stdlib header models, so an opaque first frame must not suppress the
+// alpha scan of the rest.
+func TestProbeSequenceLateAlphaIntegration(t *testing.T) {
+	tools := toolsOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// GIF: frame 1 opaque, frames 2-3 with a transparent pixel.
+	gifDir := t.TempDir()
+	writeSeqGIF(t, gifDir, 1, false)
+	writeSeqGIF(t, gifDir, 2, true)
+	writeSeqGIF(t, gifDir, 3, true)
+	info, err := ProbeSequence(ctx, tools, gifDir, 0)
+	if err != nil {
+		t.Fatalf("ProbeSequence gif: %v", err)
+	}
+	if !info.HasAlpha {
+		t.Errorf("gif frames with late transparency: HasAlpha false: %+v", info)
+	}
+	if info.Codec != "gif" || info.Frames != 3 || info.Width != 16 || info.Height != 12 {
+		t.Errorf("gif sequence facts: %+v", info)
+	}
+
+	// Fully opaque GIF frames still scan as opaque (every gif header is a
+	// candidate, but the scan decides).
+	opaqueDir := t.TempDir()
+	for n := 1; n <= 3; n++ {
+		writeSeqGIF(t, opaqueDir, n, false)
+	}
+	info, err = ProbeSequence(ctx, tools, opaqueDir, 0)
+	if err != nil {
+		t.Fatalf("ProbeSequence opaque gif: %v", err)
+	}
+	if info.HasAlpha {
+		t.Errorf("opaque gif frames: HasAlpha true: %+v", info)
+	}
+
+	// RGB + tRNS PNG: key unused in frame 1, used in frames 2-3.
+	pngDir := t.TempDir()
+	writeRGBTrnsPNG(t, filepath.Join(pngDir, "000001.png"), 8, 6, false)
+	writeRGBTrnsPNG(t, filepath.Join(pngDir, "000002.png"), 8, 6, true)
+	writeRGBTrnsPNG(t, filepath.Join(pngDir, "000003.png"), 8, 6, true)
+	info, err = ProbeSequence(ctx, tools, pngDir, 0)
+	if err != nil {
+		t.Fatalf("ProbeSequence rgb+tRNS: %v", err)
+	}
+	if !info.HasAlpha {
+		t.Errorf("colour-keyed png frames with late transparency: HasAlpha false: %+v", info)
+	}
+}
+
+// TestProbeSequenceUnreadableIntegration: a sequence stored under an
+// extension whose frames the image2 demuxer cannot decode probes its first
+// frame fine standalone (ffprobe auto-detects the real format) but is
+// unreadable through the pattern the render opens; ProbeSequence must
+// reject it as an unreadable source (an ffprobe exit error or the "has no
+// dimensions" marker, which the server maps to a 422 + blob discard), not
+// assume a uniform renderable sequence.
+func TestProbeSequenceUnreadableIntegration(t *testing.T) {
+	tools := toolsOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	for n := 1; n <= 2; n++ {
+		// Real GIF bytes behind ".tga": image2 picks the targa decoder from
+		// the extension and decodes nothing.
+		pal := color.Palette{color.RGBA{0, 0, 0, 255}, color.RGBA{200, 30, 30, 255}}
+		fr := image.NewPaletted(image.Rect(0, 0, 8, 6), pal)
+		var buf bytes.Buffer
+		if err := gif.Encode(&buf, fr, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%06d.tga", n)), buf.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := ProbeSequence(ctx, tools, dir, 0)
+	if err == nil {
+		t.Fatal("unreadable sequence accepted")
+	}
+	t.Logf("rejected with: %v", err)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) && !strings.Contains(err.Error(), "has no dimensions") {
+		t.Errorf("error must classify as an unreadable source (exit error or marker): %v", err)
+	}
+}
+
+func TestSampleIndices(t *testing.T) {
+	if got := sampleIndices(3, 5); len(got) != 3 || got[0] != 0 || got[2] != 2 {
+		t.Errorf("small: %v", got)
+	}
+	got := sampleIndices(1000, 5)
+	if len(got) != 5 || got[0] != 0 || got[4] != 999 || got[2] != 499 {
+		t.Errorf("spread: %v", got)
+	}
+	if got := sampleIndices(1, 5); len(got) != 1 || got[0] != 0 {
+		t.Errorf("one: %v", got)
+	}
+	if got := sampleIndices(0, 5); got != nil {
+		t.Errorf("none: %v", got)
+	}
+	if got := sampleIndices(10, 1); len(got) != 1 || got[0] != 0 {
+		t.Errorf("single sample: %v", got)
+	}
+	for _, c := range []struct{ ext, want string }{{"png", "%06d.png"}, {"tif", "%06d.tif"}} {
+		if got := sequencePattern(c.ext); got != c.want {
+			t.Errorf("sequencePattern(%q) = %q", c.ext, got)
+		}
+	}
+}
+
+func TestSequenceFrameFactHelpers(t *testing.T) {
+	// Largest frame + mixed flag.
+	if w, h, mixed := largestFrame([]frameFacts{{w: 16, h: 12}, {w: 24, h: 10}, {w: 8, h: 30}}); w != 24 || h != 30 || !mixed {
+		t.Errorf("largestFrame mixed = %d x %d %v", w, h, mixed)
+	}
+	if w, h, mixed := largestFrame([]frameFacts{{w: 16, h: 12}, {w: 16, h: 12}}); w != 16 || h != 12 || mixed {
+		t.Errorf("largestFrame uniform = %d x %d %v", w, h, mixed)
+	}
+	// Colour models.
+	if !modelHasAlpha(color.NRGBAModel) || !modelHasAlpha(color.NRGBA64Model) {
+		t.Error("NRGBA models carry alpha")
+	}
+	if modelHasAlpha(color.RGBAModel) || modelHasAlpha(color.YCbCrModel) || modelHasAlpha(color.GrayModel) {
+		t.Error("opaque models alone must not count (format-level cases — GIF GCE, PNG tRNS keys — go through headerAdmitsAlpha)")
+	}
+	if modelHasAlpha(color.Palette{color.RGBA{1, 2, 3, 255}}) || !modelHasAlpha(color.Palette{color.RGBA{1, 2, 3, 255}, color.RGBA{0, 0, 0, 0}}) {
+		t.Error("palette alpha detection")
+	}
+	// Candidates: only frames whose header admits alpha, spread, at most 5.
+	facts := []frameFacts{{index: 0}, {index: 1, alphaP: true}, {index: 2}, {index: 3, alphaP: true}}
+	if got := alphaCandidates(facts, false, 4); len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Errorf("candidates = %v", got)
+	}
+	if got := alphaCandidates(facts, true, 4); len(got) != 3 || got[0] != 0 {
+		t.Errorf("first frame pix_fmt admits alpha: %v", got)
+	}
+	if got := alphaCandidates([]frameFacts{{index: 0}, {index: 1}}, false, 2); got != nil {
+		t.Errorf("no alpha anywhere: %v", got)
+	}
+	many := make([]frameFacts, 100)
+	for i := range many {
+		many[i] = frameFacts{index: i, alphaP: true}
+	}
+	if got := alphaCandidates(many, true, 100); len(got) != maxSequenceAlphaSamples || got[0] != 0 || got[len(got)-1] != 99 {
+		t.Errorf("spread candidates = %v", got)
+	}
+	// No headers read: fall back to the first frame's pix_fmt.
+	if got := alphaCandidates(nil, true, 10); len(got) != maxSequenceAlphaSamples {
+		t.Errorf("no facts, alpha pix_fmt: %v", got)
+	}
+	if got := alphaCandidates(nil, false, 10); got != nil {
+		t.Errorf("no facts, opaque pix_fmt: %v", got)
 	}
 }
 

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/duckautomata/ez-local-gif/internal/graph"
+	"github.com/duckautomata/ez-local-gif/internal/recipe"
 )
 
 // Scratch admission (DESIGN.md §4.1 frame cap, §9.9 tmpfs sizing).
@@ -50,6 +52,32 @@ func scratchReserve(need int64) int64 {
 		return 0
 	}
 	return need + max(need/scratchHeadroomDiv, scratchHeadroomMin)
+}
+
+// scratchFactor is how many master-sized chunks of scratch a render may
+// need on top of the headroom: 1 for outputs encoded straight from the
+// master (gif, webp, RGBA apng, static); +1 when PNG intermediates of every
+// frame are written next to it — the indexed-APNG tile sheet, the PNG
+// frames avifenc reads, or the frame export's images plus their zip copy
+// (both compressed, together bounded by about one master); and +1 more for
+// a fit search, whose ladder keeps up to fitParallel() candidates plus the
+// per-variant sheet/frame intermediates alive until the search returns and
+// renderFit removes its directory.
+func scratchFactor(out recipe.Output) int64 {
+	format := strings.ToLower(out.Format)
+	f := int64(1)
+	switch format {
+	case recipe.FormatAVIF, recipe.FormatFrames:
+		f = 2
+	case recipe.FormatAPNG:
+		if out.Colors > 0 || out.FitBytes > 0 {
+			f = 2
+		}
+	}
+	if out.FitBytes > 0 && fitFormats[format] {
+		f++
+	}
+	return f
 }
 
 // byteBudget is a counting semaphore over bytes: acquire blocks until the
@@ -130,9 +158,11 @@ func (b *byteBudget) release(n int64) {
 
 // admitScratch checks the plan's master estimate against the per-render cap
 // and the scratch filesystem, then reserves it from the budget (waiting for
-// concurrent renders when needed, cancellable). It returns the release func
-// (idempotent; call after the scratch dir is removed).
-func (m *Manager) admitScratch(ctx context.Context, j *job, plan *graph.Plan) (release func(), err error) {
+// concurrent renders when needed, cancellable). factor (>= 1, see
+// scratchFactor) multiplies the reservation for outputs that write PNG
+// intermediates of every frame next to the master. It returns the release
+// func (idempotent; call after the scratch dir is removed).
+func (m *Manager) admitScratch(ctx context.Context, j *job, plan *graph.Plan, factor int64) (release func(), err error) {
 	need := masterBytes(plan)
 	if need == 0 {
 		return func() {}, nil // unknown length: only the ENOSPC mapping can help
@@ -143,6 +173,21 @@ func (m *Manager) admitScratch(ctx context.Context, j *job, plan *graph.Plan) (r
 			ErrInvalidRecipe, desc, humanBytes(m.opts.MaxMasterBytes))
 	}
 	reserve := scratchReserve(need)
+	if factor > 1 {
+		reserve += (factor - 1) * need
+		desc += fmt.Sprintf(" plus %d× as much for the PNG intermediates / fit candidates this render writes", factor-1)
+	}
+	return m.reserveScratch(ctx, j, reserve, desc)
+}
+
+// reserveScratch reserves bytes from the scratch budget (waiting for
+// concurrent renders when needed, cancellable) and live-checks the
+// filesystem; desc describes the need for error messages. The returned
+// release is idempotent.
+func (m *Manager) reserveScratch(ctx context.Context, j *job, reserve int64, desc string) (release func(), err error) {
+	if reserve <= 0 {
+		return func() {}, nil
+	}
 	if limit := m.scratch.Limit(); limit > 0 && reserve > limit {
 		return nil, fmt.Errorf("%w: %s but the scratch filesystem %s holds only %s — trim the clip, lower the fps or resize the output (or raise shm_size / point EZLG_SCRATCH at a larger filesystem)",
 			ErrInvalidRecipe, desc, m.st.Scratch, humanBytes(limit))
@@ -165,6 +210,26 @@ func (m *Manager) admitScratch(ctx context.Context, j *job, plan *graph.Plan) (r
 			m.st.Scratch, humanBytes(free), desc)
 	}
 	return release, nil
+}
+
+// admitOptimizeScratch reserves scratch for the optimize preset's fit search:
+// unlike a decode render it has no plan or master, but the search can hold up
+// to fitParallel() candidates at once (each at most about the source's size —
+// the optimiser only ever shrinks) plus the delivered files. Without a fit
+// budget the path writes a single output and needs no reservation beyond the
+// ENOSPC mapping.
+func (m *Manager) admitOptimizeScratch(ctx context.Context, j *job, srcPath string, out recipe.Output) (func(), error) {
+	if out.FitBytes <= 0 {
+		return func() {}, nil
+	}
+	fi, err := os.Stat(srcPath)
+	if err != nil || fi.Size() <= 0 {
+		return func() {}, nil // unknown size: only the ENOSPC mapping can help
+	}
+	need := fi.Size() * int64(fitParallel()+1)
+	desc := fmt.Sprintf("the optimize fit search may hold %s of candidates (%d concurrent attempts on the %s source)",
+		humanBytes(need), fitParallel(), humanBytes(fi.Size()))
+	return m.reserveScratch(ctx, j, scratchReserve(need), desc)
 }
 
 // isNoSpace reports whether err is (or carries in its ffmpeg/gifsicle

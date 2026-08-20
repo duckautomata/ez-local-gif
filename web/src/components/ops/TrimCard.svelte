@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { ProbeInfo } from '../../lib/api';
   import { fmtSeconds, round } from '../../lib/format';
-  import { app, toSourceTime, trimRange } from '../../lib/state.svelte';
+  import { app, sourceDuration, toSourceTime, trimRange } from '../../lib/state.svelte';
   import NumField from '../NumField.svelte';
   import OpCard from '../OpCard.svelte';
 
@@ -13,7 +13,10 @@
   let open = $state(false);
   const trim = $derived(app.ops.trim);
   const range = $derived(trimRange(info, app.ops));
-  const dur = $derived(Math.max(0, info.duration));
+  // The effective source length: for an image sequence with the Delay op on,
+  // the op rewrites the timing, so the probe's duration would be wrong here
+  // (same helper the scrubber's range uses via trimRange).
+  const dur = $derived(sourceDuration(info, app.ops));
   const summary = $derived(
     trim.enabled
       ? `${fmtSeconds(range.start)} → ${trim.end > 0 ? fmtSeconds(range.end) : 'end'} (${fmtSeconds(range.end - range.start)})`

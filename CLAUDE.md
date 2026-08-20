@@ -9,6 +9,7 @@ of truth for architecture, Discord rules, encoder commands and the phase plan.
 - `internal/recipe` — shared data model (Recipe/Op/Output/ProbeInfo); stdlib only, no ffmpeg
 - `internal/graph` — op stack → ffmpeg filter_complex (pure, golden-tested; `alpha_ffmpeg_test.go` is an external `graph_test` package that pixel-checks the alpha chains against a real ffmpeg when one is on PATH, skipped otherwise)
 - `internal/enc` — argv builders for ffmpeg/gifsicle/… (pure, golden-tested)
+- `internal/fit` — fit-to-size search (ladder + secant over one knob; pure orchestration, fake-encoder tested)
 - `internal/ffrun` — the only package that spawns processes; ffmpeg progress parsing
 - `internal/discordlint` — GIF/WebP byte-level lint + fix (stdlib only)
 - `internal/probe` — ffprobe → ProbeInfo (+ alpha scan)

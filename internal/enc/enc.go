@@ -78,6 +78,11 @@ type Master struct {
 // MasterArgs renders the plan to an RGBA rawvideo file:
 // [plan.InputArgs...] -i src -filter_complex <plan.Filter> -map [out]
 // -f rawvideo -pix_fmt rgba outPath
+//
+// For an image-sequence plan (p.InputPattern != "") srcPath is the blob
+// directory and the input becomes "-i <srcPath>/<InputPattern>" (the image2
+// demuxer pattern; p.InputArgs carry its -framerate/-start_number). The
+// same holds for StillArgs, StillArgsFromStart and ProxyArgs.
 func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 	if p == nil {
 		return nil
@@ -85,7 +90,7 @@ func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 	args := make([]string, 0, len(p.InputArgs)+14)
 	args = append(args, p.InputArgs...)
 	args = append(args,
-		"-i", srcPath,
+		"-i", inputPath(srcPath, p),
 		"-filter_complex", p.Filter,
 		"-map", outLabel(p),
 		"-an", "-sn", "-dn",
@@ -167,7 +172,7 @@ func stillArgs(srcPath string, p *graph.Plan, s stillSeek, maxW int) []string {
 	}
 	args = append(args, input...)
 	args = append(args,
-		"-i", srcPath,
+		"-i", inputPath(srcPath, p),
 		"-frames:v", "1",
 		"-filter_complex", f.String(),
 		"-map", "[outs]",
@@ -213,7 +218,7 @@ func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outP
 	args := make([]string, 0, len(p.InputArgs)+30)
 	args = append(args, p.InputArgs...)
 	args = append(args,
-		"-i", srcPath,
+		"-i", inputPath(srcPath, p),
 		"-filter_complex", f.String(),
 		"-map", "[outp]",
 		"-an", "-sn", "-dn",
@@ -261,6 +266,9 @@ type GIFOptions struct {
 	Loop      int
 	StatsMode string // palettegen stats_mode (0 = "diff")
 	HasAlpha  bool   // when false, skip the matte/alphaextract chain and use reserve_transparent=0
+	// Variant (Phase 2) pre-filters the master (fps drop / downscale) before
+	// the palette chain: see VariantFilter. nil = encode the master as-is.
+	Variant *Variant
 }
 
 // gifDithers lists every paletteuse dither mode ffmpeg accepts; anything
@@ -317,6 +325,10 @@ func (o GIFOptions) ditherArg() string {
 // master rate alone: the gif muxer rounds every pts to its 1/100 s timebase,
 // so a master at <= 50 fps (graph.SnapFPS's GIF cap) never yields a delay
 // below 2 cs and a 30 fps master gets 3,4,3 cs delays with an exact total.
+//
+// With o.Variant the graph starts with "[0:v]<VariantFilter>[v];" and the
+// palette chain reads [v]; the matte colour source takes the variant's size
+// and rate. A nil or no-op variant leaves the graph exactly as before.
 func GIFArgs(m Master, o GIFOptions, outPath string) []string {
 	o = o.normalized()
 	args := RawInputArgs(m)
@@ -337,18 +349,21 @@ func GIFArgs(m Master, o GIFOptions, outPath string) []string {
 // transparent slot, so it is passed unchanged (normalized keeps it >= 3
 // with alpha).
 func gifFilter(m Master, o GIFOptions) string {
+	prefix, in := variantPrefix(m, o.Variant)
+	vm := VariantMaster(m, o.Variant)
 	var b strings.Builder
+	b.WriteString(prefix)
 	if o.HasAlpha {
-		b.WriteString("[0:v]split[c][a];")
+		b.WriteString(in + "split[c][a];")
 		b.WriteString("[a]alphaextract,lut=c0='gte(val," + strconv.Itoa(o.AlphaThreshold) + ")*255'[m];")
-		b.WriteString("color=c=0x" + o.Matte + ":s=" + strconv.Itoa(m.Width) + "x" + strconv.Itoa(m.Height) + ":r=" + formatFloat(masterFPS(m)) + ",format=rgba[bg];")
+		b.WriteString("color=c=0x" + o.Matte + ":s=" + strconv.Itoa(vm.Width) + "x" + strconv.Itoa(vm.Height) + ":r=" + formatFloat(masterFPS(vm)) + ",format=rgba[bg];")
 		b.WriteString("[bg][c]overlay=format=auto:shortest=1,format=rgb24[f];")
 		b.WriteString("[f][m]alphamerge,split[p1][p2];")
 		b.WriteString("[p1]palettegen=max_colors=" + strconv.Itoa(o.Colors) + ":reserve_transparent=1:stats_mode=" + o.StatsMode + "[pal];")
 		b.WriteString("[p2][pal]paletteuse=dither=" + o.ditherArg() + ":diff_mode=rectangle:alpha_threshold=128[out]")
 		return b.String()
 	}
-	b.WriteString("[0:v]split[p1][p2];")
+	b.WriteString(in + "split[p1][p2];")
 	b.WriteString("[p1]palettegen=max_colors=" + strconv.Itoa(o.Colors) + ":reserve_transparent=0:stats_mode=" + o.StatsMode + "[pal];")
 	b.WriteString("[p2][pal]paletteuse=dither=" + o.ditherArg() + ":diff_mode=rectangle[out]")
 	return b.String()
@@ -432,6 +447,9 @@ type WebPOptions struct {
 	// the ANIM chunk's loop count, which is the number of PLAYS (0 =
 	// infinite), so WebPArgs passes N+1. Negative counts as 0.
 	Loop int
+	// Variant (Phase 2) pre-filters the master (fps drop / downscale): see
+	// VariantFilter. nil = encode the master as-is.
+	Variant *Variant
 }
 
 // WebPArgs encodes the master with the WebPAnimEncoder path only:
@@ -442,13 +460,18 @@ type WebPOptions struct {
 // -q:v is omitted for lossless output (libwebp then uses its default
 // effort). Lossy output uses yuv420p when the master has no alpha so the
 // VP8X ALPHA flag is only set when frames really carry alpha (§5.3).
+//
+// With o.Variant, "-filter_complex [0:v]<VariantFilter>[v] -map [v]" follows
+// the input (a nil or no-op variant adds nothing); the still decision then
+// uses the variant's frame count (VariantMaster).
 func WebPArgs(m Master, o WebPOptions, outPath string) []string {
 	args := RawInputArgs(m)
+	args = append(args, variantArgs(m, o.Variant)...)
 	// A single-frame master becomes a plain still WebP: WebPAnimEncoder would
 	// wrap one frame in VP8X+ANIM+ANMF, which Discord's lint (webp.anim-flag)
 	// rightly rejects. The legacy libwebp encoder is fine for stills — the
 	// ghost-trail bug only concerns animations.
-	still := m.Frames == 1
+	still := VariantMaster(m, o.Variant).Frames == 1
 	if still {
 		args = append(args, "-frames:v", "1", "-c:v", "libwebp")
 	} else {
@@ -531,6 +554,16 @@ func outLabel(p *graph.Plan) string {
 	return p.OutLabel
 }
 
+// inputPath returns the "-i" value for a plan: srcPath itself, or for an
+// image-sequence plan "<srcPath>/<InputPattern>" (srcPath is then the blob
+// directory; joined with "/" so the argv is identical on every host).
+func inputPath(srcPath string, p *graph.Plan) string {
+	if p.InputPattern == "" {
+		return srcPath
+	}
+	return joinSlash(srcPath, p.InputPattern)
+}
+
 // masterFPS returns the master frame rate with the documented fallback.
 func masterFPS(m Master) float64 {
 	if m.FPS > 0 && !math.IsInf(m.FPS, 0) {
@@ -566,7 +599,10 @@ type stillSeek struct {
 // The target source time is TrimStart + t*Speed, clamped to
 // [TrimStart, srcEnd - stillEndMargin] where srcEnd is TrimEnd, else
 // TrimStart + Duration*Speed when the duration is known. The output slot
-// displayed at t is k = floor(tOut*FPS) (tOut = clamped t); the seek start
+// displayed at t is k = floor(tOut*FPS) (tOut = clamped t), capped at the
+// render's last slot floor(Duration*FPS) - 1 when the duration is known
+// (the plan's fps stage runs with round=down, so no slot past that is ever
+// rendered); the seek start
 // is snapped down onto the slot grid, K = floor((target - back -
 // TrimStart)*FPS/Speed) slots after TrimStart, so the fps stage after the
 // seek emits slot j = k-K exactly where the render emits slot k. The select
@@ -621,7 +657,21 @@ func stillSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 	// Snap onto the render's slot grid.
 	slots := math.Floor((rawStart-trimStart)/period + stillSlotEpsilon)
 	start := trimStart + slots*period
-	slot := math.Floor(tOut*fps+stillSlotEpsilon) - slots // j: slot after start
+	abs := math.Floor(tOut*fps + stillSlotEpsilon) // output slot displayed at t
+	// The render's fps stage rounds the clip end DOWN (fps=F:round=down), so
+	// the last rendered slot is floor(Duration*FPS)-1. A t at the very end of
+	// the clip would otherwise select the slot past it and show a source
+	// frame the render's EOF flush drops.
+	durOut := p.Duration
+	if !(durOut > 0) && p.TrimEnd > 0 {
+		durOut = (p.TrimEnd - trimStart) / speed
+	}
+	if durOut > 0 && !math.IsInf(durOut, 0) {
+		if last := math.Floor(durOut*fps+stillSlotEpsilon) - 1; last >= 0 && abs > last {
+			abs = last
+		}
+	}
+	slot := abs - slots // j: slot after start
 	if slot < 0 {
 		slot = 0
 	}

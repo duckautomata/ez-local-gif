@@ -9,7 +9,9 @@
 // DOM globals of the same name; their JSON is unchanged.
 //
 // API (see internal/server/server.go):
-//   POST /api/upload            multipart "file"      -> Source
+//   POST /api/upload            multipart "file" (one file, or several images
+//                               + "delayMs" = one image sequence)  -> Source
+//   POST /api/sources/from-result {recipeHash, name}  -> Source ("edit as source")
 //   GET  /api/sources/{hash}                          -> Source
 //   POST /api/still             StillRequest          -> image/png
 //   POST /api/jobs              Recipe                -> 202 Job
@@ -27,6 +29,14 @@
 
 export type Kind = 'video' | 'animation' | 'image' | 'sequence';
 
+/** Go: recipe.SequenceInfo — set for uploaded image sequences. */
+export interface SequenceInfo {
+  count: number;
+  pattern: string;
+  delayMs: number;
+  mixed: boolean;
+}
+
 export interface ProbeInfo {
   format: string;
   codec: string;
@@ -43,6 +53,9 @@ export interface ProbeInfo {
   isStill: boolean;
   kind: Kind;
   premultiplied: boolean;
+  /** index of a separate alpha stream (AVIF); 0/absent = alpha in the main stream */
+  alphaStream?: number;
+  sequence?: SequenceInfo | null;
 }
 
 export interface Source {
@@ -61,10 +74,15 @@ export type OpKind =
   | 'speed'
   | 'flip'
   | 'rotate'
-  | 'unpremultiply';
+  | 'unpremultiply'
+  | 'delay';
 
 export type FitMode = 'contain' | 'cover' | 'exact';
 
+/** Go: recipe.DelayParams — per-frame duration of an image sequence (ms, 1..60000). */
+export interface DelayParams {
+  ms: number;
+}
 export interface TrimParams {
   start: number;
   end?: number; // <= 0 / omitted = to the end
@@ -107,7 +125,8 @@ export type OpParams =
   | FPSParams
   | SpeedParams
   | FlipParams
-  | RotateParams;
+  | RotateParams
+  | DelayParams;
 
 /** One step of the non-destructive op stack (Go: recipe.Op; params is json.RawMessage). */
 export interface Op {
@@ -115,10 +134,23 @@ export interface Op {
   params?: OpParams;
 }
 
-export type OutputFormat = 'gif' | 'webp';
+/** Go: recipe.Format* constants. */
+export type OutputFormat = 'gif' | 'webp' | 'apng' | 'avif' | 'png' | 'jpeg' | 'frames';
+export const OUTPUT_FORMATS: readonly OutputFormat[] = ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames'];
+/** Go: recipe.Output.FrameFormat values (FormatFrames only). */
+export type FrameFormat = 'png' | 'jpeg' | 'webp';
 export type Target = '' | 'emote' | 'sticker' | 'attachment';
-export type PresetId = 'emote' | 'sticker' | 'chat-gif' | 'chat-webp' | 'custom';
+export type PresetId = 'emote' | 'sticker' | 'chat-gif' | 'chat-webp' | 'chat-avif' | 'optimize' | 'frames' | 'custom';
 export type Dither = 'bayer' | 'sierra2_4a' | 'floyd_steinberg' | 'none';
+
+/** Mirrors recipe.IsAnimatedFormat. */
+export function isAnimatedFormat(f: OutputFormat | string): boolean {
+  return f === 'gif' || f === 'webp' || f === 'apng' || f === 'avif';
+}
+/** Mirrors recipe.IsStaticFormat. */
+export function isStaticFormat(f: OutputFormat | string): boolean {
+  return f === 'png' || f === 'jpeg';
+}
 
 /** Go: recipe.Output. Zero values / omitted fields mean "default". */
 export interface Output {
@@ -136,6 +168,9 @@ export interface Output {
   matte?: string;
   loop?: number;
   fitBytes?: number;
+  fitKeepSize?: boolean;
+  fitKeepFps?: boolean;
+  frameFormat?: FrameFormat;
   preset?: PresetId;
   target?: Target;
 }
@@ -185,6 +220,9 @@ export interface Report {
 export type JobState = 'queued' | 'running' | 'done' | 'error';
 export type Stage = 'probe' | 'master' | 'encode' | 'lint' | 'verify' | 'done' | (string & {});
 
+/** Go: jobs.FileKind* — "" and "output" are the primary file. */
+export type FileKind = '' | 'output' | 'alternative' | 'frame' | 'archive';
+
 /** Go: jobs.File — one produced output. */
 export interface ResultFile {
   name: string;
@@ -198,6 +236,12 @@ export interface ResultFile {
   duration: number;
   limit: number;
   report?: Report | null;
+  /** Phase 2: "" | "output" = primary; "alternative" = fit runner-up; "frame" = extracted frame; "archive" = frames.zip */
+  kind?: FileKind | (string & {});
+  /** human description: the binding fit knob ("fit at 20 fps · 128 colours · lossy 60") or "frame 12 (0.48 s)" */
+  desc?: string;
+  /** 1-based frame number for "frame"; rank for "alternative" */
+  index?: number;
 }
 
 /** Go: jobs.Result — the manifest written to the result dir. */
@@ -248,6 +292,16 @@ export interface Capabilities {
   tools: Record<string, string>;
   limits: Record<string, unknown>;
   rulesVersion: string;
+  version?: string;
+  concurrency?: number;
+  maxUploadBytes?: number;
+  formats?: string[] | null;
+}
+
+/** Body of POST /api/sources/from-result. */
+export interface FromResultRequest {
+  recipeHash: string;
+  name: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,13 +391,31 @@ export interface UploadHandle {
   abort(): void;
 }
 
+export interface UploadOptions {
+  /**
+   * Per-frame duration for an image sequence (several files), sent as the
+   * "delayMs" form field; the server defaults to 100 ms when absent.
+   */
+  delayMs?: number;
+}
+
 /**
- * upload streams one file as multipart/form-data (field "file") with XHR so
- * upload progress is observable. Resolves with the probed Source.
+ * upload streams one file — or several image files as one image sequence —
+ * as multipart/form-data (every file in a "file" part) with XHR so upload
+ * progress is observable. Resolves with the probed Source.
  */
-export function upload(file: File, onProgress?: (loaded: number, total: number) => void): UploadHandle {
+export function upload(
+  files: File | readonly File[],
+  onProgress?: (loaded: number, total: number) => void,
+  opts: UploadOptions = {},
+): UploadHandle {
+  const list = Array.isArray(files) ? (files as readonly File[]) : [files as File];
   const xhr = new XMLHttpRequest();
   const promise = new Promise<Source>((resolve, reject) => {
+    if (list.length === 0) {
+      reject(new ApiError('No file to upload', 0));
+      return;
+    }
     xhr.open('POST', '/api/upload');
     xhr.responseType = 'text';
     xhr.setRequestHeader('Accept', 'application/json');
@@ -365,7 +437,10 @@ export function upload(file: File, onProgress?: (loaded: number, total: number) 
     xhr.ontimeout = () => reject(new ApiError('Upload timed out', 0));
     xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'));
     const form = new FormData();
-    form.append('file', file, file.name);
+    if (list.length > 1 && opts.delayMs !== undefined && opts.delayMs > 0) {
+      form.append('delayMs', String(Math.round(opts.delayMs)));
+    }
+    for (const f of list) form.append('file', f, f.name);
     xhr.send(form);
   });
   return { promise, abort: () => xhr.abort() };
@@ -373,6 +448,34 @@ export function upload(file: File, onProgress?: (loaded: number, total: number) 
 
 export function getSource(hash: string, signal?: AbortSignal): Promise<Source> {
   return requestJSON<Source>(`/api/sources/${encodeURIComponent(hash)}`, { signal });
+}
+
+/**
+ * sourceFromResult copies a rendered result file into the blob store and
+ * probes it, so it can be edited like an upload ("edit as source").
+ */
+export function sourceFromResult(recipeHash: string, name: string, signal?: AbortSignal): Promise<Source> {
+  const body: FromResultRequest = { recipeHash, name };
+  return requestJSON<Source>('/api/sources/from-result', jsonInit('POST', body, signal));
+}
+
+/** isHash mirrors recipe.IsHash: a lowercase sha256 hex digest. */
+export function isHash(s: string): boolean {
+  return /^[0-9a-f]{64}$/.test(s);
+}
+
+/**
+ * sourceHashFromSearch reads the `src` query parameter that "edit as source"
+ * opens a new tab with ('/?src=<hash>'); null unless it is a valid hash.
+ */
+export function sourceHashFromSearch(search: string): string | null {
+  const v = new URLSearchParams(search).get('src');
+  return v && isHash(v) ? v : null;
+}
+
+/** sourceURL is the shareable / reloadable address of a loaded source. */
+export function sourceURL(hash: string | null): string {
+  return hash ? `/?src=${hash}` : '/';
 }
 
 /** fetchStill renders one preview frame (PNG) for the given op stack at output time t. */

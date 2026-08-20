@@ -18,6 +18,48 @@ on Discord.
 
 The design, Discord rules and phase plan live in [`docs/DESIGN.md`](docs/DESIGN.md).
 
+## Features
+
+Phase 1 (accepted — renders verified on a private Discord server, see
+[`docs/discord-testkit-results.md`](docs/discord-testkit-results.md)):
+
+- **ProRes 4444 / any video / GIF / animated WebP → Discord-safe GIF and animated WebP** with
+  transparency: premultiplied-alpha toggle (on by default for ProRes), matte + 1-bit threshold
+  for GIF, 8-bit straight alpha for WebP, one global palette, `gifsicle -O2 --careful`,
+  `libwebp_anim` with `-loop 0`.
+- **Discord linter** (`internal/discordlint`): checks and fixes the byte-level rules that make
+  files render black / opaque / flickering / play-once after Discord's server-side transcode
+  (GCE on every frame, frame-0 transparency flag, explicit disposal, NETSCAPE loop, VP8X
+  ALPHA/ANIM flags, loop 0, no metadata); the result card shows the report.
+- Trim, crop, resize/canvas, fps, speed, flip/rotate ops; still preview with scrubber over
+  checkerboard / Discord dark / white.
+
+Phase 2:
+
+- **Fit to size** — `fitBytes` runs the ladder + secant search of DESIGN.md §5.4 (fps → colours
+  → lossy/quality → downscale, mildest first, in parallel) so the primary file lands under the
+  Discord emote (256 KiB) / sticker (512 KiB) budget or any byte target ("compress to X KiB",
+  optionally keeping size / fps); the manifest reports the binding knob ("fit at 20 fps · 128
+  colours · lossy 40") and lists the runner-up rungs as **alternatives**.
+- **APNG stickers** — 320×320, ≤ 5 s, `-plays 0`: the sticker fit probes RGBA APNG first at
+  ≥ 12.5 fps (best quality when it fits); the **indexed 8-bit-alpha APNG** (tile → pngquant →
+  untile → `apng -pix_fmt pal8`, PLTE + tRNS) is the default rung (user-verified best on
+  Discord) and GIF the fallback; APNG lint rules.
+- **AVIF** — animated AVIF with alpha via `avifenc` (verified to animate with soft alpha as a
+  Discord attachment; `--repetition-count infinite`), stills from a single-frame source; AVIF
+  input is accepted (ffmpeg's mov demuxer exposes the alpha as a second stream).
+- **Static images** — PNG (pngquant + oxipng) and JPEG (flattened onto the matte) from the first
+  frame; static emote / sticker presets.
+- **Frames** — export every frame as PNG / JPEG / lossless WebP plus a `frames.zip` (STORE'd;
+  `?dl=1` downloads it as an attachment); the manifest lists every frame file.
+- **Image sequences** — upload several images in one request (`delayMs` per frame, `delay` op
+  to change it) → one sequence source → GIF / WebP / APNG / AVIF.
+- **Optimize** — GIF → GIF without decoding (`gifsicle -O2 --lossy --colors`, frame dropping
+  with delays merged), ezgif "optimize" parity.
+- **Edit as source** — `POST /api/sources/from-result` turns any rendered file into a new source
+  so results can be chained from the result card.
+- Result memoisation by recipe hash + pipeline version, TTL / size sweeper for `/data`.
+
 ## Quick start
 
 ```sh
@@ -28,7 +70,8 @@ docker compose up -d --build          # first build downloads ~150 MB of tools
 ```
 
 `compose.yaml` runs the `app` service with a named volume for `/data`, `./output` bound to
-`/output` ("Save to /output" in the UI, and where the Discord test kit writes), `shm_size: 4gb`
+`/output` (where the Discord test kit writes; a "Save to /output" UI action is planned for
+Phase 4), `shm_size: 4gb`
 for the frame master, and sane defaults for retention. Uncomment the `/input` bind to pick files
 from a host folder without uploading. Logs: `docker compose logs -f app`. Update:
 `git pull && docker compose up -d --build`.
@@ -58,6 +101,34 @@ Everything is optional; set it under `environment:` in `compose.yaml`.
 Volumes / mounts: `/data` (required, keep it on a Linux filesystem), `/output` (optional, rw,
 must be writable by uid 1000 — see Quick start), `/input` (optional, ro), `/dev/shm` sized by
 `shm_size`.
+
+## HTTP API
+
+Everything the UI does goes through this JSON API (errors are `{"error": "message"}` with a
+4xx/5xx status; the full contract is the package comment of `internal/server/server.go`, the
+recipe schema is `internal/recipe`). `curl` works as-is; browsers are held to same-origin.
+
+| Method / path | What |
+|---|---|
+| `POST /api/upload` | multipart `file` → `Source` (`hash`, `name`, `size`, `info` = probe: format, codec, W×H, fps, frames, alpha, kind, premultiplied guess). Several `file` parts that are all images → one **image-sequence** source (optional `delayMs`, default 100). |
+| `POST /api/sources/from-result` | `{"recipeHash": "…", "name": "out.gif"}` → copies that result file into the blob store and probes it → `Source` (**edit as source**) |
+| `GET /api/sources/{hash}` | `Source` |
+| `POST /api/still` | `{"src": hash, "ops": […], "output": {…}, "t": 1.5, "maxW": 480}` → `image/png` preview frame |
+| `POST /api/jobs` | a `Recipe` (`{"v":1,"sources":[hash],"ops":[…],"output":{…}}`) → `202 Job`; the result is served from cache when the same recipe was rendered before |
+| `GET /api/jobs/{id}` · `DELETE /api/jobs/{id}` · `GET /api/jobs/{id}/events` | poll, cancel, or follow a job (SSE: `event: progress|done|error`, `data: Event`) |
+| `GET /api/results/{recipeHash}` | the result manifest (`files[]` with `name`, `url`, `bytes`, W×H, frames, fps, `report` = Discord lint, `kind` = `output` / `alternative` / `frame` / `archive`, `desc` = binding fit knob) |
+| `GET /out/{recipeHash}/{name}` | a result file (immutable; `?dl=1` adds `Content-Disposition: attachment` named after the source) |
+| `GET /api/capabilities` | tool versions, Discord byte limits, lint rules version, concurrency, max upload, formats |
+| `GET /healthz` | `ok` |
+
+`Output` fields that matter most: `format` (`gif` · `webp` · `apng` · `avif` · `png` · `jpeg` ·
+`frames`), `width`/`height`/`fit`, `fps`, `quality` / `lossless` (webp, avif), `lossy` / `colors`
+/ `dither` / `alphaThreshold` / `matte` (gif), `loop`, `fitBytes` (+ `fitKeepSize`,
+`fitKeepFps`), `frameFormat` (frames: `png` · `jpeg` · `webp`), `preset` (UI label: `emote` ·
+`sticker` · `chat-gif` · `chat-webp` · `chat-avif` · `optimize` · `frames` · `custom`) and
+`target` (which Discord rules and byte limit the linter enforces: `emote` · `sticker` ·
+`attachment` · none). `scripts/integration-test.sh` exercises upload, sequence upload, jobs,
+result downloads (`?dl=1`), from-result and the source endpoints.
 
 ## Running on WSL2 (Windows workstation)
 
@@ -110,9 +181,9 @@ or throw the volume away and start clean: `docker compose down -v && docker comp
 Linux or with Docker inside a WSL distro, a `./output` that did not exist at the first `up` is
 created by the daemon as `root:root 0755`, and files written there by an earlier run as another
 user (e.g. the root dev stack, if you pointed it at `./output`) are equally read-only for the app.
-The server itself does not touch `/output` today (it is the "Save to /output" target and the test
-kit's output dir), so nothing fails at startup — the kit checks up front and stops with this hint
-before running the matrix. Fix on the host: `mkdir -p output && sudo chown -R 1000:1000 output`;
+The server itself does not touch `/output` today (only the test kit writes there; a "Save to
+/output" UI action is planned for Phase 4), so nothing fails at startup — the kit checks up
+front and stops with this hint before running the matrix. Fix on the host: `mkdir -p output && sudo chown -R 1000:1000 output`;
 or without sudo: `docker compose run --rm --user root --entrypoint chown app -R 1000:1000
 /output`. Docker Desktop on Windows/macOS: nothing to do (binds appear world-writable). The dev
 stack writes to `./output-dev` (root-owned on Linux hosts, by design) so it never poisons `./output`.
@@ -168,8 +239,17 @@ Useful one-liners:
 # Go tests inside the real toolchain image
 docker compose -f compose.yaml -f compose.dev.yaml run --rm app go test ./...
 
-# End-to-end test (starts the server in the container, uploads a ProRes clip, renders GIF + WebP)
+# End-to-end test (starts the server in the container on a throw-away temp data dir — the dev
+# image's EZLG_DATA=/data is deliberately ignored so every re-run really re-renders instead of
+# being answered from the on-disk result cache — then uploads a ProRes clip, renders the Phase 1
+# GIF + WebP, then the Phase 2 cases: emote fit-to-size with alternatives, indexed APNG sticker,
+# animated AVIF, PNG/JPEG stills, frames + zip, 3-PNG image sequence, GIF optimise, edit-as-source)
 docker compose -f compose.yaml -f compose.dev.yaml run --rm -e EZLG_START_SERVER=1 app bash scripts/integration-test.sh
+#   against an already running stack instead:  EZLG_URL=http://localhost:8080 bash scripts/integration-test.sh
+#     (that stack keeps its ezlg-data-dev volume, so repeat recipes are answered from the result
+#      cache — the script warns per cached job and in the summary; wipe the volume (down -v) or
+#      bump jobs.PipelineVersion to force a re-render, or set EZLG_TEST_STRICT=1 to fail on it)
+#   Phase 1 checks only:                       … -e EZLG_TEST_PHASE2=0 …
 
 # Self-test of the Discord test kit (OUTDIR guard, frame-rate handling, variants, scratch; ~1–2 min)
 docker compose -f compose.yaml -f compose.dev.yaml run --rm app bash scripts/testkit-test.sh
@@ -191,11 +271,23 @@ healthcheck) and `dev` (tools + Go + Node, root). Third-party downloads are pinn
 sha256 in the `ARG`s at the top of the Dockerfile; `scripts/pin-ffmpeg.sh` prints fresh values
 when the BtbN autobuild tag is pruned (daily tags live ~2 weeks, month-end tags are permanent).
 
-## Discord acceptance test (Phase 1)
+## Discord acceptance test
 
 Files that look fine in a browser can still break on Discord, which re-encodes every preview
-server-side. Before trusting a build, run the test kit and upload the variants to a **private**
-Discord server:
+server-side. The Phase 1 acceptance run was done on 2026-08-19: every variant below was uploaded
+to a private server and the per-file outcome is recorded in
+[`docs/discord-testkit-results.md`](docs/discord-testkit-results.md); the consequences for the
+encoders are in [`docs/DESIGN.md` §9a](docs/DESIGN.md). Headlines: the ffmpeg-palette GIF paths
+(with or without gifsicle), lossy (`yuva420p` and `bgra`) and lossless WebP, the 128² emote GIF
+and WebP, the 320² sticker GIF and both APNG stickers all render correctly; gifski's per-frame
+palettes do **not** (dark background, ghosting — never offered for Discord targets); APNG
+attachments show frame 0 only (sticker-only, as designed); the **indexed 8-bit-alpha APNG at
+25 fps is the best sticker** and is the sticker default; animated **AVIF with alpha animates with
+soft alpha** as an attachment; all GIFs show a dark 1-bit outline in light mode (inherent —
+WebP/AVIF/APNG when soft edges matter).
+
+Re-run the kit after any encoder or linter change and upload the variants to a **private**
+Discord server again:
 
 ```sh
 # writes ./output/testkit/{a..j}_*.{gif,webp,png,avif} + README.md  (15–50 s)
@@ -223,13 +315,14 @@ RGBA masters live on `/dev/shm/ezl-testkit`, or under `$TMPDIR` with a warning w
 Docker's default 64 MiB) and emits every encoder path from `docs/DESIGN.md` §4.2 / §9:
 ffmpeg palette GIF + `gifsicle -O2` (default), the same coalesced with `gifsicle -U`, gifski
 (local palettes), ffmpeg-only GIF, animated WebP lossy (`yuva420p` and `bgra` input, e / e2) and
-lossless, RGBA APNG, 128×128 emote GIF/WebP fitted under 256 KiB, 320×320 sticker GIF / RGBA APNG
-/ indexed 8-bit-alpha APNG fitted under 512 KiB, and an experimental animated AVIF.
-`output/testkit/README.md` says for each file
-where to upload it (attachment / Server Settings › Emoji / Server Settings › Stickers), lists the
-client matrix (desktop, web, iOS, Android × dark/light theme × autoplay on/off, reduced motion),
-what to look for (alpha survives, no black background, no colour flicker, first-frame still,
-loops forever, timing) and a sizes table with the fit rung used.
+lossless, RGBA APNG, 128×128 emote GIF/WebP fitted under 256 KiB, 320×320 sticker indexed
+8-bit-alpha APNG (i3, the default rung, listed first) / GIF / RGBA APNG fitted under 512 KiB, and
+an animated AVIF with alpha. `output/testkit/README.md` opens with a "results so far" pointer to
+`docs/discord-testkit-results.md`, then says for each file where to upload it (attachment /
+Server Settings › Emoji / Server Settings › Stickers), lists the client matrix (desktop, web,
+iOS, Android × dark/light theme × autoplay on/off, reduced motion), what to look for (alpha
+survives, no black background, no colour flicker, first-frame still, loops forever, timing) and a
+sizes table with the fit rung used.
 
 Checklist for sign-off (per client and theme):
 
@@ -238,13 +331,16 @@ Checklist for sign-off (per client and theme):
    difference in soft-edge colour or size — that decides the lossy WebP input format).
 2. Emote **h1** (GIF) and **h2** (WebP): upload accepted, animate inline / jumbo / reaction /
    picker, transparent.
-3. Sticker **i1** (GIF), **i2** (RGBA APNG), **i3** (indexed APNG): upload accepted (no
-   "frame rate too small or too large"), animate in the picker and in chat, soft alpha kept.
-4. **c** (gifski) and **j** (AVIF) are informational — record what happens.
+3. Sticker **i3** (indexed 8-bit-alpha APNG — the default), **i1** (GIF fallback), **i2** (RGBA
+   APNG probe rung): upload accepted (no "frame rate too small or too large"), animate in the
+   picker and in chat at the fitted fps, soft alpha kept (i3/i2).
+4. **j** (animated AVIF with alpha) as an attachment: animates with soft alpha. **c** (gifski)
+   is informational — expected to fail (dark background, ghosting).
 5. `g` (APNG attachment) is expected to show only its first frame; that is a Discord limitation.
 
-Record findings (client + version, theme, autoplay, screenshot of anything wrong) against
-`docs/DESIGN.md` §9. Rules the linter enforces are versioned in `internal/discordlint`.
+Record findings (client + version, theme, autoplay, screenshot of anything wrong) in
+`docs/discord-testkit-results.md` and their consequences in `docs/DESIGN.md` §9a. Rules the
+linter enforces are versioned in `internal/discordlint`.
 
 ## Scripts
 
@@ -252,17 +348,18 @@ Record findings (client + version, theme, autoplay, screenshot of anything wrong
 |---|---|
 | `scripts/go.ps1`, `scripts/go.sh` | Run `go …` in `golang:1.26-trixie` with the repo mounted (host has no Go) |
 | `scripts/check-tools.sh` | Print + assert every bundled tool and ffmpeg capability (runs at image build) |
-| `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`) or GIF; premultiplied or straight alpha |
+| `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`), GIF, animated AVIF with alpha (`.avif`: avifenc, or ffmpeg's colour + alpha stream pair without it), or `seq OUTDIR N` = N straight-alpha PNG frames for an image-sequence upload; premultiplied or straight alpha |
 | `scripts/discord-testkit.sh` | Emit the Discord render-test matrix + README (see above) |
 | `scripts/testkit-test.sh` | Self-test for the test kit: OUTDIR guard + hint, synthetic clip at the master rate, resample warning, every variant produced, native-depth unpremultiply, /dev/shm scratch (full checks need the toolchain image) |
-| `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one) |
+| `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one on a throw-away data dir): the 18 Phase 1 checks (ProRes → emote GIF + chat WebP) plus the Phase 2 cases (fit-to-size + alternatives, indexed APNG sticker, AVIF, PNG/JPEG, frames + zip, image sequence, optimise, from-result); `EZLG_TEST_PHASE2=0` for Phase 1 only; jobs answered from the server's result cache are warned about (`EZLG_TEST_STRICT=1` fails on them) |
+| `scripts/integration-test-selftest.sh` | Unit tests for `integration-test.sh` itself (no server/toolchain needed): `EZLG_START_SERVER=1` must ignore an inherited `EZLG_DATA` (else dev-image re-runs are vacuous cache hits), `EZLG_TEST_DATA` override, cached-result detection |
 | `scripts/pin-ffmpeg.sh` | Print new `FFMPEG_TAG/ASSET/SHA256` ARG lines for a BtbN release tag |
 
 ## Layout
 
-See [`CLAUDE.md`](CLAUDE.md) for the package map (`cmd/ezlg`, `internal/{recipe,graph,enc,ffrun,
-discordlint,probe,store,jobs,server}`, `web/`) and [`docs/DESIGN.md`](docs/DESIGN.md) for the
-architecture, Discord rules, encoder commands, verification list and build phases.
+See [`CLAUDE.md`](CLAUDE.md) for the package map (`cmd/ezlg`, `internal/{recipe,graph,enc,fit,
+ffrun,discordlint,probe,store,jobs,server}`, `web/`) and [`docs/DESIGN.md`](docs/DESIGN.md) for
+the architecture, Discord rules, encoder commands, verification list and build phases.
 
 ## License
 

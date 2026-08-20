@@ -10,6 +10,9 @@
 #   docker compose -f compose.yaml -f compose.dev.yaml run --rm app bash scripts/discord-testkit.sh /output/testkit   # → ./output-dev/testkit
 #   docker compose -f compose.yaml -f compose.dev.yaml run --rm app bash scripts/testkit-test.sh
 #   docker compose -f compose.yaml -f compose.dev.yaml run --rm -e EZLG_START_SERVER=1 app bash scripts/integration-test.sh
+#     (the test spawns its own server on a throw-away temp data dir — it deliberately ignores
+#      this file's EZLG_DATA=/data so re-runs are never answered from the ezlg-data-dev result
+#      cache; the EZLG_URL=… variant reuses the running stack's volume and will warn on cache hits)
 #
 # The Go server is not auto-restarted on edits: `docker compose ... restart app`
 # (or run everything by hand in `... run --rm --service-ports app bash`, see

@@ -3,30 +3,40 @@
 // table with SSE-style event subscription. There is no queue broker: a
 // semaphore bounds concurrent encodes.
 //
-// Render pipeline (Phase 1):
+// Render pipeline:
 //  1. Look up sources in the store (probe info must exist); touch them so
-//     the sweeper's TTL counts from this use.
+//     the sweeper's TTL counts from this use. An image-sequence source is a
+//     blob directory; enc joins graph.Plan.InputPattern onto it.
 //  2. plan := graph.Compile(mainInfo, ops, output). Estimate the RGBA
-//     master (plan.Frames*W*H*4): refuse renders over Options.MaxMasterBytes
-//     or larger than the scratch filesystem up-front, otherwise reserve the
-//     estimate from the scratch budget (waiting for concurrent renders when
-//     needed) — see scratch.go.
+//     master (plan.Frames*W*H*4; one frame for the static formats, whose
+//     master is cut to the first frame): refuse renders over
+//     Options.MaxMasterBytes or larger than the scratch filesystem up-front,
+//     otherwise reserve the estimate (plus room for PNG intermediates where
+//     the format needs them) from the scratch budget — see scratch.go.
 //  3. If store.HasResult(hash) → done immediately with the existing manifest.
 //  4. scratch := store.ScratchDir(jobID); render the master with
 //     enc.MasterArgs + ffrun.RunFFmpeg (progress → Percent, using
 //     plan.Frames or plan.Duration for the denominator); scan alpha; fill
 //     enc.Master.
-//  5. Encode per output.Format: gif → enc.GIFArgs then enc.GifsicleArgs
-//     (with output.Loop restated as --loopcount); webp → enc.WebPArgs.
-//     (Phase 2 adds fit search / more formats.)
-//  6. discordlint.LintGIF(fix=true) / LintWebP with output.Target; write the
-//     fixed bytes; if a LevelError check remains for gif, retry once through
-//     the gifsicle fallback ladder (--colors → -U -O2 → -U). Report.HasAlpha
-//     is then overridden with the master's pixel alpha scan (the linter's
-//     flag is structural and over-reports on frame-diff optimised opaque
-//     animations; the structural verdict stays in a render.alpha info check
-//     when they differ).
-//  7. Verify: enc.VerifyDecodeArgs must succeed.
+//  5. Encode per output.Format (encoders.go, frames.go):
+//     gif → enc.GIFArgs then enc.GifsicleArgs (output.Loop restated as
+//     --loopcount); webp → enc.WebPArgs; apng → enc.APNGArgs (RGBA) or,
+//     with Colors > 0, the indexed tile → pngquant → untile pipeline, then
+//     oxipng; avif → PNG frames → avifenc (still: AVIFStillArgs); png/jpeg →
+//     first frame (+ pngquant/oxipng for png); frames → one image per frame
+//     + delays.json + frames.zip (STORE). With Output.FitBytes > 0 the fit
+//     engine (fit.go)
+//     runs the §5.4 ladder for gif/webp/apng/avif/jpeg and delivers the
+//     winner plus up to two alternatives. Output.Preset "optimize" skips the
+//     master: a GIF source goes straight through gifsicle (optimize.go).
+//  6. Lint per format with output.Target: discordlint.LintGIF(fix=true)
+//     (+ the gifsicle fallback ladder when a structural error remains),
+//     LintWebP, LintAPNG, LintStatic; frames are not linted. Report.HasAlpha
+//     is overridden with the master's pixel alpha scan (the linter's flag is
+//     structural and over-reports on frame-diff optimised opaque animations;
+//     the structural verdict stays in a render.alpha info check when they
+//     differ).
+//  7. Verify: enc.VerifyDecodeArgs must succeed for every delivered file.
 //  8. Write manifest.json (Result) into staging, store.CommitResult, publish
 //     done.
 package jobs
@@ -103,7 +113,20 @@ type File struct {
 	Duration float64             `json:"duration"` // seconds
 	Limit    int64               `json:"limit"`    // byte cap for the recipe's Discord target (0 = none)
 	Report   *discordlint.Report `json:"report,omitempty"`
+
+	// Phase 2.
+	Kind  string `json:"kind,omitempty"`  // "" or "output" = the primary file; "alternative" = fit-search runner-up; "frame" = one extracted frame; "archive" = frames.zip
+	Desc  string `json:"desc,omitempty"`  // human description, e.g. the binding knob "fit at 20 fps · 128 colours · lossy 60" or "frame 12 (0.48 s)"
+	Index int    `json:"index,omitempty"` // 1-based frame number for Kind "frame"; rank for "alternative"
 }
+
+// File kinds.
+const (
+	FileKindOutput      = "output"
+	FileKindAlternative = "alternative"
+	FileKindFrame       = "frame"
+	FileKindArchive     = "archive"
+)
 
 // Result is the manifest written to the result dir.
 type Result struct {
@@ -295,8 +318,14 @@ func (m *Manager) ToolVersions() map[string]string {
 	return m.versions
 }
 
-// supportedFormats lists the Phase 1 encoders.
-var supportedFormats = map[string]bool{"gif": true, "webp": true}
+// supportedFormats lists the output formats the pipeline encodes.
+var supportedFormats = map[string]bool{
+	recipe.FormatGIF: true, recipe.FormatWebP: true, recipe.FormatAPNG: true, recipe.FormatAVIF: true,
+	recipe.FormatPNG: true, recipe.FormatJPEG: true, recipe.FormatFrames: true,
+}
+
+// supportedFormatList is the human list for error messages.
+const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames"
 
 // PipelineVersion salts the result key so that memoised outputs are only
 // reused while the code that produced them is unchanged. Bump it whenever
@@ -304,7 +333,7 @@ var supportedFormats = map[string]bool{"gif": true, "webp": true}
 // flags, lint fixes); discordlint.RulesVersion is folded in automatically so
 // rule changes invalidate results too. Recipes themselves keep their
 // content hash (recipe.Recipe.Hash) — only the on-disk result key changes.
-const PipelineVersion = "2026-08-18.2"
+const PipelineVersion = "2026-08-19.3"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what
@@ -321,7 +350,7 @@ func (m *Manager) Submit(r recipe.Recipe) (Job, error) {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
 	if !supportedFormats[strings.ToLower(r.Output.Format)] {
-		return Job{}, fmt.Errorf("%w: unsupported output format %q (supported: gif, webp)", ErrInvalidRecipe, r.Output.Format)
+		return Job{}, fmt.Errorf("%w: unsupported output format %q (supported: %s)", ErrInvalidRecipe, r.Output.Format, supportedFormatList)
 	}
 	if _, err := r.Canonical(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)

@@ -341,6 +341,12 @@ func TestSanitizeExtAndName(t *testing.T) {
 		{"RECIPE.JSON", "jsonfile", "RECIPE.JSON"},
 		{"weird.j.s.o.n", "n", "weird.j.s.o.n"},
 		{"x.jsonl", "jsonl", "x.jsonl"},
+		// "seq" is the sequence-directory contract (Blob.IsSequence); a plain
+		// upload never gets it.
+		{"frames.seq", "seqfile", "frames.seq"},
+		{"FRAMES.SEQ", "seqfile", "FRAMES.SEQ"},
+		{".seq", "seqfile", ".seq"},
+		{"x.seq2", "seq2", "x.seq2"},
 	}
 	for _, c := range cases {
 		if got := SanitizeExt(c.in); got != c.ext {
@@ -430,6 +436,61 @@ func TestPutBlobJSONKeepsPayloadAndMeta(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(b.Path); !bytes.Equal(got, payload) {
 		t.Errorf("re-uploaded payload: %q", got)
+	}
+}
+
+// TestPutBlobSeqStaysAFileBlob: Ext "seq" means "Path is the frame directory"
+// (sequence.go), so a plain upload named "*.seq" must be stored under another
+// extension — otherwise Blob.IsSequence would report true for a regular file.
+func TestPutBlobSeqStaysAFileBlob(t *testing.T) {
+	st := newTestStore(t)
+	payload := []byte("not a frame directory")
+	b, err := st.PutBlob(bytes.NewReader(payload), "frames.seq")
+	if err != nil {
+		t.Fatalf("PutBlob: %v", err)
+	}
+	if b.Ext != "seqfile" {
+		t.Errorf("ext = %q, want seqfile", b.Ext)
+	}
+	if b.IsSequence() {
+		t.Error("IsSequence() true for a plain file upload")
+	}
+	if want := filepath.Join(st.Root, "blobs", b.Hash+".seqfile"); b.Path != want {
+		t.Errorf("path = %q, want %q", b.Path, want)
+	}
+	got, err := st.GetBlob(b.Hash)
+	if err != nil {
+		t.Fatalf("GetBlob: %v", err)
+	}
+	if got.IsSequence() || got.Ext != "seqfile" || got.Path != b.Path {
+		t.Errorf("GetBlob = %+v", got)
+	}
+	if data, err := os.ReadFile(got.Path); err != nil || !bytes.Equal(data, payload) {
+		t.Errorf("payload: %q (%v)", data, err)
+	}
+	// A legacy meta claiming Ext "seq" for a plain file (an upload from before
+	// SanitizeExt reserved the extension) must not surface as a sequence: the
+	// payload shape disagrees, so the blob is simply not found and the upload
+	// path stores it again under the truthful extension.
+	stale := *got
+	stale.Ext = "seq"
+	data, _ := json.MarshalIndent(&stale, "", "  ")
+	if err := os.WriteFile(st.metaPath(b.Hash), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(st.Root, "blobs", b.Hash+".seq")
+	if err := os.Rename(b.Path, legacyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetBlob(b.Hash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("legacy seq-ext file blob: err = %v, want ErrNotFound", err)
+	}
+	re, err := st.PutBlob(bytes.NewReader(payload), "frames.seq")
+	if err != nil || re.Ext != "seqfile" || re.IsSequence() || re.Path != b.Path {
+		t.Errorf("re-upload = %+v (%v)", re, err)
+	}
+	if data, _ := os.ReadFile(b.Path); !bytes.Equal(data, payload) {
+		t.Errorf("re-uploaded payload: %q", data)
 	}
 }
 

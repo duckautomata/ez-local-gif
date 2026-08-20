@@ -9,6 +9,7 @@
     probe: 'Probing source',
     master: 'Decoding frames',
     encode: 'Encoding',
+    fit: 'Fitting to size',
     lint: 'Discord lint',
     verify: 'Verifying',
     done: 'Done',
