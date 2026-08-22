@@ -20,7 +20,9 @@
 //	GET  /api/sources/{hash}        → recipe.Source
 //	POST /api/still                 {"src": hash, "ops": [...], "output": {...}, "t": 1.5, "maxW": 480}
 //	                                → image/png (Cache-Control: private, max-age=3600)
-//	POST /api/jobs                  recipe.Recipe → 202 jobs.Job (503 + Retry-After while shutting down)
+//	POST /api/jobs                  recipe.Recipe → 202 jobs.Job (503 + Retry-After while shutting down;
+//	                                400 for an output.target outside the set /api/capabilities "targets"
+//	                                lists — the error names the valid ones)
 //	GET  /api/jobs/{id}             → jobs.Job
 //	DELETE /api/jobs/{id}           cancel → 204
 //	GET  /api/jobs/{id}/events      text/event-stream of jobs.Event ("event: progress|done|error",
@@ -32,7 +34,12 @@
 //	                                everything else keeps its stem ("clip-f00001.png", "clip-alt1.gif",
 //	                                "clip-frames.zip");
 //	                                Cache-Control: public, max-age=31536000, immutable
-//	GET  /api/capabilities          {"tools": {name: version}, "limits": {"emote","sticker","attachment"},
+//	GET  /api/capabilities          {"tools": {name: version},
+//	                                "targets": ["emote","sticker","attachment","attachment-50","attachment-100","attachment-500"]
+//	                                (every Discord target, in display order),
+//	                                "limits": {target: byte cap} for each of them (the attachment tiers
+//	                                are 20/50/100/500 MB: free, Nitro Basic or a Level-2 boosted server,
+//	                                a Level-3 boosted server, Nitro),
 //	                                "rulesVersion": "...", "version": "...", "concurrency": N,
 //	                                "maxUploadBytes": N,
 //	                                "formats": ["gif","webp","apng","avif","png","jpeg","frames"],

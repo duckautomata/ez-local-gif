@@ -19,17 +19,10 @@
   const count = $derived(info.sequence?.count ?? info.frames);
   const fps = $derived(sequenceFps(cfg.ms));
   const summary = $derived(
-    cfg.enabled ? `${fmtNum(cfg.ms, 0)} ms / frame (${fmtNum(fps)} fps)` : `as uploaded: ${uploaded} ms / frame (${fmtNum(info.fps)} fps)`,
+    cfg.enabled ? `${fmtNum(cfg.ms, 0)} ms → ${fmtNum(fps)} fps` : `as uploaded: ${uploaded} ms → ${fmtNum(info.fps)} fps`,
   );
-  const quick = [
-    { ms: 20, label: '20 ms (50 fps)' },
-    { ms: 33, label: '33 ms (30 fps)' },
-    { ms: 40, label: '40 ms (25 fps)' },
-    { ms: 50, label: '50 ms (20 fps)' },
-    { ms: 67, label: '67 ms (15 fps)' },
-    { ms: 100, label: '100 ms (10 fps)' },
-    { ms: 200, label: '200 ms (5 fps)' },
-  ];
+  // Quick picks, labelled with the rate the delay really gives (33 ms is 30.3 fps, not 30).
+  const quick = [20, 33, 40, 50, 67, 100, 200].map((ms) => ({ ms, label: `${ms} ms → ${fmtNum(sequenceFps(ms), 1)} fps` }));
 
   function set(ms: number) {
     app.ops.delay.ms = ms;
@@ -40,7 +33,7 @@
 <OpCard title="Delay (sequence timing)" {summary} bind:enabled={app.ops.delay.enabled} bind:open>
   <div class="row">
     <label class="field"><span>ms per frame</span><NumField bind:value={app.ops.delay.ms} min={1} max={60000} small /></label>
-    <span class="hint">= <b>{fmtNum(fps)} fps</b> · {count} frames → {fmtSeconds(sourceDuration(info, app.ops))}</span>
+    <span class="hint">→ <b>{fmtNum(fps)} fps</b> · {count} frames = {fmtSeconds(sourceDuration(info, app.ops))}</span>
     <div class="chips">
       {#each quick as q (q.ms)}
         <button type="button" class="chip" aria-pressed={cfg.enabled && cfg.ms === q.ms} onclick={() => set(q.ms)}>{q.label}</button>
@@ -48,7 +41,8 @@
     </div>
   </div>
   <p class="hint">
-    Every frame of the sequence is shown for this long (the upload used {uploaded} ms). GIF delays are whole centiseconds
-    and browsers clamp delays ≤ 10 ms to 100 ms, so 20 ms is the floor for GIF; WebP / APNG delays should be ≥ 20 ms too.
+    Every frame of the sequence is shown for this long (the upload used {uploaded} ms → {fmtNum(info.fps)} fps); the frame count
+    stays {count} whatever the delay. GIF delays are whole centiseconds and browsers clamp delays ≤ 10 ms to 100 ms, so 20 ms is
+    the floor for GIF; WebP / APNG delays should be ≥ 20 ms too.
   </p>
 </OpCard>

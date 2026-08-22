@@ -29,14 +29,15 @@
 // frame 0 cannot be decoded.
 //
 // Loop counts (gif.netscape-loop / webp.loop-forever) depend on the target:
-// Discord targets require "loop forever" (GIF NETSCAPE2.0 count 0 — the
-// fixer forces it; WebP ANIM loop count 0 — an error otherwise), because
-// Discord honours a finite count and the animation stops. TargetNone treats
-// the count as the user's choice: a GIF only needs a NETSCAPE2.0 block
-// before the first image (inserted with count 0 when missing) and a WebP
-// animation only needs an ANIM chunk; the count is reported in the detail.
-// GIF counts follow NETSCAPE semantics (N = play N+1 times), WebP counts
-// are the number of plays; 0 = forever in both.
+// Discord targets (IsDiscord: emote, sticker and every attachment tier)
+// require "loop forever" (GIF NETSCAPE2.0 count 0 — the fixer forces it;
+// WebP ANIM loop count 0 — an error otherwise), because Discord honours a
+// finite count and the animation stops. TargetNone treats the count as the
+// user's choice: a GIF only needs a NETSCAPE2.0 block before the first
+// image (inserted with count 0 when missing) and a WebP animation only
+// needs an ANIM chunk; the count is reported in the detail. GIF counts
+// follow NETSCAPE semantics (N = play N+1 times), WebP counts are the
+// number of plays; 0 = forever in both.
 //
 // Report.HasAlpha is structural: it says the file carries transparency that
 // decoders must honour (a GIF frame whose transparency flag is set and whose
@@ -47,29 +48,92 @@
 // HasAlpha — the Discord rules apply to it all the same.
 package discordlint
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
-// Target selects which limits and rules apply.
+// Target selects which limits and rules apply. The attachment tiers
+// (DESIGN.md §5.1) share every rule and differ only in the byte cap:
+// IsAttachment groups them, Limit tells them apart.
 type Target string
 
 const (
-	TargetNone       Target = ""           // generic (structural rules only, no byte limit)
-	TargetEmote      Target = "emote"      // 262,144 B, 128x128 recommended
-	TargetSticker    Target = "sticker"    // 524,288 B, 320x320 recommended (larger is shrunk by Discord — a warning), <= 5 s, <= 1000 frames, <= 60 fps
-	TargetAttachment Target = "attachment" // 20 MB (free tier)
+	TargetNone          Target = ""               // generic (structural rules only, no byte limit)
+	TargetEmote         Target = "emote"          // 262,144 B, 128x128 recommended
+	TargetSticker       Target = "sticker"        // 524,288 B, 320x320 recommended (larger is shrunk by Discord — a warning), <= 5 s, <= 1000 frames, <= 60 fps
+	TargetAttachment    Target = "attachment"     // 20 MB (free tier)
+	TargetAttachment50  Target = "attachment-50"  // 50 MB (Nitro Basic, or a Level-2 boosted server)
+	TargetAttachment100 Target = "attachment-100" // 100 MB (Level-3 boosted server)
+	TargetAttachment500 Target = "attachment-500" // 500 MB (Nitro)
 )
 
-// Limit returns the hard byte cap for target (0 = none).
-func Limit(t Target) int64 {
-	switch t {
-	case TargetEmote:
-		return 262144
-	case TargetSticker:
-		return 524288
-	case TargetAttachment:
-		return 20 * 1000 * 1000
+// targetInfo is what the package knows about one Discord target.
+type targetInfo struct {
+	limit      int64  // hard byte cap
+	attachment bool   // a chat-attachment tier (IsAttachment)
+	words      string // cap and who gets it, for Describe
+}
+
+// targets is the single source of truth for Limit, IsAttachment, IsDiscord
+// and Describe; targetOrder is the display order Targets reports.
+var (
+	targets = map[Target]targetInfo{
+		TargetEmote:         {limit: 262144, words: "256 KiB"},
+		TargetSticker:       {limit: 524288, words: "512 KiB"},
+		TargetAttachment:    {limit: 20_000_000, attachment: true, words: "20 MB, free tier"},
+		TargetAttachment50:  {limit: 50_000_000, attachment: true, words: "50 MB, Nitro Basic or a Level-2 boosted server"},
+		TargetAttachment100: {limit: 100_000_000, attachment: true, words: "100 MB, Level-3 boosted server"},
+		TargetAttachment500: {limit: 500_000_000, attachment: true, words: "500 MB, Nitro"},
 	}
-	return 0
+	targetOrder = []Target{TargetEmote, TargetSticker, TargetAttachment, TargetAttachment50, TargetAttachment100, TargetAttachment500}
+)
+
+// Targets lists every Discord target (TargetNone excluded) in display
+// order: emote, sticker, then the attachment tiers by cap.
+func Targets() []Target {
+	return append([]Target(nil), targetOrder...)
+}
+
+// Limit returns the hard byte cap for target (0 = none, also for a string
+// that is not a known target).
+func Limit(t Target) int64 {
+	return targets[t].limit
+}
+
+// IsAttachment reports whether t is a chat-attachment tier (attachment,
+// attachment-50, attachment-100, attachment-500). The tiers share every
+// attachment rule and differ only in Limit.
+func IsAttachment(t Target) bool {
+	return targets[t].attachment
+}
+
+// IsDiscord reports whether t is a known Discord target — one that the
+// loop-forever, palette and byte-limit rules apply to. TargetNone and
+// unrecognised strings are not.
+func IsDiscord(t Target) bool {
+	_, ok := targets[t]
+	return ok
+}
+
+// Valid reports whether t is a target a recipe may carry: TargetNone or
+// any Discord target. Comparison is exact ("Emote" is not valid).
+func Valid(t Target) bool {
+	return t == TargetNone || IsDiscord(t)
+}
+
+// Describe words a target for details and error messages: "emote (256
+// KiB)", "attachment-50 (50 MB, Nitro Basic or a Level-2 boosted server)",
+// "no Discord target" for TargetNone, `unknown target "x"` otherwise.
+func Describe(t Target) string {
+	if t == TargetNone {
+		return "no Discord target"
+	}
+	info, ok := targets[t]
+	if !ok {
+		return fmt.Sprintf("unknown target %q", string(t))
+	}
+	return fmt.Sprintf("%s (%s)", t, info.words)
 }
 
 // Level of a check outcome.
@@ -126,7 +190,19 @@ type Report struct {
 //	              files) and tRNS-before-PLTE for indexed colour (the palette
 //	              alpha is silently discarded), and caps the listed unknown
 //	              chunk types at 32 ("and N more types").
-const RulesVersion = "2026-08-19.3"
+//	2026-08-19.4  Attachment tiers: "attachment" (20 MB, free) is joined by
+//	              "attachment-50" (50 MB), "attachment-100" (100 MB) and
+//	              "attachment-500" (500 MB); every attachment rule
+//	              (apng.attachment, the size limits) keys on IsAttachment, so
+//	              the tiers differ only in Limit. The size-limit failure
+//	              detail names the tier and its cap ("… byte limit for
+//	              attachment-50 (50 MB, …)"). Rules that apply to "a Discord
+//	              target" (gif.netscape-loop forcing count 0, gif.global-
+//	              palette as an error, webp.loop-forever / apng.plays-forever
+//	              as errors) key on IsDiscord: an unrecognised target string
+//	              now behaves like TargetNone instead of a cap-less Discord
+//	              target.
+const RulesVersion = "2026-08-19.4"
 
 // ErrNotImplemented was returned by the pre-implementation stubs. It is
 // kept for API compatibility; no linter returns it any more.

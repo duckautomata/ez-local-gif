@@ -16,10 +16,11 @@ import {
   type RotateParams,
   type Source,
   type SpeedParams,
+  type Target,
   type TrimParams,
 } from './api';
-import { GIF_MAX_FPS, round, snapFPS } from './format';
-import { defaultOutput, fitsFormat, isSequence, presetAvailable, presetById, type OutputCfg } from './presets';
+import { clamp, frameCount, frameSpan, GIF_MAX_FPS, round, snapFPS, trimTime } from './format';
+import { defaultOutput, fitsFormat, isSequence, limitKiB, presetAvailable, presetById, type OutputCfg } from './presets';
 
 // isSequence lives in presets.ts (isGifSource needs it there); re-exported so
 // components keep importing it from the state module.
@@ -79,8 +80,14 @@ export interface OpsCfg {
 
 export interface UiState {
   backdrop: Backdrop;
-  /** scrubber position in output time (after trim and speed), seconds */
-  scrubT: number;
+  /**
+   * Scrubber position as a 0-based frame index on the plan's frame grid
+   * (planFrames / planFPS — output time after trim and speed). The preview
+   * requests the still at the middle of that frame (format.stillTime) and
+   * displays its start time; Trim "from scrubber" maps it back to source
+   * seconds. Components clamp it to [0, planFrames − 1].
+   */
+  scrubFrame: number;
   /** true while the Crop card is expanded: the preview shows the full pre-crop frame */
   cropOpen: boolean;
 }
@@ -109,25 +116,52 @@ export const app = $state({
   source: null as Source | null,
   ops: defaultOps(null),
   output: defaultOutput(),
-  ui: { backdrop: 'checker', scrubT: 0, cropOpen: false } as UiState,
+  ui: { backdrop: 'checker', scrubFrame: 0, cropOpen: false } as UiState,
 });
 
 /**
  * setSource installs a freshly uploaded source and resets the op stack for
  * it. A preset the new source cannot use (Optimize needs a GIF) falls back to
- * Chat GIF.
+ * Chat.
  */
 export function setSource(src: Source | null): void {
   app.source = src;
   app.ops = defaultOps(src?.info ?? null);
-  app.ui.scrubT = 0;
-  if (!presetAvailable(presetById(app.output.preset), src?.info ?? null)) applyPreset('chat-gif');
+  app.ui.scrubFrame = 0;
+  app.ui.cropOpen = false;
+  if (!presetAvailable(presetById(app.output.preset), src?.info ?? null)) applyPreset('chat');
+}
+
+/**
+ * resetApp returns to the landing state (the header logo): no source,
+ * default op stack and Output card, scrubber at frame 0. The render state
+ * (job / result) lives in render.svelte.ts and is reset by the caller.
+ */
+export function resetApp(): void {
+  app.source = null;
+  app.ops = defaultOps(null);
+  app.output = defaultOutput();
+  app.ui.scrubFrame = 0;
+  app.ui.cropOpen = false;
 }
 
 /** applyPreset switches the Output card to a preset (Custom keeps current values). */
 export function applyPreset(id: PresetId): void {
   app.output.preset = id;
   presetById(id).apply(app.output, app.source?.info ?? null);
+}
+
+/**
+ * setTarget changes the Discord target of an output configuration. A fit
+ * budget that was sitting exactly on the old target's cap ("= limit")
+ * follows the new cap, so the byte-limit readout and the fit stay in step
+ * with the dropdown; any other budget is the user's and is left alone.
+ */
+export function setTarget(o: OutputCfg, t: Target): void {
+  const prev = limitKiB(o.target);
+  o.target = t;
+  const next = limitKiB(t);
+  if (next > 0 && prev > 0 && o.fitKiB === prev) o.fitKiB = next;
 }
 
 /** opsApply reports whether the op stack is part of the recipe (false for the gifsicle-only Optimize preset). */
@@ -150,8 +184,11 @@ export function buildOps(c: OpsCfg, opts: { cropPreview?: boolean } = {}): Op[] 
   }
 
   if (c.trim.enabled && (c.trim.start > 0 || c.trim.end > 0)) {
-    const p: TrimParams = { start: round(Math.max(0, c.trim.start)) };
-    if (c.trim.end > 0) p.end = round(c.trim.end);
+    // Microsecond precision (trimTime), never milliseconds: the graph writes
+    // -ss/-to with µs, and a scrubber start of 2/30 sent as 0.067 would make
+    // a 30 fps clip start one frame late.
+    const p: TrimParams = { start: trimTime(Math.max(0, c.trim.start)) };
+    if (c.trim.end > 0) p.end = trimTime(c.trim.end);
     ops.push({ kind: 'trim', params: p });
   }
   if (c.speed.enabled && c.speed.factor > 0 && c.speed.factor !== 1) {
@@ -317,16 +354,33 @@ export function sourceFPS(info: ProbeInfo | null | undefined, c: OpsCfg): number
 
 /**
  * sourceDuration is the source length in seconds: for an image sequence with
- * the delay op on it is frames × ms (the op rewrites the timing); otherwise
- * the probe's duration.
+ * the delay op on it is count / rate (the op rewrites the timing; the
+ * compiler computes it the same way from the 3-decimal rate, so the two
+ * sides floor to the same frame count); otherwise the probe's duration.
  */
 export function sourceDuration(info: ProbeInfo | null | undefined, c: OpsCfg): number {
   if (!info) return 0;
   if (isSequence(info) && c.delay.enabled && c.delay.ms > 0) {
     const n = info.sequence?.count ?? info.frames;
-    if (n > 0) return round((n * c.delay.ms) / 1000, 3);
+    const rate = sourceFPS(info, c);
+    if (n > 0 && rate > 0) return n / rate;
   }
   return Math.max(0, info.duration);
+}
+
+/**
+ * sourceFrames is the number of frames on the *source* grid: a sequence's
+ * frame count, else floor(duration × source fps) (0 when unknown). Used to
+ * label trim points as frames.
+ */
+export function sourceFrames(info: ProbeInfo | null | undefined, c: OpsCfg): number {
+  if (!info) return 0;
+  if (isSequence(info)) {
+    const n = info.sequence?.count ?? info.frames;
+    if (n > 0) return n;
+  }
+  if (info.isStill) return 1;
+  return frameCount(sourceDuration(info, c), sourceFPS(info, c));
 }
 
 /**
@@ -341,27 +395,224 @@ export function effectiveFPS(ops: OpsCfg, out: OutputCfg, srcFps: number): numbe
   return snapFPS(out.format, requested);
 }
 
-/** trimRange returns the selected source-time window [start, end] in seconds. */
+/**
+ * trimRange returns the selected source-time window [start, end] in seconds,
+ * with the bounds as the recipe carries them (trimTime: whole µs) and
+ * clamped to the source: an end at or past the source end is the source end
+ * (the graph reads "to the end" then).
+ */
 export function trimRange(info: ProbeInfo, c: OpsCfg): { start: number; end: number } {
   const dur = sourceDuration(info, c);
   if (!c.trim.enabled) return { start: 0, end: dur };
-  const start = Math.min(Math.max(0, c.trim.start), dur);
-  const end = c.trim.end > 0 ? Math.min(Math.max(c.trim.end, start), dur) : dur;
+  const start = Math.min(Math.max(0, trimTime(c.trim.start)), dur);
+  const end = c.trim.end > 0 ? Math.min(Math.max(trimTime(c.trim.end), start), dur) : dur;
   return { start, end };
 }
 
+/** speedFactor is the speed the recipe carries (buildOps sends 3 decimals): 1 when the op is off. */
 export function speedFactor(c: OpsCfg): number {
-  return c.speed.enabled && c.speed.factor > 0 ? c.speed.factor : 1;
+  const f = c.speed.enabled && c.speed.factor > 0 ? round(c.speed.factor, 3) : 1;
+  return f > 0 ? f : 1;
 }
 
-/** previewDuration is the output-time length of the clip after trim and speed. */
+// ---------------------------------------------------------------------------
+// Image-sequence frame grid — mirrors graph.sequenceSelection /
+// graph.sequenceFrames (internal/graph/compile.go). ffmpeg reads a sequence
+// through image2 at -framerate 1000/delay, whose timebase is one frame, so
+// the trim bounds and the retiming stages work in whole frames:
+//   - -ss/-to are rescaled into that timebase with av_rescale (nearest,
+//     halves away from zero): the first frame read is round(start × rate) and
+//     round((end − start) × rate) frames are kept;
+//   - setpts=PTS/speed truncates the end timestamp to a whole tick;
+//   - the fps stage (round=down) floors the end onto the output grid.
+// Every expectation is pinned against ffmpeg in graph's TestSequenceGridModel
+// and phase2_ffmpeg_test.go.
+// ---------------------------------------------------------------------------
+
+/** micros returns t seconds as whole microseconds (exact for trimTime values). */
+export function micros(t: number): number {
+  return Math.round(t * 1e6);
+}
+
+/**
+ * gridRound converts a time in microseconds to a frame number at
+ * rate1000/1000 fps the way ffmpeg's av_rescale does: nearest, halves away
+ * from zero; <= 0 is frame 0. Integer arithmetic (BigInt) so it is exact for
+ * every sequence the store accepts, like graph.gridRound's int64 math.
+ */
+export function gridRound(us: number, rate1000: number): number {
+  if (!(us > 0) || !(rate1000 > 0)) return 0;
+  const u = BigInt(Math.round(us));
+  const r = BigInt(Math.round(rate1000));
+  return Number((2n * u * r + 1_000_000_000n) / 2_000_000_000n);
+}
+
+/**
+ * sequenceSelection maps a trim [start, end) (end 0 = to the end) onto the
+ * image2 grid of a `count`-frame sequence at `rate` fps: `first` is the
+ * 0-based source frame the render starts at and `selected` how many it
+ * reads. `selected` is 0 where the graph rejects the trim: a start that
+ * rounds past the last frame, or a range shorter than half a frame.
+ */
+export function sequenceSelection(count: number, rate: number, start: number, end: number): { first: number; selected: number } {
+  if (!(count > 0)) return { first: 0, selected: 0 };
+  const rate1000 = Math.round(rate * 1000);
+  if (!(rate1000 > 0)) return { first: 0, selected: count };
+  const first = gridRound(micros(start), rate1000);
+  if (first >= count) return { first, selected: 0 };
+  let selected = count - first;
+  if (end > 0) selected = Math.min(selected, gridRound(micros(end) - micros(start), rate1000));
+  return { first, selected };
+}
+
+/**
+ * sequenceFrames is the number of master frames ffmpeg renders for n selected
+ * sequence frames at `rate` fps, played at `speed` and resampled to `fps`:
+ * floor(trunc(n / speed) × fps / rate) on the 3-decimal rates as integers —
+ * 7 frames at speed 2 end at tick 3, not 3.5, and resampled to 20 fps that
+ * is 6 frames, not the 7 of floor(0.35 s × 20). n itself without trim, speed
+ * or an fps change. 0 means ffmpeg emits nothing (the graph rejects it).
+ */
+export function sequenceFrames(n: number, speed: number, rate: number, fps: number): number {
+  if (!(n > 0)) return 0;
+  const ticks = Math.trunc(n / speed);
+  const rate1000 = Math.round(rate * 1000);
+  const fps1000 = Math.round(fps * 1000);
+  if (!(ticks > 0) || !(rate1000 > 0) || !(fps1000 > 0)) return 0;
+  return Math.floor((ticks * fps1000) / rate1000);
+}
+
+/**
+ * sequenceGrid resolves an image-sequence source the way the compiler does:
+ * its frame count, image2 rate (sourceFPS: the delay op, else the probe)
+ * and the frames the current trim selects on that grid. null for every
+ * other source, or when the count / rate is unknown.
+ */
+function sequenceGrid(info: ProbeInfo, c: OpsCfg): { count: number; rate: number; first: number; selected: number } | null {
+  if (!isSequence(info)) return null;
+  const count = info.sequence?.count ?? info.frames;
+  const rate = sourceFPS(info, c);
+  if (!(count > 0) || !(rate > 0)) return null;
+  if (count === 1) return { count, rate, first: 0, selected: 1 }; // a single frame is never trimmed (graph.singleFrame)
+  const range = trimRange(info, c);
+  const dur = count / rate;
+  return { count, rate, ...sequenceSelection(count, rate, range.start, range.end >= dur ? 0 : range.end) };
+}
+
+/**
+ * previewDuration is the output-time length of the clip after trim and speed
+ * (graph.Plan.Duration): for an image sequence the selected grid frames at
+ * their rate, else the trimmed source time; both divided by the speed.
+ */
 export function previewDuration(info: ProbeInfo, c: OpsCfg): number {
+  const seq = sequenceGrid(info, c);
+  if (seq) return seq.selected / seq.rate / speedFactor(c);
   const { start, end } = trimRange(info, c);
   return Math.max(0, (end - start) / speedFactor(c));
+}
+
+/**
+ * sourceSpan is the selection as 1-based inclusive source frames
+ * [first, last] (of sourceFrames) — the numbers the Trim card labels with.
+ * For an image sequence it is exactly what the graph's trim selects on the
+ * image2 grid (sequenceSelection: nearest frame, so a typed 0.06..0.11 s at
+ * 25 fps is frame 3 alone, as ffmpeg renders it; a rejected trim shows the
+ * frame its start lands on). For a clip it is the frames the window covers
+ * on the source grid (format.frameSpan).
+ */
+export function sourceSpan(info: ProbeInfo, c: OpsCfg): { first: number; last: number } {
+  const seq = sequenceGrid(info, c);
+  if (seq) {
+    const first = Math.min(seq.first, seq.count - 1) + 1;
+    return { first, last: Math.max(first, seq.first + seq.selected) };
+  }
+  const range = trimRange(info, c);
+  return frameSpan(range.start, range.end, sourceFPS(info, c), sourceFrames(info, c));
 }
 
 /** toSourceTime maps a scrubber (output-time) position back to source seconds. */
 export function toSourceTime(t: number, info: ProbeInfo, c: OpsCfg): number {
   const { start, end } = trimRange(info, c);
   return Math.min(end, start + t * speedFactor(c));
+}
+
+/**
+ * planFPS is the plan's frame grid: the effective output fps (fps op →
+ * Output.fps → source rate, snapped for the format). 0 when unknown. `c`
+ * should be effectiveOps (all-off for Optimize).
+ */
+export function planFPS(info: ProbeInfo | null | undefined, c: OpsCfg, out: OutputCfg): number {
+  if (!info) return 0;
+  return effectiveFPS(c, out, sourceFPS(info, c));
+}
+
+/**
+ * planFrames mirrors graph.Plan.Frames — the number of frames the render
+ * (and so the scrubber) has, at least 1:
+ *
+ *   1. an image sequence with no trim, speed or fps change has exactly its
+ *      frame count (34 frames at 33 ms are 34, whatever 34 / 30.303 × 30.303
+ *      comes to in floating point);
+ *   2. a trimmed sequence has the frames the trim selects on the image2 grid
+ *      (sequenceSelection: nearest frame, end 0 = to the end);
+ *   3. a sequence played at a speed and/or resampled to another fps has
+ *      sequenceFrames(selected, speed, rate, fps) of them — the end
+ *      timestamp is truncated by setpts and floored by the fps stage;
+ *   4. every other clip has floor(duration × fps + FRAME_TOLERANCE)
+ *      (format.frameCount).
+ *
+ * A still source has one frame; 0 when the rate is unknown. Where the graph
+ * would reject the recipe (a sequence trim or speed that leaves no frame)
+ * the scrubber keeps one notch, like rule 4's floor; the preview shows the
+ * graph's error. `c` should be effectiveOps (all-off for Optimize).
+ */
+export function planFrames(info: ProbeInfo | null | undefined, c: OpsCfg, out: OutputCfg): number {
+  if (!info) return 0;
+  const fps = planFPS(info, c, out);
+  if (!(fps > 0)) return 0;
+  if (info.isStill) return 1;
+  const seq = sequenceGrid(info, c);
+  if (seq) {
+    if (seq.count === 1) return 1;
+    return Math.max(1, sequenceFrames(seq.selected, speedFactor(c), seq.rate, fps));
+  }
+  const dur = previewDuration(info, c);
+  if (!(dur > 0)) return 1;
+  return frameCount(dur, fps);
+}
+
+/**
+ * trimStartMax is the latest trim start the graph accepts: one source frame
+ * before the end of the clip ("trim start at or beyond the end of the
+ * source" is rejected), at the µs precision trim bounds carry (trimTime) so
+ * the start of the last plan frame is never displaced by the clamp.
+ */
+export function trimStartMax(info: ProbeInfo, c: OpsCfg): number {
+  const dur = sourceDuration(info, c);
+  const srcFps = sourceFPS(info, c);
+  return Math.max(0, trimTime(dur - (srcFps > 0 ? 1 / srcFps : 0.001)));
+}
+
+/**
+ * frameWindow is the source-time window [start, end] of 0-based plan frame
+ * i — what Trim "from scrubber" uses: Start = where the frame starts, End =
+ * where it ends. Both go through the current trim/speed (toSourceTime) and
+ * are rounded to whole µs like buildOps sends them (trimTime — never ms: a
+ * ms-rounded 0.067 starts a 30 fps clip one frame late); start is clamped
+ * to trimStartMax so the graph never sees a start at or beyond the end. On
+ * the last frame the window ends exactly at the current range end, and an
+ * end at the clip end is reported as 0 ("to the end").
+ */
+export function frameWindow(info: ProbeInfo, c: OpsCfg, out: OutputCfg, i: number): { start: number; end: number } {
+  const ops = effectiveOps(c, out);
+  const fps = planFPS(info, ops, out);
+  const total = planFrames(info, ops, out);
+  if (!(fps > 0) || total <= 0) return { start: 0, end: 0 };
+  const idx = clamp(Math.round(i), 0, total - 1);
+  const dur = sourceDuration(info, c);
+  const range = trimRange(info, c);
+  const start = Math.min(trimTime(toSourceTime(idx / fps, info, c)), trimStartMax(info, c));
+  let end = idx >= total - 1 ? range.end : Math.min(trimTime(toSourceTime((idx + 1) / fps, info, c)), dur);
+  if (end >= dur) end = 0;
+  return { start, end };
 }

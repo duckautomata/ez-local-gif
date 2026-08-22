@@ -1,31 +1,43 @@
 <script lang="ts">
-  import { isAnimatedFormat, type Dither, type FitMode } from '../lib/api';
-  import { dropRates, fitSize, fmtKiB, fmtNum, gifDelays, MAX_FPS, normalizeHex } from '../lib/format';
+  import { isAnimatedFormat, type Dither, type FitMode, type Target } from '../lib/api';
+  import { dropRates, fitSize, fmtLimit, fmtNum, gifDelays, MAX_FPS, normalizeHex } from '../lib/format';
   import {
-    chatPresetFor,
     DEFAULT_ALPHA_THRESHOLD,
     DEFAULT_MATTE,
-    FIT_KIB,
+    fitKiBFor,
     fitsFormat,
     FORMAT_LABEL,
+    formatHint,
     formatsFor,
     FRAME_FORMATS,
-    LIMITS,
+    limitKiB,
+    limitOf,
     presetAvailable,
     PRESETS,
     presetById,
-    TARGET_LABEL,
-    TARGETS,
+    TARGET_DEFS,
+    targetLabel,
     TRIM_FRINGE_THRESHOLD,
     WHITE_MATTE,
   } from '../lib/presets';
-  import { app, applyPreset, effectiveFPS, effectiveOps, loopFor, opsApply, previewDuration, sourceFPS, usesMatte } from '../lib/state.svelte';
+  import {
+    app,
+    applyPreset,
+    effectiveFPS,
+    effectiveOps,
+    loopFor,
+    opsApply,
+    previewDuration,
+    setTarget,
+    sourceFPS,
+    usesMatte,
+  } from '../lib/state.svelte';
   import NumField from './NumField.svelte';
 
   const out = $derived(app.output);
   const preset = $derived(presetById(out.preset));
   const locked = $derived(preset.locksSize);
-  const limit = $derived(LIMITS[out.target]);
+  const limit = $derived(limitOf(out.target));
   const info = $derived(app.source?.info ?? null);
   const ops = $derived(effectiveOps(app.ops, out));
   const withOps = $derived(opsApply(out));
@@ -75,7 +87,6 @@
   const loopEditable = $derived(out.target === '');
   const loop = $derived(loopFor(out));
   const loopHint = $derived(loop === 0 ? 'forever' : `plays ${loop + 1} times (loop count ${loop})`);
-  const targetEditable = $derived(out.preset === 'custom' || out.preset === 'optimize');
 
   const fits: FitMode[] = ['contain', 'cover', 'exact'];
   const dithers: { id: Dither; label: string }[] = [
@@ -120,25 +131,18 @@
     app.output.alphaThreshold = on ? TRIM_FRINGE_THRESHOLD : DEFAULT_ALPHA_THRESHOLD;
   }
 
-  // The chat presets differ only by format: keep the chip in sync when the
-  // user flips the format, without resetting the other fields.
+  // A format switch within a preset re-seeds that format's quality defaults
+  // (Chat: lossy 20 GIF / q 80 WebP / q 60 AVIF) without resetting the rest.
   function onFormatChange() {
-    if (out.preset === 'chat-gif' || out.preset === 'chat-webp' || out.preset === 'chat-avif') {
-      const p = chatPresetFor(out.format);
-      if (p) app.output.preset = p;
-    }
-    normalizeColors();
-  }
-  /** swapFormat flips between the preset's default format and its one-click alternative. */
-  function swapFormat() {
-    const swap = preset.swap;
-    if (!swap) return;
-    app.output.format = out.format === swap.format ? preset.formats[0] : swap.format;
+    preset.onFormat?.(app.output, out.format);
     normalizeColors();
   }
   /** GIF always has a palette: a "0 = truecolour" left over from APNG/PNG becomes 256. */
   function normalizeColors() {
     if (out.format === 'gif' && !(out.colors > 0)) app.output.colors = 256;
+  }
+  function onTargetChange(e: Event) {
+    setTarget(app.output, (e.currentTarget as HTMLSelectElement).value as Target);
   }
   function setFit(kib: number) {
     app.output.fitKiB = kib;
@@ -147,7 +151,7 @@
   function onFitToggle(e: Event) {
     const on = (e.currentTarget as HTMLInputElement).checked;
     app.output.fitEnabled = on;
-    if (on && !(out.fitKiB > 0)) app.output.fitKiB = FIT_KIB[out.target];
+    if (on && !(out.fitKiB > 0)) app.output.fitKiB = fitKiBFor(out.target);
   }
 
   const webpTooWide = $derived(out.format === 'webp' && (finalSize?.w ?? 0) > 480);
@@ -155,41 +159,53 @@
   const stickerTooLong = $derived(out.target === 'sticker' && animated && !!info && previewDuration(info, ops) > 5.0);
   const apngOffTarget = $derived(out.format === 'apng' && out.target !== 'sticker');
   const emoteApng = $derived(out.format === 'apng' && out.target === 'emote');
-  const fitLimitKiB = $derived(limit > 0 ? Math.floor(limit / 1024) : 0);
+  const fitLimitKiB = $derived(limitKiB(out.target));
   const fitOverLimit = $derived(out.fitEnabled && fitLimitKiB > 0 && out.fitKiB * 1024 > limit);
+
+  // The Advanced fold: matte, alpha threshold / trim fringe, dither, loop —
+  // only the rows that apply to the format; collapsed by default with a
+  // one-line summary of the current values.
+  let advOpen = $state(false);
+  const advMatte = $derived(usesMatte(out) && withOps);
+  const advThreshold = $derived(out.format === 'gif' && withOps);
+  const advDither = $derived(out.format === 'gif');
+  const advLoop = $derived(animated);
+  const hasAdvanced = $derived(advMatte || advThreshold || advDither || advLoop);
+  const advSummary = $derived.by(() => {
+    const parts: string[] = [];
+    if (advMatte) parts.push(`matte #${out.matte}`);
+    if (advThreshold) parts.push(trimFringe ? 'trim fringe' : `alpha threshold ${out.alphaThreshold}`);
+    if (advDither) parts.push(`dither ${out.dither}`);
+    if (advLoop) parts.push(`loop ${loop === 0 ? 'forever' : `${loop + 1}×`}`);
+    return parts.join(' · ');
+  });
 </script>
 
 <section class="card output">
   <h2>Output</h2>
 
-  <div class="chips presets" role="group" aria-label="Preset">
-    {#each PRESETS as p (p.id)}
-      {@const ok = presetAvailable(p, info)}
-      <button
-        type="button"
-        class="chip"
-        aria-pressed={out.preset === p.id}
-        disabled={!ok}
-        title={ok ? p.hint : (p.unavailableHint ?? p.hint)}
-        onclick={() => applyPreset(p.id)}
-      >
-        {p.label}
-      </button>
-    {/each}
+  <div class="row use">
+    <span class="lbl">Use for</span>
+    <div class="chips presets" role="group" aria-label="Use for">
+      {#each PRESETS as p (p.id)}
+        {@const ok = presetAvailable(p, info)}
+        <button
+          type="button"
+          class="chip"
+          aria-pressed={out.preset === p.id}
+          disabled={!ok}
+          title={ok ? p.hint : (p.unavailableHint ?? p.hint)}
+          onclick={() => applyPreset(p.id)}
+        >
+          {p.label}
+        </button>
+      {/each}
+    </div>
   </div>
   <p class="hint">{preset.hint}</p>
-  {#if preset.swap}
-    {@const swap = preset.swap}
-    {@const swapped = out.format === swap.format}
-    <div class="row swap">
-      <button type="button" class="sm" onclick={swapFormat} title={swap.hint}>
-        {swapped ? `${FORMAT_LABEL[preset.formats[0]].split(' ')[0]} instead` : swap.label}
-      </button>
-      <span class="hint">{swapped ? `${FORMAT_LABEL[out.format].split(' ')[0]} selected — ${swap.hint}` : swap.hint}</span>
-    </div>
-  {/if}
   {#if preset.warn}<p class="note">{preset.warn}</p>{/if}
 
+  <!-- Row 1: format · Discord target (always editable; presets only set the default) · byte limit -->
   <div class="row">
     <label class="field">
       <span>Format{formatLocked ? ' (preset)' : ''}</span>
@@ -207,23 +223,20 @@
     {:else}
       <label class="field">
         <span>Discord target</span>
-        {#if targetEditable}
-          <select bind:value={app.output.target}>
-            {#each TARGETS as t (t)}<option value={t}>{TARGET_LABEL[t]}</option>{/each}
-          </select>
-        {:else}
-          <span class="static">{TARGET_LABEL[out.target]}</span>
-        {/if}
+        <select value={out.target} onchange={onTargetChange} aria-label="Discord target" title="Which Discord rules and byte cap the linter enforces — the preset only sets the default">
+          {#each TARGET_DEFS as t (t.id)}<option value={t.id}>{t.label}</option>{/each}
+        </select>
       </label>
       <span class="field">
-        <span>Byte limit</span>
+        <span>Limit</span>
         <span class="static">
-          {#if limit > 0}<b>{fmtKiB(limit)} KiB</b> <span class="muted">({limit.toLocaleString('en-US')} B)</span>{:else}none{/if}
+          {#if limit > 0}<b>{fmtLimit(limit)}</b> <span class="muted">({limit.toLocaleString('en-US')} B)</span>{:else}none{/if}
         </span>
       </span>
     {/if}
   </div>
 
+  <!-- Row 2: size + fps (Optimize: frame drop instead) -->
   <div class="row">
     {#if out.preset !== 'optimize'}
       <label class="field">
@@ -282,59 +295,7 @@
     {/if}
   </div>
 
-  {#if fitCapable}
-    <div class="row fit">
-      <label class="inline" title="Parallel ladder + secant search over the format's quality knob (DESIGN §5.4); the primary file ends up ≤ the budget, runner-ups are shown as alternatives">
-        <input type="checkbox" checked={out.fitEnabled} onchange={onFitToggle} />
-        <span>Fit to ≤</span>
-      </label>
-      <NumField bind:value={app.output.fitKiB} min={1} max={1_000_000} disabled={!out.fitEnabled} small />
-      <span class="small">KiB</span>
-      {#if fitLimitKiB > 0}
-        <button type="button" class="sm ghost" onclick={() => setFit(fitLimitKiB)} title="Use the Discord limit as the budget">= limit ({fmtKiB(limit)})</button>
-      {/if}
-      {#if out.preset !== 'optimize'}
-        <!-- the gifsicle-only Optimize ladder never scales, so "keep size" would be a no-op there -->
-        <label class="inline" title="Never downscale to fit (FitKeepSize)">
-          <input type="checkbox" bind:checked={app.output.fitKeepSize} disabled={!out.fitEnabled} /><span>keep size</span>
-        </label>
-      {/if}
-      <label class="inline" title="Never lower the frame rate to fit (FitKeepFPS)">
-        <input type="checkbox" bind:checked={app.output.fitKeepFps} disabled={!out.fitEnabled} /><span>keep fps</span>
-      </label>
-      <span class="hint">
-        {#if !out.fitEnabled}
-          off — the knobs below are used as-is.
-        {:else if out.preset === 'optimize'}
-          cheapest first: lossy → frame drop → colours (gifsicle only — never scaled); the 2 runner-ups are listed as
-          alternatives.
-        {:else}
-          cheapest first: lossy → fps → colours → downscale{out.target === 'sticker' ? ' (stickers are never downscaled)' : ''}; the
-          2 runner-ups are listed as alternatives.
-        {/if}
-      </span>
-    </div>
-    {#if fitOverLimit}<p class="note">The fit budget is above the {fmtKiB(limit)} KiB {TARGET_LABEL[out.target]} limit — the file may still be rejected.</p>{/if}
-  {/if}
-
-  {#if animated}
-    <div class="row">
-      <label class="field">
-        <span>Loop count{loopEditable ? ' (0 = forever, N = play N+1 times)' : ''}</span>
-        {#if loopEditable}
-          <span class="row loop">
-            <NumField bind:value={app.output.loop} min={0} max={65535} small title="GIF NETSCAPE loop count: 0 = forever, N = play N+1 times" />
-            <span class="hint">{loopHint}</span>
-          </span>
-        {:else}
-          <input type="text" class="loop-fixed" value="forever (Discord requires it)" disabled readonly />
-        {/if}
-      </label>
-    </div>
-  {/if}
-
-  <hr class="sep" />
-
+  <!-- Row 3: the quality knobs of the chosen format -->
   {#if out.format === 'gif'}
     <div class="row">
       <label class="field">
@@ -343,14 +304,6 @@
           {#each gifColors as c (c)}<option value={c}>{c}</option>{/each}
         </select>
       </label>
-      <label class="field">
-        <span>Dither</span>
-        <select bind:value={app.output.dither}>
-          {#each dithers as d (d.id)}<option value={d.id}>{d.label}</option>{/each}
-        </select>
-      </label>
-    </div>
-    <div class="row">
       <label class="field slider">
         <span>Lossy (gifsicle 0–200) — <b>{out.lossy}</b>{out.lossy === 0 ? ' off' : out.lossy <= 80 ? ' near-invisible' : ' visible'}</span>
         <span class="row">
@@ -359,21 +312,6 @@
         </span>
       </label>
     </div>
-    {#if withOps}
-      <div class="row">
-        <label class="field slider">
-          <span>Alpha threshold (1–255) — <b>{out.alphaThreshold}</b> (pixels below become transparent)</span>
-          <span class="row">
-            <input type="range" min="1" max="255" step="1" bind:value={app.output.alphaThreshold} aria-label="Alpha threshold" />
-            <NumField bind:value={app.output.alphaThreshold} min={1} max={255} small />
-          </span>
-        </label>
-        <label class="inline" title="Threshold {TRIM_FRINGE_THRESHOLD}: drops more of the semi-transparent edge, so less of the matte colour shows on the other theme">
-          <input type="checkbox" checked={trimFringe} onchange={(e) => setTrimFringe(e.currentTarget.checked)} />
-          <span>Trim fringe</span>
-        </label>
-      </div>
-    {/if}
   {:else if out.format === 'apng'}
     <div class="row">
       <label class="field">
@@ -386,10 +324,6 @@
     {#if apngFitLocked}
       <p class="hint">Fit always searches the indexed pngquant ladder; turn fit off to pick a fixed palette or RGBA truecolour.</p>
     {/if}
-    <p class="hint">
-      Indexed APNG = one shared palette with 8-bit alpha (pngquant) — soft edges at a fraction of the RGBA size; verified at 25 fps
-      as a sticker. Plays forever, delays ≥ 20 ms, ≤ 5 s / 1000 frames / 60 fps.
-    </p>
   {:else if out.format === 'webp'}
     <div class="row">
       <label class="field slider">
@@ -401,11 +335,7 @@
       </label>
       <label class="inline"><input type="checkbox" bind:checked={app.output.lossless} /><span>Lossless</span></label>
     </div>
-    <p class="hint">
-      Alpha stays 8-bit and lossless in this path (soft edges survive on Discord); libwebp_anim, no metadata, plays {loop === 0 ? 'forever' : `${loop + 1} times`}.
-      q 80 blurs fine texture — raise it or go lossless for detailed art.
-    </p>
-  {:else if out.format === 'avif'}
+  {:else if out.format === 'avif' || out.format === 'jpeg'}
     <div class="row">
       <label class="field slider">
         <span>Quality (1–100) — <b>{out.quality}</b></span>
@@ -415,10 +345,6 @@
         </span>
       </label>
     </div>
-    <p class="hint">
-      avifenc, alpha quality 90, 4:2:0 — soft alpha verified on Discord attachments (Discord transcodes it to WebP; large files
-      take a few seconds to appear). Animated AVIF is also accepted as an emote.
-    </p>
   {:else if out.format === 'png'}
     <div class="row">
       <label class="field">
@@ -428,76 +354,140 @@
         </select>
       </label>
     </div>
-    <p class="hint">
-      First frame as RGBA PNG: pngquant to the palette size (8-bit alpha kept) when set, then oxipng. Fits any Discord budget
-      trivially — no fit search for a static PNG, pngquant palette + oxipng only.
-    </p>
-  {:else if out.format === 'jpeg'}
+  {:else if isFrames && out.frameFormat === 'jpeg'}
     <div class="row">
       <label class="field slider">
-        <span>Quality (1–100) — <b>{out.quality}</b></span>
+        <span>JPEG quality (1–100) — <b>{out.quality}</b></span>
         <span class="row">
           <input type="range" min="1" max="100" step="1" bind:value={app.output.quality} aria-label="Quality" />
           <NumField bind:value={app.output.quality} min={1} max={100} small />
         </span>
       </label>
     </div>
-    <p class="hint">First frame, no alpha: transparent areas are flattened onto the matte colour below.</p>
-  {:else if isFrames}
-    {#if out.frameFormat === 'jpeg'}
-      <div class="row">
-        <label class="field slider">
-          <span>JPEG quality (1–100) — <b>{out.quality}</b></span>
-          <span class="row">
-            <input type="range" min="1" max="100" step="1" bind:value={app.output.quality} aria-label="Quality" />
-            <NumField bind:value={app.output.quality} min={1} max={100} small />
-          </span>
-        </label>
-      </div>
-    {/if}
-    <p class="hint">
-      One file per frame after the op stack (trim / fps / crop / resize) plus frames.zip (stored, not compressed) and a
-      delays.json with the per-frame timing. The result shows a thumbnail grid with per-frame downloads.
-    </p>
   {/if}
+  <p class="hint">{formatHint(preset, out.format)}</p>
 
-  {#if usesMatte(out) && withOps}
-    <div class="row">
-      <span class="field wrap">
-        <span>
-          {#if out.format === 'gif'}
-            Matte — blended under semi-transparent edges before the 1-bit cut
-          {:else}
-            Matte — background the image is flattened onto
-          {/if}
-        </span>
-        <span class="row">
-          <span class="seg" role="group" aria-label="Matte">
-            <button type="button" aria-pressed={matteMode === 'dark'} onclick={() => setMatte(DEFAULT_MATTE)} title="#313338, Discord dark theme">Discord dark</button>
-            <button type="button" aria-pressed={matteMode === 'light'} onclick={() => setMatte(WHITE_MATTE)} title="#ffffff, Discord light theme">Discord light</button>
-            <button type="button" aria-pressed={matteMode === 'custom'} onclick={() => hexInput?.focus()}>Custom</button>
-          </span>
-          <input type="color" value={'#' + out.matte} oninput={(e) => setMatte(e.currentTarget.value)} aria-label="Matte colour" />
-          <input
-            bind:this={hexInput}
-            type="text"
-            class="hex mono"
-            value={matteText}
-            oninput={onMatteText}
-            maxlength="7"
-            spellcheck="false"
-            aria-label="Matte hex"
-          />
-        </span>
+  <!-- Row 4: fit-to-size -->
+  {#if fitCapable}
+    <div class="row fit">
+      <label class="inline" title="Parallel ladder + secant search over the format's quality knob (DESIGN §5.4); the primary file ends up ≤ the budget, runner-ups are shown as alternatives">
+        <input type="checkbox" checked={out.fitEnabled} onchange={onFitToggle} />
+        <span>Fit to ≤</span>
+      </label>
+      <NumField bind:value={app.output.fitKiB} min={1} max={1_000_000} disabled={!out.fitEnabled} small />
+      <span class="small">KiB</span>
+      {#if fitLimitKiB > 0}
+        <button type="button" class="sm ghost" onclick={() => setFit(fitLimitKiB)} title="Use the {targetLabel(out.target)} cap as the budget">= limit ({fmtLimit(limit)})</button>
+      {/if}
+      {#if out.preset !== 'optimize'}
+        <!-- the gifsicle-only Optimize ladder never scales, so "keep size" would be a no-op there -->
+        <label class="inline" title="Never downscale to fit (FitKeepSize)">
+          <input type="checkbox" bind:checked={app.output.fitKeepSize} disabled={!out.fitEnabled} /><span>keep size</span>
+        </label>
+      {/if}
+      <label class="inline" title="Never lower the frame rate to fit (FitKeepFPS)">
+        <input type="checkbox" bind:checked={app.output.fitKeepFps} disabled={!out.fitEnabled} /><span>keep fps</span>
+      </label>
+      <span class="hint">
+        {#if !out.fitEnabled}
+          off — the knobs above are used as-is.
+        {:else if out.preset === 'optimize'}
+          ladder, cheapest first: lossy → frame drop → colours (gifsicle only, never scaled); 2 runner-ups as alternatives.
+        {:else}
+          ladder, cheapest first: lossy → fps → colours → downscale{out.target === 'sticker' ? ' (stickers are never downscaled)' : ''}; 2
+          runner-ups as alternatives.
+        {/if}
       </span>
     </div>
-    {#if out.format === 'gif'}
-      <p class="hint">
-        GIF has 1-bit alpha: every semi-transparent edge pixel is either dropped or blended onto this colour, so pick the matte for
-        the theme your audience uses — on the other theme the edge shows as a thin outline. For soft alpha use WebP / AVIF
-        (attachments, emoji) or APNG (stickers).
-      </p>
-    {/if}
+    {#if fitOverLimit}<p class="note">The fit budget is above the {fmtLimit(limit)} {targetLabel(out.target)} cap — the file may still be rejected.</p>{/if}
+  {/if}
+
+  <!-- Advanced: matte · alpha threshold / trim fringe · dither · loop -->
+  {#if hasAdvanced}
+    <details class="adv" bind:open={advOpen}>
+      <summary>
+        <span class="sum">Advanced</span>
+        {#if !advOpen && advSummary}<span class="muted small">· {advSummary}</span>{/if}
+      </summary>
+      {#if advMatte}
+        <div class="row">
+          <span class="field wrap">
+            <span>
+              {#if out.format === 'gif'}
+                Matte — blended under semi-transparent edges before the 1-bit cut
+              {:else}
+                Matte — background the image is flattened onto
+              {/if}
+            </span>
+            <span class="row">
+              <span class="seg" role="group" aria-label="Matte">
+                <button type="button" aria-pressed={matteMode === 'dark'} onclick={() => setMatte(DEFAULT_MATTE)} title="#313338, Discord dark theme">Discord dark</button>
+                <button type="button" aria-pressed={matteMode === 'light'} onclick={() => setMatte(WHITE_MATTE)} title="#ffffff, Discord light theme">Discord light</button>
+                <button type="button" aria-pressed={matteMode === 'custom'} onclick={() => hexInput?.focus()}>Custom</button>
+              </span>
+              <input type="color" value={'#' + out.matte} oninput={(e) => setMatte(e.currentTarget.value)} aria-label="Matte colour" />
+              <input
+                bind:this={hexInput}
+                type="text"
+                class="hex mono"
+                value={matteText}
+                oninput={onMatteText}
+                maxlength="7"
+                spellcheck="false"
+                aria-label="Matte hex"
+              />
+            </span>
+          </span>
+        </div>
+        {#if out.format === 'gif'}
+          <p class="hint">
+            GIF has 1-bit alpha: every semi-transparent edge pixel is dropped or blended onto this colour, so pick the matte for the
+            theme your audience uses — on the other theme the edge shows as a thin outline. For soft alpha use WebP / AVIF
+            (attachments, emoji) or APNG (stickers).
+          </p>
+        {/if}
+      {/if}
+      {#if advThreshold}
+        <div class="row">
+          <label class="field slider">
+            <span>Alpha threshold (1–255) — <b>{out.alphaThreshold}</b> (pixels below become transparent)</span>
+            <span class="row">
+              <input type="range" min="1" max="255" step="1" bind:value={app.output.alphaThreshold} aria-label="Alpha threshold" />
+              <NumField bind:value={app.output.alphaThreshold} min={1} max={255} small />
+            </span>
+          </label>
+          <label class="inline" title="Threshold {TRIM_FRINGE_THRESHOLD}: drops more of the semi-transparent edge, so less of the matte colour shows on the other theme">
+            <input type="checkbox" checked={trimFringe} onchange={(e) => setTrimFringe(e.currentTarget.checked)} />
+            <span>Trim fringe</span>
+          </label>
+        </div>
+      {/if}
+      {#if advDither}
+        <div class="row">
+          <label class="field">
+            <span>Dither</span>
+            <select bind:value={app.output.dither}>
+              {#each dithers as d (d.id)}<option value={d.id}>{d.label}</option>{/each}
+            </select>
+          </label>
+        </div>
+      {/if}
+      {#if advLoop}
+        <div class="row">
+          <label class="field">
+            <span>Loop count{loopEditable ? ' (0 = forever, N = play N+1 times)' : ''}</span>
+            {#if loopEditable}
+              <span class="row loop">
+                <NumField bind:value={app.output.loop} min={0} max={65535} small title="GIF NETSCAPE loop count: 0 = forever, N = play N+1 times" />
+                <span class="hint">{loopHint}</span>
+              </span>
+            {:else}
+              <input type="text" class="loop-fixed" value="forever (Discord requires it)" disabled readonly />
+            {/if}
+          </label>
+        </div>
+      {/if}
+    </details>
   {/if}
 
   {#if stickerWebp}<p class="note error">{out.format.toUpperCase()} is not a Discord sticker format — the check will fail. Use APNG (best) or GIF.</p>{/if}
@@ -516,11 +506,17 @@
   .output > h2 {
     margin-bottom: 0;
   }
+  .use {
+    gap: 8px 10px;
+  }
+  .lbl {
+    font-size: 11.5px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
   .presets {
     gap: 5px;
-  }
-  .swap {
-    gap: 8px;
   }
   .static {
     display: inline-flex;
@@ -552,5 +548,35 @@
   }
   .loop-fixed {
     width: 220px;
+  }
+  .adv {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0 10px;
+  }
+  .adv > summary {
+    cursor: pointer;
+    padding: 6px 0;
+    font-size: 12.5px;
+    user-select: none;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .adv > summary .sum {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .adv[open] > summary {
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+  }
+  .adv > .row,
+  .adv > .hint {
+    margin-bottom: 8px;
+  }
+  .adv > .row + .row {
+    margin-top: 0;
   }
 </style>

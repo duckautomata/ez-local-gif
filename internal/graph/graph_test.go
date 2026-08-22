@@ -50,6 +50,9 @@ var (
 		HasAlpha: true, Kind: recipe.KindSequence,
 		Sequence: &recipe.SequenceInfo{Count: 60, Pattern: "%06d.png", DelayMS: 100},
 	}
+	// The review's sequence: 34 frames uploaded at the default 100 ms (and
+	// later retimed to 33 ms by a delay op).
+	seq34 = with(withSeq(pngSeq, func(s *recipe.SequenceInfo) { s.Count = 34 }), func(p *recipe.ProbeInfo) { p.Frames, p.Duration = 34, 3.4 })
 	// Still AVIF with alpha (Phase 2): ffmpeg's mov demuxer exposes the
 	// colour as stream 0 (opaque yuv420p) and the alpha as a gray stream 1.
 	avifAlpha = recipe.ProbeInfo{
@@ -525,13 +528,13 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "trim times are rounded to milliseconds",
-			src:  h264, ops: []recipe.Op{trim(0.12345, 1.98765)}, out: webp(),
+			name: "trim times are rounded to microseconds",
+			src:  h264, ops: []recipe.Op{trim(0.1234567, 1.9876543)}, out: webp(),
 			want: Plan{
-				InputArgs: []string{"-ss", "0.123", "-to", "1.988"},
+				InputArgs: []string{"-ss", "0.123457", "-to", "1.987654"},
 				Filter:    "[0:v]fps=29.97:round=down,format=rgba[out]",
-				Width:     1280, Height: 720, FPS: 29.97, Duration: 1.865, Frames: 55,
-				TrimStart: 0.123, TrimEnd: 1.988,
+				Width:     1280, Height: 720, FPS: 29.97, Duration: 1.864197, Frames: 55,
+				TrimStart: 0.123457, TrimEnd: 1.987654,
 			},
 		},
 		{
@@ -916,6 +919,70 @@ func TestCompile(t *testing.T) {
 				Width:  200, Height: 100, FPS: 10, HasAlpha: true, Frames: 1, SourceFPS: 10, Speed: 2,
 			},
 		},
+		{
+			// The frame count is exact, not floor(Duration*FPS): 34 frames at
+			// 33 ms are 34 master frames however 34/30.303*30.303 rounds.
+			name: "sequence: 34 frames retimed from 100 ms to 33 ms plan exactly 34 frames",
+			src:  seq34, ops: []recipe.Op{delay(33)}, out: webp(),
+			want: Plan{
+				InputArgs: seqArgs("30.303"), InputPattern: "%06d.png",
+				Filter: seqHead200 + "fps=30.303:round=down,format=rgba[out]",
+				Width:  200, Height: 100, FPS: 30.303, HasAlpha: true, Duration: 34 / 30.303, Frames: 34, SourceFPS: 30.303,
+			},
+		},
+		{
+			// A trim from the frame-index scrubber (start = i/fps, end =
+			// (j+1)/fps) selects exactly frames i..j: 4 frames, although
+			// (0.231-0.099)*30.303 = 3.99996 would floor to 3.
+			name: "sequence: trim from the frame-index scrubber keeps every selected frame",
+			src:  seq34, ops: []recipe.Op{delay(33), trim(3/30.303, 7/30.303)}, out: webp(),
+			want: Plan{
+				InputArgs: seqArgs("30.303", "-ss", "0.099", "-to", "0.231"), InputPattern: "%06d.png",
+				Filter: seqHead200 + "fps=30.303:round=down,format=rgba[out]",
+				Width:  200, Height: 100, FPS: 30.303, HasAlpha: true, Duration: 4 / 30.303, Frames: 4, SourceFPS: 30.303,
+				TrimStart: 0.099, TrimEnd: 0.231,
+			},
+		},
+		{
+			// Mid-frame bounds snap to the nearest grid frame like ffmpeg's
+			// av_rescale: 0.06 s at 10 fps is frame 1 (0.6 rounds up), the
+			// 0.05 s duration is 1 frame (0.5 rounds away from zero).
+			name: "sequence: trim bounds snap to the nearest frame of the image2 grid",
+			src:  pngSeq, ops: []recipe.Op{trim(0.06, 0.11)}, out: webp(),
+			want: Plan{
+				InputArgs: seqArgs("10", "-ss", "0.06", "-to", "0.11"), InputPattern: "%06d.png",
+				Filter: seqHead200 + "fps=10:round=down,format=rgba[out]",
+				Width:  200, Height: 100, FPS: 10, HasAlpha: true, Duration: 0.1, Frames: 1, SourceFPS: 10,
+				TrimStart: 0.06, TrimEnd: 0.11,
+			},
+		},
+		{
+			// 7 selected frames at speed 2 end at tick trunc(3.5) = 3, which
+			// the 20 fps stage turns into 6 slots — not the 7 of
+			// floor(0.35 s * 20). Verified against ffmpeg (phase2_ffmpeg_test).
+			name: "sequence: speed truncates the end timestamp before the fps stage",
+			src:  pngSeq, ops: []recipe.Op{trim(0, 0.7), speed(2), fps(20)}, out: webp(),
+			want: Plan{
+				InputArgs: seqArgs("10", "-to", "0.7"), InputPattern: "%06d.png",
+				Filter: seqHead200 + "setpts=PTS/2,fps=20:round=down,format=rgba[out]",
+				Width:  200, Height: 100, FPS: 20, HasAlpha: true, Duration: 0.35, Frames: 6, SourceFPS: 10,
+				TrimEnd: 0.7, Speed: 2,
+			},
+		},
+		{
+			// Trim bounds are written with microsecond precision: rounding
+			// 2/30 to 0.067 made ffmpeg's accurate seek drop frame 2 (its pts
+			// 0.066667 precedes the seek point). The count uses
+			// FrameTolerance: 0.133333*30 = 3.99999 is 4 frames.
+			name: "trim bounds keep microsecond precision on a 30 fps frame grid",
+			src:  prores, ops: []recipe.Op{trim(2.0/30, 6.0/30)}, out: webp(),
+			want: Plan{
+				InputArgs: []string{"-ss", "0.066667", "-to", "0.2"},
+				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Width:     1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 0.133333, Frames: 4,
+				TrimStart: 0.066667, TrimEnd: 0.2,
+			},
+		},
 
 		// --- Phase 2: separate alpha stream ------------------------------
 		{
@@ -1136,6 +1203,113 @@ func TestFramesNeverExceedDuration(t *testing.T) {
 	}
 }
 
+// TestSequenceGridModel pins Plan.Frames/Duration for image sequences to the
+// integer frame-grid model (sequenceSelection + sequenceFrames). Every
+// expectation was measured on FFmpeg 9.0.1 with the corresponding argv
+// (phase2_ffmpeg_test.go re-checks a subset against the real binary):
+//
+//   - -ss/-to are rescaled into the image2 timebase (one frame) with
+//     av_rescale: nearest, halves away from zero;
+//   - a -to duration that rounds to 0 frames is ignored (Compile rejects it);
+//   - setpts=PTS/speed truncates the end timestamp to a whole tick;
+//   - the fps stage (round=down) floors the end onto the output grid.
+func TestSequenceGridModel(t *testing.T) {
+	seq := func(count, delayMS int) recipe.ProbeInfo {
+		rate := SequenceFPS(delayMS)
+		return with(withSeq(pngSeq, func(s *recipe.SequenceInfo) { s.Count, s.DelayMS = count, delayMS }),
+			func(p *recipe.ProbeInfo) { p.FPS, p.Duration, p.Frames = rate, float64(count)/rate, count })
+	}
+	cases := []struct {
+		name   string
+		src    recipe.ProbeInfo
+		ops    []recipe.Op
+		frames int
+		dur    float64
+	}{
+		{"34 at 33 ms", seq(34, 33), nil, 34, 34 / 30.303},
+		{"60 at 33 ms", seq(60, 33), nil, 60, 60 / 30.303},
+		{"1818 at 33 ms (one minute)", seq(1818, 33), nil, 1818, 1818 / 30.303},
+		{"5000 at 17 ms", seq(5000, 17), nil, 5000, 5000 / 58.824},
+		{"77 at 999 ms", seq(77, 999), nil, 77, 77 / 1.001},
+		{"trim 0..0.11 at 25 fps rounds the duration up to 3", seq(60, 40), []recipe.Op{trim(0, 0.11)}, 3, 0.12},
+		{"trim 0..0.09 at 25 fps rounds the duration down to 2", seq(60, 40), []recipe.Op{trim(0, 0.09)}, 2, 0.08},
+		{"trim 0.01..0.09: start rounds to frame 0, 2 frames", seq(60, 40), []recipe.Op{trim(0.01, 0.09)}, 2, 0.08},
+		{"trim 0.03..0.11: start rounds to frame 1, 2 frames", seq(60, 40), []recipe.Op{trim(0.03, 0.11)}, 2, 0.08},
+		{"trim 0.06..0.11: start 1.5 → 2, duration 1.25 → 1", seq(60, 40), []recipe.Op{trim(0.06, 0.11)}, 1, 0.04},
+		{"trim 0.099..0.231 on the 33 ms grid: frames 3..6", seq(34, 33), []recipe.Op{trim(3/30.303, 7/30.303)}, 4, 4 / 30.303},
+		{"to the end from 1.089 s on the 33 ms grid: the last frame", seq(34, 33), []recipe.Op{trim(33/30.303, 0)}, 1, 1 / 30.303},
+		{"to the end from 5.9 s at 10 fps: the last frame", seq(60, 100), []recipe.Op{trim(5.9, 0)}, 1, 0.1},
+		{"trim 0..5.95 at 10 fps rounds to all 60", seq(60, 100), []recipe.Op{trim(0, 5.95)}, 60, 6},
+		{"trim 0..5.94 at 10 fps is 59", seq(60, 100), []recipe.Op{trim(0, 5.94)}, 59, 5.9},
+		{"speed 2 halves 60", seq(60, 100), []recipe.Op{speed(2)}, 30, 3},
+		{"speed 0.5 doubles 60", seq(60, 100), []recipe.Op{speed(0.5)}, 120, 12},
+		{"speed 1.5 on 60 is 40", seq(60, 100), []recipe.Op{speed(1.5)}, 40, 4},
+		{"7 frames at speed 2: the end truncates to tick 3", seq(60, 100), []recipe.Op{trim(0, 0.7), speed(2)}, 3, 0.35},
+		{"7 frames at speed 2 resampled to 20 fps: 6, not 7", seq(60, 100), []recipe.Op{trim(0, 0.7), speed(2), fps(20)}, 6, 0.35},
+		{"fps 25 from 10 fps", seq(60, 100), []recipe.Op{fps(25)}, 150, 6},
+		{"speed 2 then fps 25", seq(60, 100), []recipe.Op{speed(2), fps(25)}, 75, 3},
+		{"trim 1..3 at speed 2", seq(60, 100), []recipe.Op{trim(1, 3), speed(2)}, 10, 1},
+		{"1 ms delay capped to 60 fps", seq(60, 1), nil, 3, 0.06},
+		{"60 s delay", seq(60, 60000), nil, 60, 60 / 0.017},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := Compile(tc.src, tc.ops, webp())
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			if p.Frames != tc.frames {
+				t.Errorf("Frames = %d, want %d", p.Frames, tc.frames)
+			}
+			if math.Abs(p.Duration-tc.dur) > 1e-9 {
+				t.Errorf("Duration = %v, want %v", p.Duration, tc.dur)
+			}
+			if got := float64(p.Frames) / p.FPS; got > p.Duration+1e-9 {
+				t.Errorf("%d frames / %v fps = %v s exceeds the duration %v s", p.Frames, p.FPS, got, p.Duration)
+			}
+		})
+	}
+
+	// The integer helpers themselves: ffmpeg's av_rescale rounding on the
+	// frame grid (halves away from zero), exact for the largest sequences.
+	for _, tc := range []struct {
+		us, rate1000, want int64
+	}{
+		{0, 10000, 0}, {-5, 10000, 0}, {49999, 10000, 0}, {50000, 10000, 1}, {60000, 10000, 1}, {149999, 10000, 1}, {150000, 10000, 2},
+		{99000, 30303, 3}, {132000, 30303, 4}, {1089000, 30303, 33}, {5950000, 10000, 60}, {5940000, 10000, 59},
+		{10000, 25000, 0}, {30000, 25000, 1}, {60000, 25000, 2}, {110000, 25000, 3}, {90000, 25000, 2}, {19000, 25000, 0},
+		{60000 * 1000 * 5000, 17, 5100}, // 5000 frames at 60 s: 300000 s * 0.017
+	} {
+		if got := gridRound(tc.us, tc.rate1000); got != tc.want {
+			t.Errorf("gridRound(%d, %d) = %d, want %d", tc.us, tc.rate1000, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		n                int
+		speed, rate, fps float64
+		want             int
+	}{
+		{34, 1, 30.303, 30.303, 34}, {7, 2, 10, 10, 3}, {7, 2, 10, 20, 6}, {60, 1.5, 10, 10, 40}, {60, 1, 10, 25, 150},
+		{60, 1, 1000, 60, 3}, {1, 2, 10, 10, 0}, {60, 100, 10, 10, 0}, {0, 1, 10, 10, 0}, {60, 1, 0.017, 0.017, 60},
+	} {
+		if got := sequenceFrames(tc.n, tc.speed, tc.rate, tc.fps); got != tc.want {
+			t.Errorf("sequenceFrames(%d, %v, %v, %v) = %d, want %d", tc.n, tc.speed, tc.rate, tc.fps, got, tc.want)
+		}
+	}
+	if FrameTolerance < 6e-5 || FrameTolerance > 1e-3 {
+		t.Errorf("FrameTolerance %v must cover 1 µs at 60 fps (6e-5 frames) and stay far below a frame", FrameTolerance)
+	}
+	// The microsecond precision the trim args carry.
+	for _, tc := range []struct {
+		v    float64
+		want string
+	}{{2.0 / 30, "0.066667"}, {6.0 / 30, "0.2"}, {1.5, "1.5"}, {3 / 30.303, "0.099"}, {0, "0"}, {-0.0000001, "0"}, {1.0000004, "1"}, {1.0000006, "1.000001"}} {
+		if got := fnum6(tc.v); got != tc.want {
+			t.Errorf("fnum6(%v) = %q, want %q", tc.v, got, tc.want)
+		}
+	}
+}
+
 // checkPlan compares every Plan field, with a tolerance on floats.
 func checkPlan(t *testing.T, got, want *Plan) {
 	t.Helper()
@@ -1267,6 +1441,14 @@ func TestCompileErrors(t *testing.T) {
 		{"trim on a one-frame sequence", with(withSeq(pngSeq, func(s *recipe.SequenceInfo) { s.Count = 1 }), func(p *recipe.ProbeInfo) { p.Frames = 1 }), []recipe.Op{trim(0.05, 0)}, webp(), "op 0 (trim): the source has a single frame and cannot be trimmed"},
 		{"trim start beyond the sequence end", pngSeq, []recipe.Op{trim(6, 0)}, webp(), "trim start (6 s) is at or beyond the end of the source (6 s)"},
 		{"trim start beyond the retimed sequence end", pngSeq, []recipe.Op{delay(40), trim(3, 0)}, webp(), "trim start (3 s) is at or beyond the end of the source (2.4 s)"},
+		// On the image2 grid 5.95 s at 10 fps rounds to frame 60 of 0..59:
+		// ffmpeg's seek fails and the render produces nothing.
+		{"trim start rounds past the last sequence frame", pngSeq, []recipe.Op{trim(5.95, 0)}, webp(), "trim start (5.95 s) selects no frame: the last frame of the sequence starts at 5.9 s"},
+		// A duration that rounds to 0 frames is ignored by ffmpeg's trim
+		// filter (it would render to the end).
+		{"trim shorter than half a sequence frame", pngSeq, []recipe.Op{trim(0.1, 0.119)}, webp(), "trim range (0.1 s to 0.119 s) is shorter than half a frame (0.05 s) and selects no frame"},
+		{"speed leaves no sequence frame", pngSeq, []recipe.Op{speed(100)}, webp(), "speed 100 leaves no frame: 60 sequence frame(s) end before the first output frame"},
+		{"trim and speed leave no sequence frame", pngSeq, []recipe.Op{trim(0, 0.1), speed(2)}, webp(), "speed 2 leaves no frame: 1 sequence frame(s) end before the first output frame"},
 		{"negative alpha stream index", with(h264, func(p *recipe.ProbeInfo) { p.AlphaStream = -1 }), nil, webp(), "source alpha stream index must be >= 0 (got -1)"},
 		{"unknown frame format", h264, nil, recipe.Output{Format: recipe.FormatFrames, FrameFormat: "gif"}, `output: frame format "gif" must be one of png, jpeg, webp`},
 		{"frame format is case-sensitive", h264, nil, recipe.Output{Format: recipe.FormatFrames, FrameFormat: "PNG"}, `output: frame format "PNG" must be one of png, jpeg, webp`},

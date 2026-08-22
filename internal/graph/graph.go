@@ -40,9 +40,11 @@
 //     scale, canvas pad, flip/rotate; each sees the frame size produced by
 //     the previous one) → output fit (Output.Width/Height/Fit) →
 //     format=rgba. Trim never becomes a filter: it is expressed as -ss/-to
-//     input seek args (source time). Temporal and spatial filters commute,
-//     so hoisting setpts/fps in front of the geometry ops does not change
-//     the result but keeps the frame count low before scaling.
+//     input seek args (source time, microsecond precision so a bound taken
+//     from the frame grid keeps its frame — see compiler.trim). Temporal and
+//     spatial filters commute, so hoisting setpts/fps in front of the
+//     geometry ops does not change the result but keeps the frame count low
+//     before scaling.
 //   - Output.FPS (or the fps op) is capped with SnapFPS(out.Format, fps): 50
 //     for GIF, 60 otherwise; no other snapping (see SnapFPS for why 30 fps
 //     GIFs need none). Every recipe.Format* compiles to the same RGBA master
@@ -75,7 +77,15 @@ type Plan struct {
 	FPS           float64 // output frame rate (constant); > 0
 	HasAlpha      bool    // whether the output carries (non-trivial) alpha
 	Duration      float64 // expected output duration in seconds (0 = unknown)
-	Frames        int     // expected frame count (0 = unknown)
+	// Frames is the expected master frame count (0 = unknown). For image
+	// sequences it is exact: the frames the trim selects on the image2 grid
+	// (all of them without a trim), through the speed and fps stages the way
+	// ffmpeg ends the stream (see sequenceFrames) — so a sequence that is not
+	// retimed plans exactly its frame count. For every other source it is
+	// the floor model of the fps stage's round=down, floor(Duration*FPS +
+	// FrameTolerance), which is an estimate: the probed rate may not be the
+	// source's exact cadence. The UI mirrors both rules for its scrubber.
+	Frames int
 
 	// Facts the still/proxy renderers need to map a preview time to source
 	// time: TrimStart/TrimEnd are the source-time bounds selected by the trim
@@ -178,10 +188,16 @@ func SnapFPS(format string, fps float64) float64 {
 	return round3(math.Min(fps, MaxFPS))
 }
 
-// round3 rounds v to 3 decimals (the precision used everywhere in filter
-// text and seek args).
+// round3 rounds v to 3 decimals (the precision used for rates in filter
+// text).
 func round3(v float64) float64 {
 	return math.Round(v*1000) / 1000
+}
+
+// round6 rounds v to 6 decimals (microseconds, ffmpeg's -ss/-to resolution;
+// used for trim bounds, see compiler.trim for why milliseconds lose frames).
+func round6(v float64) float64 {
+	return math.Round(v*1e6) / 1e6
 }
 
 // fnum renders v for filter/argv text: rounded to 3 decimals, minimal
@@ -189,6 +205,15 @@ func round3(v float64) float64 {
 // 33.3333 → "33.333").
 func fnum(v float64) string {
 	v = round3(v)
+	if v == 0 {
+		v = 0 // normalise -0
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// fnum6 is fnum at 6 decimals (2/30 → "0.066667", 1.5 → "1.5").
+func fnum6(v float64) string {
+	v = round6(v)
 	if v == 0 {
 		v = 0 // normalise -0
 	}

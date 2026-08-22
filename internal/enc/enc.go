@@ -600,9 +600,10 @@ type stillSeek struct {
 // [TrimStart, srcEnd - stillEndMargin] where srcEnd is TrimEnd, else
 // TrimStart + Duration*Speed when the duration is known. The output slot
 // displayed at t is k = floor(tOut*FPS) (tOut = clamped t), capped at the
-// render's last slot floor(Duration*FPS) - 1 when the duration is known
-// (the plan's fps stage runs with round=down, so no slot past that is ever
-// rendered); the seek start
+// render's last slot — Plan.Frames - 1 when the plan knows its frame count,
+// else floor(Duration*FPS) - 1 when the duration is known (the plan's fps
+// stage runs with round=down, so no slot past that is ever rendered); the
+// seek start
 // is snapped down onto the slot grid, K = floor((target - back -
 // TrimStart)*FPS/Speed) slots after TrimStart, so the fps stage after the
 // seek emits slot j = k-K exactly where the render emits slot k. The select
@@ -658,18 +659,25 @@ func stillSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 	slots := math.Floor((rawStart-trimStart)/period + stillSlotEpsilon)
 	start := trimStart + slots*period
 	abs := math.Floor(tOut*fps + stillSlotEpsilon) // output slot displayed at t
-	// The render's fps stage rounds the clip end DOWN (fps=F:round=down), so
-	// the last rendered slot is floor(Duration*FPS)-1. A t at the very end of
-	// the clip would otherwise select the slot past it and show a source
-	// frame the render's EOF flush drops.
+	// Cap at the render's last slot: a t at the very end of the clip would
+	// otherwise select the slot past it and show a source frame the render's
+	// EOF flush drops. The plan's Frames is that count when it is known
+	// (exact for image sequences, where the speed stage truncates the end
+	// timestamp and Frames can be below floor(Duration*FPS)); otherwise the
+	// fps stage's round=down puts the last slot at floor(Duration*FPS)-1.
 	durOut := p.Duration
 	if !(durOut > 0) && p.TrimEnd > 0 {
 		durOut = (p.TrimEnd - trimStart) / speed
 	}
-	if durOut > 0 && !math.IsInf(durOut, 0) {
-		if last := math.Floor(durOut*fps+stillSlotEpsilon) - 1; last >= 0 && abs > last {
-			abs = last
-		}
+	last := -1.0
+	switch {
+	case p.Frames > 0:
+		last = float64(p.Frames) - 1
+	case durOut > 0 && !math.IsInf(durOut, 0):
+		last = math.Floor(durOut*fps+stillSlotEpsilon) - 1
+	}
+	if last >= 0 && abs > last {
+		abs = last
 	}
 	slot := abs - slots // j: slot after start
 	if slot < 0 {

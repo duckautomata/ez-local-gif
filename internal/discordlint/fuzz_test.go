@@ -17,7 +17,7 @@ func FuzzLintGIF(f *testing.F) {
 	f.Add(encodeFx(f, alphaAnim()))
 	f.Add([]byte("GIF89a"))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, target := range []Target{TargetNone, TargetEmote, TargetSticker} {
+		for _, target := range []Target{TargetNone, TargetEmote, TargetSticker, TargetAttachment50} {
 			r, out, err := LintGIF(data, target, true)
 			if err != nil {
 				continue
@@ -55,7 +55,7 @@ func FuzzLintAPNG(f *testing.F) {
 	f.Add(synthAPNG{w: 8, h: 8, colorType: pngIndexed, plte: 4, trns: 2}.bytes())
 	f.Add(append([]byte(nil), pngSignature...))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, target := range []Target{TargetNone, TargetEmote, TargetSticker, TargetAttachment} {
+		for _, target := range []Target{TargetNone, TargetEmote, TargetSticker, TargetAttachment, TargetAttachment500} {
 			r, err := LintAPNG(data, target)
 			if err != nil {
 				continue
@@ -106,7 +106,7 @@ func FuzzLintWebP(f *testing.F) {
 	f.Add(goodAnim())
 	f.Add([]byte("RIFF\x04\x00\x00\x00WEBP"))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, target := range []Target{TargetNone, TargetEmote, TargetSticker} {
+		for _, target := range []Target{TargetNone, TargetEmote, TargetSticker, TargetAttachment100} {
 			r, err := LintWebP(data, target)
 			if err != nil {
 				continue

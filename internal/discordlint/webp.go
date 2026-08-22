@@ -147,9 +147,9 @@ func (l *webpLinter) run() {
 	}
 
 	// webp.loop-forever — animations carry an ANIM chunk; its loop count is
-	// the number of plays (0 = forever). Discord targets require 0 (Discord
-	// honours a finite count and the animation stops); for TargetNone any
-	// count is the user's choice and is only reported.
+	// the number of plays (0 = forever). Discord targets (IsDiscord) require
+	// 0 (Discord honours a finite count and the animation stops); for
+	// TargetNone any count is the user's choice and is only reported.
 	animated := frames > 1 || f.anim != nil || (f.vp8x != nil && f.vp8x.flags&vp8xFlagAnim != 0)
 	switch {
 	case !animated:
@@ -158,7 +158,7 @@ func (l *webpLinter) run() {
 		l.checks.fail(RuleWebPLoopForever, LevelError, "animation without an ANIM chunk (no loop count)")
 	case f.anim.loopCount == 0:
 		l.checks.pass(RuleWebPLoopForever, LevelError, "ANIM loop count 0 (loops forever)")
-	case l.target == TargetNone:
+	case !IsDiscord(l.target):
 		l.checks.pass(RuleWebPLoopForever, LevelInfo, fmt.Sprintf("ANIM loop count %d (%s); Discord targets require 0 (loop forever)", f.anim.loopCount, plays(int(f.anim.loopCount))))
 	default:
 		l.checks.fail(RuleWebPLoopForever, LevelError, fmt.Sprintf("ANIM loop count is %d (%s); Discord needs 0 = loop forever — encode with -loop 0", f.anim.loopCount, plays(int(f.anim.loopCount))))
@@ -198,16 +198,10 @@ func (l *webpLinter) run() {
 	// webp.min-delay — see webpClampDelayMS / webpMinDelayMS.
 	l.checkMinDelay()
 
-	// webp.size-limit.
-	if limit := Limit(l.target); limit > 0 {
-		if int64(f.size) > limit {
-			l.checks.fail(RuleWebPSizeLimit, LevelError, fmt.Sprintf("%d bytes exceeds the %d byte limit for %s", f.size, limit, l.target))
-		} else {
-			l.checks.pass(RuleWebPSizeLimit, LevelError, fmt.Sprintf("%d of %d bytes", f.size, limit))
-		}
-	}
+	// webp.size-limit (the tier's cap; nothing for TargetNone).
+	l.checks.sizeLimit(RuleWebPSizeLimit, int64(f.size), l.target)
 
-	// Target-specific.
+	// Target-specific; the attachment tiers have no shape rules.
 	w, h := f.canvas()
 	switch l.target {
 	case TargetSticker:

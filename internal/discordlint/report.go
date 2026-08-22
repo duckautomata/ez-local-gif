@@ -33,6 +33,23 @@ func (c *checkList) outcome(rule string, level Level, fixed bool, detail string)
 	c.add(rule, level, fixed, fixed, detail)
 }
 
+// sizeLimit records the byte-limit rule for target: nothing when the target
+// has no cap (TargetNone, unknown strings), a LevelError failure naming the
+// tier and its cap when size exceeds it, a pass quoting size and cap
+// otherwise. Every format's *.size-limit rule goes through here so the
+// attachment tiers read alike.
+func (c *checkList) sizeLimit(rule string, size int64, target Target) {
+	limit := Limit(target)
+	if limit <= 0 {
+		return
+	}
+	if size > limit {
+		c.fail(rule, LevelError, fmt.Sprintf("%d bytes exceeds the %d byte limit for %s", size, limit, Describe(target)))
+		return
+	}
+	c.pass(rule, LevelError, fmt.Sprintf("%d of %d bytes", size, limit))
+}
+
 // allOK reports whether no LevelError check failed.
 func (c checkList) allOK() bool {
 	for _, ch := range c {

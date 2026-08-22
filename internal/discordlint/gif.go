@@ -86,7 +86,7 @@ func LintGIF(data []byte, target Target, fix bool) (Report, []byte, error) {
 		}
 		out = g.encode()
 	}
-	l.ruleSizeLimit(RuleGIFSizeLimit, len(out))
+	l.checks.sizeLimit(RuleGIFSizeLimit, int64(len(out)), l.target)
 	l.ruleTargetShape()
 
 	return l.report(len(out)), out, nil
@@ -448,14 +448,14 @@ func (l *gifLinter) ruleDisposal() {
 // only after the first image is ignored by giflib-based decoders such as
 // Discord's). Its count N means "play N+1 times"; 0 = loop forever.
 //
-// For Discord targets the count must be 0 (Discord's GIF→WebP transcode
-// honours a finite count and would stop the animation): non-zero counts
-// are set to 0, a missing block is inserted with count 0. For TargetNone
-// any count is acceptable — the recipe's Loop setting is the user's choice
-// — and only reported; the block merely has to exist before the first
-// image: a missing one is inserted right after the global colour table
-// with count 0 (or with the file's own count when a block sits later in
-// the stream), and a malformed loop sub-block is repaired the same way.
+// For Discord targets (IsDiscord) the count must be 0 (Discord's GIF→WebP
+// transcode honours a finite count and would stop the animation): non-zero
+// counts are set to 0, a missing block is inserted with count 0. For
+// TargetNone any count is acceptable — the recipe's Loop setting is the
+// user's choice — and only reported; the block merely has to exist before
+// the first image: a missing one is inserted right after the global colour
+// table with count 0 (or with the file's own count when a block sits later
+// in the stream), and a malformed loop sub-block is repaired the same way.
 // Well-formed blocks are never rewritten for TargetNone.
 func (l *gifLinter) ruleNetscapeLoop() {
 	const rule = RuleGIFNetscapeLoop
@@ -482,7 +482,7 @@ func (l *gifLinter) ruleNetscapeLoop() {
 	}
 	// The count the fixer writes: 0 for Discord targets; the file's own
 	// (first well-formed) count for TargetNone, 0 when it has none.
-	mustZero := l.target != TargetNone
+	mustZero := IsDiscord(l.target)
 	want := uint16(0)
 	if !mustZero && len(counts) > 0 {
 		want = counts[0]
@@ -605,12 +605,12 @@ func (l *gifLinter) ruleMinDelay() {
 
 // ruleGlobalPalette: a single global colour table, no local ones (per-frame
 // palettes have produced random-colour glitches on Discord). An error for
-// Discord targets, a warning otherwise; a file with no palette at all is
-// always an error.
+// Discord targets (IsDiscord), a warning otherwise; a file with no palette
+// at all is always an error.
 func (l *gifLinter) ruleGlobalPalette() {
 	const rule = RuleGIFGlobalPalette
 	level := LevelWarn
-	if l.target != TargetNone {
+	if IsDiscord(l.target) {
 		level = LevelError
 	}
 	frames, _ := l.g.frames()
@@ -754,20 +754,8 @@ func (l *gifLinter) ruleTrailer() {
 	l.checks.outcome(rule, LevelError, l.fix, detail)
 }
 
-// ruleSizeLimit checks the final byte count against the target's cap.
-func (l *gifLinter) ruleSizeLimit(rule string, size int) {
-	limit := Limit(l.target)
-	if limit <= 0 {
-		return
-	}
-	if int64(size) > limit {
-		l.checks.fail(rule, LevelError, fmt.Sprintf("%d bytes exceeds the %d byte limit for %s", size, limit, l.target))
-		return
-	}
-	l.checks.pass(rule, LevelError, fmt.Sprintf("%d of %d bytes", size, limit))
-}
-
 // ruleTargetShape applies the sticker / emote geometry and timing rules.
+// The attachment tiers have no shape rules.
 // Sticker dimensions only warn when a side exceeds 320 px: Discord shrinks
 // larger stickers and accepts smaller or non-square ones (user-verified
 // 2026-08-19), so they are not an error.

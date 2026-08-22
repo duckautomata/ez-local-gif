@@ -65,7 +65,10 @@ const ManifestName = "manifest.json"
 //	          by their track, not the one-frame primary item; sequences
 //	          whose frames ffmpeg cannot read via the image2 pattern are
 //	          rejected at probe time
-const InfoVersion = 5
+//	6:        sequence FPS is graph.SequenceFPS(delay) (3 decimals, exactly
+//	          what -framerate gets) and Duration = count/FPS, so probe facts
+//	          match graph.Plan bit-for-bit (user Phase 2 review, bug 4)
+const InfoVersion = 6
 
 // MinScratchBytes is the smallest scratch filesystem New accepts quietly.
 // Docker's default /dev/shm is 64 MiB, which holds about 160 frames of

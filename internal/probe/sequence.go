@@ -22,6 +22,7 @@ import (
 
 	"github.com/duckautomata/ez-local-gif/internal/enc"
 	"github.com/duckautomata/ez-local-gif/internal/ffrun"
+	"github.com/duckautomata/ez-local-gif/internal/graph"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
 )
 
@@ -85,6 +86,7 @@ func probeSequence(ctx context.Context, tools ffrun.Tools, dir string, delayMS i
 	}
 
 	count := len(files)
+	fps, duration := sequenceTiming(count, delayMS)
 	info := recipe.ProbeInfo{
 		Format:   sequenceFormat,
 		Codec:    vs.CodecName,
@@ -93,8 +95,8 @@ func probeSequence(ctx context.Context, tools ffrun.Tools, dir string, delayMS i
 		Bits:     bitsFromPixFmt(vs.PixFmt),
 		Width:    vs.Width,
 		Height:   vs.Height,
-		FPS:      1000 / float64(delayMS),
-		Duration: float64(count) * float64(delayMS) / 1000,
+		FPS:      fps,
+		Duration: duration,
 		Frames:   count,
 		Kind:     recipe.KindSequence,
 		Sequence: &recipe.SequenceInfo{Count: count, Pattern: sequencePattern(ext), DelayMS: delayMS},
@@ -136,6 +138,21 @@ func probeSequence(ctx context.Context, tools ffrun.Tools, dir string, delayMS i
 		info.HasAlpha = has
 	}
 	return info, nil
+}
+
+// sequenceTiming returns the FPS and Duration an image sequence of count
+// frames at delayMS per frame reports: the image2 -framerate the render
+// actually uses (1000/delay rounded to 3 decimals, graph.SequenceFPS — 33 ms
+// is 30.303 fps, not 30.30303…) and count/FPS, so Frames, Duration and FPS
+// agree with graph.Plan exactly and Duration*FPS floors back to count (the
+// unrounded rate with count*delay/1000 did not: 34 * 0.033 * 30.303 =
+// 33.99997). delayMS <= 0 means DefaultSequenceDelayMS.
+func sequenceTiming(count, delayMS int) (fps, duration float64) {
+	if delayMS <= 0 {
+		delayMS = DefaultSequenceDelayMS
+	}
+	fps = graph.SequenceFPS(delayMS)
+	return fps, float64(count) / fps
 }
 
 // listSequenceFrames returns the frame files of a sequence dir in order and

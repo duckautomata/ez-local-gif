@@ -50,20 +50,43 @@ into the Go binary by `web/embed.go`.
 - Stills: `POST /api/still` with `{src, ops, output, t, maxW}`; debounced 150 ms,
   in-flight requests aborted by newer ones (and when the state returns to the
   still already on screen, so a superseded frame can never land later), object
-  URLs revoked after the next frame loads. `t` is output time (after
-  trim/speed), ceiled to whole ms (`ceilMs`) so a frame-start time stays inside
-  its own frame when the server maps t → floor(t × fps). Logic lives in
-  `lib/still.ts` / `lib/format.ts`.
-- Preview position is shown Resolve-style (`00:01.12 · f 28 / 75`) on the plan's
-  frame grid (effective fps). The stage is focusable (`role="slider"`, visible
-  focus ring): ← → step one frame, Shift ×10, Home/End; the ⏮ ◂ ▸ ⏭ buttons do
-  the same; the range input's step is 1/fps.
-- Presets pre-fill the Output card: Emote (GIF, 128², fit 256 KiB on, "WebP
-  instead"), Sticker (indexed APNG 256 colours, 320², fit 512 KiB on, keep size,
-  "GIF instead"), Chat GIF / WebP / AVIF (attachment), Optimize (GIF source only:
-  gifsicle-only, no ops, drop-every-Nth-frame fps chips), Frames (frame format
-  png/jpeg/webp), Custom. The Format select lists the formats sensible for the
-  preset; APNG appears only for Sticker and Custom; gifski never appears.
+  URLs revoked after the next frame loads. Logic lives in `lib/still.ts` /
+  `lib/format.ts`.
+- The scrubber is a **frame index** `app.ui.scrubFrame` ∈ [0, N−1] on the
+  plan's grid: N = `planFrames` (mirrors `graph.Plan.Frames`: an image sequence
+  whose timing is untouched has exactly its frame count, everything else
+  `floor(duration × fps + 1e-6)`), fps = `planFPS` (effective output fps). The
+  range input has min 0 / max N−1 / step 1, so it reaches both ends and one
+  notch is one frame. The still is requested at the *middle* of the frame
+  (`stillTime` = (i + 0.5)/fps, whole ms) — the server maps t → floor(t × fps),
+  which is robust there — and the readout shows the frame's start
+  Resolve-style (`00:01.12 · f 29 / 75`). The readout is a focusable
+  `role="slider"`: ← → step one frame, Shift ×10, Home/End; ⏮ ◂ ▸ ⏭ do the
+  same.
+- Trim "from scrubber" uses `frameWindow`: Start = the frame's start, End =
+  the point after it, both mapped back through trim/speed to source seconds;
+  on the last frame End means "to the end" (0). Start is capped at
+  `trimStartMax` (one source frame before the end), so the graph never sees a
+  trim start at or beyond the clip. The selection is also shown as source
+  frames (`frameSpan`).
+- Output card: "Use for" chips Emote · Sticker · Chat · Optimize · Frames ·
+  Custom pre-fill it — Emote (GIF, 128², fit 256 KiB on), Sticker (indexed APNG
+  256 colours, 320², fit 512 KiB on, keep size), Chat (GIF by default; the
+  Format select offers GIF / WebP / AVIF and `onFormat` re-seeds lossy 20 /
+  q 80 / q 60), Optimize (GIF source only: gifsicle-only, no ops,
+  drop-every-Nth-frame fps chips), Frames (frame format png/jpeg/webp), Custom.
+  The **Discord target** dropdown is always editable (presets only set its
+  default): none · emote · sticker · attachment (free, 20 MB) · attachment-50
+  (Nitro Basic / Level-2 server) · attachment-100 (Level-3 server) ·
+  attachment-500 (Nitro); the table in `lib/presets.ts` (`TARGET_DEFS`)
+  mirrors `discordlint` and drives the limit readout, the "= limit" fit budget
+  (`setTarget` moves a budget that sat on the old cap) and the notes. Rows:
+  format · target · limit | size + fps | the format's quality knobs | fit |
+  an **Advanced** fold (matte, alpha threshold / trim fringe, dither, loop).
+  APNG appears only for Sticker and Custom; gifski never appears.
+- The header logo is a link to `/` that resets to the landing state
+  (`resetRender` + `resetApp`: no source / result / job, default ops and
+  output) without a reload.
 - Fit-to-size: "Fit to ≤ N KiB" + "keep size" / "keep fps" → `fitBytes`,
   `fitKeepSize`, `fitKeepFps` (only sent when the budget is on; never for frames).
 - GIF matte: "Discord dark / Discord light / Custom" with the 1-bit-alpha

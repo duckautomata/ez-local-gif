@@ -129,12 +129,22 @@ func VariantMaster(m Master, v *Variant) Master {
 	return out
 }
 
+// variantFrameTolerance is the slack fpsFrames adds before flooring. The
+// product frames*out/in is a ratio of integers and 3-decimal rates, so it is
+// either exactly a whole number (up to ~1e-12 of float noise, e.g.
+// 62 * 12.5 / 25 = 31) or at least 1/(in*1000) >= 1/60000 away from one; 1e-6
+// sits far above the noise and well below that gap, so it never turns a real
+// sub-frame shortfall into an extra frame. (graph.FrameTolerance is larger
+// because it also absorbs the microsecond rounding of trim bounds; variants
+// carry none.)
+const variantFrameTolerance = 1e-6
+
 // fpsFrames is the number of frames ffmpeg's fps filter with round=down
-// emits for frames input frames at rate in re-timed to rate out (the input's
-// end time floored onto the output grid; the 1e-9 absorbs float error when
-// the product is exact, e.g. 62 * 12.5 / 25 = 31).
+// emits for frames input frames at rate in re-timed to rate out: the input's
+// end time floored onto the output grid, floor(frames*out/in) within
+// variantFrameTolerance.
 func fpsFrames(frames int, in, out float64) int {
-	return int(math.Floor(float64(frames)*out/in + 1e-9))
+	return int(math.Floor(float64(frames)*out/in + variantFrameTolerance))
 }
 
 // variantFPS returns the fps stage's rate, or 0 when the variant keeps the

@@ -47,6 +47,19 @@ const (
 	DefaultDelayMS = 100
 )
 
+// FrameTolerance is the slack (in frames) Plan.Frames adds before flooring
+// Duration*FPS for sources that are not image sequences: floor(D*F +
+// FrameTolerance). The seek args carry microsecond precision, so a trim taken
+// from the frame grid lands up to 1 µs short of a whole number of frames —
+// [2/30, 6/30) becomes "-ss 0.066667 -to 0.2", and 0.133333 × 30 = 3.99999,
+// which a naive floor (or a 1e-6 tolerance) would count as 3 frames while
+// ffmpeg renders 4. 1 µs at the 60 fps cap is 6e-5 frames, hence 1e-4. A
+// product that is genuinely a real sub-frame short of an integer by less
+// than that cannot come out of µs-precision times, so the tolerance only
+// ever absorbs rounding. (Image sequences do not use it: their count is
+// exact, see sequenceFrames.)
+const FrameTolerance = 1e-4
+
 // Fit modes shared by the resize op and Output.Fit.
 const (
 	fitContain = "contain"
@@ -142,6 +155,10 @@ type compiler struct {
 type sequence struct {
 	count int     // frame count (0 = unknown)
 	rate  float64 // 1000/delay ms rounded to 3 decimals; the image2 -framerate
+	// first and selected are the source frames the trim selects on the image2
+	// frame grid (set by trim when count is known; selected == count and
+	// first == 0 without a trim). See sequenceSelection.
+	first, selected int
 }
 
 func newCompiler(src recipe.ProbeInfo, out recipe.Output) *compiler {
@@ -253,7 +270,7 @@ func (c *compiler) sequenceSource(ops []decodedOp) error {
 	if count <= 0 {
 		count = c.src.Frames
 	}
-	c.seq = &sequence{count: count, rate: SequenceFPS(delay)}
+	c.seq = &sequence{count: count, rate: SequenceFPS(delay), selected: count}
 	c.plan.InputPattern = info.Pattern
 	c.plan.SourceFPS = c.seq.rate
 	// Arg order is fixed: "-f image2" first (force the demuxer explicitly, so
@@ -410,6 +427,16 @@ func decoderArgs(src recipe.ProbeInfo) []string {
 // expresses the result as -ss/-to input seek args. No trim filter is
 // emitted; input seeking rebases timestamps to 0 so the rest of the graph
 // sees a clip starting at t=0.
+//
+// The bounds are rounded to microseconds (ffmpeg's own -ss/-to resolution),
+// not milliseconds: a trim taken from the frame grid of a 30 fps source
+// starts at 2/30 = 0.066667 s, and rounding that to 0.067 made ffmpeg's
+// accurate seek drop frame 2 (its pts 0.066667 is before the seek point),
+// while an end of 5/30 → 0.167 let frame 5 (0.166667) slip in. Verified
+// against ffmpeg 9 on a 30 fps mp4: -ss 0.067 starts at frame 3, -ss 0.066667
+// at frame 2; -ss 0.1 -to 0.167 yields frames 3..5, -to 0.166667 frames 3..4.
+// For image sequences the bounds are additionally mapped onto the image2
+// frame grid (sequenceSelection) so Plan.Frames is exact.
 func (c *compiler) trim(ops []decodedOp) error {
 	start, end := 0.0, 0.0 // end 0 = to the end of the source
 	trimmed := false
@@ -418,15 +445,15 @@ func (c *compiler) trim(ops []decodedOp) error {
 		if !ok {
 			continue
 		}
-		s, e := round3(p.Start), round3(p.End)
+		s, e := round6(p.Start), round6(p.End)
 		if e < 0 { // TrimParams: End <= 0 means "to the end"
 			e = 0
 		}
 		if s < 0 {
-			return opErrorf(d, "start must be >= 0 (got %s)", fnum(s))
+			return opErrorf(d, "start must be >= 0 (got %s)", fnum6(s))
 		}
 		if e > 0 && e <= s {
-			return opErrorf(d, "end (%s s) must be after start (%s s)", fnum(e), fnum(s))
+			return opErrorf(d, "end (%s s) must be after start (%s s)", fnum6(e), fnum6(s))
 		}
 		if s == 0 && e == 0 {
 			continue // whole source
@@ -447,24 +474,110 @@ func (c *compiler) trim(ops []decodedOp) error {
 		return nil
 	}
 	if end > 0 && end <= start {
-		return errorf("trim ranges do not overlap (start %s s, end %s s)", fnum(start), fnum(end))
+		return errorf("trim ranges do not overlap (start %s s, end %s s)", fnum6(start), fnum6(end))
 	}
 	if dur := c.sourceDuration(); dur > 0 {
 		if start >= dur {
-			return errorf("trim start (%s s) is at or beyond the end of the source (%s s)", fnum(start), fnum(dur))
+			return errorf("trim start (%s s) is at or beyond the end of the source (%s s)", fnum6(start), fnum6(dur))
 		}
 		if end >= dur {
 			end = 0 // reading to the end is the same clip and avoids a -to past EOF
 		}
 	}
+	if c.seq != nil && c.seq.count > 0 {
+		if err := c.sequenceSelection(start, end); err != nil {
+			return err
+		}
+	}
 	if start > 0 {
-		c.plan.InputArgs = append(c.plan.InputArgs, "-ss", fnum(start))
+		c.plan.InputArgs = append(c.plan.InputArgs, "-ss", fnum6(start))
 	}
 	if end > 0 {
-		c.plan.InputArgs = append(c.plan.InputArgs, "-to", fnum(end))
+		c.plan.InputArgs = append(c.plan.InputArgs, "-to", fnum6(end))
 	}
 	c.plan.TrimStart, c.plan.TrimEnd = start, end
 	return nil
+}
+
+// sequenceSelection maps a trim [start, end) (end 0 = to the end) onto the
+// image2 frame grid the way ffmpeg does, so the plan knows exactly which
+// source frames the render reads (verified against ffmpeg 9 in
+// TestSequenceGridModel / phase2_ffmpeg_test.go):
+//
+//   - The image2 stream's timebase is one frame (1/rate), and both the seek
+//     and the accurate-seek trim convert "-ss start" into it with
+//     av_rescale (nearest, halves away from zero): the first frame read is
+//     number round(start*rate). A start that rounds past the last frame
+//     makes the seek fail and the render produce nothing, so it is an error.
+//   - "-to end" becomes a duration end-start relative to that first frame,
+//     rescaled the same way: round((end-start)*rate) frames are kept. A
+//     duration that rounds to 0 frames is ignored by ffmpeg's trim filter
+//     (it would render to the end), so a range shorter than half a frame is
+//     an error too.
+//
+// The arithmetic is done on integers (microseconds x rate*1000) so it is
+// exact: k = (2*us*rate1000 + 1e9) / 2e9.
+func (c *compiler) sequenceSelection(start, end float64) error {
+	rate1000 := int64(math.Round(c.seq.rate * 1000))
+	count := int64(c.seq.count)
+	first := gridRound(micros(start), rate1000)
+	if first >= count {
+		return errorf("trim start (%s s) selects no frame: the last frame of the sequence starts at %s s", fnum6(start), fnum6(float64(count-1)/c.seq.rate))
+	}
+	selected := count - first
+	if end > 0 {
+		kept := gridRound(micros(end)-micros(start), rate1000)
+		if kept == 0 {
+			return errorf("trim range (%s s to %s s) is shorter than half a frame (%s s) and selects no frame", fnum6(start), fnum6(end), fnum6(0.5/c.seq.rate))
+		}
+		selected = min(selected, kept)
+	}
+	c.seq.first, c.seq.selected = int(first), int(selected)
+	return nil
+}
+
+// micros returns t seconds as whole microseconds (t is already rounded to 6
+// decimals, so this is exact).
+func micros(t float64) int64 {
+	return int64(math.Round(t * 1e6))
+}
+
+// gridRound converts a time in microseconds to a frame number at rate1000/1000
+// frames per second the way ffmpeg's av_rescale does: nearest, halves away
+// from zero. Exact in int64 for sequences up to MaxDelayMS*MaxSequenceFrames.
+func gridRound(us, rate1000 int64) int64 {
+	if us <= 0 {
+		return 0
+	}
+	return (2*us*rate1000 + 1e9) / (2 * 1e9)
+}
+
+// sequenceFrames is the number of master frames ffmpeg renders for n
+// selected sequence frames at rate fps, played at speed and resampled to fps
+// (verified against ffmpeg 9 in phase2_ffmpeg_test.go):
+//
+//   - The decoder ends the stream at the first unread frame's timestamp, n
+//     frames after the first one (exact ticks of 1/rate).
+//   - setpts=PTS/speed evaluates that timestamp in floating point and
+//     truncates it to a whole tick: trunc(n/speed) — 7 frames at speed 2 end
+//     at tick 3, not 3.5.
+//   - The fps stage (round=down) floors the end onto the output grid:
+//     floor(ticks * fps / rate), computed on the 3-decimal rates as
+//     integers.
+//
+// Without trim, speed or an fps change this is n itself. 0 means ffmpeg
+// emits nothing (Compile rejects it).
+func sequenceFrames(n int, speed, rate, fps float64) int {
+	if n <= 0 {
+		return 0
+	}
+	ticks := int64(math.Trunc(float64(n) / speed))
+	rate1000 := int64(math.Round(rate * 1000))
+	fps1000 := int64(math.Round(fps * 1000))
+	if ticks <= 0 || rate1000 <= 0 || fps1000 <= 0 {
+		return 0
+	}
+	return int(ticks * fps1000 / rate1000)
 }
 
 // speed multiplies all speed factors and emits setpts=PTS/<factor>. It must
@@ -737,6 +850,21 @@ func (c *compiler) finish() (*Plan, error) {
 	switch {
 	case c.singleFrame():
 		p.Duration, p.Frames = 0, 1
+	case c.seq != nil:
+		// Image sequences are exact: the frames the trim selects on the
+		// image2 grid (sequenceSelection; all of them without a trim) last
+		// selected/rate source seconds, and the render emits
+		// sequenceFrames(...) of them — the count itself when nothing
+		// retimes it (34 frames at 33 ms are 34 master frames, whatever
+		// 34/30.303*30.303 comes to in floating point).
+		if c.seq.count <= 0 {
+			return p, nil // unknown
+		}
+		p.Duration = float64(c.seq.selected) / c.seq.rate / p.Speed
+		p.Frames = sequenceFrames(c.seq.selected, p.Speed, c.seq.rate, p.FPS)
+		if p.Frames < 1 {
+			return nil, errorf("speed %s leaves no frame: %d sequence frame(s) end before the first output frame", fexact(p.Speed), c.seq.selected)
+		}
 	default:
 		dur := c.sourceDuration()
 		if dur <= 0 {
@@ -747,10 +875,10 @@ func (c *compiler) finish() (*Plan, error) {
 			end = dur
 		}
 		p.Duration = math.Max(end-p.TrimStart, 0) / p.Speed
-		// floor, matching the fps stage's round=down (the 1e-9 absorbs float
-		// error when Duration*FPS is exact); >= 1 so a sub-frame clip still
-		// plans a frame.
-		p.Frames = max(1, int(math.Floor(p.Duration*p.FPS+1e-9)))
+		// floor, matching the fps stage's round=down; FrameTolerance absorbs
+		// the microsecond rounding of the seek args (see its doc); >= 1 so a
+		// sub-frame clip still plans a frame.
+		p.Frames = max(1, int(math.Floor(p.Duration*p.FPS+FrameTolerance)))
 	}
 	if bytes := float64(p.Width) * float64(p.Height) * 4 * float64(p.Frames); bytes > MaxMasterBytes {
 		return nil, errorf("expected master (%dx%d x %d frames = %.1f GiB) exceeds the %d GiB limit; trim, lower the fps or resize",

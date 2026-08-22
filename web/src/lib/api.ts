@@ -139,8 +139,15 @@ export type OutputFormat = 'gif' | 'webp' | 'apng' | 'avif' | 'png' | 'jpeg' | '
 export const OUTPUT_FORMATS: readonly OutputFormat[] = ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames'];
 /** Go: recipe.Output.FrameFormat values (FormatFrames only). */
 export type FrameFormat = 'png' | 'jpeg' | 'webp';
-export type Target = '' | 'emote' | 'sticker' | 'attachment';
-export type PresetId = 'emote' | 'sticker' | 'chat-gif' | 'chat-webp' | 'chat-avif' | 'optimize' | 'frames' | 'custom';
+/**
+ * Go: discordlint.Target. The attachment tiers share every rule and differ
+ * only in the byte cap (discordlint.IsAttachment / Limit): "attachment" is
+ * the free 20 MB tier, "-50" Nitro Basic or a Level-2 boosted server,
+ * "-100" a Level-3 boosted server, "-500" Nitro.
+ */
+export type Target = '' | 'emote' | 'sticker' | 'attachment' | 'attachment-50' | 'attachment-100' | 'attachment-500';
+/** Preset chips of the Output card ("chat" replaced chat-gif / chat-webp / chat-avif; the server accepts any string). */
+export type PresetId = 'emote' | 'sticker' | 'chat' | 'optimize' | 'frames' | 'custom';
 export type Dither = 'bayer' | 'sierra2_4a' | 'floyd_steinberg' | 'none';
 
 /** Mirrors recipe.IsAnimatedFormat. */
@@ -171,7 +178,8 @@ export interface Output {
   fitKeepSize?: boolean;
   fitKeepFps?: boolean;
   frameFormat?: FrameFormat;
-  preset?: PresetId;
+  /** informational; manifests rendered by older builds may carry retired ids (chat-gif, …) */
+  preset?: PresetId | (string & {});
   target?: Target;
 }
 
@@ -200,7 +208,8 @@ export interface Check {
 export interface Report {
   rulesVersion: string;
   format: string;
-  target: Target;
+  /** a discordlint target; a newer server may report a tier this build does not know */
+  target: Target | (string & {});
   bytes: number;
   limit: number;
   width: number;

@@ -43,12 +43,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-cache")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"tools": versions,
-		"limits": map[string]int64{
-			"emote":      discordlint.Limit(discordlint.TargetEmote),
-			"sticker":    discordlint.Limit(discordlint.TargetSticker),
-			"attachment": discordlint.Limit(discordlint.TargetAttachment),
-		},
+		"tools":          versions,
+		"targets":        targetNames(),
+		"limits":         targetLimits(),
 		"rulesVersion":   discordlint.RulesVersion,
 		"version":        s.cfg.Version,
 		"concurrency":    conc,
@@ -56,6 +53,46 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"formats":        outputFormats(),
 		"features":       features(),
 	})
+}
+
+// targetNames lists every Discord target recipe.Output.Target accepts, in
+// the linter's display order (emote, sticker, then the attachment tiers by
+// cap) — the order a UI dropdown should use, which the limits map cannot
+// carry.
+func targetNames() []string {
+	ts := discordlint.Targets()
+	names := make([]string, len(ts))
+	for i, t := range ts {
+		names[i] = string(t)
+	}
+	return names
+}
+
+// targetLimits maps every Discord target to its byte cap: the emote and
+// sticker caps plus one entry per attachment tier.
+func targetLimits() map[string]int64 {
+	ts := discordlint.Targets()
+	limits := make(map[string]int64, len(ts))
+	for _, t := range ts {
+		limits[string(t)] = discordlint.Limit(t)
+	}
+	return limits
+}
+
+// validateTarget rejects an Output.Target the linter does not know. Neither
+// recipe.Validate nor jobs.Submit checks it, and an unknown string would
+// render with no Discord rules and no cap (while a near miss such as
+// "Emote" is plainly a mistake) and memoise its result under that string,
+// so the API refuses it up front, naming the valid targets.
+func validateTarget(target string) error {
+	if discordlint.Valid(discordlint.Target(target)) {
+		return nil
+	}
+	valid := make([]string, 0, len(discordlint.Targets()))
+	for _, t := range discordlint.Targets() {
+		valid = append(valid, discordlint.Describe(t))
+	}
+	return fmt.Errorf("unknown output.target %q; valid targets: %s; omit it for no Discord target", target, strings.Join(valid, ", "))
 }
 
 // outputFormats lists the recipe.Output formats this build renders, in the
@@ -449,6 +486,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := rec.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, errText(err))
+		return
+	}
+	if err := validateTarget(rec.Output.Target); err != nil {
 		writeError(w, http.StatusBadRequest, errText(err))
 		return
 	}

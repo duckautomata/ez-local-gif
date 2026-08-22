@@ -1,17 +1,8 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
   import { fetchStill, type StillRequest } from '../lib/api';
-  import { ceilMs, fmtNum, fmtSeconds, fmtTimecode, frameAt, frameCount, frameTime } from '../lib/format';
-  import {
-    app,
-    buildOutput,
-    effectiveFPS,
-    effectiveOps,
-    opsApply,
-    previewDuration,
-    recipeOps,
-    sourceFPS,
-  } from '../lib/state.svelte';
+  import { clamp, fmtNum, fmtSeconds, fmtTimecode, frameStart, stillTime } from '../lib/format';
+  import { app, buildOutput, effectiveOps, opsApply, planFPS, planFrames, previewDuration, recipeOps } from '../lib/state.svelte';
   import { StillScheduler, type StillView } from '../lib/still';
   import BackdropToggle from './BackdropToggle.svelte';
   import CropOverlay from './CropOverlay.svelte';
@@ -31,35 +22,36 @@
   const ops = $derived(effectiveOps(app.ops, app.output));
   const duration = $derived(info ? previewDuration(info, ops) : 0);
   const cropMode = $derived(app.ui.cropOpen && !!info && opsApply(app.output));
-  // The displayed / requested time: the scrubber position clamped to the clip
-  // and ceiled to whole ms, which is what the still memo keys on and what
-  // keeps a frame-start time inside its own frame (see ceilMs).
-  const t = $derived(Math.min(ceilMs(Math.min(Math.max(0, app.ui.scrubT), Math.max(0, duration))), Math.max(0, duration)));
 
-  // Frame grid of the plan: the effective output fps (fps op → Output.fps →
-  // source), so stepping lands on the frames the render will contain.
-  const fps = $derived(info ? effectiveFPS(ops, app.output, sourceFPS(info, ops)) : 0);
-  const total = $derived(duration > 0 ? frameCount(duration, fps) : fps > 0 ? 1 : 0);
-  const frame = $derived(fps > 0 ? frameAt(t, fps, total) : 0);
-  const stepSec = $derived(fps > 0 ? 1 / fps : 0.01);
+  // The scrubber is a frame index on the plan's grid (planFPS / planFrames
+  // mirror graph.Plan.FPS / Plan.Frames): i ∈ [0, total − 1], one notch per
+  // frame, so it reaches both ends exactly and can never stop on a phantom
+  // extra step. The still is requested at the middle of the frame
+  // (stillTime) — the server maps t → floor(t × fps), which is robust there —
+  // and the readout shows the frame's start time.
+  const fps = $derived(planFPS(info, ops, app.output));
+  const total = $derived(planFrames(info, ops, app.output));
+  const last = $derived(Math.max(0, total - 1));
   const canStep = $derived(fps > 0 && total > 1);
+  const i = $derived(clamp(Math.round(app.ui.scrubFrame) || 0, 0, last));
+  const shown = $derived(frameStart(i, fps));
+  const t = $derived(stillTime(i, fps));
 
-  // Keep the scrubber inside the (trim/speed dependent) range.
+  // Keep the scrubber inside the (trim / speed / fps dependent) frame range.
   $effect(() => {
-    if (app.ui.scrubT > duration) app.ui.scrubT = duration;
+    if (app.ui.scrubFrame > last) app.ui.scrubFrame = last;
   });
 
-  /** seekFrame moves the scrubber to 1-based frame f (clamped). */
-  function seekFrame(f: number) {
+  /** seekFrame moves the scrubber to 0-based frame idx (clamped). */
+  function seekFrame(idx: number) {
     if (!canStep) return;
-    const clamped = Math.min(Math.max(1, Math.round(f)), total);
-    app.ui.scrubT = Math.min(frameTime(clamped, fps), duration);
+    app.ui.scrubFrame = clamp(Math.round(idx), 0, last);
   }
   function step(delta: number) {
-    seekFrame(frame + delta);
+    seekFrame(i + delta);
   }
 
-  // Arrow keys step frames while the preview (or the scrubber) is focused;
+  // Arrow keys step frames while the scrubber (or the readout) is focused;
   // Shift steps 10, Home/End jump to the ends.
   function onStageKey(e: KeyboardEvent) {
     if (!canStep) return;
@@ -73,10 +65,10 @@
         step(big);
         break;
       case 'Home':
-        seekFrame(1);
+        seekFrame(0);
         break;
       case 'End':
-        seekFrame(total);
+        seekFrame(last);
         break;
       default:
         return;
@@ -136,8 +128,8 @@
   onDestroy(() => still.dispose());
 
   const zoomStyle = $derived(zoom === 'fit' || natural.w === 0 ? '' : `width:${natural.w * zoom}px;max-width:none;`);
-  const position = $derived(canStep ? `${fmtTimecode(t)} · f ${frame} / ${total}` : fmtSeconds(t));
-  const positionText = $derived(canStep ? `frame ${frame} of ${total}, ${fmtTimecode(t)}` : `${fmtSeconds(t)} of ${fmtSeconds(duration)}`);
+  const position = $derived(canStep ? `${fmtTimecode(shown)} · f ${i + 1} / ${total}` : fmtSeconds(shown));
+  const positionText = $derived(canStep ? `frame ${i + 1} of ${total}, ${fmtTimecode(shown)}` : `${fmtSeconds(shown)} of ${fmtSeconds(duration)}`);
 </script>
 
 <section class="card preview">
@@ -189,25 +181,26 @@
 
   <div class="scrub">
     <div class="steps" role="group" aria-label="Step frames">
-      <button type="button" class="sm" onclick={() => seekFrame(1)} disabled={!canStep || frame <= 1} title="First frame (Home)" aria-label="First frame">⏮</button>
-      <button type="button" class="sm" onclick={() => step(-1)} disabled={!canStep || frame <= 1} title="Previous frame (←)" aria-label="Previous frame">◂</button>
-      <button type="button" class="sm" onclick={() => step(1)} disabled={!canStep || frame >= total} title="Next frame (→)" aria-label="Next frame">▸</button>
-      <button type="button" class="sm" onclick={() => seekFrame(total)} disabled={!canStep || frame >= total} title="Last frame (End)" aria-label="Last frame">⏭</button>
+      <button type="button" class="sm" onclick={() => seekFrame(0)} disabled={!canStep || i <= 0} title="First frame (Home)" aria-label="First frame">⏮</button>
+      <button type="button" class="sm" onclick={() => step(-1)} disabled={!canStep || i <= 0} title="Previous frame (←)" aria-label="Previous frame">◂</button>
+      <button type="button" class="sm" onclick={() => step(1)} disabled={!canStep || i >= last} title="Next frame (→)" aria-label="Next frame">▸</button>
+      <button type="button" class="sm" onclick={() => seekFrame(last)} disabled={!canStep || i >= last} title="Last frame (End)" aria-label="Last frame">⏭</button>
     </div>
+    <!-- One notch per plan frame: min 0, max total − 1, step 1. -->
     <input
       type="range"
       min="0"
-      max={Math.max(0, duration)}
-      step={canStep ? stepSec : 0.01}
-      disabled={duration <= 0}
-      bind:value={app.ui.scrubT}
+      max={last}
+      step="1"
+      disabled={!canStep}
+      bind:value={app.ui.scrubFrame}
       onkeydown={onStageKey}
-      aria-label="Scrub time"
+      aria-label="Scrub frames"
       aria-valuetext={positionText}
     />
     <!-- The position readout doubles as the frame stepper: a dedicated
          slider element with no interactive children (← → step one frame,
-         Shift ×10, Home/End first/last — same keys as on the time scrubber). -->
+         Shift ×10, Home/End first/last — same keys as on the range input). -->
     <span
       class="time mono"
       role="slider"
@@ -215,11 +208,11 @@
       aria-label="Preview frame — arrow keys step one frame, Shift for ten, Home/End for the first/last"
       aria-valuemin={1}
       aria-valuemax={Math.max(1, total)}
-      aria-valuenow={Math.max(1, frame)}
+      aria-valuenow={i + 1}
       aria-valuetext={positionText}
       aria-disabled={!canStep}
       onkeydown={onStageKey}
-      title={canStep ? `${fmtSeconds(t)} of ${fmtSeconds(duration)} at ${fmtNum(fps)} fps` : ''}
+      title={canStep ? `${fmtSeconds(shown)} of ${fmtSeconds(duration)} at ${fmtNum(fps)} fps` : ''}
     >
       {position}
       {#if canStep}<span class="muted"> · {fmtTimecode(duration)}</span>{:else if duration > 0}<span class="muted"> / {fmtSeconds(duration)}</span>{/if}
@@ -231,8 +224,8 @@
     {#if !cropMode && info && !opsApply(app.output)}<span>Optimize: the source GIF as-is (ops are not applied)</span>{/if}
     {#if !cropMode && info && opsApply(app.output)}
       <span>
-        preview shows the op stack and output canvas · <kbd>←</kbd> <kbd>→</kbd> on the scrubber or the frame readout step
-        frames · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> renders
+        preview shows the op stack and output canvas · one notch = one output frame · <kbd>←</kbd> <kbd>→</kbd> on the scrubber or
+        the frame readout step frames · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> renders
       </span>
     {/if}
   </div>

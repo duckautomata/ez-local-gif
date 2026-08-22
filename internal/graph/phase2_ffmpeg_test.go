@@ -376,6 +376,121 @@ func TestSequencePixels(t *testing.T) {
 	})
 }
 
+// --- frame counts on the image2 grid -----------------------------------------
+
+// idxSize is the frame size of the index sequences below.
+const idxSize = 16
+
+// writeIndexFrames writes n opaque idxSize-square frames 000001.png …
+// whose red channel is the 1-based frame number (G = 200, B = 0), so the
+// identity of every master frame is one pixel read.
+func writeIndexFrames(t *testing.T, dir string, n int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		img := image.NewNRGBA(image.Rect(0, 0, idxSize, idxSize))
+		for y := 0; y < idxSize; y++ {
+			for x := 0; x < idxSize; x++ {
+				img.SetNRGBA(x, y, color.NRGBA{R: uint8(i), G: 200, A: 255})
+			}
+		}
+		f, err := os.Create(filepath.Join(dir, fmt.Sprintf("%06d.png", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := png.Encode(f, img); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// indexSeqInfo is what probe.ProbeSequence reports for an n-frame index
+// sequence uploaded at delayMS per frame.
+func indexSeqInfo(n, delayMS int) recipe.ProbeInfo {
+	fps := graph.SequenceFPS(delayMS)
+	return recipe.ProbeInfo{
+		Format: "image2", Codec: "png", PixFmt: "rgb24", Bits: 8,
+		Width: idxSize, Height: idxSize, FPS: fps, Duration: float64(n) / fps, Frames: n,
+		Kind:     recipe.KindSequence,
+		Sequence: &recipe.SequenceInfo{Count: n, Pattern: "%06d.png", DelayMS: delayMS},
+	}
+}
+
+// indexOf returns the 1-based source frame number an index-sequence master
+// frame was made from.
+func indexOf(frame []byte) int {
+	return int(pixel(frame, idxSize, idxSize/2, idxSize/2)[0])
+}
+
+// TestSequenceFrameCountsMatchFFmpeg is contract B against the real binary:
+// Plan.Frames for an image sequence is exactly what the master render
+// yields, with the frames the trim selects on the image2 grid. The review's
+// case first: a 34-frame sequence at 33 ms (30.303 fps) renders 34 frames,
+// whether probed at 33 ms or retimed from 100 ms by a delay op. Then the
+// grid rounding of trim bounds (ffmpeg rescales -ss/-to into the one-frame
+// timebase to the nearest frame) and the speed/fps end-timestamp rules
+// (see graph.sequenceFrames).
+func TestSequenceFrameCountsMatchFFmpeg(t *testing.T) {
+	ff := ffmpegOrSkip(t)
+	dir := t.TempDir()
+	const n = 34
+	writeIndexFrames(t, dir, n)
+	out := recipe.Output{Format: "webp"}
+	trim := func(start, end float64) recipe.Op {
+		return recipe.Op{Kind: recipe.OpTrim, Params: []byte(fmt.Sprintf(`{"start":%v,"end":%v}`, start, end))}
+	}
+	cases := []struct {
+		name    string
+		delayMS int // probed delay
+		ops     []recipe.Op
+		frames  int // expected master frames == Plan.Frames
+		first   int // 1-based source frame of master frame 0
+		inOrder bool
+	}{
+		{"34 frames at 33 ms render 34 master frames", 33, nil, 34, 1, true},
+		{"probed at 100 ms and retimed to 33 ms by the delay op", 100, []recipe.Op{{Kind: recipe.OpDelay, Params: []byte(`{"ms":33}`)}}, 34, 1, true},
+		{"trim from the frame-index scrubber on the 33 ms grid: frames 4..7", 33, []recipe.Op{trim(3/30.303, 7/30.303)}, 4, 4, true},
+		{"to the end from the last frame's start on the 33 ms grid", 33, []recipe.Op{trim(33/30.303, 0)}, 1, 34, true},
+		{"mid-frame end rounds to the nearest frame: 0..0.11 s at 25 fps is 3 frames", 40, []recipe.Op{trim(0, 0.11)}, 3, 1, true},
+		{"0..0.09 s at 25 fps is 2 frames", 40, []recipe.Op{trim(0, 0.09)}, 2, 1, true},
+		{"both bounds mid-frame: 0.06..0.11 s at 25 fps is frame 3 alone", 40, []recipe.Op{trim(0.06, 0.11)}, 1, 3, true},
+		{"start rounds down: 0.03..0.11 s at 25 fps is frames 2..3", 40, []recipe.Op{trim(0.03, 0.11)}, 2, 2, true},
+		{"to the end from 3.3 s at 10 fps: the last frame", 100, []recipe.Op{trim(3.3, 0)}, 1, 34, true},
+		// setpts=PTS/2 gives frames 1 and 2 the same timestamp and the fps
+		// stage keeps the later one, so master frame 0 is source frame 2.
+		{"speed 2 halves 34 frames to 17", 100, []recipe.Op{{Kind: recipe.OpSpeed, Params: []byte(`{"factor":2}`)}}, 17, 2, false},
+		{"speed truncates the end: 7 frames at speed 2 resampled to 20 fps are 6", 100, []recipe.Op{trim(0, 0.7), {Kind: recipe.OpSpeed, Params: []byte(`{"factor":2}`)}, {Kind: recipe.OpFPS, Params: []byte(`{"fps":20}`)}}, 6, 2, false},
+		{"fps 25 from 10 fps: floor(34 * 2.5) = 85", 100, []recipe.Op{{Kind: recipe.OpFPS, Params: []byte(`{"fps":25}`)}}, 85, 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := compile(t, indexSeqInfo(n, tc.delayMS), tc.ops, out)
+			if p.Frames != tc.frames {
+				t.Errorf("plan Frames = %d, want %d (args %q)", p.Frames, tc.frames, p.InputArgs)
+			}
+			frames := renderFrames(t, ff, dir, p)
+			if len(frames) != tc.frames {
+				t.Fatalf("master has %d frames, want %d (plan %d; args %q filter %s)", len(frames), tc.frames, p.Frames, p.InputArgs, p.Filter)
+			}
+			if got := indexOf(frames[0]); got != tc.first {
+				t.Errorf("master frame 0 is source frame %d, want %d (args %q)", got, tc.first, p.InputArgs)
+			}
+			if tc.inOrder {
+				for i, f := range frames {
+					if got := indexOf(f); got != tc.first+i {
+						t.Errorf("master frame %d is source frame %d, want %d", i, got, tc.first+i)
+					}
+				}
+			}
+			if got := float64(len(frames)) / p.FPS; got > p.Duration+1e-9 {
+				t.Errorf("%d frames at %v fps = %v s exceed the planned duration %v s", len(frames), p.FPS, got, p.Duration)
+			}
+		})
+	}
+}
+
 // --- AVIF with a separate alpha stream ---------------------------------------
 
 // hasCodec reports whether `ffmpeg -encoders|-decoders` lists name.

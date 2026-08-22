@@ -213,7 +213,7 @@ func TestStillArgs(t *testing.T) {
 			name: "no trim, unknown duration: seek follows t unclamped",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
-				p.TrimStart, p.TrimEnd, p.Duration = 0, 0, 0
+				p.TrimStart, p.TrimEnd, p.Duration, p.Frames = 0, 0, 0, 0
 			},
 			t: 12.25, maxW: 480,
 			want: append([]string{"-ss", "12.08"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
@@ -242,7 +242,7 @@ func TestStillArgs(t *testing.T) {
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
 				p.Filter = "[0:v]fps=33.333,format=rgba[out]"
-				p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS = 0, 0, 4, 33.333, 30
+				p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS, p.Frames = 0, 0, 4, 33.333, 30, 133
 			},
 			t: 4, maxW: 480,
 			want: append([]string{"-ss", "3.840038"},
@@ -255,7 +255,7 @@ func TestStillArgs(t *testing.T) {
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
 				p.Filter = "[0:v]fps=4,format=rgba[out]"
-				p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS = 0, 0, 4, 4, 30
+				p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS, p.Frames = 0, 0, 4, 4, 30, 16
 			},
 			t: 4, maxW: 480,
 			want: append([]string{"-ss", "3.5"},
@@ -360,7 +360,7 @@ func TestStillArgsFromStart(t *testing.T) {
 		p := testPlan()
 		p.InputArgs = nil
 		p.Filter = "[0:v]fps=10,format=rgba[out]"
-		p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS = 0, 0, 3, 10, 100.0/27
+		p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS, p.Frames = 0, 0, 3, 10, 100.0/27, 30
 		got := StillArgsFromStart(src, p, 2.5, 480)
 		want := stillTail(stillFilter("[0:v]fps=10,format=rgba[out]", "3.5", "2.45", alphaScale480))
 		assertArgs(t, got, want)
@@ -400,6 +400,11 @@ func TestStillSeekInvariants(t *testing.T) {
 		{"slow motion 0.25, 29.97 source, 10 fps", graph.Plan{FPS: 10, SourceFPS: 29.97, Duration: 40, Speed: 0.25}},
 		{"unknown source fps and duration", graph.Plan{FPS: 15, Speed: 1}},
 		{"low fps 2, source 5", graph.Plan{FPS: 2, SourceFPS: 5, Duration: 10, Speed: 1}},
+		// A plan that knows its frame count caps at Frames-1, which can be
+		// below floor(Duration*FPS)-1: 7 sequence frames at speed 2 resampled
+		// to 20 fps are 6 master frames, not 7.
+		{"sequence 7 frames, speed 2, 20 fps: 6 frames", graph.Plan{FPS: 20, SourceFPS: 10, Duration: 0.35, Frames: 6, Speed: 2}},
+		{"sequence 34 frames at 33 ms", graph.Plan{FPS: 30.303, SourceFPS: 30.303, Duration: 34 / 30.303, Frames: 34, Speed: 1}},
 	}
 	for _, pl := range plans {
 		t.Run(pl.name, func(t *testing.T) {
@@ -436,17 +441,23 @@ func TestStillSeekInvariants(t *testing.T) {
 				}
 				// The wanted slot (relative to the seek) is between the threshold
 				// and threshold + one slot, and the pad reaches it. The absolute
-				// slot is capped at the render's last slot: the fps stage runs
-				// round=down, so slots end at floor(Duration*FPS) - 1.
+				// slot is capped at the render's last slot: Frames-1 when the
+				// plan knows its count, else floor(Duration*FPS) - 1 (the fps
+				// stage runs round=down).
 				abs := math.Floor((target-trimStart)/speed*p.FPS + stillSlotEpsilon)
 				durOut := p.Duration
 				if durOut <= 0 && p.TrimEnd > 0 {
 					durOut = (p.TrimEnd - trimStart) / speed
 				}
-				if durOut > 0 {
-					if last := math.Floor(durOut*p.FPS+stillSlotEpsilon) - 1; last >= 0 && abs > last {
-						abs = last
-					}
+				last := -1.0
+				switch {
+				case p.Frames > 0:
+					last = float64(p.Frames) - 1
+				case durOut > 0:
+					last = math.Floor(durOut*p.FPS+stillSlotEpsilon) - 1
+				}
+				if last >= 0 && abs > last {
+					abs = last
 				}
 				want := abs - math.Round(slots)
 				if want < 0 {
@@ -481,6 +492,41 @@ func TestStillSeekInvariants(t *testing.T) {
 		if s.start != 0 || s.threshold != 0 || s.pad != stillPadSlack {
 			t.Errorf("t=%v: got %+v", tt, s)
 		}
+	}
+}
+
+// TestStillSeekCapsAtPlanFrames: when the plan knows its frame count the
+// still never selects a slot past Frames-1, even where floor(Duration*FPS)
+// would allow one — 7 sequence frames at speed 2 resampled to 20 fps last
+// 0.35 s but render 6 frames (the speed stage truncates the end timestamp),
+// so t = 0.34 (slot 6 by the clock) must show slot 5, the last frame.
+func TestStillSeekCapsAtPlanFrames(t *testing.T) {
+	p := graph.Plan{FPS: 20, SourceFPS: 10, Duration: 0.35, Frames: 6, Speed: 2}
+	// Seek-back max(2/10, 0.1) + one slot (0.1 s source) = 0.3 s before the
+	// target 0.68 s → 0.38 → snapped to 3 slots = 0.3 s; slot 5 - 3 = 2 →
+	// threshold 1.5/20 = 0.075, pad 2/20 + 1 = 1.1.
+	s := stillSeekFor(&p, 0.34, false)
+	if math.Abs(s.start-0.3) > 1e-9 || math.Abs(s.threshold-0.075) > 1e-9 || math.Abs(s.pad-1.1) > 1e-9 {
+		t.Errorf("t=0.34: got %+v, want start 0.3 threshold 0.075 pad 1.1 (slot 5, the plan's last frame)", s)
+	}
+	// From the start: the same absolute slot 5 → threshold 4.5/20.
+	if fs := stillSeekFor(&p, 0.34, true); math.Abs(fs.threshold-0.225) > 1e-9 {
+		t.Errorf("from start: got %+v, want threshold 0.225", fs)
+	}
+	// The frame-index scrubber's midpoints land on their own slots: 5.5/20
+	// (target 0.55 s, seek 0.25 → 2 slots = 0.2 s) → slot 5 = 3 after the
+	// seek; 4.5/20 (target 0.45, seek 0.15 → 1 slot = 0.1 s) → slot 4 = 3
+	// after the seek. Both: threshold 2.5/20, pad 3/20 + 1.
+	if s := stillSeekFor(&p, 5.5/20, false); math.Abs(s.start-0.2) > 1e-9 || math.Abs(s.threshold-0.125) > 1e-9 || math.Abs(s.pad-1.15) > 1e-9 {
+		t.Errorf("t=5.5/20: got %+v, want start 0.2 threshold 0.125 pad 1.15", s)
+	}
+	if s := stillSeekFor(&p, 4.5/20, false); math.Abs(s.start-0.1) > 1e-9 || math.Abs(s.threshold-0.125) > 1e-9 || math.Abs(s.pad-1.15) > 1e-9 {
+		t.Errorf("t=4.5/20: got %+v, want start 0.1 threshold 0.125 pad 1.15", s)
+	}
+	// Without a frame count the old floor cap applies: slot 6 stays.
+	p.Frames = 0
+	if s := stillSeekFor(&p, 0.34, false); math.Abs(s.threshold-0.125) > 1e-9 {
+		t.Errorf("no Frames: got %+v, want threshold 0.125 (slot 6)", s)
 	}
 }
 

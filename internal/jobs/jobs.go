@@ -333,7 +333,7 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames"
 // flags, lint fixes); discordlint.RulesVersion is folded in automatically so
 // rule changes invalidate results too. Recipes themselves keep their
 // content hash (recipe.Recipe.Hash) — only the on-disk result key changes.
-const PipelineVersion = "2026-08-19.3"
+const PipelineVersion = "2026-08-21.1"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what

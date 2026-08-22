@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/gif"
@@ -418,6 +419,119 @@ func TestStillFromStartReachesHeldFrame(t *testing.T) {
 				t.Errorf("t=%v %s: master frame %d, want %d", tt, name, got, want)
 			}
 		}
+	}
+}
+
+// indexSequence writes n opaque 16x16 PNG frames 000001.png … into dir whose
+// red channel is the 1-based frame number, and returns the probe info for
+// the sequence at delayMS per frame.
+func indexSequence(t *testing.T, dir string, n, delayMS int) recipe.ProbeInfo {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+		for y := 0; y < 16; y++ {
+			for x := 0; x < 16; x++ {
+				img.SetNRGBA(x, y, color.NRGBA{R: uint8(i), G: 200, A: 255})
+			}
+		}
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%06d.png", i)), buf.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fps := graph.SequenceFPS(delayMS)
+	return recipe.ProbeInfo{
+		Format: "image2", Codec: "png", PixFmt: "rgb24", Bits: 8,
+		Width: 16, Height: 16, FPS: fps, Duration: float64(n) / fps, Frames: n,
+		Kind:     recipe.KindSequence,
+		Sequence: &recipe.SequenceInfo{Count: n, Pattern: "%06d.png", DelayMS: delayMS},
+	}
+}
+
+// TestStillReachesLastFrameOfSequence is contract A on image sequences: a
+// still at the midpoint of the last frame, (N-0.5)/FPS with N = Plan.Frames,
+// is the render's last frame, the midpoint before it is the frame before,
+// and a t at the very end of the clip is capped at the last frame — also
+// when Frames is below floor(Duration*FPS) because the speed stage
+// truncated the end timestamp, and for a window trimmed on the grid.
+//
+// The speed + resample case is exact for StillArgsFromStart only: setpts
+// truncation pairs source frames (0,1), (2,3), … from the decode origin,
+// and the seeking StillArgs starts the pairing at its seek point, which is
+// a whole number of output slots — one source frame at speed 2 → 20 fps —
+// so an odd seek shows the pair's other frame. A known limitation of the
+// seeking still (speed != 1 combined with an fps change); it must still
+// return a frame.
+func TestStillReachesLastFrameOfSequence(t *testing.T) {
+	ff := ffmpegOrSkip(t)
+	dir := t.TempDir()
+	info := indexSequence(t, dir, 34, 100)
+	cases := []struct {
+		name      string
+		ops       []recipe.Op
+		frames    int
+		first     int // 1-based source frame of master frame 0
+		seekExact bool
+	}{
+		{"34 frames retimed to 33 ms", []recipe.Op{op(recipe.OpDelay, recipe.DelayParams{MS: 33})}, 34, 1, true},
+		{"trimmed from the scrubber: frames 4..7 at 33 ms", []recipe.Op{op(recipe.OpDelay, recipe.DelayParams{MS: 33}), op(recipe.OpTrim, recipe.TrimParams{Start: 3 / 30.303, End: 7 / 30.303})}, 4, 4, true},
+		{"7 frames at speed 2: 3 master frames (sources 2, 4, 6)", []recipe.Op{op(recipe.OpTrim, recipe.TrimParams{Start: 0, End: 0.7}), op(recipe.OpSpeed, recipe.SpeedParams{Factor: 2})}, 3, 2, true},
+		{"7 frames at speed 2 resampled to 20 fps: 6 master frames", []recipe.Op{op(recipe.OpTrim, recipe.TrimParams{Start: 0, End: 0.7}), op(recipe.OpSpeed, recipe.SpeedParams{Factor: 2}), op(recipe.OpFPS, recipe.FPSParams{FPS: 20})}, 6, 2, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := compile(t, info, tc.ops, recipe.Output{Format: "webp"})
+			if p.Frames != tc.frames {
+				t.Fatalf("plan Frames = %d, want %d", p.Frames, tc.frames)
+			}
+			frames := renderMaster(t, ff, dir, p)
+			if len(frames) != tc.frames {
+				t.Fatalf("master has %d frames, want %d", len(frames), tc.frames)
+			}
+			if got := int(frames[0][0]); got != tc.first {
+				t.Errorf("master frame 0 is source frame %d, want %d", got, tc.first)
+			}
+			// Frames are compared by the source frame they carry (the red
+			// channel): an fps resample can leave the last two master frames
+			// as copies of one source frame, and the still of either must be
+			// that frame.
+			n := float64(p.Frames)
+			for _, tt := range []struct {
+				t    float64
+				want int // master frame index
+			}{
+				{(n - 0.5) / p.FPS, p.Frames - 1},
+				{(n - 1.5) / p.FPS, p.Frames - 2},
+				{p.Duration, p.Frames - 1},
+				{p.Duration + 3, p.Frames - 1},
+				{0.5 / p.FPS, 0},
+				{0, 0},
+			} {
+				wantSrc := int(frames[tt.want][0])
+				for name, args := range map[string][]string{"seek": enc.StillArgs(dir, p, tt.t, 0), "from start": enc.StillArgsFromStart(dir, p, tt.t, 0)} {
+					data := run(t, ff, args)
+					if len(data) == 0 {
+						t.Errorf("t=%v %s: no image (args %q)", tt.t, name, args)
+						continue
+					}
+					img := decodePNG(t, data)
+					if bytes.Equal(img.Pix, frames[tt.want]) {
+						continue
+					}
+					if name == "seek" && !tc.seekExact {
+						t.Logf("t=%v seek: source frame %d, the render shows %d (pairing differs after the seek; from-start is exact)", tt.t, img.Pix[0], wantSrc)
+						continue
+					}
+					t.Errorf("t=%v %s: still is source frame %d (master frame %d), want source frame %d (master frame %d; args %q)", tt.t, name, img.Pix[0], frameIndex(frames, img), wantSrc, tt.want, args)
+				}
+			}
+			if bytes.Equal(frames[p.Frames-1], frames[p.Frames-2]) {
+				t.Logf("the last two master frames both carry source frame %d (fps resample); the (N-1.5)/FPS check is the same frame", frames[p.Frames-1][0])
+			}
+		})
 	}
 }
 

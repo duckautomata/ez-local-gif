@@ -27,9 +27,13 @@ import (
 //
 // Only the geometry/timing part of out (Format, Width, Height, Fit, FPS) is
 // used, so quality-knob changes never invalidate the memo. t is an output
-// (preview) time; it is clamped to the plan's duration (to 0 for a still
-// source, whose only frame is at 0 whatever t the scrubber sends) and
-// enc.StillArgs maps it to source time.
+// (preview) time showing frame floor(t*FPS) of the plan: it is clamped to
+// the last frame's midpoint (Frames-0.5)/FPS — or the plan's duration when
+// the frame count is unknown, or 0 for a still source, whose only frame is
+// at 0 whatever t the scrubber sends — and enc.StillArgs maps it to source
+// time. A scrubber that addresses frames by index therefore asks for the
+// midpoint (i+0.5)/FPS, which is robust to rounding on both sides and, for
+// the last frame, yields that frame rather than an error or its predecessor.
 //
 // Rendering a still counts as using the source: the blob is touched so the
 // store's sweeper measures its TTL from the last use.
@@ -97,11 +101,16 @@ func stillOutput(out recipe.Output) recipe.Output {
 	}
 }
 
-// clampStillTime bounds t to [0, plan.Duration] (when the duration is known)
-// and rounds it to milliseconds so scrub positions collapse onto memo keys.
-// A still source (or a plan with a single frame) has its only frame at 0, so
-// every t maps there: the plan's duration is 0 for stills and would not
-// clamp, and a seek past the one frame would yield no image.
+// clampStillTime bounds t to [0, (Frames-0.5)/FPS] — the midpoint of the
+// plan's last frame — when the frame count is known (every later t shows
+// that same frame, so they collapse onto one memo entry and none can land
+// past the render's last slot), else to [0, plan.Duration] when only the
+// duration is, and rounds it to milliseconds so scrub positions collapse
+// onto memo keys (half a millisecond never crosses a frame boundary from a
+// midpoint: frames are >= 16.7 ms at the 60 fps cap). A still source (or a
+// plan with a single frame) has its only frame at 0, so every t maps there:
+// the plan's duration is 0 for stills and would not clamp, and a seek past
+// the one frame would yield no image.
 func clampStillTime(plan *graph.Plan, t float64, still bool) float64 {
 	if still || plan.Frames == 1 {
 		return 0
@@ -109,7 +118,12 @@ func clampStillTime(plan *graph.Plan, t float64, still bool) float64 {
 	if t < 0 || t != t { // negative or NaN
 		t = 0
 	}
-	if plan.Duration > 0 && t > plan.Duration {
+	switch {
+	case plan.Frames > 1 && plan.FPS > 0:
+		if last := (float64(plan.Frames) - 0.5) / plan.FPS; t > last {
+			t = last
+		}
+	case plan.Duration > 0 && t > plan.Duration:
 		t = plan.Duration
 	}
 	return float64(int64(t*1000+0.5)) / 1000

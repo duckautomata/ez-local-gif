@@ -173,7 +173,7 @@
       <span class="row tight">
         <label class="seq small" title="Per-frame delay used when several images are uploaded as a sequence">
           <span class="muted">sequence delay</span>
-          <NumField bind:value={delayMs} min={1} max={60000} small /><span class="muted">ms</span>
+          <NumField bind:value={delayMs} min={1} max={60000} small /><span class="muted">ms{#if seqFps > 0}&nbsp;→ {fmtNum(seqFps)} fps{/if}</span>
         </label>
         <button type="button" class="sm" onclick={openPicker}>Choose file(s)…</button>
       </span>
@@ -193,7 +193,7 @@
       <label class="seq hint" title="Per-frame delay used when several images are uploaded as a sequence">
         <span>Several images (PNG / JPEG / WebP / BMP / TIFF) = one sequence · frame delay</span>
         <NumField bind:value={delayMs} min={1} max={60000} small />
-        <span>ms{#if seqFps > 0}&nbsp;= {fmtNum(seqFps)} fps{/if} (changeable later in the Delay card)</span>
+        <span>ms{#if seqFps > 0}&nbsp;→ {fmtNum(seqFps)} fps{/if} (changeable later in the Delay card)</span>
       </label>
     </div>
   {/if}

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ping } from '../lib/api';
+  import { resetRender } from '../lib/render.svelte';
+  import { resetApp } from '../lib/state.svelte';
 
   // Server reachability: probe /healthz on load, then every 15 s (5 s while
   // offline) so a missing backend is visible before the first request fails.
@@ -21,11 +23,22 @@
       if (timer !== undefined) window.clearTimeout(timer);
     };
   });
+
+  // The logo is the "home" link: back to the empty landing page without a
+  // reload — drop the source, result and in-flight job, default ops and
+  // Output card (App.svelte then syncs the address bar back to '/'). A plain
+  // href keeps middle-click / open-in-new-tab working.
+  function home(e: MouseEvent) {
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    resetRender();
+    resetApp();
+  }
 </script>
 
 <header class="hdr">
   <div class="brand">
-    <span class="logo" aria-hidden="true">GIF</span>
+    <a class="logo" href="/" onclick={home} title="Start over — back to the empty page" aria-label="ez-local-gif: start over with an empty page">GIF</a>
     <div>
       <h1>ez-local-gif</h1>
       <p class="tag">Discord-safe GIF / WebP / APNG / AVIF from ProRes, video, animations and image sequences — rendered locally</p>
@@ -64,6 +77,17 @@
     font-weight: 700;
     font-size: 13px;
     letter-spacing: 0.02em;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .logo:hover {
+    background: var(--accent-hover);
+    text-decoration: none;
+  }
+  .logo:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
   }
   h1 {
     font-size: 17px;

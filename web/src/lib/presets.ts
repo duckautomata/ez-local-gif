@@ -1,23 +1,76 @@
-// Discord presets and limits (docs/DESIGN.md §5.1, §5.4, §9a).
+// Discord presets, targets and limits (docs/DESIGN.md §5.1, §5.4, §9a).
 
 import type { Dither, FitMode, FrameFormat, OutputFormat, PresetId, ProbeInfo, Target } from './api';
 
-/** Byte caps per Discord target, mirroring discordlint.Limit. */
-export const LIMITS: Record<Target, number> = {
-  '': 0,
-  emote: 262_144,
-  sticker: 524_288,
-  attachment: 20 * 1000 * 1000,
-};
+/**
+ * TargetDef is one row of the Discord-target table, mirroring
+ * internal/discordlint (Target constants, Limit, IsAttachment). The four
+ * attachment tiers share every rule and differ only in the byte cap:
+ * 20 MB free, 50 MB Nitro Basic or a Level-2 boosted server, 100 MB a
+ * Level-3 boosted server, 500 MB Nitro (DESIGN §5.1).
+ */
+export interface TargetDef {
+  id: Target;
+  /** option text of the "Discord target" dropdown */
+  label: string;
+  /** prose name ("Discord emote") for notes and the lint report header */
+  name: string;
+  /** hard byte cap; 0 = none */
+  limit: number;
+  /** true for every attachment tier (discordlint.IsAttachment) */
+  attachment: boolean;
+}
 
-export const TARGET_LABEL: Record<Target, string> = {
-  '': 'No Discord target',
-  emote: 'Discord emote',
-  sticker: 'Discord sticker',
-  attachment: 'Discord attachment (free tier)',
-};
+export const TARGET_DEFS: readonly TargetDef[] = [
+  { id: '', label: 'none — structural checks only', name: 'No Discord target', limit: 0, attachment: false },
+  { id: 'emote', label: 'emote — 256 KiB, 128×128', name: 'Discord emote', limit: 262_144, attachment: false },
+  { id: 'sticker', label: 'sticker — 512 KiB, 320×320, ≤ 5 s', name: 'Discord sticker', limit: 524_288, attachment: false },
+  { id: 'attachment', label: 'attachment — free, 20 MB', name: 'Discord attachment (free, 20 MB)', limit: 20_000_000, attachment: true },
+  {
+    id: 'attachment-50',
+    label: 'attachment — Nitro Basic / Level-2 server, 50 MB',
+    name: 'Discord attachment (Nitro Basic / Level-2 server, 50 MB)',
+    limit: 50_000_000,
+    attachment: true,
+  },
+  { id: 'attachment-100', label: 'attachment — Level-3 server, 100 MB', name: 'Discord attachment (Level-3 server, 100 MB)', limit: 100_000_000, attachment: true },
+  { id: 'attachment-500', label: 'attachment — Nitro, 500 MB', name: 'Discord attachment (Nitro, 500 MB)', limit: 500_000_000, attachment: true },
+];
 
-export const TARGETS: Target[] = ['', 'emote', 'sticker', 'attachment'];
+/** Every target id, in dropdown order. */
+export const TARGETS: readonly Target[] = TARGET_DEFS.map((t) => t.id);
+
+/** Byte caps per Discord target, mirroring discordlint.Limit (0 = none). */
+export const LIMITS: Record<Target, number> = Object.fromEntries(TARGET_DEFS.map((t) => [t.id, t.limit])) as Record<Target, number>;
+
+/** Prose names per target ("Discord emote"). */
+export const TARGET_LABEL: Record<Target, string> = Object.fromEntries(TARGET_DEFS.map((t) => [t.id, t.name])) as Record<Target, string>;
+
+/** targetDef looks a target up (null for an id this build does not know). */
+export function targetDef(t: string | null | undefined): TargetDef | null {
+  return TARGET_DEFS.find((d) => d.id === (t ?? '')) ?? null;
+}
+
+/** targetLabel is the prose name of a target; an unknown id (newer server) is shown as-is. */
+export function targetLabel(t: string | null | undefined): string {
+  return targetDef(t)?.name ?? `Discord target "${t}"`;
+}
+
+/** limitOf is the byte cap of a target (0 for none / unknown) — discordlint.Limit. */
+export function limitOf(t: string | null | undefined): number {
+  return targetDef(t)?.limit ?? 0;
+}
+
+/** isAttachmentTarget mirrors discordlint.IsAttachment: any of the attachment tiers. */
+export function isAttachmentTarget(t: string | null | undefined): boolean {
+  return targetDef(t)?.attachment ?? false;
+}
+
+/** limitKiB is the cap in whole KiB (0 = none) — what "Fit to ≤ … KiB = limit" uses. */
+export function limitKiB(t: string | null | undefined): number {
+  const b = limitOf(t);
+  return b > 0 ? Math.floor(b / 1024) : 0;
+}
 
 export const FORMAT_LABEL: Record<OutputFormat, string> = {
   gif: 'GIF',
@@ -27,6 +80,21 @@ export const FORMAT_LABEL: Record<OutputFormat, string> = {
   png: 'PNG (static)',
   jpeg: 'JPEG (static)',
   frames: 'Frames (zip + grid)',
+};
+
+/**
+ * FORMAT_HINT is the one-line note shown under the quality knobs of a
+ * format when the preset has nothing more specific to say (presets may
+ * override per format via formatHints). Verified-on-Discord facts only.
+ */
+export const FORMAT_HINT: Record<OutputFormat, string> = {
+  gif: '1-bit alpha: soft edges are cut against the matte (Advanced). Plays everywhere.',
+  webp: 'libwebp_anim, 8-bit alpha, no metadata. q 80 blurs fine texture — raise it or go lossless for detailed art.',
+  apng: 'Indexed APNG: one palette with 8-bit alpha (pngquant) — soft edges at a fraction of the RGBA size; verified at 25 fps as a sticker.',
+  avif: 'avifenc, alpha q 90, 4:2:0 — soft alpha verified on Discord attachments (Discord transcodes to WebP; large files take a few seconds to appear).',
+  png: 'First frame as RGBA PNG: pngquant to the palette when set, then oxipng — no fit search for a static PNG.',
+  jpeg: 'First frame, no alpha: transparent areas are flattened onto the matte (Advanced).',
+  frames: 'One file per frame after the op stack, plus frames.zip (stored) and delays.json; the result shows a thumbnail grid.',
 };
 
 export const FRAME_FORMATS: { id: FrameFormat; label: string }[] = [
@@ -87,19 +155,16 @@ export function fitsFormat(f: OutputFormat): boolean {
   return FIT_FORMATS.has(f);
 }
 
-/** Fit budgets in KiB per Discord target (the hard caps; the engine keeps a 1–2 % margin). */
-export const FIT_KIB: Record<Target, number> = {
-  '': 256,
-  emote: 256,
-  sticker: 512,
-  attachment: 8192,
-};
+/** DEFAULT_FIT_KIB is the budget offered when fit is switched on with no Discord target. */
+export const DEFAULT_FIT_KIB = 256;
 
-export interface PresetSwap {
-  format: OutputFormat;
-  label: string;
-  hint: string;
+/** fitKiBFor is the default fit budget for a target: its cap in KiB, or DEFAULT_FIT_KIB with no target. */
+export function fitKiBFor(t: string | null | undefined): number {
+  return limitKiB(t) || DEFAULT_FIT_KIB;
 }
+
+/** Fit budgets in KiB per Discord target (the hard caps; the engine keeps a 1–2 % margin). */
+export const FIT_KIB: Record<Target, number> = Object.fromEntries(TARGET_DEFS.map((t) => [t.id, fitKiBFor(t.id)])) as Record<Target, number>;
 
 export interface PresetDef {
   id: PresetId;
@@ -110,10 +175,14 @@ export interface PresetDef {
   locksSize: boolean;
   /** Formats offered in the Format select while this preset is active (the first is the preset default). */
   formats: readonly OutputFormat[];
-  /** A prominent one-click alternative format ("WebP instead"). */
-  swap?: PresetSwap;
+  /** The Discord target the preset starts with — the dropdown stays editable. */
+  target: Target;
   /** The op stack (trim/crop/…) applies. Optimize works on the GIF bytes directly and sends no ops. */
   usesOps: boolean;
+  /** One-line notes per format shown under the quality knobs (fall back to FORMAT_HINT). */
+  formatHints?: Partial<Record<OutputFormat, string>>;
+  /** onFormat re-seeds the format's quality defaults when the user switches the Format select within the preset. */
+  onFormat?(o: OutputCfg, format: OutputFormat): void;
   /** available reports whether the preset can be used with this source (default: always). */
   available?(info: ProbeInfo | null): boolean;
   unavailableHint?: string;
@@ -144,15 +213,44 @@ function setFit(o: OutputCfg, enabled: boolean, kib?: number, keepSize = false, 
   o.fitKeepFps = keepFps;
 }
 
+/**
+ * chatFormat seeds the quality-first chat defaults of a format: GIF
+ * sierra2_4a + lossy 20, WebP q 80, AVIF q 60 (the former chat-gif /
+ * chat-webp / chat-avif presets).
+ */
+function chatFormat(o: OutputCfg, format: OutputFormat): void {
+  switch (format) {
+    case 'gif':
+      o.colors = 256;
+      o.dither = 'sierra2_4a';
+      o.lossy = 20;
+      break;
+    case 'webp':
+      o.quality = 80;
+      o.lossless = false;
+      break;
+    case 'avif':
+      o.quality = 60;
+      o.lossless = false;
+      break;
+  }
+}
+
 export const PRESETS: PresetDef[] = [
   {
     id: 'emote',
     label: 'Emote',
-    hint: '128×128, ≤ 256 KiB, fit on. GIF by default (renders everywhere); WebP keeps soft alpha.',
+    hint: '128×128, ≤ 256 KiB, fit on. GIF renders everywhere; WebP keeps soft alpha.',
     locksSize: true,
     formats: ['gif', 'webp', 'avif', 'png'],
-    swap: { format: 'webp', label: 'WebP instead', hint: 'keeps soft edges — verified on Discord' },
+    target: 'emote',
     usesOps: true,
+    formatHints: {
+      gif: 'Universal emote format; 1-bit alpha — pick the matte for your audience’s theme under Advanced.',
+      webp: 'Keeps soft edges — verified on Discord as an animated emoji.',
+      avif: 'Animated AVIF is accepted as an emote (since 2025-05); soft alpha.',
+      png: 'Static emote: pngquant palette + oxipng, fits 256 KiB trivially.',
+    },
     apply(o) {
       o.format = 'gif';
       o.target = 'emote';
@@ -169,12 +267,17 @@ export const PRESETS: PresetDef[] = [
   {
     id: 'sticker',
     label: 'Sticker',
-    hint: '320×320, ≤ 512 KiB, ≤ 5 s, fit on. Indexed 8-bit-alpha APNG by default (best sticker quality, verified); GIF as the fallback.',
+    hint: '320×320, ≤ 512 KiB, ≤ 5 s, fit on (never downscaled). Indexed 8-bit-alpha APNG by default; GIF as the fallback.',
     warn: 'Discord shrinks stickers larger than 320×320 (smaller / non-square are accepted). APNG animates only as a server sticker — in chat it shows frame 0.',
     locksSize: true,
     formats: ['apng', 'gif', 'png'],
-    swap: { format: 'gif', label: 'GIF instead', hint: '1-bit alpha, plays everywhere — verified as a sticker' },
+    target: 'sticker',
     usesOps: true,
+    formatHints: {
+      apng: 'Indexed 8-bit-alpha APNG — best sticker quality, verified at 25 fps; the fit ladder walks 256 → 128 → 64 colours.',
+      gif: '1-bit alpha, plays everywhere — verified as a sticker.',
+      png: 'Static sticker: pngquant palette + oxipng.',
+    },
     apply(o) {
       o.format = 'apng';
       o.target = 'sticker';
@@ -189,12 +292,19 @@ export const PRESETS: PresetDef[] = [
     },
   },
   {
-    id: 'chat-gif',
-    label: 'Chat GIF',
-    hint: 'Quality-first GIF attachment (sierra2_4a dither, lossy 20), source size and fps.',
+    id: 'chat',
+    label: 'Chat',
+    hint: 'Chat attachment at the source size and fps, quality first. Pick the format: GIF plays everywhere, WebP / AVIF keep soft alpha.',
     locksSize: false,
     formats: ['gif', 'webp', 'avif'],
+    target: 'attachment',
     usesOps: true,
+    formatHints: {
+      gif: 'sierra2_4a dither, lossy 20 — 1-bit alpha, so pick the matte for your audience’s theme under Advanced.',
+      webp: '8-bit alpha, q 80. Keep it ≤ 480 px wide — Discord’s proxy takes seconds to show bigger animated WebPs.',
+      avif: 'avifenc q 60, alpha q 90 — soft alpha, verified on Discord attachments (transcoded to WebP on upload).',
+    },
+    onFormat: chatFormat,
     apply(o) {
       o.format = 'gif';
       o.target = 'attachment';
@@ -202,47 +312,9 @@ export const PRESETS: PresetDef[] = [
       o.height = 0;
       o.fit = 'contain';
       o.fps = 0;
-      o.colors = 256;
-      o.dither = 'sierra2_4a';
-      o.lossy = 20;
-      setFit(o, false);
-    },
-  },
-  {
-    id: 'chat-webp',
-    label: 'Chat WebP',
-    hint: 'Animated WebP attachment with 8-bit alpha (q 80). Keep it ≤ 480 px wide for fast Discord previews.',
-    locksSize: false,
-    formats: ['gif', 'webp', 'avif'],
-    usesOps: true,
-    apply(o) {
-      o.format = 'webp';
-      o.target = 'attachment';
-      o.width = 0;
-      o.height = 0;
-      o.fit = 'contain';
-      o.fps = 0;
-      o.quality = 80;
+      o.quality = 80; // the WebP default; onFormat re-seeds per format on a switch
       o.lossless = false;
-      setFit(o, false);
-    },
-  },
-  {
-    id: 'chat-avif',
-    label: 'Chat AVIF',
-    hint: 'Animated AVIF attachment (avifenc q 60, alpha q 90) — soft alpha, verified on Discord attachments.',
-    locksSize: false,
-    formats: ['gif', 'webp', 'avif'],
-    usesOps: true,
-    apply(o) {
-      o.format = 'avif';
-      o.target = 'attachment';
-      o.width = 0;
-      o.height = 0;
-      o.fit = 'contain';
-      o.fps = 0;
-      o.quality = 60;
-      o.lossless = false;
+      chatFormat(o, 'gif');
       setFit(o, false);
     },
   },
@@ -252,9 +324,11 @@ export const PRESETS: PresetDef[] = [
     hint: 'GIF → GIF with gifsicle only — no decode, no re-quantisation: lossy, colours, dither, frame drop, optional fit.',
     locksSize: true,
     formats: ['gif'],
+    target: '',
     usesOps: false,
     available: (info) => isGifSource(info),
     unavailableHint: 'Optimize needs a GIF source (it edits the file without re-encoding)',
+    formatHints: { gif: 'The source palette is kept (gifsicle --colors only drops entries); no matte or alpha threshold applies.' },
     apply(o) {
       o.format = 'gif';
       o.target = '';
@@ -274,6 +348,7 @@ export const PRESETS: PresetDef[] = [
     hint: 'Extract every frame (after trim / fps / crop / resize) as PNG, JPEG or WebP files plus a zip.',
     locksSize: false,
     formats: ['frames'],
+    target: '',
     usesOps: true,
     apply(o) {
       o.format = 'frames';
@@ -289,9 +364,10 @@ export const PRESETS: PresetDef[] = [
   {
     id: 'custom',
     label: 'Custom',
-    hint: 'Everything editable, including the Discord target used by the linter; with no target the loop count is editable too.',
+    hint: 'Everything editable; with no Discord target the loop count is editable too.',
     locksSize: false,
     formats: ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames'],
+    target: '',
     usesOps: true,
     apply() {
       /* keep the current values */
@@ -299,7 +375,7 @@ export const PRESETS: PresetDef[] = [
   },
 ];
 
-export function presetById(id: PresetId): PresetDef {
+export function presetById(id: PresetId | string): PresetDef {
   return PRESETS.find((p) => p.id === id) ?? PRESETS[PRESETS.length - 1];
 }
 
@@ -313,23 +389,14 @@ export function formatsFor(p: PresetDef, current: OutputFormat): readonly Output
   return p.formats.includes(current) ? p.formats : [...p.formats, current];
 }
 
-/** chatPresetFor maps an animated format to the matching Chat preset chip (null for the rest). */
-export function chatPresetFor(format: OutputFormat): PresetId | null {
-  switch (format) {
-    case 'gif':
-      return 'chat-gif';
-    case 'webp':
-      return 'chat-webp';
-    case 'avif':
-      return 'chat-avif';
-    default:
-      return null;
-  }
+/** formatHint is the one-line note for a format under a preset (the preset's own, else the generic one). */
+export function formatHint(p: PresetDef, format: OutputFormat): string {
+  return p.formatHints?.[format] ?? FORMAT_HINT[format];
 }
 
 export function defaultOutput(): OutputCfg {
   const o: OutputCfg = {
-    preset: 'chat-gif',
+    preset: 'chat',
     format: 'gif',
     target: 'attachment',
     width: 0,
@@ -345,7 +412,7 @@ export function defaultOutput(): OutputCfg {
     lossless: false,
     loop: 0,
     fitEnabled: false,
-    fitKiB: FIT_KIB[''],
+    fitKiB: DEFAULT_FIT_KIB,
     fitKeepSize: false,
     fitKeepFps: false,
     frameFormat: 'png',

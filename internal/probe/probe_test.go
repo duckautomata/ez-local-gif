@@ -12,6 +12,7 @@ import (
 	"image/color"
 	"image/gif"
 	"image/png"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,8 +23,49 @@ import (
 
 	"github.com/duckautomata/ez-local-gif/internal/enc"
 	"github.com/duckautomata/ez-local-gif/internal/ffrun"
+	"github.com/duckautomata/ez-local-gif/internal/graph"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
 )
+
+// TestSequenceTimingAgreesWithGraph: a sequence's probed FPS is the image2
+// rate the render uses (graph.SequenceFPS, 3 decimals), Duration is
+// count/FPS, and graph.Compile of that info plans exactly count frames with
+// the same duration and rate — so Frames, Duration and FPS never disagree
+// by a frame (34 frames at 33 ms are 34, not 33).
+func TestSequenceTimingAgreesWithGraph(t *testing.T) {
+	for _, delay := range []int{1, 3, 6, 7, 17, 33, 40, 41, 99, 100, 250, 333, 999, 1000, 60000} {
+		for _, count := range []int{2, 3, 34, 60, 77, 1818, 5000} {
+			fps, dur := sequenceTiming(count, delay)
+			if fps != graph.SequenceFPS(delay) {
+				t.Errorf("delay %d: fps %v, want graph.SequenceFPS %v", delay, fps, graph.SequenceFPS(delay))
+			}
+			if n := int(math.Floor(dur*fps + 1e-9)); n != count {
+				t.Errorf("delay %d, %d frames: Duration %v * FPS %v floors to %d", delay, count, dur, fps, n)
+			}
+			if fps > 60 {
+				continue // the output caps the rate; Plan.Frames is the capped count
+			}
+			info := recipe.ProbeInfo{
+				Format: sequenceFormat, Codec: "png", PixFmt: "rgba", Bits: 8, Width: 16, Height: 16,
+				FPS: fps, Duration: dur, Frames: count, Kind: recipe.KindSequence,
+				Sequence: &recipe.SequenceInfo{Count: count, Pattern: sequencePattern("png"), DelayMS: delay},
+			}
+			p, err := graph.Compile(info, nil, recipe.Output{Format: "webp"})
+			if err != nil {
+				t.Fatalf("delay %d, %d frames: %v", delay, count, err)
+			}
+			if p.Frames != count || p.Duration != dur || p.SourceFPS != fps || p.FPS != fps {
+				t.Errorf("delay %d, %d frames: plan Frames %d Duration %v SourceFPS %v FPS %v; probe Duration %v FPS %v", delay, count, p.Frames, p.Duration, p.SourceFPS, p.FPS, dur, fps)
+			}
+		}
+	}
+	if fps, dur := sequenceTiming(5, 0); fps != 10 || dur != 0.5 {
+		t.Errorf("default delay: fps %v dur %v, want 10 / 0.5", fps, dur)
+	}
+	if fps, dur := sequenceTiming(34, 33); fps != 30.303 || dur != 34/30.303 {
+		t.Errorf("33 ms: fps %v dur %v, want 30.303 / %v", fps, dur, 34/30.303)
+	}
+}
 
 // mustDerive parses fixture JSON and derives; fatal on error.
 func mustDerive(t *testing.T, raw string) derived {

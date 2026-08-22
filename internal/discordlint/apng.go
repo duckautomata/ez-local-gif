@@ -18,7 +18,7 @@ const (
 	RuleAPNGSizeLimit  = "apng.size-limit"    // error: Bytes <= Limit(target)
 	RuleAPNGSticker    = "apng.sticker"       // sticker: dims > 320 on a side → warn (Discord shrinks); duration <= 5000 ms, frames <= 1000, fps <= 60 → error
 	RuleAPNGNotEmote   = "apng.not-emote"     // error for emote: APNG is not an animated-emoji format
-	RuleAPNGAttachment = "apng.attachment"    // info for attachment: Discord shows only frame 0 of APNG attachments
+	RuleAPNGAttachment = "apng.attachment"    // info for every attachment tier (IsAttachment): Discord shows only frame 0 of APNG attachments
 	RuleAPNGIndexed    = "apng.indexed"       // info (non-blocking): OK only for colour type 3 + PLTE + tRNS — the indexed 8-bit-alpha APNG the sticker default rung produces; detail lists palette size
 )
 
@@ -95,12 +95,12 @@ func (l *apngLinter) run() {
 	l.ruleMinDelay()
 	l.ruleIndexed()
 	l.ruleSizeLimit()
-	switch l.target {
-	case TargetSticker:
+	switch {
+	case l.target == TargetSticker:
 		l.ruleSticker()
-	case TargetEmote:
+	case l.target == TargetEmote:
 		l.ruleNotEmote()
-	case TargetAttachment:
+	case IsAttachment(l.target): // every tier: the rule does not depend on the cap
 		l.ruleAttachment()
 	}
 }
@@ -131,8 +131,9 @@ func (l *apngLinter) ruleContainer() {
 	l.checks.pass(rule, LevelError, detail)
 }
 
-// rulePlays: acTL num_plays must be 0 for Discord targets (a finite count
-// stops the sticker after N plays); TargetNone reports the count.
+// rulePlays: acTL num_plays must be 0 for Discord targets (IsDiscord; a
+// finite count stops the sticker after N plays); TargetNone reports the
+// count.
 func (l *apngLinter) rulePlays() {
 	const rule = RuleAPNGPlays
 	f := l.f
@@ -141,7 +142,7 @@ func (l *apngLinter) rulePlays() {
 		l.checks.pass(rule, LevelError, "plain PNG (no acTL); looping does not apply")
 	case f.actl.numPlays == 0:
 		l.checks.pass(rule, LevelError, "acTL num_plays 0 (loops forever)")
-	case l.target == TargetNone:
+	case !IsDiscord(l.target):
 		l.checks.pass(rule, LevelInfo, fmt.Sprintf("acTL num_plays %d (%s); Discord targets require 0 (loop forever)", f.actl.numPlays, plays(int(f.actl.numPlays))))
 	default:
 		l.checks.fail(rule, LevelError, fmt.Sprintf("acTL num_plays is %d (%s); Discord needs 0 = loop forever — encode with -plays 0", f.actl.numPlays, plays(int(f.actl.numPlays))))
@@ -280,19 +281,10 @@ func (l *apngLinter) ruleIndexed() {
 	l.checks.fail(rule, LevelInfo, desc+"; not an indexed 8-bit-alpha APNG (the sticker default rung)")
 }
 
-// ruleSizeLimit checks the byte count against the target's cap.
+// ruleSizeLimit checks the byte count against the target's cap (the tier's
+// for attachments; nothing for TargetNone).
 func (l *apngLinter) ruleSizeLimit() {
-	const rule = RuleAPNGSizeLimit
-	limit := Limit(l.target)
-	if limit <= 0 {
-		return
-	}
-	size := l.f.size
-	if int64(size) > limit {
-		l.checks.fail(rule, LevelError, fmt.Sprintf("%d bytes exceeds the %d byte limit for %s", size, limit, l.target))
-		return
-	}
-	l.checks.pass(rule, LevelError, fmt.Sprintf("%d of %d bytes", size, limit))
+	l.checks.sizeLimit(RuleAPNGSizeLimit, int64(l.f.size), l.target)
 }
 
 // ruleSticker applies the sticker geometry and timing limits: a side over
@@ -347,6 +339,7 @@ func (l *apngLinter) ruleNotEmote() {
 
 // ruleAttachment: Discord shows only frame 0 of an APNG attachment
 // (verified 2026-08-19), so an animation posted in chat looks like a still.
+// It applies to every attachment tier; the cap plays no part.
 func (l *apngLinter) ruleAttachment() {
 	const rule = RuleAPNGAttachment
 	if l.f.animated() {

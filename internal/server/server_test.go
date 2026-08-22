@@ -231,6 +231,7 @@ func TestCapabilities(t *testing.T) {
 	}
 	var caps struct {
 		Tools          map[string]string `json:"tools"`
+		Targets        []string          `json:"targets"`
 		Limits         map[string]int64  `json:"limits"`
 		RulesVersion   string            `json:"rulesVersion"`
 		Version        string            `json:"version"`
@@ -245,8 +246,27 @@ func TestCapabilities(t *testing.T) {
 	if caps.Tools == nil {
 		t.Error("tools must be an object")
 	}
-	if caps.Limits["emote"] != 262144 || caps.Limits["sticker"] != 524288 || caps.Limits["attachment"] != discordlint.Limit(discordlint.TargetAttachment) {
-		t.Errorf("limits = %v", caps.Limits)
+	// Every Discord target with its cap — the attachment tiers included —
+	// and nothing else; targets carries the display order.
+	wantLimits := map[string]int64{
+		"emote": 262144, "sticker": 524288,
+		"attachment": 20_000_000, "attachment-50": 50_000_000, "attachment-100": 100_000_000, "attachment-500": 500_000_000,
+	}
+	if len(caps.Limits) != len(wantLimits) {
+		t.Errorf("limits = %v, want exactly %v", caps.Limits, wantLimits)
+	}
+	for name, want := range wantLimits {
+		if got, ok := caps.Limits[name]; !ok || got != want || got != discordlint.Limit(discordlint.Target(name)) {
+			t.Errorf("limits[%q] = %d (present %v), want %d", name, got, ok, want)
+		}
+	}
+	if strings.Join(caps.Targets, ",") != "emote,sticker,attachment,attachment-50,attachment-100,attachment-500" {
+		t.Errorf("targets = %v", caps.Targets)
+	}
+	for _, name := range caps.Targets {
+		if _, ok := caps.Limits[name]; !ok {
+			t.Errorf("target %q has no entry in limits", name)
+		}
 	}
 	if caps.RulesVersion != discordlint.RulesVersion || caps.Version != "v9" || caps.Concurrency != 1 || caps.MaxUploadBytes != 12345 {
 		t.Errorf("caps = %+v", caps)
@@ -635,6 +655,64 @@ func TestCreateJobValidation(t *testing.T) {
 	resp, body = e.postJSON(t, "/api/jobs", recipe.Recipe{Sources: []string{h}, Output: recipe.Output{Format: "mp4"}})
 	if resp.StatusCode != 400 {
 		t.Errorf("unsupported format: %d %s", resp.StatusCode, body)
+	}
+}
+
+// TestCreateJobTargetValidation: output.target must be one of the linter's
+// targets (or empty); anything else — a made-up tier, a case variant — is a
+// 400 that names every valid target, before sources are even looked at.
+// Every real tier is accepted.
+func TestCreateJobTargetValidation(t *testing.T) {
+	e := newEnv(t, Config{}, nil)
+	h := putProbedSource(t, e, "a.gif", tinyGIF(t))
+	for _, bad := range []string{"attachment-1000", "Emote", "ATTACHMENT-50", "nitro", " sticker", "attachment-20"} {
+		// An unknown source: the target check must come first.
+		rec := recipe.Recipe{Sources: []string{strings.Repeat("1", 64)}, Output: recipe.Output{Format: "gif", Target: bad}}
+		resp, body := e.postJSON(t, "/api/jobs", rec)
+		if resp.StatusCode != 400 {
+			t.Errorf("target %q: %d %s, want 400", bad, resp.StatusCode, body)
+			continue
+		}
+		msg := errorOf(t, body)
+		if !strings.Contains(msg, fmt.Sprintf("unknown output.target %q", bad)) || strings.Contains(msg, "not uploaded") {
+			t.Errorf("target %q: error %q", bad, msg)
+		}
+		for _, valid := range []string{"emote", "sticker", "attachment (20 MB", "attachment-50 (50 MB", "attachment-100 (100 MB", "attachment-500 (500 MB"} {
+			if !strings.Contains(msg, valid) {
+				t.Errorf("target %q: error %q does not list %q", bad, msg, valid)
+			}
+		}
+		if resp, _ := e.get(t, "/api/results/"+jobs.ResultKey(rec)); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("target %q: a result exists for a refused recipe (%d)", bad, resp.StatusCode)
+		}
+	}
+	for _, good := range []string{"", "emote", "sticker", "attachment", "attachment-50", "attachment-100", "attachment-500"} {
+		rec := recipe.Recipe{Sources: []string{h}, Output: recipe.Output{Format: "gif", Width: 8, Height: 8, Target: good}}
+		resp, body := e.postJSON(t, "/api/jobs", rec)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("target %q: %d %s, want 202", good, resp.StatusCode, body)
+			continue
+		}
+		var job jobs.Job
+		if err := json.Unmarshal(body, &job); err != nil || job.Recipe.Output.Target != good {
+			t.Errorf("target %q: job %s (%v)", good, body, err)
+		}
+	}
+	// The set the API accepts is exactly what /api/capabilities advertises.
+	_, capsBody := e.get(t, "/api/capabilities")
+	var caps struct {
+		Targets []string `json:"targets"`
+	}
+	if err := json.Unmarshal(capsBody, &caps); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range caps.Targets {
+		if err := validateTarget(name); err != nil {
+			t.Errorf("advertised target %q is refused: %v", name, err)
+		}
+	}
+	if validateTarget("") != nil || validateTarget("attachment-1000") == nil {
+		t.Error("validateTarget: empty must pass, a made-up tier must fail")
 	}
 }
 

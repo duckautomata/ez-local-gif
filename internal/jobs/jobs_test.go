@@ -563,7 +563,18 @@ func TestApplyMasterAlpha(t *testing.T) {
 }
 
 func TestClampStillTime(t *testing.T) {
-	anim := &graph.Plan{Duration: 2, Frames: 50}
+	// Frame count known: t is capped at the last frame's midpoint
+	// (49.5/25 = 1.98), so t == Duration and anything beyond map to the last
+	// frame's own memo entry.
+	anim := &graph.Plan{Duration: 2, Frames: 50, FPS: 25}
+	// Frame count unknown (only a duration): the old cap at Duration.
+	durOnly := &graph.Plan{Duration: 2}
+	// 34 frames at 33 ms: the midpoint of the last frame rounds to 1.106 ms,
+	// which still maps to frame 33 (1.106*30.303 = 33.5).
+	seq34 := &graph.Plan{Duration: 34 / 30.303, Frames: 34, FPS: 30.303}
+	// 7 sequence frames at speed 2 resampled to 20 fps: 6 master frames even
+	// though Duration*FPS is 7 — the cap follows Frames, not the duration.
+	trunc := &graph.Plan{Duration: 0.35, Frames: 6, FPS: 20, Speed: 2}
 	cases := []struct {
 		t     float64
 		still bool
@@ -572,9 +583,20 @@ func TestClampStillTime(t *testing.T) {
 	}{
 		{0.5, false, anim, 0.5},
 		{-1, false, anim, 0},
-		{2.5, false, anim, 2},
+		{2.5, false, anim, 1.98},
+		{2, false, anim, 1.98},
+		{1.98, false, anim, 1.98},
+		{1.979, false, anim, 1.979},
 		{0.12345, false, anim, 0.123},
 		{0.9996, false, anim, 1},
+		{2.5, false, durOnly, 2},
+		{0.5, false, durOnly, 0.5},
+		{33.5 / 30.303, false, seq34, 1.106},
+		{34 / 30.303, false, seq34, 1.106},
+		{99, false, seq34, 1.106},
+		{0.34, false, trunc, 0.275},
+		{5.5 / 20, false, trunc, 0.275},
+		{4.5 / 20, false, trunc, 0.225},
 		// Unknown duration: only the lower bound and rounding apply.
 		{7.25, false, &graph.Plan{}, 7.25},
 		// Still source: every t is the one frame at 0 (the plan's duration is
@@ -593,6 +615,24 @@ func TestClampStillTime(t *testing.T) {
 	// NaN → 0.
 	if got := clampStillTime(anim, math.NaN(), false); got != 0 {
 		t.Errorf("NaN → %v", got)
+	}
+	// The midpoint of the last frame maps to that frame (floor(t*FPS) ==
+	// Frames-1) for every rate the output can run at, after the millisecond
+	// rounding — the contract the frame-index scrubber relies on.
+	for _, fps := range []float64{0.017, 1, 4, 10, 12.5, 16.7, 23.976, 25, 29.97, 30, 30.303, 33.333, 50, 60} {
+		for _, frames := range []int{2, 3, 7, 34, 299, 600} {
+			p := &graph.Plan{Duration: float64(frames) / fps, Frames: frames, FPS: fps}
+			for _, tt := range []float64{(float64(frames) - 0.5) / fps, p.Duration, p.Duration + 1, 1e9} {
+				got := clampStillTime(p, tt, false)
+				if slot := int(math.Floor(got*fps + 1e-6)); slot != frames-1 {
+					t.Errorf("fps %v, %d frames, t=%v: clamped to %v = slot %d, want the last frame %d", fps, frames, tt, got, slot, frames-1)
+				}
+			}
+			// And the frame before it stays distinct.
+			if got := clampStillTime(p, (float64(frames)-1.5)/fps, false); int(math.Floor(got*fps+1e-6)) != frames-2 {
+				t.Errorf("fps %v, %d frames: (N-1.5)/fps clamped to %v, not frame %d", fps, frames, got, frames-2)
+			}
+		}
 	}
 }
 

@@ -33,7 +33,8 @@
     c.x = clamp(Math.round(c.x), 0, info.width - c.w);
     c.y = clamp(Math.round(c.y), 0, info.height - c.h);
   }
-  function fullFrame() {
+  /** resetCrop clears the crop: op off, rectangle back to the full frame. */
+  function resetCrop() {
     app.ops.crop = { enabled: false, x: 0, y: 0, w: info.width, h: info.height };
   }
   function centerSquare() {
@@ -55,7 +56,7 @@
     <label class="field"><span>Width</span><NumField bind:value={app.ops.crop.w} min={1} max={info.width} small onchange={fix} /></label>
     <label class="field"><span>Height</span><NumField bind:value={app.ops.crop.h} min={1} max={info.height} small onchange={fix} /></label>
     <button type="button" class="sm" onclick={centerSquare} title="Largest centred square (handy for emotes)">Centre square</button>
-    <button type="button" class="sm ghost" onclick={fullFrame}>Full frame</button>
+    <button type="button" class="sm ghost" onclick={resetCrop} title="Clear the crop — back to the full {info.width}×{info.height} frame" aria-label="Reset crop">Reset crop</button>
   </div>
   <p class="hint">
     Drag on the preview to draw the rectangle, drag inside it to move. Coordinates are source pixels (before resize,

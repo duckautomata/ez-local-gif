@@ -97,7 +97,7 @@ type staticLinter struct {
 func (l *staticLinter) run() {
 	l.ruleFormat()
 	l.ruleSizeLimit()
-	switch l.target {
+	switch l.target { // the attachment tiers have no shape rules
 	case TargetEmote:
 		l.ruleEmoteDims()
 	case TargetSticker:
@@ -116,17 +116,10 @@ func (l *staticLinter) ruleFormat() {
 	l.checks.pass(rule, LevelInfo, l.info.desc)
 }
 
+// ruleSizeLimit checks the byte count against the target's cap (the tier's
+// for attachments; nothing for TargetNone).
 func (l *staticLinter) ruleSizeLimit() {
-	const rule = RuleStaticSizeLimit
-	limit := Limit(l.target)
-	if limit <= 0 {
-		return
-	}
-	if int64(l.size) > limit {
-		l.checks.fail(rule, LevelError, fmt.Sprintf("%d bytes exceeds the %d byte limit for %s", l.size, limit, l.target))
-		return
-	}
-	l.checks.pass(rule, LevelError, fmt.Sprintf("%d of %d bytes", l.size, limit))
+	l.checks.sizeLimit(RuleStaticSizeLimit, int64(l.size), l.target)
 }
 
 // ruleEmoteDims warns when the image is larger than 128x128.

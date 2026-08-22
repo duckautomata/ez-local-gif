@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Check, Report } from '../lib/api';
-  import { TARGET_LABEL } from '../lib/presets';
+  import { targetLabel } from '../lib/presets';
   import { ruleLabel } from '../lib/rules';
 
   interface Props {
@@ -31,7 +31,7 @@
   <div class="head">
     <b class={report.ok ? 'ok' : 'bad'}>{report.ok ? '✓ Discord-safe' : '✕ Will not render safely on Discord'}</b>
     <span class="muted small">
-      {report.target ? TARGET_LABEL[report.target] : 'structural rules only'}
+      {report.target ? targetLabel(report.target) : 'structural rules only'}
       {#if errors}· {errors} error{errors === 1 ? '' : 's'}{/if}
       {#if warns}· {warns} warning{warns === 1 ? '' : 's'}{/if}
       {#if fixed}· {fixed} fixed{/if}

@@ -72,46 +72,109 @@ export function fmtTimecode(s: number): string {
 }
 
 /**
+ * FRAME_TOLERANCE is the slack, in frames, added before flooring
+ * duration × fps (frameCount) and before deciding which frame a time
+ * belongs to (frameAt, frameSpan). It mirrors graph.FrameTolerance
+ * (internal/graph/compile.go) and must stay equal to it: trim bounds travel
+ * at microsecond precision (trimTime), so a bound taken from the frame grid
+ * lands up to 1 µs short of a whole number of frames — [2/30, 6/30) is sent
+ * as 0.066667..0.2 and 0.133333 × 30 = 3.99999, which ffmpeg renders as 4
+ * frames while a naive floor, or the old 1e-6 tolerance, counted 3. 1 µs at
+ * the 60 fps cap is 6e-5 frames, hence 1e-4; a clip that is genuinely a
+ * real sub-frame short of an integer by less than that cannot come out of
+ * µs-precise times, so the tolerance only ever absorbs rounding.
+ */
+export const FRAME_TOLERANCE = 1e-4;
+
+/**
+ * trimTime rounds a trim bound to whole microseconds — ffmpeg's -ss/-to
+ * resolution and what graph keeps of a recipe's trim params (round6 in
+ * internal/graph). Never round a trim bound to milliseconds: 2/30 sent as
+ * 0.067 makes ffmpeg's accurate seek drop frame 2 of a 30 fps source (its
+ * pts 0.066667 precedes the seek point), and 5/30 sent as 0.167 lets frame 5
+ * slip in. Hand-typed values keep whatever precision they have up to the µs.
+ */
+export function trimTime(v: number): number {
+  return round(v, 6);
+}
+
+/**
  * frameCount is the number of frames a clip of `duration` seconds has at
- * `fps` (the plan's frame grid): max(1, floor(duration × fps)); 0 when the
- * rate is unknown. Floor, not round: the render's fps stage runs
- * `round=down` so an fps drop never lengthens the clip (graph.Plan.Frames
- * uses the same model).
+ * `fps` (the plan's frame grid): max(1, floor(duration × fps +
+ * FRAME_TOLERANCE)); 0 when the rate is unknown. Floor, not round: the
+ * render's fps stage runs `round=down` so an fps drop never lengthens the
+ * clip (graph.Plan.Frames uses the same model for every source that is not
+ * an image sequence). The tolerance also absorbs the float error of a
+ * duration that is exactly a whole number of frames — 34 frames at 33 ms is
+ * 34 / 30.303 × 30.303 = 33.999…. Image sequences do not go through this at
+ * all: state.planFrames counts their frames on the image2 grid exactly.
  */
 export function frameCount(duration: number, fps: number): number {
   if (!(fps > 0) || !Number.isFinite(duration)) return 0;
-  return Math.max(1, Math.floor(Math.max(0, duration) * fps + 1e-9));
+  return Math.max(1, Math.floor(Math.max(0, duration) * fps + FRAME_TOLERANCE));
 }
 
 /**
  * frameAt maps a time to its 1-based frame number on the fps grid, clamped
- * to [1, count] (count ≤ 0 = unclamped). A small epsilon absorbs the
- * floating-point error of k/fps so the frame boundary itself belongs to
- * frame k+1, not k.
+ * to [1, count] (count ≤ 0 = unclamped). FRAME_TOLERANCE absorbs the
+ * floating-point and µs-rounding error of k/fps so the frame boundary itself
+ * belongs to frame k+1, not k.
  */
 export function frameAt(t: number, fps: number, count = 0): number {
   if (!(fps > 0)) return 1;
-  let f = Math.floor(Math.max(0, t) * fps + 1e-6) + 1;
+  let f = Math.floor(Math.max(0, t) * fps + FRAME_TOLERANCE) + 1;
   if (count > 0) f = Math.min(f, count);
   return Math.max(1, f);
 }
 
-/**
- * ceilMs rounds a time up to whole milliseconds (with a tiny tolerance so an
- * exact millisecond stays put). Still requests are keyed on milliseconds
- * server-side and map t to frame floor(t × fps), so rounding *up* keeps a
- * frame-start time inside its own frame (rounding down would show the
- * previous frame at 23.976 fps, where 2/23.976 = 0.08342 → 0.083 → frame 2).
- */
-export function ceilMs(t: number): number {
-  if (!Number.isFinite(t) || t <= 0) return 0;
-  return Math.ceil(t * 1000 - 1e-6) / 1000;
+/** frameStart is the start time (seconds) of 0-based frame i on the fps grid. */
+export function frameStart(i: number, fps: number): number {
+  if (!(fps > 0)) return 0;
+  return Math.max(0, i) / fps;
 }
 
-/** frameTime is the start time of 1-based frame f on the fps grid, ceiled to ms (see ceilMs). */
-export function frameTime(f: number, fps: number): number {
+/**
+ * stillTime is the time the preview requests for 0-based frame i: the
+ * middle of the frame, (i + 0.5) / fps, rounded to whole milliseconds the
+ * way jobs.Still keys its memo. The server maps t → floor(t × fps), so a
+ * mid-frame time lands on frame i whatever the float error of either side
+ * (a frame-start time would be one ulp away from the previous frame).
+ */
+export function stillTime(i: number, fps: number): number {
   if (!(fps > 0)) return 0;
-  return ceilMs(Math.max(0, f - 1) / fps);
+  return round((Math.max(0, i) + 0.5) / fps, 3);
+}
+
+/**
+ * frameSpan is the 1-based inclusive frame range [first, last] the window
+ * [start, end) seconds covers on the fps grid, clamped to [1, count] when
+ * count > 0 (end ≤ start yields a single frame). Tolerances as in frameAt,
+ * so [i/fps, (i+1)/fps) is exactly frame i+1 — also when the bounds are the
+ * µs-rounded trimTime values a recipe carries (0.033333..0.133333 at 30 fps
+ * is frames 2–4, matching graph's count of 3). For image sequences the
+ * graph snaps the bounds to the nearest grid frame instead: use
+ * state.sourceSpan, which goes through sequenceSelection for them.
+ */
+export function frameSpan(start: number, end: number, fps: number, count = 0): { first: number; last: number } {
+  if (!(fps > 0)) return { first: 1, last: 1 };
+  let first = Math.floor(Math.max(0, start) * fps + FRAME_TOLERANCE) + 1;
+  let last = Math.max(first, Math.ceil(Math.max(0, end) * fps - FRAME_TOLERANCE));
+  if (count > 0) {
+    first = Math.min(first, count);
+    last = Math.min(last, count);
+  }
+  return { first: Math.max(1, first), last: Math.max(1, last) };
+}
+
+/**
+ * fmtLimit renders a Discord byte cap: the attachment tiers are decimal
+ * megabytes ("20 MB"), the emote / sticker caps whole KiB ("256 KiB").
+ */
+export function fmtLimit(bytes: number): string {
+  if (!(bytes > 0)) return 'none';
+  if (bytes % 1_000_000 === 0) return `${bytes / 1_000_000} MB`;
+  const k = bytes / 1024;
+  return `${Number.isInteger(k) ? k : fmtKiB(bytes)} KiB`;
 }
 
 /**
@@ -147,12 +210,15 @@ export const MAX_FPS = 60;
  * otherwise left alone — ffmpeg's gif muxer runs at a 1/100 s timebase and
  * rounds each frame's pts, so e.g. 30 fps gets 3/3/4 cs delays with exact
  * total timing and no dropped or duplicated frames (there is no 100/n
- * snapping any more). Other animated formats are capped at 60. fps <= 0
- * returns 0.
+ * snapping any more). Other animated formats are capped at 60. The result
+ * is rounded to 3 decimals like graph.SnapFPS (the precision of the fps
+ * filter text and of the recipe's fps fields): a 30000/1001 source plans
+ * 29.97 fps, not 29.97002997…, and the frame count follows that rate.
+ * fps <= 0 returns 0.
  */
 export function snapFPS(format: OutputFormat | string, fps: number): number {
   if (!(fps > 0)) return 0;
-  return Math.min(fps, format === 'gif' ? GIF_MAX_FPS : MAX_FPS);
+  return round(Math.min(fps, format === 'gif' ? GIF_MAX_FPS : MAX_FPS), 3);
 }
 
 /**

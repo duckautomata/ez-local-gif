@@ -246,10 +246,14 @@ type Output struct {
 	FrameFormat string `json:"frameFormat,omitempty"`
 
 	// Preset is informational for the UI ("emote", "sticker", "chat-gif",
-	// "chat-webp", "chat-avif", "optimize", "frames", "custom"); "optimize"
-	// additionally selects the no-decode GIF→GIF pipeline in jobs. Target
-	// selects which Discord rules and byte limit the linter enforces:
-	// "emote" | "sticker" | "attachment" | "" (none).
+	// "chat" (formerly chat-gif/chat-webp/chat-avif), "optimize", "frames",
+	// "custom"); "optimize" additionally selects the no-decode GIF→GIF
+	// pipeline in jobs. Target selects which Discord rules and byte limit the
+	// linter enforces: "emote" | "sticker" | "attachment" (free, 20 MB) |
+	// "attachment-50" (Nitro Basic / Level-2 boosted server) | "attachment-100"
+	// (Level-3 boosted server) | "attachment-500" (Nitro) | "" (none). The
+	// attachment tiers share every rule and differ only in the byte cap
+	// (discordlint.IsAttachment / Limit).
 	Preset string `json:"preset,omitempty"`
 	Target string `json:"target,omitempty"`
 }
