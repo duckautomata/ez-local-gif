@@ -117,6 +117,128 @@ type DelayParams struct {
 	MS int `json:"ms"`
 }
 
+// Op kinds added in Phase 3 (editing ops, DESIGN.md §4.3). Keying ops run at
+// full resolution before any scaling; reverse runs after the geometry;
+// text/overlay ops run on the FINAL output canvas (after Output.Width/Height
+// fit), so their coordinates are in output pixels — what the preview shows.
+const (
+	OpChromaKey = "chromakey" // ChromaKeyParams — greenscreen/bluescreen keying in YUV 4:4:4 + despill
+	OpColorKey  = "colorkey"  // ColorKeyParams — make one RGB colour (eyedropper) transparent
+	OpReverse   = "reverse"   // no params — play backwards (after the geometry stages; trim applies in source time)
+	OpAutoCrop  = "autocrop"  // AutoCropParams — crop to the content bounding box (resolved by jobs before compiling)
+	OpText      = "text"      // TextParams — drawtext overlay
+	OpOverlay   = "overlay"   // OverlayParams — image / animated image / video overlay from Recipe.Sources[Source]
+)
+
+// ChromaKeyParams keys out a colour in YUV (soft edges). Zero values:
+// Color "00ff00", Similarity 0.2 (0.01..1), Blend 0.05 (0..1), Despill
+// on with Mix 0.6 and Expand 0.3 (DespillOff disables it).
+//
+// Blend 0 therefore means the DEFAULT 0.05, not "no blend": a hard key edge
+// needs a small positive value such as 0.001 (the UI's slider floors at
+// 0.01 for the same reason). Despill applies only when Color has a single
+// dominant channel (green or blue; the despill type follows that channel);
+// for any other colour it is skipped even when DespillMix/DespillExpand are
+// set. On frames that already carry alpha the key's matte is intersected
+// with the incoming alpha (the compiler wraps the key), never substituted
+// for it.
+type ChromaKeyParams struct {
+	Color         string  `json:"color,omitempty"`
+	Similarity    float64 `json:"similarity,omitempty"`
+	Blend         float64 `json:"blend,omitempty"`
+	DespillOff    bool    `json:"despillOff,omitempty"`
+	DespillMix    float64 `json:"despillMix,omitempty"`
+	DespillExpand float64 `json:"despillExpand,omitempty"`
+}
+
+// ColorKeyParams makes one RGB colour transparent (the eyedropper picks it).
+// Zero values: Similarity 0.1 (0.01..1), Blend 0 (0..1). Color is required.
+type ColorKeyParams struct {
+	Color      string  `json:"color"`
+	Similarity float64 `json:"similarity,omitempty"`
+	Blend      float64 `json:"blend,omitempty"`
+}
+
+// AutoCropParams crops to the union bounding box of the content over the
+// (trimmed) clip: alpha >= Threshold counts as content for sources with
+// alpha, otherwise non-border (non-black/flat) pixels via cropdetect.
+// Padding adds pixels on every side (clamped to the frame). Resolved is
+// filled by jobs (it runs the detection pass; the graph compiler refuses an
+// unresolved autocrop) and is ignored when supplied by a client.
+type AutoCropParams struct {
+	Threshold int         `json:"threshold,omitempty"` // 1..255 (0 = 1)
+	Padding   int         `json:"padding,omitempty"`   // px (0..1024)
+	Resolved  *CropParams `json:"resolved,omitempty"`
+}
+
+// Anchor names for text/overlay placement: two letters, vertical then
+// horizontal — "tl" (default), "tc", "tr", "ml", "mc", "mr", "bl", "bc", "br".
+// X/Y locate the anchor point of the element on the output canvas.
+const (
+	AnchorTopLeft      = "tl"
+	AnchorTopCenter    = "tc"
+	AnchorTopRight     = "tr"
+	AnchorMiddleLeft   = "ml"
+	AnchorMiddleCenter = "mc"
+	AnchorMiddleRight  = "mr"
+	AnchorBottomLeft   = "bl"
+	AnchorBottomCenter = "bc"
+	AnchorBottomRight  = "br"
+)
+
+// TextParams draws text. Zero values: Font "DejaVu Sans" (a fontconfig
+// family name; letters, digits, spaces and hyphens only), Size 32 px, Color
+// "ffffff", Border 0, BorderColor "000000", Box off with BoxColor
+// "00000080" and BoxPad 8, Anchor "tl", X/Y 0, Start/End 0 = whole clip
+// (output seconds; the window is [Start, End) — the frame at exactly End is
+// not drawn, like trim; End 0 = to the end), LineSpacing 0. Text may
+// contain newlines; it is passed to ffmpeg through a text file, never
+// escaped inline.
+type TextParams struct {
+	Text        string  `json:"text"`
+	Font        string  `json:"font,omitempty"`
+	Size        int     `json:"size,omitempty"`
+	Color       string  `json:"color,omitempty"` // RRGGBB or RRGGBBAA
+	Border      int     `json:"border,omitempty"`
+	BorderColor string  `json:"borderColor,omitempty"`
+	Box         bool    `json:"box,omitempty"`
+	BoxColor    string  `json:"boxColor,omitempty"`
+	BoxPad      int     `json:"boxPad,omitempty"`
+	X           int     `json:"x"`
+	Y           int     `json:"y"`
+	Anchor      string  `json:"anchor,omitempty"`
+	Start       float64 `json:"start,omitempty"`
+	End         float64 `json:"end,omitempty"`
+	LineSpacing int     `json:"lineSpacing,omitempty"`
+}
+
+// OverlayParams composites Recipe.Sources[Source] (index >= 1; a still
+// image, an animated image or a video, with alpha if it has one) onto the
+// output canvas. Width/Height 0 = natural size (one of them 0 keeps the
+// aspect); Opacity 0 = 1; Loop (default true for animated sources) repeats
+// the overlay until the base ends, otherwise it holds its last frame;
+// Start/End as for text; Anchor/X/Y as for text.
+//
+// Looping (NoLoop false) depends on the asset's container: GIF and video
+// assets are repeated (-stream_loop -1) until the base ends; animated WebP
+// and APNG assets are read with -ignore_loop 0 and therefore obey the
+// asset's OWN loop count — a loop-forever file repeats until the base ends,
+// a play-once / play-N-times file plays N times and then holds its last
+// frame. With NoLoop every asset plays once and holds its last frame; a
+// still image is shown for the whole window either way.
+type OverlayParams struct {
+	Source  int     `json:"source"`
+	X       int     `json:"x"`
+	Y       int     `json:"y"`
+	Width   int     `json:"width,omitempty"`
+	Height  int     `json:"height,omitempty"`
+	Opacity float64 `json:"opacity,omitempty"`
+	NoLoop  bool    `json:"noLoop,omitempty"`
+	Anchor  string  `json:"anchor,omitempty"`
+	Start   float64 `json:"start,omitempty"`
+	End     float64 `json:"end,omitempty"`
+}
+
 // TrimParams selects a time range of the source, in seconds. End <= 0 means
 // "to the end".
 type TrimParams struct {

@@ -9,6 +9,7 @@
   import Toasts from './components/Toasts.svelte';
   import UploadZone from './components/UploadZone.svelte';
   import { getSource, messageOf, sourceHashFromSearch, sourceURL } from './lib/api';
+  import { loadFeatures } from './lib/capabilities.svelte';
   import { resetRender, startRender } from './lib/render.svelte';
   import { app, setSource } from './lib/state.svelte';
   import { toast } from './lib/toast.svelte';
@@ -32,6 +33,10 @@
   const startHash = sourceHashFromSearch(window.location.search);
   let loadingSrc = $state(startHash !== null);
   onMount(() => {
+    // The server's feature flags gate Play, the font picker and the
+    // keying / overlay notices; a fetch that fails (server still starting)
+    // is retried once a source is loaded — the server is reachable then.
+    void loadFeatures();
     if (!startHash) return;
     void getSource(startHash)
       .then((src) => {
@@ -51,6 +56,9 @@
     if (loadingSrc) return;
     const want = sourceURL(hash);
     if (window.location.pathname + window.location.search !== want) window.history.replaceState(null, '', want);
+  });
+  $effect(() => {
+    if (app.source) void loadFeatures(); // a no-op once the flags are known
   });
 </script>
 

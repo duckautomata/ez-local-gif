@@ -114,21 +114,25 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 	if m.tools.FFmpeg == "" {
 		return nil, errors.New("ffmpeg is not available on this server")
 	}
-	blobs, err := m.lookupSources(r.Sources)
+	srcs, err := m.resolveSources(r.Sources)
 	if err != nil {
 		return nil, err
 	}
-	src := blobs[0]
+	src := srcs.main()
+
+	// Someone may have finished the same recipe while we were queued
+	// (Submit already served an existing result): checked before the
+	// compile so a cached recipe never pays for an autocrop detection.
+	if m.st.HasResult(hash) {
+		if res, err := m.LoadResult(hash); err == nil {
+			res.Cached = true
+			res.RenderMS = 0
+			return res, nil
+		}
+	}
 
 	// The gifsicle-only optimiser never decodes: no plan, no master.
 	if isOptimizePreset(r.Output) {
-		if m.st.HasResult(hash) {
-			if res, err := m.LoadResult(hash); err == nil {
-				res.Cached = true
-				res.RenderMS = 0
-				return res, nil
-			}
-		}
 		releaseScratch, err := m.admitOptimizeScratch(ctx, j, src.Path, r.Output)
 		if err != nil {
 			return nil, err
@@ -146,13 +150,10 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return m.deliver(ctx, j, started, r, hash, scratch, items)
 	}
 
-	// 2. Compile.
-	plan, err := graph.Compile(*src.Info, r.Ops, r.Output)
+	// 2. Compile (autocrop resolved, overlay inputs bound to their blobs).
+	plan, err := m.compile(ctx, srcs, r.Ops, r.Output)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
-	}
-	if plan.Width <= 0 || plan.Height <= 0 {
-		return nil, fmt.Errorf("compiled plan has an empty frame size (%dx%d)", plan.Width, plan.Height)
+		return nil, err
 	}
 	static := recipe.IsStaticFormat(format)
 	if static {
@@ -167,17 +168,10 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return nil, err
 	}
 
-	// 3. Someone may have finished the same recipe while we were queued.
-	if m.st.HasResult(hash) {
-		if res, err := m.LoadResult(hash); err == nil {
-			res.Cached = true
-			res.RenderMS = 0
-			return res, nil
-		}
-	}
-
-	// 4. Scratch admission, then the master. The reservation is released
-	// after the scratch dir is removed (defers run last-in-first-out).
+	// 3./4. Scratch admission, then the master. The reservation is released
+	// after the scratch dir is removed (defers run last-in-first-out). Text
+	// overlays are written into the scratch dir and bound into the plan
+	// before any encoder sees it.
 	releaseScratch, err := m.admitScratch(ctx, j, plan, scratchFactor(r.Output))
 	if err != nil {
 		return nil, err
@@ -188,6 +182,9 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return nil, err
 	}
 	defer cleanup()
+	if plan, err = bindTextFiles(plan, scratch); err != nil {
+		return nil, err
+	}
 	master, err := m.renderMaster(ctx, j, src.Path, plan, scratch, static)
 	if err != nil {
 		return nil, err

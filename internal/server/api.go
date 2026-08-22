@@ -13,10 +13,12 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/duckautomata/ez-local-gif/internal/discordlint"
+	"github.com/duckautomata/ez-local-gif/internal/enc"
 	"github.com/duckautomata/ez-local-gif/internal/jobs"
 	"github.com/duckautomata/ez-local-gif/internal/probe"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
@@ -26,12 +28,12 @@ import (
 // ---- capabilities -----------------------------------------------------------
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), capabilitiesTimeout)
+	defer cancel()
 	var versions map[string]string
 	if s.jm != nil {
 		versions = s.jm.ToolVersions()
 	} else {
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
 		versions = s.tools.Versions(ctx)
 	}
 	if versions == nil {
@@ -51,7 +53,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"concurrency":    conc,
 		"maxUploadBytes": s.cfg.MaxUploadBytes,
 		"formats":        outputFormats(),
-		"features":       features(),
+		"features":       features(len(s.fonts(ctx)) > 0),
 	})
 }
 
@@ -104,11 +106,44 @@ func outputFormats() []string {
 	}
 }
 
-// features flags the Phase 2 capabilities the SPA gates its UI on: fit-to-
+// features flags the capabilities the SPA gates its UI on. Phase 2: fit-to-
 // size (Output.FitBytes), image-sequence uploads (several "file" parts) and
-// the GIF→GIF optimiser path.
-func features() map[string]bool {
-	return map[string]bool{"fit": true, "sequence": true, "optimize": true}
+// the GIF→GIF optimiser path. Phase 3: background keying (the chromakey /
+// colorkey ops), overlays (text / overlay ops, extra "sources"), the
+// animated Play preview (POST /api/proxy) and — only when the container can
+// enumerate faces, i.e. GET /api/fonts is non-empty — the font picker.
+// Every flag but "fonts" is a property of this build.
+func features(fonts bool) map[string]bool {
+	return map[string]bool{
+		"fit": true, "sequence": true, "optimize": true,
+		"keying": true, "overlays": true, "proxy": true, "fonts": fonts,
+	}
+}
+
+// ---- fonts --------------------------------------------------------------------
+
+// fonts lists the drawtext-usable faces of this server: what the job
+// manager found with fc-list, cached for its lifetime. Never nil, so the
+// JSON is always an array.
+func (s *Server) fonts(ctx context.Context) []enc.Font {
+	if s.jm == nil {
+		return []enc.Font{}
+	}
+	if fonts := s.jm.Fonts(ctx); fonts != nil {
+		return fonts
+	}
+	return []enc.Font{}
+}
+
+// handleFonts answers GET /api/fonts with {"fonts": [...]} — empty when
+// fc-list is not available (drawtext then still resolves the bundled
+// families by name). The list only changes with a restart (the manager
+// caches it), but it is small, so clients are asked to revalidate.
+func (s *Server) handleFonts(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), fontsTimeout)
+	defer cancel()
+	w.Header().Set("Cache-Control", "no-cache")
+	writeJSON(w, http.StatusOK, map[string]any{"fonts": s.fonts(ctx)})
 }
 
 // ---- upload / sources ---------------------------------------------------------
@@ -429,48 +464,157 @@ func resultFile(res *jobs.Result, name string) *jobs.File {
 	return nil
 }
 
-// ---- still --------------------------------------------------------------------
+// ---- previews: still + proxy ------------------------------------------------
 
-type stillRequest struct {
-	Src    string        `json:"src"`
-	Ops    []recipe.Op   `json:"ops"`
-	Output recipe.Output `json:"output"`
-	T      float64       `json:"t"`
-	MaxW   int           `json:"maxW"`
+// previewRequest is the body of POST /api/still and POST /api/proxy: the
+// recipe's sources and op stack plus the preview's own knobs. "src" (the
+// one main source, Phase 1) and "sources" (the recipe's list, main source
+// first, overlay assets after it — Phase 3) are alternatives; when both are
+// given they must name the same main source. T is the still's output time,
+// MaxSeconds the proxy's length cap; each endpoint ignores the other's.
+type previewRequest struct {
+	Src        string        `json:"src"`
+	Sources    []string      `json:"sources"`
+	Ops        []recipe.Op   `json:"ops"`
+	Output     recipe.Output `json:"output"`
+	T          float64       `json:"t"`
+	MaxW       int           `json:"maxW"`
+	MaxSeconds float64       `json:"maxSeconds"`
 }
 
+// sourceList resolves src/sources into the recipe's source list, every
+// entry a well-formed hash.
+func (p *previewRequest) sourceList() ([]string, error) {
+	srcs := p.Sources
+	switch {
+	case len(srcs) == 0 && p.Src == "":
+		return nil, errors.New("src (one source hash) or sources (the recipe's hashes) is required")
+	case len(srcs) == 0:
+		srcs = []string{p.Src}
+	case p.Src != "" && p.Src != srcs[0]:
+		return nil, errors.New("src and sources[0] name different main sources")
+	}
+	for i, h := range srcs {
+		if recipe.IsHash(h) {
+			continue
+		}
+		if i == 0 {
+			return nil, errors.New("src must be a source hash")
+		}
+		return nil, fmt.Errorf("sources[%d] must be a source hash", i)
+	}
+	return srcs, nil
+}
+
+// checkSources verifies that every source names a blob with probe info,
+// answering the request otherwise: a missing blob gets missingStatus (404
+// for stills, whose unknown main source has always been a 404; 400 for
+// proxies and jobs, where the recipe is the client's claim), an unprobed
+// one 409 — both naming the index, which is how overlay ops refer to
+// sources. Reports whether the request may proceed.
+func (s *Server) checkSources(w http.ResponseWriter, srcs []string, missingStatus int) bool {
+	for i, h := range srcs {
+		blob, err := s.st.GetBlob(h)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, missingStatus, fmt.Sprintf("source %d (%s…) is not uploaded", i, h[:12]))
+				return false
+			}
+			writeError(w, http.StatusInternalServerError, errText(err))
+			return false
+		}
+		if blob.Info == nil {
+			writeError(w, http.StatusConflict, fmt.Sprintf("source %d (%s…) has not been probed yet; upload it again", i, h[:12]))
+			return false
+		}
+	}
+	return true
+}
+
+// handleStill answers POST /api/still with one preview frame
+// (jobs.Manager.StillSources: srcs[0] is the main source, the rest the
+// blobs behind the recipe's overlay sources).
 func (s *Server) handleStill(w http.ResponseWriter, r *http.Request) {
-	var req stillRequest
+	var req previewRequest
 	if !decodeJSON(w, r, &req, "still request") {
 		return
 	}
-	if !recipe.IsHash(req.Src) {
-		writeError(w, http.StatusBadRequest, "src must be a source hash")
+	srcs, err := req.sourceList()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errText(err))
+		return
+	}
+	if !s.checkSources(w, srcs, http.StatusNotFound) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), stillTimeout)
 	defer cancel()
-	png, err := s.jm.Still(ctx, req.Src, req.Ops, req.Output, req.T, req.MaxW)
+	png, err := s.jm.StillSources(ctx, srcs, req.Ops, req.Output, req.T, req.MaxW)
 	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			writeError(w, http.StatusNotFound, errText(err))
-		case errors.Is(err, jobs.ErrInvalidRecipe):
-			writeError(w, http.StatusBadRequest, errText(err))
-		case errors.Is(err, context.DeadlineExceeded):
-			writeError(w, http.StatusGatewayTimeout, "still render timed out")
-		case errors.Is(err, context.Canceled):
-			return // client went away
-		default:
-			writeError(w, http.StatusInternalServerError, errText(err))
-		}
+		previewError(w, r, err, http.StatusNotFound, "still render")
 		return
 	}
-	w.Header().Set("Content-Type", "image/png")
+	writePreview(w, "image/png", png)
+}
+
+// handleProxy answers POST /api/proxy with the animated low-resolution WebP
+// preview of the op stack (jobs.Manager.Proxy): what the UI's Play button
+// shows. Same request shape, guard and cancellation as /api/still; a
+// missing source is the client's mistake here (400).
+func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	var req previewRequest
+	if !decodeJSON(w, r, &req, "proxy request") {
+		return
+	}
+	srcs, err := req.sourceList()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errText(err))
+		return
+	}
+	if req.MaxW < 0 || req.MaxSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "maxW and maxSeconds must not be negative (0 = default)")
+		return
+	}
+	if !s.checkSources(w, srcs, http.StatusBadRequest) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), proxyTimeout)
+	defer cancel()
+	webp, err := s.jm.Proxy(ctx, srcs, req.Ops, req.Output, req.MaxW, req.MaxSeconds)
+	if err != nil {
+		previewError(w, r, err, http.StatusBadRequest, "proxy render")
+		return
+	}
+	writePreview(w, "image/webp", webp)
+}
+
+// previewError answers a failed still/proxy render: an unknown source gets
+// missingStatus, a recipe the compiler refused 400, a render past its
+// deadline 504, anything else 500. A client that hung up gets nothing.
+func previewError(w http.ResponseWriter, r *http.Request, err error, missingStatus int, what string) {
+	switch {
+	case r.Context().Err() != nil, errors.Is(err, context.Canceled):
+		return // client went away; nobody is listening
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, missingStatus, errText(err))
+	case errors.Is(err, jobs.ErrInvalidRecipe):
+		writeError(w, http.StatusBadRequest, errText(err))
+	case errors.Is(err, context.DeadlineExceeded):
+		writeError(w, http.StatusGatewayTimeout, what+" timed out")
+	default:
+		writeError(w, http.StatusInternalServerError, errText(err))
+	}
+}
+
+// writePreview sends a rendered preview. It is private to the requester
+// and may be cached for an hour: the SPA asks again for every op change
+// anyway, and the memo behind the render is what makes repeats cheap.
+func writePreview(w http.ResponseWriter, contentType string, data []byte) {
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	w.Header().Set("Content-Length", fmt.Sprint(len(png)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(png)
+	_, _ = w.Write(data)
 }
 
 // ---- jobs ---------------------------------------------------------------------
@@ -493,20 +637,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errText(err))
 		return
 	}
-	for i, h := range rec.Sources {
-		blob, err := s.st.GetBlob(h)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("source %d (%s…) is not uploaded", i, h[:12]))
-				return
-			}
-			writeError(w, http.StatusInternalServerError, errText(err))
-			return
-		}
-		if blob.Info == nil {
-			writeError(w, http.StatusConflict, fmt.Sprintf("source %d (%s…) has not been probed yet; upload it again", i, h[:12]))
-			return
-		}
+	// Every source — the main one and the overlay assets after it — must be
+	// an uploaded, probed blob before the render is queued.
+	if !s.checkSources(w, rec.Sources, http.StatusBadRequest) {
+		return
 	}
 	job, err := s.jm.Submit(rec)
 	if err != nil {

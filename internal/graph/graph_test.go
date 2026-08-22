@@ -60,6 +60,14 @@ var (
 		Width: 64, Height: 64, Frames: 1, HasAlpha: true, IsStill: true, Kind: recipe.KindImage,
 		AlphaStream: 1,
 	}
+	// Lossless animated WebP with alpha (Phase 3): FFmpeg 9's webp_anim
+	// demuxer, which decodes nothing after an input seek (its trim is a
+	// filter stage, Plan.FilterTrim; every plan of it is Plan.SeekUnsafe).
+	webpAnim = recipe.ProbeInfo{
+		Format: "webp_anim", Codec: "webp_anim", PixFmt: "argb", Bits: 8,
+		Width: 64, Height: 48, FPS: 10, Duration: 3, Frames: 30,
+		HasAlpha: true, Kind: recipe.KindAnimation,
+	}
 )
 
 // with returns a copy of src with fn applied.
@@ -147,10 +155,13 @@ func TestCompile(t *testing.T) {
 		want Plan // OutLabel is implied; Speed 0 means 1
 	}{
 		{
-			name: "no ops: fps and format only",
+			// A ProRes 4444 source decodes to planar yuva444p10le: its alpha
+			// head converts it to rgba once, in front of every other stage
+			// (alphaHead), with or without the unpremultiply op.
+			name: "no ops: the yuva head, fps and format only",
 			src:  prores, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter: "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:  1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
@@ -200,7 +211,7 @@ func TestCompile(t *testing.T) {
 			name: "crop then resize contain with alpha uses the premultiplied scale chain",
 			src:  prores, ops: []recipe.Op{crop(100, 50, 800, 600), resize(400, 400, "contain")}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=30:round=down,crop=800:600:100:50:exact=1,format=gbrap,premultiply=inplace=1,scale=400:300:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
+				Filter: "[0:v]format=rgba,fps=30:round=down,crop=800:600:100:50:exact=1,format=gbrap,premultiply=inplace=1,scale=400:300:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
 				Width:  400, Height: 300, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
@@ -240,7 +251,7 @@ func TestCompile(t *testing.T) {
 			name: "resize height only keeps aspect (alpha chain)",
 			src:  prores, ops: []recipe.Op{resize(0, 540, "")}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=30:round=down,format=gbrap,premultiply=inplace=1,scale=960:540:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
+				Filter: "[0:v]format=rgba,fps=30:round=down,format=gbrap,premultiply=inplace=1,scale=960:540:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
 				Width:  960, Height: 540, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
@@ -368,7 +379,7 @@ func TestCompile(t *testing.T) {
 			name: "output fit contain 128x128 (emote): alpha scale + transparent pad",
 			src:  prores, out: recipe.Output{Format: "gif", Width: 128, Height: 128, FPS: 25},
 			want: Plan{
-				Filter: "[0:v]fps=25:round=down,format=gbrap,premultiply=inplace=1,scale=128:72:flags=lanczos,unpremultiply=inplace=1,format=rgba,pad=128:128:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba[out]",
+				Filter: "[0:v]format=rgba,fps=25:round=down,format=gbrap,premultiply=inplace=1,scale=128:72:flags=lanczos,unpremultiply=inplace=1,format=rgba,pad=128:128:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba[out]",
 				Width:  128, Height: 128, FPS: 25, HasAlpha: true, Duration: 4, Frames: 100,
 			},
 		},
@@ -424,33 +435,66 @@ func TestCompile(t *testing.T) {
 			name: "output fit follows the op stack",
 			src:  prores, ops: []recipe.Op{crop(0, 0, 1080, 1080)}, out: recipe.Output{Format: "webp", Width: 128, Height: 128},
 			want: Plan{
-				Filter: "[0:v]fps=30:round=down,crop=1080:1080:0:0:exact=1,format=gbrap,premultiply=inplace=1,scale=128:128:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
+				Filter: "[0:v]format=rgba,fps=30:round=down,crop=1080:1080:0:0:exact=1,format=gbrap,premultiply=inplace=1,scale=128:128:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
 				Width:  128, Height: 128, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
 		{
-			name: "unpremultiply is hoisted first at 10-bit",
+			// Planar YUV-with-alpha sources are unpremultiplied at their native
+			// format (no gbrap10le in front: the tv-range alpha plane of a
+			// ProRes decode only survives the direct yuva→rgba conversion
+			// exactly, see alphaHead) and converted to rgba right after.
+			name: "unpremultiply is hoisted first, natively on the 10-bit yuva frames, then one format=rgba",
 			src:  prores, ops: []recipe.Op{crop(0, 0, 960, 1080), unpremultiply()}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]format=gbrap10le,setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,fps=30:round=down,crop=960:1080:0:0:exact=1,format=rgba[out]",
+				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,fps=30:round=down,crop=960:1080:0:0:exact=1,format=rgba[out]",
 				Width:  960, Height: 1080, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
 		{
-			name: "unpremultiply at 12-bit (ProRes 4444 XQ)",
+			name: "unpremultiply at 12-bit (ProRes 4444 XQ) is native too",
 			src:  with(prores, func(p *recipe.ProbeInfo) { p.PixFmt, p.Bits = "yuva444p12le", 12 }),
 			ops:  []recipe.Op{unpremultiply(), speed(2)}, out: gif(),
 			want: Plan{
-				Filter: "[0:v]format=gbrap12le,setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,setpts=PTS/2,fps=30:round=down,format=rgba[out]",
+				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,setpts=PTS/2,fps=30:round=down,format=rgba[out]",
 				Width:  1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 2, Frames: 60, Speed: 2,
 			},
 		},
 		{
-			name: "unpremultiply at 8-bit uses gbrap",
+			name: "unpremultiply at 8-bit on an RGB source uses gbrap",
 			src:  gifSrc, ops: []recipe.Op{unpremultiply()}, out: webp(),
 			want: Plan{
 				Filter: "[0:v]format=gbrap,setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,fps=20:round=down,format=rgba[out]",
 				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
+			},
+		},
+		{
+			name: "unpremultiply on a 16-bit RGB source uses gbrap at 8 bits (no 16-bit gbrap variant)",
+			src:  with(still, func(p *recipe.ProbeInfo) { p.PixFmt, p.Bits = "rgba64be", 16 }),
+			ops:  []recipe.Op{unpremultiply()}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]format=gbrap,setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba[out]",
+				Width:  800, Height: 600, FPS: 10, HasAlpha: true, Frames: 1,
+			},
+		},
+		{
+			name: "lossy webp animation with alpha (yuva420p) takes the native head",
+			src:  with(webpAnim, func(p *recipe.ProbeInfo) { p.PixFmt = "yuva420p" }),
+			ops:  []recipe.Op{unpremultiply()}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 3, Frames: 30,
+			},
+		},
+		{
+			name: "a yuva still: the head's format=rgba is the terminal one",
+			src: with(webpAnim, func(p *recipe.ProbeInfo) {
+				p.PixFmt, p.IsStill, p.Kind, p.FPS, p.Duration, p.Frames = "yuva420p", true, recipe.KindImage, 0, 0, 1
+			}),
+			out: webp(),
+			want: Plan{
+				Filter: "[0:v]format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Frames: 1,
 			},
 		},
 		{
@@ -462,11 +506,13 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "vp9 alpha forces libvpx-vp9",
+			// libvpx decodes VP9 alpha as yuva420p (the probe's yuv420p plus the
+			// alpha plane), so the source takes the planar-YUV alpha head.
+			name: "vp9 alpha forces libvpx-vp9 and takes the yuva head",
 			src:  vp9, out: webp(),
 			want: Plan{
 				InputArgs: []string{"-c:v", "libvpx-vp9"},
-				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:     640, Height: 360, FPS: 30, HasAlpha: true, Duration: 2, Frames: 60,
 			},
 		},
@@ -475,9 +521,18 @@ func TestCompile(t *testing.T) {
 			src:  vp9, ops: []recipe.Op{trim(1, 0)}, out: webp(),
 			want: Plan{
 				InputArgs: []string{"-c:v", "libvpx-vp9", "-ss", "1"},
-				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:     640, Height: 360, FPS: 30, HasAlpha: true, Duration: 1, Frames: 30,
 				TrimStart: 1,
+			},
+		},
+		{
+			name: "vp9 alpha with the unpremultiply op is unpremultiplied natively",
+			src:  vp9, ops: []recipe.Op{unpremultiply()}, out: webp(),
+			want: Plan{
+				InputArgs: []string{"-c:v", "libvpx-vp9"},
+				Filter:    "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,fps=30:round=down,format=rgba[out]",
+				Width:     640, Height: 360, FPS: 30, HasAlpha: true, Duration: 2, Frames: 60,
 			},
 		},
 		{
@@ -485,7 +540,7 @@ func TestCompile(t *testing.T) {
 			src:  with(vp9, func(p *recipe.ProbeInfo) { p.Codec = "vp8" }), out: webp(),
 			want: Plan{
 				InputArgs: []string{"-c:v", "libvpx"},
-				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:     640, Height: 360, FPS: 30, HasAlpha: true, Duration: 2, Frames: 60,
 			},
 		},
@@ -502,7 +557,7 @@ func TestCompile(t *testing.T) {
 			src:  prores, ops: []recipe.Op{trim(1, 0)}, out: webp(),
 			want: Plan{
 				InputArgs: []string{"-ss", "1"},
-				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:     1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 3, Frames: 90,
 				TrimStart: 1,
 			},
@@ -512,9 +567,87 @@ func TestCompile(t *testing.T) {
 			src:  prores, ops: []recipe.Op{trim(0, 2.5)}, out: webp(),
 			want: Plan{
 				InputArgs: []string{"-to", "2.5"},
-				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:     1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 2.5, Frames: 75,
 				TrimEnd: 2.5,
+			},
+		},
+		{
+			// FFmpeg 9's webp_anim demuxer decodes nothing after an input seek,
+			// so a trimmed animated WebP is cut in the graph: the trim filter is
+			// the first temporal stage, the clock is rebased like -ss would, no
+			// -ss/-to, and the plan's trim facts are those of a seek.
+			name: "webp_anim: the trim is a filter stage, not a seek",
+			src:  webpAnim, ops: []recipe.Op{trim(0.5, 1.5)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]trim=start=0.5:end=1.5,setpts=PTS-STARTPTS,fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 1, Frames: 10,
+				TrimStart: 0.5, TrimEnd: 1.5, FilterTrim: true,
+			},
+		},
+		{
+			name: "webp_anim: a start-only trim",
+			src:  webpAnim, ops: []recipe.Op{trim(0.5, 0)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]trim=start=0.5,setpts=PTS-STARTPTS,fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 2.5, Frames: 25,
+				TrimStart: 0.5, FilterTrim: true,
+			},
+		},
+		{
+			name: "webp_anim: an end at or past the source end is clamped to 'to the end' before the stage is built",
+			src:  webpAnim, ops: []recipe.Op{trim(0.5, 3)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]trim=start=0.5,setpts=PTS-STARTPTS,fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 2.5, Frames: 25,
+				TrimStart: 0.5, FilterTrim: true,
+			},
+		},
+		{
+			name: "webp_anim: an end-only trim keeps start=0 in the stage",
+			src:  webpAnim, ops: []recipe.Op{trim(0, 1)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]trim=start=0:end=1,setpts=PTS-STARTPTS,fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 1, Frames: 10,
+				TrimEnd: 1, FilterTrim: true,
+			},
+		},
+		{
+			name: "webp_anim: the trim stage precedes speed and fps; two trims intersect",
+			src:  webpAnim, ops: []recipe.Op{fps(5), trim(0.25, 2), speed(2), trim(0.5, 1.5)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]trim=start=0.5:end=1.5,setpts=PTS-STARTPTS,setpts=PTS/2,fps=5:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 5, HasAlpha: true, Duration: 0.5, Frames: 2,
+				TrimStart: 0.5, TrimEnd: 1.5, Speed: 2, FilterTrim: true,
+			},
+		},
+		{
+			name: "webp_anim: the alpha head precedes the trim stage (a lossy yuva420p file with the unpremultiply op)",
+			src:  with(webpAnim, func(p *recipe.ProbeInfo) { p.PixFmt = "yuva420p" }),
+			ops:  []recipe.Op{unpremultiply(), trim(0.5, 1.5)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,trim=start=0.5:end=1.5,setpts=PTS-STARTPTS,fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 1, Frames: 10,
+				TrimStart: 0.5, TrimEnd: 1.5, FilterTrim: true,
+			},
+		},
+		{
+			name: "webp_anim without a trim is not a filter trim",
+			src:  webpAnim, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=10:round=down,format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Duration: 3, Frames: 30,
+			},
+		},
+		{
+			name: "a still webp (webp_pipe) is a plain single frame (a trim on it is rejected like any still's)",
+			src: with(webpAnim, func(p *recipe.ProbeInfo) {
+				p.Format, p.IsStill, p.Kind, p.FPS, p.Duration, p.Frames = "webp_pipe", true, recipe.KindImage, 0, 0, 1
+			}),
+			out: webp(),
+			want: Plan{
+				Filter: "[0:v]format=rgba[out]",
+				Width:  64, Height: 48, FPS: 10, HasAlpha: true, Frames: 1,
 			},
 		},
 		{
@@ -705,7 +838,7 @@ func TestCompile(t *testing.T) {
 			out:  recipe.Output{Format: "gif", Width: 128, Height: 128, FPS: 25, Preset: "emote", Target: "emote"},
 			want: Plan{
 				InputArgs: []string{"-ss", "0.5", "-to", "3.5"},
-				Filter:    "[0:v]format=gbrap10le,setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,setpts=PTS/1.5,fps=25:round=down,crop=1080:1080:420:0:exact=1,format=gbrap,premultiply=inplace=1,scale=128:128:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
+				Filter:    "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,setpts=PTS/1.5,fps=25:round=down,crop=1080:1080:420:0:exact=1,format=gbrap,premultiply=inplace=1,scale=128:128:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
 				Width:     128, Height: 128, FPS: 25, HasAlpha: true, Duration: 2, Frames: 50,
 				TrimStart: 0.5, TrimEnd: 3.5, Speed: 1.5,
 			},
@@ -978,7 +1111,7 @@ func TestCompile(t *testing.T) {
 			src:  prores, ops: []recipe.Op{trim(2.0/30, 6.0/30)}, out: webp(),
 			want: Plan{
 				InputArgs: []string{"-ss", "0.066667", "-to", "0.2"},
-				Filter:    "[0:v]fps=30:round=down,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=rgba[out]",
 				Width:     1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 0.133333, Frames: 4,
 				TrimStart: 0.066667, TrimEnd: 0.2,
 			},
@@ -1067,7 +1200,7 @@ func TestCompile(t *testing.T) {
 			src:  prores, ops: []recipe.Op{trim(1, 2)}, out: recipe.Output{Format: recipe.FormatPNG, Width: 128, Height: 128},
 			want: Plan{
 				InputArgs: []string{"-ss", "1", "-to", "2"},
-				Filter:    "[0:v]fps=30:round=down,format=gbrap,premultiply=inplace=1,scale=128:72:flags=lanczos,unpremultiply=inplace=1,format=rgba,pad=128:128:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down,format=gbrap,premultiply=inplace=1,scale=128:72:flags=lanczos,unpremultiply=inplace=1,format=rgba,pad=128:128:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba[out]",
 				Width:     128, Height: 128, FPS: 30, HasAlpha: true, Duration: 1, Frames: 30,
 				TrimStart: 1, TrimEnd: 2,
 			},
@@ -1123,6 +1256,12 @@ func TestCompile(t *testing.T) {
 			if want.SourceFPS == 0 {
 				want.SourceFPS = tc.src.FPS
 			}
+			// SourceVFR follows the source kind: every gif/apng/webp/avif
+			// animation (never an image sequence or a video) is VFR.
+			want.SourceVFR = tc.src.Kind == recipe.KindAnimation
+			// SeekUnsafe follows the demuxer: every webp_anim main source,
+			// trimmed or not (a still webp is webp_pipe and seeks fine).
+			want.SeekUnsafe = seekUnsafeDemuxer(tc.src.Format)
 			checkPlan(t, got, &want)
 		})
 	}
@@ -1348,6 +1487,28 @@ func checkPlan(t *testing.T, got, want *Plan) {
 	}
 	if got.Frames != want.Frames {
 		t.Errorf("Frames got %d want %d", got.Frames, want.Frames)
+	}
+	if got.SourceVFR != want.SourceVFR {
+		t.Errorf("SourceVFR got %v want %v", got.SourceVFR, want.SourceVFR)
+	}
+	if got.FilterTrim != want.FilterTrim {
+		t.Errorf("FilterTrim got %v want %v", got.FilterTrim, want.FilterTrim)
+	}
+	if got.SeekUnsafe != want.SeekUnsafe {
+		t.Errorf("SeekUnsafe got %v want %v", got.SeekUnsafe, want.SeekUnsafe)
+	}
+	if got.FilterTrim && !got.SeekUnsafe {
+		t.Errorf("FilterTrim implies SeekUnsafe: %+v", got)
+	}
+	if got.FilterTrim {
+		if !strings.Contains(got.Filter, "trim=start=") || strings.Contains(strings.Join(got.InputArgs, " "), "-ss") || strings.Contains(strings.Join(got.InputArgs, " "), "-to") {
+			t.Errorf("a FilterTrim plan must carry the trim stage and no -ss/-to: %q %s", got.InputArgs, got.Filter)
+		}
+	} else if strings.Contains(got.Filter, "trim=") {
+		t.Errorf("a trim stage without FilterTrim: %s", got.Filter)
+	}
+	if args := strings.Join(got.InputArgs, " "); got.SeekUnsafe && (strings.Contains(args, "-ss") || strings.Contains(args, "-to")) {
+		t.Errorf("a SeekUnsafe plan must carry no -ss/-to: %q", got.InputArgs)
 	}
 	floats := []struct {
 		name      string

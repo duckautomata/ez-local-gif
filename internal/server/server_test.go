@@ -279,8 +279,15 @@ func TestCapabilities(t *testing.T) {
 			t.Errorf("format %q is not a recipe.Format* constant", f)
 		}
 	}
-	if len(caps.Features) != 3 || !caps.Features["fit"] || !caps.Features["sequence"] || !caps.Features["optimize"] {
-		t.Errorf("features = %v, want fit/sequence/optimize all true", caps.Features)
+	// Phase 2 + Phase 3 flags; "fonts" is the only one that depends on the
+	// host (TestFontsEndpoint ties it to the font list).
+	for _, f := range []string{"fit", "sequence", "optimize", "keying", "overlays", "proxy"} {
+		if !caps.Features[f] {
+			t.Errorf("features[%q] = false, want true (%v)", f, caps.Features)
+		}
+	}
+	if _, ok := caps.Features["fonts"]; !ok || len(caps.Features) != 7 {
+		t.Errorf("features = %v, want exactly fit/sequence/optimize/keying/overlays/proxy/fonts", caps.Features)
 	}
 }
 

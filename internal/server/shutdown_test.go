@@ -12,26 +12,44 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duckautomata/ez-local-gif/internal/enc"
 	"github.com/duckautomata/ez-local-gif/internal/ffrun"
 	"github.com/duckautomata/ez-local-gif/internal/jobs"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
 )
 
-// The test binary doubles as a stand-in ffmpeg/ffprobe: when fakeToolEnv is
+// The test binary doubles as a stand-in ffmpeg/ffprobe/fc-list: when fakeToolEnv is
 // set it answers "-version" with a version line and otherwise behaves per
 // fakeModeEnv — by default it drops a marker file (pid + argv) into
 // $fakeDirEnv and blocks until it is killed (like a long master render or a
 // slow probe), so tests can hold a real child process in flight; the other
 // modes imitate an ffprobe that ran but did not like the file.
 const (
-	fakeToolEnv  = "EZLG_TEST_FAKE_TOOL"
-	fakeDirEnv   = "EZLG_TEST_FAKE_DIR"
-	fakeModeEnv  = "EZLG_TEST_FAKE_MODE"
-	fakeToolMax  = 60 * time.Second
-	fakeModeFail = "fail"    // exit 1 with an ffprobe-style complaint on stderr
-	fakeModeJunk = "junk"    // exit 0 with non-JSON on stdout
-	fakeModeNoV  = "novideo" // exit 0 with JSON that has no video stream
+	fakeToolEnv    = "EZLG_TEST_FAKE_TOOL"
+	fakeDirEnv     = "EZLG_TEST_FAKE_DIR"
+	fakeModeEnv    = "EZLG_TEST_FAKE_MODE"
+	fakeToolMax    = 60 * time.Second
+	fakeModeFail   = "fail"    // exit 1 with an ffprobe-style complaint on stderr
+	fakeModeJunk   = "junk"    // exit 0 with non-JSON on stdout
+	fakeModeNoV    = "novideo" // exit 0 with JSON that has no video stream
+	fakeModeFcList = "fclist"  // exit 0 with fc-list --format output (fakeFcListOutput)
 )
+
+// fakeFcListOutput is what the fake fc-list prints: the enc.FcListArgs
+// format (family, style, file per line), with a duplicate face and a family
+// drawtext could not name (enc.ParseFcList drops both).
+const fakeFcListOutput = "DejaVu Sans\tBold\t/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf\n" +
+	"Noto Sans\tRegular\t/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf\n" +
+	"DejaVu Sans\tBook\t/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\n" +
+	"DejaVu Sans\tBold\t/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf\n" +
+	"Weird:Name\tRegular\t/fonts/weird.ttf\n"
+
+// fakeFcListFonts is the face list fakeFcListOutput parses to.
+var fakeFcListFonts = []enc.Font{
+	{Family: "DejaVu Sans", Style: "Bold", File: "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"},
+	{Family: "DejaVu Sans", Style: "Book", File: "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"},
+	{Family: "Noto Sans", Style: "Regular", File: "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"},
+}
 
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeToolEnv) != "" {
@@ -56,6 +74,9 @@ func runFakeTool() int {
 		return 0
 	case fakeModeNoV:
 		fmt.Println(`{"streams":[{"index":0,"codec_type":"audio","codec_name":"mp3"}],"format":{"format_name":"mp3","duration":"1.0"}}`)
+		return 0
+	case fakeModeFcList:
+		fmt.Print(fakeFcListOutput)
 		return 0
 	}
 	if dir := os.Getenv(fakeDirEnv); dir != "" {

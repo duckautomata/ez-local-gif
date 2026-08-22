@@ -12,11 +12,29 @@
 
   let open = $state(false);
   const cfg = $derived(app.ops.speed);
+  const reverse = $derived(app.ops.reverse);
   const range = $derived(trimRange(info, app.ops));
   const inDur = $derived(range.end - range.start);
   const factor = $derived(cfg.enabled && cfg.factor > 0 ? cfg.factor : 1);
-  const summary = $derived(cfg.enabled && cfg.factor !== 1 ? `${fmtNum(cfg.factor)}× → ${fmtSeconds(inDur / factor)}` : '1×');
+  const summary = $derived.by(() => {
+    const parts: string[] = [];
+    if (cfg.enabled && cfg.factor !== 1) parts.push(`${fmtNum(cfg.factor)}× → ${fmtSeconds(inDur / factor)}`);
+    if (reverse) parts.push('reversed');
+    return parts.length ? parts.join(' · ') : '1×';
+  });
   const quick = [0.5, 0.75, 1, 1.5, 2, 3, 4];
+
+  // The header toggle covers the factor and the reverse switch.
+  function getEnabled(): boolean {
+    return cfg.enabled || reverse;
+  }
+  function setEnabled(v: boolean) {
+    if (v) app.ops.speed.enabled = true;
+    else {
+      app.ops.speed.enabled = false;
+      app.ops.reverse = false;
+    }
+  }
 
   function set(v: number) {
     app.ops.speed.factor = v;
@@ -24,7 +42,7 @@
   }
 </script>
 
-<OpCard title="Speed" {summary} bind:enabled={app.ops.speed.enabled} bind:open>
+<OpCard title="Speed" {summary} bind:enabled={getEnabled, setEnabled} bind:open>
   <div class="row">
     <label class="field"><span>Factor (2 = twice as fast)</span><NumField bind:value={app.ops.speed.factor} min={0.05} max={20} step="any" small /></label>
     <div class="chips">
@@ -34,5 +52,10 @@
     </div>
     <span class="hint">{fmtSeconds(inDur)} → <b>{fmtSeconds(inDur / factor)}</b></span>
   </div>
-  <p class="hint">Applied after trim. Stickers must be ≤ 5 s — speeding up is one way to fit.</p>
+  <div class="row">
+    <label class="inline" title="Play the clip backwards (after trim, speed and the geometry ops)">
+      <input type="checkbox" bind:checked={app.ops.reverse} /><span>Reverse</span>
+    </label>
+  </div>
+  <p class="hint">Applied after trim. Stickers must be ≤ 5 s — speeding up is one way to fit. Reverse plays the trimmed range backwards.</p>
 </OpCard>

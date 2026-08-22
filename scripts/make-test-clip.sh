@@ -6,6 +6,7 @@
 #   make-test-clip.sh OUT.gif  [seconds]   [size]
 #   make-test-clip.sh OUT.avif [seconds]   [size]         [premultiplied|straight]
 #   make-test-clip.sh seq OUTDIR [frames=12] [size=320x320]
+#   make-test-clip.sh green OUT.mov|OUT.mp4 [seconds=2] [size=160x160]
 #
 # Content: testsrc2 colour bars/gradients as RGB, with an alpha channel made of
 #   - a soft-edged circle orbiting the centre once per clip (seamless loop),
@@ -25,12 +26,16 @@
 # seq   → OUTDIR/f00001.png … f0000N.png, straight-alpha RGBA PNG frames of the
 #         same animation (N frames at FPS, orbit closes over the N frames) —
 #         an image-sequence upload for the integration test
+# green → an opaque green-screen clip for the keying ops (Phase 3): an orange
+#         square with a blue border (a third of the short side) orbiting once
+#         per clip over solid 0x00ff00, encoded 4:4:4 so the key edges are
+#         clean — ProRes 4444 without alpha (.mov) or H.264 High 4:4:4 (.mp4)
 #
 # Env: FPS (default 30), EZLG_FFMPEG / EZLG_FFPROBE / EZLG_AVIFENC (tool paths).
 set -euo pipefail
 
 usage() {
-  sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -58,6 +63,20 @@ if [ "$1" = seq ]; then
   seconds=$(awk -v n="$frames" -v f="$fps" 'BEGIN { printf "%.6f", n / f }')
   duration=$(awk -v n="$frames" -v f="$fps" 'BEGIN { printf "%.6f", (n + 0.5) / f }')
   frame_cap=(-frames:v "$frames")
+elif [ "$1" = green ]; then
+  kind=green
+  [ $# -ge 2 ] || usage
+  out=$2
+  seconds=${3:-2}
+  size=${4:-160x160}
+  mode=opaque
+  case "$out" in
+    *.mov|*.mp4) ;;
+    *) echo "make-test-clip: green OUT must end in .mov or .mp4 (got '$out')" >&2; usage ;;
+  esac
+  is_num "$seconds" || { echo "make-test-clip: seconds must be a positive number (got '$seconds')" >&2; exit 2; }
+  duration=$seconds
+  frame_cap=()
 else
   out=$1
   seconds=${2:-3}
@@ -102,6 +121,17 @@ if [ "$mode" = premultiplied ]; then
   graph="${graph},format=gbrap,premultiply=inplace=1"
 fi
 
+# --- green screen (opaque): a bordered square orbiting once per clip over 0x00ff00
+# The square is a third of the short side, its border an eighth of that; the
+# orbit keeps a green margin all round (amplitude 0.45 of the free travel) so
+# every frame has pure background at the corners and fully inside the square.
+w=${size%x*}; h=${size#*x}
+sq=$(( (w < h ? w : h) / 3 )); [ "$sq" -ge 8 ] || sq=8
+bw=$(( sq / 8 )); [ "$bw" -ge 2 ] || bw=2
+green_graph="color=c=0x00ff00:s=${size}:r=${fps}:d=${duration}[bg];"
+green_graph+="color=c=0xff6a00:s=${sq}x${sq}:r=${fps}:d=${duration},drawbox=x=0:y=0:w=iw:h=ih:color=0x2040c0:t=${bw}[sq];"
+green_graph+="[bg][sq]overlay=x='(W-w)/2+0.45*(W-w)*sin(2*PI*t/${seconds})':y='(H-h)/2+0.45*(H-h)*cos(2*PI*t/${seconds})'"
+
 ff() { "$ffmpeg" -hide_banner -loglevel error -nostdin -y "$@"; }
 
 # png_frames DIR → DIR/f00001.png … (straight/premultiplied as per $graph)
@@ -122,6 +152,21 @@ case "$kind" in
     "$ffprobe" -v error -select_streams v:0 \
       -show_entries stream=codec_name,pix_fmt,width,height -of default=nw=1 "$out/f00001.png"
     exit 0
+    ;;
+  green)
+    echo "make-test-clip: ${out} (green screen, ${seconds}s, ${size}, ${fps} fps, opaque 4:4:4, square ${sq}px)"
+    case "$out" in
+      *.mov)
+        ff -filter_complex "$green_graph" \
+          -c:v prores_ks -profile:v 4444 -pix_fmt yuv444p10le -vendor apl0 \
+          -movflags +faststart "$out"
+        ;;
+      *.mp4)
+        ff -filter_complex "$green_graph" \
+          -c:v libx264 -pix_fmt yuv444p -preset fast -crf 8 \
+          -movflags +faststart "$out"
+        ;;
+    esac
     ;;
   mov)
     echo "make-test-clip: ${out} (${kind}, ${seconds}s, ${size}, ${fps} fps, ${mode} alpha)"

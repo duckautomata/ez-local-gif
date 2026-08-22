@@ -14,9 +14,12 @@
 #      rate, so the master has exactly as many frames as the source, the README
 #      says "@ N fps → master N fps" and carries no resample note, and no
 #      resample warning is printed. Same run: every variant file exists (incl.
-#      e2 lossy-bgra WebP), the ProRes source is unpremultiplied at its native
-#      depth (gbrap10le/gbrap12le), and scratch sits on /dev/shm/ezl-testkit
-#      (or the tiny-/dev/shm warning is printed) and is cleaned up.
+#      e2 lossy-bgra WebP), the ProRes source goes through the app's alpha
+#      head (unpremultiplied natively at its decoded yuva444p10le/12le depth,
+#      then one format=rgba — no gbrap detour) so a transparent pixel of the
+#      lossless WebP / RGBA APNG decodes to alpha 0, and scratch sits on
+#      /dev/shm/ezl-testkit (or the tiny-/dev/shm warning is printed) and is
+#      cleaned up.
 #   4. Resample warning — a SRC whose rate differs from --fps yields the warning
 #      on stderr, the README note and a master with a different frame count.
 # 3 and 4 run the whole matrix (~15 s each) and need the toolchain image
@@ -57,6 +60,12 @@ probe() { # probe FILE KEY → first video stream entry
 }
 master_frames() { # master_frames LOGFILE → N from "[testkit] master: N frames of WxH"
   sed -n 's/^\[testkit\] master: \([0-9][0-9]*\) frames.*/\1/p' "$1" | head -n 1
+}
+corner_alpha() { # corner_alpha FILE → alpha byte (0..255) of pixel (0,0) in frame 0, decoded as rgba
+  # format=rgba before the crop: a 1 px crop of a subsampled yuva420p frame
+  # (lossy WebP) has a 0 px chroma plane and fails.
+  "$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf format=rgba,crop=1:1:0:0 -f rawvideo -pix_fmt rgba - 2>/dev/null \
+    | od -An -tu1 | awk 'NR == 1 { print $4 }'
 }
 
 # ---------------------------------------------------------------------------
@@ -119,8 +128,19 @@ if have "$ffmpeg" && have "$ffprobe" && have "$gifsicle"; then
     # shellcheck disable=SC2016  # markdown backticks
     if grep -q '^| `e2_webp_lossy_bgra_q80.webp` |' "$out25/README.md"; then ok "README lists e2 (lossy bgra)"; else fail "README lacks the e2 row"; fi
     # The synthetic ProRes 4444 decodes as yuva444p12le (10-bit for plain 4444
-    # exports); either way the kit must unpremultiply at that depth, not gbrap.
-    if grep -qE 'unpremultiply at gbrap1[02]le \(source yuva444p1[02]le\)' "$tmp/kit25.log"; then ok "unpremultiply at the source depth (gbrap10le/gbrap12le)"; else fail "no native-depth unpremultiply log line: $(grep -m1 unpremultiply "$tmp/kit25.log")"; fi
+    # exports); either way the kit must run the app's yuva alpha head —
+    # unpremultiply natively at that depth, then one format=rgba — and never
+    # route the alpha plane through gbrap (which left transparent pixels at
+    # alpha 1; internal/graph/compile.go alphaHead).
+    if grep -qE 'alpha head: unpremultiply natively at yuva444p1[02]le \(1[02]-bit\), then format=rgba' "$tmp/kit25.log"; then ok "alpha head: unpremultiply natively at yuva444p10le/12le, then format=rgba"; else fail "no native yuva alpha-head log line: $(grep -m1 'alpha head' "$tmp/kit25.log")"; fi
+    if ! grep -q 'alpha head:.*gbrap' "$tmp/kit25.log"; then ok "alpha head: no gbrap detour for the yuva source"; else fail "yuva source routed through gbrap: $(grep -m1 'alpha head:' "$tmp/kit25.log")"; fi
+    # Pixel (0,0) is outside every shape of the synthetic clip in every frame:
+    # with the app's head it decodes to alpha 0 in the exact formats (the
+    # gbrap route gave 1). Lossless WebP and RGBA APNG are byte-exact encoders.
+    for f in f_webp_lossless_bgra.webp g_apng_rgba.png; do
+      a=$(corner_alpha "$out25/$f")
+      if [ "$a" = 0 ]; then ok "$f: transparent corner pixel has alpha 0"; else fail "$f: corner pixel alpha '$a', want 0"; fi
+    done
     # Scratch: tmpfs when /dev/shm is big enough, otherwise a warning + $TMPDIR.
     shm_kib=$(df -Pk /dev/shm 2>/dev/null | awk 'NR == 2 { print $4 + 0 }')
     if [ -d /dev/shm ] && [ -w /dev/shm ] && [ -n "$shm_kib" ] && [ "$shm_kib" -ge $((256 * 1024)) ]; then

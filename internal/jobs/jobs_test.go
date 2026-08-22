@@ -660,7 +660,7 @@ func TestStillClampsStillSourceToZero(t *testing.T) {
 	}
 	dir := filepath.Join(st.Scratch, stillsDir)
 	os.MkdirAll(dir, 0o755)
-	key, _ := stillKey(b.Hash, nil, stillOutput(out), 0, DefaultStillWidth)
+	key, _ := stillKey([]string{b.Hash}, nil, stillOutput(out), 0, DefaultStillWidth)
 	os.WriteFile(filepath.Join(dir, key+".png"), []byte("FRAME0"), 0o644)
 	for _, tt := range []float64{0, 0.5, 5, 123.4, -2} {
 		got, err := m.Still(ctx, b.Hash, nil, out, tt, 0)
@@ -988,24 +988,24 @@ func TestStillKeyAndEvict(t *testing.T) {
 	src := strings.Repeat("c", 64)
 	ops := []recipe.Op{{Kind: recipe.OpCrop, Params: json.RawMessage(`{"x":1,"y":2,"w":3,"h":4}`)}}
 	out := recipe.Output{Format: "gif", Width: 128}
-	k1, err := stillKey(src, ops, out, 1.5, 480)
+	k1, err := stillKey([]string{src}, ops, out, 1.5, 480)
 	if err != nil {
 		t.Fatal(err)
 	}
-	k1b, _ := stillKey(src, []recipe.Op{{Kind: recipe.OpCrop, Params: json.RawMessage(`{ "h":4, "w":3, "y":2, "x":1 }`)}}, out, 1.5, 480)
+	k1b, _ := stillKey([]string{src}, []recipe.Op{{Kind: recipe.OpCrop, Params: json.RawMessage(`{ "h":4, "w":3, "y":2, "x":1 }`)}}, out, 1.5, 480)
 	if k1 != k1b {
 		t.Error("key depends on params formatting")
 	}
-	if k2, _ := stillKey(src, ops, out, 1.6, 480); k2 == k1 {
+	if k2, _ := stillKey([]string{src}, ops, out, 1.6, 480); k2 == k1 {
 		t.Error("key ignores t")
 	}
-	if k3, _ := stillKey(src, ops, out, 1.5, 320); k3 == k1 {
+	if k3, _ := stillKey([]string{src}, ops, out, 1.5, 320); k3 == k1 {
 		t.Error("key ignores maxW")
 	}
-	if k4, _ := stillKey(src, ops, recipe.Output{Format: "gif", Width: 64}, 1.5, 480); k4 == k1 {
+	if k4, _ := stillKey([]string{src}, ops, recipe.Output{Format: "gif", Width: 64}, 1.5, 480); k4 == k1 {
 		t.Error("key ignores output geometry")
 	}
-	if _, err := stillKey(src, []recipe.Op{{Kind: "crop", Params: json.RawMessage(`{bad`)}}, out, 0, 0); err == nil {
+	if _, err := stillKey([]string{src}, []recipe.Op{{Kind: "crop", Params: json.RawMessage(`{bad`)}}, out, 0, 0); err == nil {
 		t.Error("bad params accepted")
 	}
 	// Quality knobs are not part of the still output.
@@ -1023,7 +1023,7 @@ func TestStillKeyAndEvict(t *testing.T) {
 		os.Chtimes(p, mt, mt)
 	}
 	os.WriteFile(filepath.Join(dir, ".still-tmp"), []byte{1}, 0o644)
-	if err := evictOldest(dir, 3); err != nil {
+	if err := evictOldest(dir, 3, 0); err != nil {
 		t.Fatal(err)
 	}
 	entries, _ := os.ReadDir(dir)
@@ -1067,7 +1067,7 @@ func TestStillErrors(t *testing.T) {
 	// A memoised file short-circuits everything (no ffmpeg needed).
 	dir := filepath.Join(st.Scratch, stillsDir)
 	os.MkdirAll(dir, 0o755)
-	key, _ := stillKey(withInfo, nil, stillOutput(recipe.Output{Format: "gif"}), 0.5, DefaultStillWidth)
+	key, _ := stillKey([]string{withInfo}, nil, stillOutput(recipe.Output{Format: "gif"}), 0.5, DefaultStillWidth)
 	os.WriteFile(filepath.Join(dir, key+".png"), []byte("PNGDATA"), 0o644)
 	got, err := m.Still(ctx, withInfo, nil, recipe.Output{Format: "gif"}, 0.5, 0)
 	if err != nil || string(got) != "PNGDATA" {

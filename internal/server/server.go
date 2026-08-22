@@ -17,12 +17,27 @@
 //	                                the manifest lists; not frames.zip) into the blob store under its
 //	                                name, probes it, → 200 recipe.Source ("edit as source"); 404 when the
 //	                                result or the file does not exist
+//	GET  /api/fonts                 Phase 3: {"fonts": [{"family","style","file"}, …]} — faces drawtext can use
+//	                                (fc-list inside the container; empty list when unavailable; always an
+//	                                array, never null; Cache-Control: no-cache)
+//	POST /api/proxy                 Phase 3: {"sources": [hash, …], "ops": [...], "output": {...}, "maxW": 360,
+//	                                "maxSeconds": 10} → image/webp (animated, lossy, alpha): the Play preview.
+//	                                Same memo/cancel semantics as /api/still ("src" is accepted too; 0 = the
+//	                                defaults; negative maxW/maxSeconds → 400). 400 when a source is missing,
+//	                                409 when one is not probed yet, 504 after 60 s.
 //	GET  /api/sources/{hash}        → recipe.Source
+//	                                Phase 3: overlay assets are ordinary uploads; a recipe lists them in
+//	                                "sources" after the main source and overlay ops reference them by index.
+//	                                /api/still and /api/jobs accept "sources" with several hashes.
 //	POST /api/still                 {"src": hash, "ops": [...], "output": {...}, "t": 1.5, "maxW": 480}
 //	                                → image/png (Cache-Control: private, max-age=3600)
+//	                                Phase 3: "sources": [hash, …] (main source first) in place of — or
+//	                                agreeing with — "src" (jobs.Manager.StillSources); 404 for an
+//	                                unknown source, 409 for one not probed yet
 //	POST /api/jobs                  recipe.Recipe → 202 jobs.Job (503 + Retry-After while shutting down;
 //	                                400 for an output.target outside the set /api/capabilities "targets"
-//	                                lists — the error names the valid ones)
+//	                                lists — the error names the valid ones; 400 for a source that is not
+//	                                uploaded, 409 for one not probed yet — every entry of "sources")
 //	GET  /api/jobs/{id}             → jobs.Job
 //	DELETE /api/jobs/{id}           cancel → 204
 //	GET  /api/jobs/{id}/events      text/event-stream of jobs.Event ("event: progress|done|error",
@@ -43,7 +58,9 @@
 //	                                "rulesVersion": "...", "version": "...", "concurrency": N,
 //	                                "maxUploadBytes": N,
 //	                                "formats": ["gif","webp","apng","avif","png","jpeg","frames"],
-//	                                "features": {"fit": true, "sequence": true, "optimize": true}}
+//	                                "features": {"fit": true, "sequence": true, "optimize": true,
+//	                                "keying": true, "overlays": true, "proxy": true,
+//	                                "fonts": <true iff /api/fonts lists at least one face>}}
 //	GET  /healthz                   "ok"
 //	GET  /*                         embedded SPA: real files as-is; extension-less paths fall back
 //	                                to index.html (client routes); paths with a file extension or
@@ -68,9 +85,10 @@
 // Cross-site protection: state-changing requests (POST/DELETE) that a
 // browser marks as coming from another site — Sec-Fetch-Site: cross-site,
 // or an Origin whose host is not this server's — are refused with 403, and
-// the JSON endpoints (/api/still, /api/jobs, /api/sources/from-result)
-// require Content-Type application/json (415 otherwise). The SPA's own
-// requests and header-less clients such as curl are unaffected.
+// the JSON endpoints (/api/still, /api/proxy, /api/jobs,
+// /api/sources/from-result) require Content-Type application/json (415
+// otherwise). The SPA's own requests and header-less clients such as curl
+// are unaffected.
 //
 // Lifecycle: NewServer returns a *Server whose Shutdown cancels every render
 // accepted through POST /api/jobs (and any preview pre-warming), ends open
@@ -117,6 +135,13 @@ const (
 	probeScanFrames = 60
 	// stillTimeout bounds one preview render.
 	stillTimeout = 60 * time.Second
+	// proxyTimeout bounds one animated-preview render (Phase 3).
+	proxyTimeout = 60 * time.Second
+	// fontsTimeout bounds the font enumeration behind GET /api/fonts (one
+	// fc-list run, cached by the manager afterwards).
+	fontsTimeout = 15 * time.Second
+	// capabilitiesTimeout bounds the tool probes behind GET /api/capabilities.
+	capabilitiesTimeout = 10 * time.Second
 	// sseShutdownGrace is how long an open SSE stream keeps forwarding
 	// events after Shutdown begins, so the client sees the job's terminal
 	// "cancelled" event instead of a bare EOF, before the stream is ended.
@@ -236,7 +261,9 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/sources/from-result", s.handleSourceFromResult)
 	mux.HandleFunc("GET /api/sources/{hash}", s.handleGetSource)
+	mux.HandleFunc("GET /api/fonts", s.handleFonts)
 	mux.HandleFunc("POST /api/still", s.handleStill)
+	mux.HandleFunc("POST /api/proxy", s.handleProxy)
 	mux.HandleFunc("POST /api/jobs", s.handleCreateJob)
 	mux.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
 	mux.HandleFunc("DELETE /api/jobs/{id}", s.handleCancelJob)

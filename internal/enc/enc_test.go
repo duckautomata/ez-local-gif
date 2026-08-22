@@ -137,7 +137,10 @@ func TestStillArgs(t *testing.T) {
 	}
 	// testPlan: 25 fps source and output, Speed 1 → one slot is 0.04 s; the
 	// seek-back is max(2/25, 0.1) + 0.04 = 0.14 s, then snapped down onto the
-	// slot grid TrimStart + k*0.04.
+	// slot grid TrimStart + K*0.04. "-itsoffset K*0.04" keeps the timestamps
+	// absolute, so the select threshold is half a slot before the wanted
+	// slot k in output time, (k-0.5)/25, and the tpad covers the (k-K) slots
+	// between the seek and the wanted frame plus one second.
 
 	tests := []struct {
 		name string
@@ -147,15 +150,15 @@ func TestStillArgs(t *testing.T) {
 		want []string
 	}{
 		{
-			// t=1 → source 2.5 = slot 25; seek 2.36 snaps to 2.34 (slot 21), so
-			// the wanted slot is 4 after the seek: threshold (4-0.5)/25 = 0.14,
-			// pad 4/25 + 1 = 1.16.
+			// t=1 → source 2.5 = slot 25; seek 2.36 snaps to 2.34 (slot 21, so
+			// the offset is 0.84); the wanted slot is 4 after the seek:
+			// threshold (25-0.5)/25 = 0.98, pad 4/25 + 1 = 1.16.
 			name: "seek a little before the target on the slot grid, scaled",
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "2.34"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
+			want: append([]string{"-ss", "2.34", "-itsoffset", "0.84"}, stillTail(stillFilter(planFilter, "1.16", "0.98", alphaScale480))...),
 		},
 		{
-			name: "t=0 seeks to TrimStart and selects the first slot",
+			name: "t=0 seeks to TrimStart (no offset) and selects the first slot",
 			t:    0, maxW: 480,
 			want: append([]string{"-ss", "1.5"}, stillTail(stillFilter(planFilter, "1", "0", alphaScale480))...),
 		},
@@ -167,56 +170,58 @@ func TestStillArgs(t *testing.T) {
 		{
 			// Target clamps to 3.999 (slot 62, capped at 61 — the render's fps
 			// stage runs round=down, so floor(2.5*25) = 62 slots end at 61);
-			// seek 3.859 snaps to 3.82 (slot 58) → slot 3 after the seek. The
-			// frames from 3.82 on exist, and tpad holds the last one if the
-			// input ends first.
+			// seek 3.859 snaps to 3.82 (slot 58, offset 2.32) → slot 3 after
+			// the seek, threshold (61-0.5)/25 = 2.42. The frames from 3.82 on
+			// exist, and tpad holds the last one if the input ends first.
 			name: "t past the trim end clamps to just inside TrimEnd",
 			t:    99, maxW: 480,
-			want: append([]string{"-ss", "3.82"}, stillTail(stillFilter(planFilter, "1.12", "0.1", alphaScale480))...),
+			want: append([]string{"-ss", "3.82", "-itsoffset", "2.32"}, stillTail(stillFilter(planFilter, "1.12", "2.42", alphaScale480))...),
 		},
 		{
 			// Source 3.5; slots are 0.08 s of source: back 0.18 → 3.32 snaps to
-			// 3.26 (slot 22); wanted slot 25 → 3 after the seek.
+			// 3.26 (slot 22, offset 1.76 source seconds); wanted slot 25 → 3
+			// after the seek, threshold 0.98 output seconds.
 			name: "speed 2 maps output time to source time",
 			mod:  func(p *graph.Plan) { p.Speed = 2 },
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "3.26"}, stillTail(stillFilter(planFilter, "1.12", "0.1", alphaScale480))...),
+			want: append([]string{"-ss", "3.26", "-itsoffset", "1.76"}, stillTail(stillFilter(planFilter, "1.12", "0.98", alphaScale480))...),
 		},
 		{
-			// Source 2; slots are 0.02 s of source: back 0.12 → 1.88 (slot 19);
-			// wanted slot 25 → 6 after the seek.
+			// Source 2; slots are 0.02 s of source: back 0.12 → 1.88 (slot 19,
+			// offset 0.38); wanted slot 25 → 6 after the seek.
 			name: "speed 0.5 (slow motion) maps output time to source time",
 			mod:  func(p *graph.Plan) { p.Speed = 0.5 },
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "1.88"}, stillTail(stillFilter(planFilter, "1.24", "0.22", alphaScale480))...),
+			want: append([]string{"-ss", "1.88", "-itsoffset", "0.38"}, stillTail(stillFilter(planFilter, "1.24", "0.98", alphaScale480))...),
 		},
 		{
 			name: "zero Speed counts as 1",
 			mod:  func(p *graph.Plan) { p.Speed = 0 },
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "2.34"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
+			want: append([]string{"-ss", "2.34", "-itsoffset", "0.84"}, stillTail(stillFilter(planFilter, "1.16", "0.98", alphaScale480))...),
 		},
 		{
 			name: "maxW 0 skips the scale but keeps tpad/select and the [outs] label",
 			t:    1, maxW: 0,
-			want: append([]string{"-ss", "2.34"}, stillTail(stillFilter(planFilter, "1.16", "0.14", ""))...),
+			want: append([]string{"-ss", "2.34", "-itsoffset", "0.84"}, stillTail(stillFilter(planFilter, "1.16", "0.98", ""))...),
 		},
 		{
 			name: "no alpha: plain scale",
 			mod:  func(p *graph.Plan) { p.HasAlpha = false },
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "2.34"}, stillTail(stillFilter(planFilter, "1.16", "0.14", plainScale480))...),
+			want: append([]string{"-ss", "2.34", "-itsoffset", "0.84"}, stillTail(stillFilter(planFilter, "1.16", "0.98", plainScale480))...),
 		},
 		{
 			// TrimEnd 0 and Duration 0: nothing to clamp against, so the seek
-			// follows t (12.11 → slot 302 = 12.08).
+			// follows t (12.11 → slot 302 = 12.08, which is also the offset
+			// since TrimStart is 0); wanted slot 306 → threshold 12.22.
 			name: "no trim, unknown duration: seek follows t unclamped",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
 				p.TrimStart, p.TrimEnd, p.Duration, p.Frames = 0, 0, 0, 0
 			},
 			t: 12.25, maxW: 480,
-			want: append([]string{"-ss", "12.08"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
+			want: append([]string{"-ss", "12.08", "-itsoffset", "12.08"}, stillTail(stillFilter(planFilter, "1.16", "12.22", alphaScale480))...),
 		},
 		{
 			// TrimEnd 0 but Duration 2.5: the source ends at 2.5, so t is clamped
@@ -228,7 +233,7 @@ func TestStillArgs(t *testing.T) {
 				p.TrimStart, p.TrimEnd = 0, 0
 			},
 			t: 12.25, maxW: 480,
-			want: append([]string{"-ss", "2.32"}, stillTail(stillFilter(planFilter, "1.12", "0.1", alphaScale480))...),
+			want: append([]string{"-ss", "2.32", "-itsoffset", "2.32"}, stillTail(stillFilter(planFilter, "1.12", "2.42", alphaScale480))...),
 		},
 		{
 			// Duration 4 s at 30 fps, plan at 33.333 fps (an fps op of 100/3;
@@ -237,7 +242,7 @@ func TestStillArgs(t *testing.T) {
 			// 3.999 = slot 133, capped at the render's last slot 132
 			// (floor(4*33.333) = 133 slots, round=down); back is 0.1 + 1/33.333,
 			// the seek snaps to slot 128 = 3.840038 s, and the wanted slot is 4
-			// after it. Six-decimal seek/threshold text.
+			// after it: threshold 131.5/33.333. Six-decimal seek/threshold text.
 			name: "t = Duration on a CFR clip at a fractional rate seeks before the last frames",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
@@ -245,12 +250,13 @@ func TestStillArgs(t *testing.T) {
 				p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS, p.Frames = 0, 0, 4, 33.333, 30, 133
 			},
 			t: 4, maxW: 480,
-			want: append([]string{"-ss", "3.840038"},
-				stillTail(stillFilter("[0:v]fps=33.333,format=rgba[out]", "1.120001", "0.105001", alphaScale480))...),
+			want: append([]string{"-ss", "3.840038", "-itsoffset", "3.840038"},
+				stillTail(stillFilter("[0:v]fps=33.333,format=rgba[out]", "1.120001", "3.945039", alphaScale480))...),
 		},
 		{
 			// A 4 fps plan needs a whole 0.25 s slot of input after the seek
-			// or the fps stage rounds it to zero frames: back = 0.1 + 0.25.
+			// or the fps stage rounds it to zero frames: back = 0.1 + 0.25 →
+			// seek 3.5 (slot 14); wanted slot 15 → threshold 14.5/4.
 			name: "low output fps widens the seek-back by one slot",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = nil
@@ -258,24 +264,25 @@ func TestStillArgs(t *testing.T) {
 				p.TrimStart, p.TrimEnd, p.Duration, p.FPS, p.SourceFPS, p.Frames = 0, 0, 4, 4, 30, 16
 			},
 			t: 4, maxW: 480,
-			want: append([]string{"-ss", "3.5"},
-				stillTail(stillFilter("[0:v]fps=4,format=rgba[out]", "1.25", "0.125", alphaScale480))...),
+			want: append([]string{"-ss", "3.5", "-itsoffset", "3.5"},
+				stillTail(stillFilter("[0:v]fps=4,format=rgba[out]", "1.25", "3.625", alphaScale480))...),
 		},
 		{
 			// Unknown source rate: 0.5 s back (+ one slot) → 1.96 → slot 11 =
-			// 1.94; wanted slot 25 → 14 after the seek.
+			// 1.94 (offset 0.44); wanted slot 25 → 14 after the seek.
 			name: "unknown source fps seeks half a second back",
 			mod:  func(p *graph.Plan) { p.SourceFPS = 0 },
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "1.94"}, stillTail(stillFilter(planFilter, "1.56", "0.54", alphaScale480))...),
+			want: append([]string{"-ss", "1.94", "-itsoffset", "0.44"}, stillTail(stillFilter(planFilter, "1.56", "0.98", alphaScale480))...),
 		},
 		{
 			// A low source rate widens the seek-back (2/5 s + one slot = 0.44):
-			// 2.06 → slot 14 = 2.06; wanted slot 25 → 11 after the seek.
+			// 2.06 → slot 14 = 2.06 (offset 0.56); wanted slot 25 → 11 after
+			// the seek.
 			name: "low source fps seeks two source frames back",
 			mod:  func(p *graph.Plan) { p.SourceFPS = 5 },
 			t:    1, maxW: 480,
-			want: append([]string{"-ss", "2.06"}, stillTail(stillFilter(planFilter, "1.44", "0.42", alphaScale480))...),
+			want: append([]string{"-ss", "2.06", "-itsoffset", "0.56"}, stillTail(stillFilter(planFilter, "1.44", "0.98", alphaScale480))...),
 		},
 		{
 			// t=0 with no trim: nothing to seek to, so -ss is omitted entirely
@@ -289,23 +296,23 @@ func TestStillArgs(t *testing.T) {
 			want: stillTail(stillFilter(planFilter, "1", "0", alphaScale480)),
 		},
 		{
-			// Source 2.0 → slot 12 (12.5 floors to 12); seek 1.86 (slot 9) →
-			// slot 3 after the seek.
+			// Source 2.0 → slot 12 (12.5 floors to 12); seek 1.86 (slot 9,
+			// offset 0.36) → slot 3 after the seek, threshold 11.5/25.
 			name: "non-seek input args survive, -ss/-to/-t are stripped",
 			mod: func(p *graph.Plan) {
 				p.InputArgs = []string{"-ss", "1.5", "-c:v", "libvpx-vp9", "-t", "2.5", "-to", "4"}
 			},
 			t: 0.5, maxW: 128,
-			want: append([]string{"-ss", "1.86", "-c:v", "libvpx-vp9"},
-				stillTail(stillFilter(planFilter, "1.12", "0.1", alphaScale128))...),
+			want: append([]string{"-ss", "1.86", "-itsoffset", "0.36", "-c:v", "libvpx-vp9"},
+				stillTail(stillFilter(planFilter, "1.12", "0.46", alphaScale128))...),
 		},
 		{
 			// TrimStart 0.1, no end, Duration 2.5 → source ends at 2.6; target
-			// 0.3 (slot 5); 0.16 snaps to slot 1 = 0.14.
+			// 0.3 (slot 5); 0.16 snaps to slot 1 = 0.14 (offset 0.04).
 			name: "fractional trim start stays on the grid",
 			mod:  func(p *graph.Plan) { p.TrimStart = 0.1; p.TrimEnd = 0; p.InputArgs = nil },
 			t:    0.2, maxW: 480,
-			want: append([]string{"-ss", "0.14"}, stillTail(stillFilter(planFilter, "1.16", "0.14", alphaScale480))...),
+			want: append([]string{"-ss", "0.14", "-itsoffset", "0.04"}, stillTail(stillFilter(planFilter, "1.16", "0.18", alphaScale480))...),
 		},
 		{
 			// A still image plan (no fps stage, Duration 0, one frame): no seek,
@@ -387,8 +394,9 @@ func TestStillArgsFromStart(t *testing.T) {
 // TestStillSeekInvariants checks the seek geometry that keeps the still from
 // ever asking ffmpeg for a frame that cannot exist: the seek is never after
 // the target, never before TrimStart, at least the seek-back plus one slot
-// before the target unless TrimStart intervenes, on the slot grid, and the
-// select threshold/pad cover the wanted slot.
+// before the target unless TrimStart intervenes, on the slot grid, the
+// -itsoffset restores absolute time, and the select threshold/pad cover the
+// wanted slot.
 func TestStillSeekInvariants(t *testing.T) {
 	plans := []struct {
 		name string
@@ -439,11 +447,19 @@ func TestStillSeekInvariants(t *testing.T) {
 				if math.Abs(slots-math.Round(slots)) > 1e-6 {
 					t.Errorf("t=%v: start %v is not on the slot grid (%v slots)", tt, s.start, slots)
 				}
-				// The wanted slot (relative to the seek) is between the threshold
-				// and threshold + one slot, and the pad reaches it. The absolute
-				// slot is capped at the render's last slot: Frames-1 when the
-				// plan knows its count, else floor(Duration*FPS) - 1 (the fps
-				// stage runs round=down).
+				// The offset undoes the seek's re-basing: it is the seek's
+				// distance from TrimStart in source seconds (0 at TrimStart).
+				if math.Abs(s.offset-(s.start-trimStart)) > 1e-9 || (math.Round(slots) == 0 && s.offset != 0) {
+					t.Errorf("t=%v: offset %v, want start - TrimStart = %v", tt, s.offset, s.start-trimStart)
+				}
+				if s.reversed || s.end != 0 {
+					t.Errorf("t=%v: forward plan got reversed=%v end=%v", tt, s.reversed, s.end)
+				}
+				// The wanted slot (in absolute output time) is between the
+				// threshold and threshold + one slot, and the pad reaches it
+				// from the seek. The absolute slot is capped at the render's
+				// last slot: Frames-1 when the plan knows its count, else
+				// floor(Duration*FPS) - 1 (the fps stage runs round=down).
 				abs := math.Floor((target-trimStart)/speed*p.FPS + stillSlotEpsilon)
 				durOut := p.Duration
 				if durOut <= 0 && p.TrimEnd > 0 {
@@ -459,28 +475,25 @@ func TestStillSeekInvariants(t *testing.T) {
 				if last >= 0 && abs > last {
 					abs = last
 				}
-				want := abs - math.Round(slots)
-				if want < 0 {
-					want = 0
-				}
-				slotT := want / p.FPS
+				slotT := abs / p.FPS // absolute output time of the wanted slot
 				if slotT < s.threshold-1e-9 || slotT-s.threshold > 1/p.FPS+1e-9 {
 					t.Errorf("t=%v: wanted slot at %v not covered by threshold %v", tt, slotT, s.threshold)
 				}
-				if s.pad < slotT+stillPadSlack-1e-9 {
-					t.Errorf("t=%v: pad %v does not reach slot %v + slack", tt, s.pad, slotT)
+				after := max(abs-math.Round(slots), 0) / p.FPS // output seconds between the seek and the slot
+				if s.pad < after+stillPadSlack-1e-9 {
+					t.Errorf("t=%v: pad %v does not reach %v after the seek + slack", tt, s.pad, after)
 				}
 				if s.threshold < 0 || s.pad <= 0 {
 					t.Errorf("t=%v: threshold %v pad %v", tt, s.threshold, s.pad)
 				}
-				// The from-start variant starts at TrimStart and selects the same
-				// absolute slot.
+				// The from-start variant starts at TrimStart without an offset
+				// and selects the same absolute slot.
 				fs := stillSeekFor(&p, tt, true)
-				if math.Abs(fs.start-trimStart) > 1e-9 {
-					t.Errorf("t=%v: from-start seek %v != TrimStart %v", tt, fs.start, trimStart)
+				if math.Abs(fs.start-trimStart) > 1e-9 || fs.offset != 0 {
+					t.Errorf("t=%v: from-start seek %v offset %v != TrimStart %v", tt, fs.start, fs.offset, trimStart)
 				}
-				if math.Abs((fs.threshold-s.threshold)-slots/p.FPS) > 1e-6 {
-					t.Errorf("t=%v: from-start threshold %v vs %v (+%v slots)", tt, fs.threshold, s.threshold, slots)
+				if math.Abs(fs.threshold-s.threshold) > 1e-9 {
+					t.Errorf("t=%v: from-start threshold %v vs %v", tt, fs.threshold, s.threshold)
 				}
 			}
 		})
@@ -489,7 +502,7 @@ func TestStillSeekInvariants(t *testing.T) {
 	// still give a usable seek.
 	for _, tt := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -5} {
 		s := stillSeekFor(&graph.Plan{Speed: math.Inf(1), TrimStart: -2}, tt, false)
-		if s.start != 0 || s.threshold != 0 || s.pad != stillPadSlack {
+		if s.start != 0 || s.offset != 0 || s.threshold != 0 || s.pad != stillPadSlack {
 			t.Errorf("t=%v: got %+v", tt, s)
 		}
 	}
@@ -503,30 +516,31 @@ func TestStillSeekInvariants(t *testing.T) {
 func TestStillSeekCapsAtPlanFrames(t *testing.T) {
 	p := graph.Plan{FPS: 20, SourceFPS: 10, Duration: 0.35, Frames: 6, Speed: 2}
 	// Seek-back max(2/10, 0.1) + one slot (0.1 s source) = 0.3 s before the
-	// target 0.68 s → 0.38 → snapped to 3 slots = 0.3 s; slot 5 - 3 = 2 →
-	// threshold 1.5/20 = 0.075, pad 2/20 + 1 = 1.1.
+	// target 0.68 s → 0.38 → snapped to 3 slots = 0.3 s (the offset); slot 5
+	// → threshold 4.5/20 = 0.225 in absolute time, 2 slots after the seek →
+	// pad 2/20 + 1 = 1.1.
 	s := stillSeekFor(&p, 0.34, false)
-	if math.Abs(s.start-0.3) > 1e-9 || math.Abs(s.threshold-0.075) > 1e-9 || math.Abs(s.pad-1.1) > 1e-9 {
-		t.Errorf("t=0.34: got %+v, want start 0.3 threshold 0.075 pad 1.1 (slot 5, the plan's last frame)", s)
+	if math.Abs(s.start-0.3) > 1e-9 || math.Abs(s.offset-0.3) > 1e-9 || math.Abs(s.threshold-0.225) > 1e-9 || math.Abs(s.pad-1.1) > 1e-9 {
+		t.Errorf("t=0.34: got %+v, want start 0.3 offset 0.3 threshold 0.225 pad 1.1 (slot 5, the plan's last frame)", s)
 	}
-	// From the start: the same absolute slot 5 → threshold 4.5/20.
-	if fs := stillSeekFor(&p, 0.34, true); math.Abs(fs.threshold-0.225) > 1e-9 {
-		t.Errorf("from start: got %+v, want threshold 0.225", fs)
+	// From the start: the same absolute slot 5 → the same threshold.
+	if fs := stillSeekFor(&p, 0.34, true); math.Abs(fs.threshold-0.225) > 1e-9 || fs.offset != 0 {
+		t.Errorf("from start: got %+v, want threshold 0.225 and no offset", fs)
 	}
 	// The frame-index scrubber's midpoints land on their own slots: 5.5/20
 	// (target 0.55 s, seek 0.25 → 2 slots = 0.2 s) → slot 5 = 3 after the
 	// seek; 4.5/20 (target 0.45, seek 0.15 → 1 slot = 0.1 s) → slot 4 = 3
-	// after the seek. Both: threshold 2.5/20, pad 3/20 + 1.
-	if s := stillSeekFor(&p, 5.5/20, false); math.Abs(s.start-0.2) > 1e-9 || math.Abs(s.threshold-0.125) > 1e-9 || math.Abs(s.pad-1.15) > 1e-9 {
-		t.Errorf("t=5.5/20: got %+v, want start 0.2 threshold 0.125 pad 1.15", s)
+	// after the seek. Thresholds 4.5/20 and 3.5/20, pad 3/20 + 1.
+	if s := stillSeekFor(&p, 5.5/20, false); math.Abs(s.start-0.2) > 1e-9 || math.Abs(s.threshold-0.225) > 1e-9 || math.Abs(s.pad-1.15) > 1e-9 {
+		t.Errorf("t=5.5/20: got %+v, want start 0.2 threshold 0.225 pad 1.15", s)
 	}
-	if s := stillSeekFor(&p, 4.5/20, false); math.Abs(s.start-0.1) > 1e-9 || math.Abs(s.threshold-0.125) > 1e-9 || math.Abs(s.pad-1.15) > 1e-9 {
-		t.Errorf("t=4.5/20: got %+v, want start 0.1 threshold 0.125 pad 1.15", s)
+	if s := stillSeekFor(&p, 4.5/20, false); math.Abs(s.start-0.1) > 1e-9 || math.Abs(s.threshold-0.175) > 1e-9 || math.Abs(s.pad-1.15) > 1e-9 {
+		t.Errorf("t=4.5/20: got %+v, want start 0.1 threshold 0.175 pad 1.15", s)
 	}
 	// Without a frame count the old floor cap applies: slot 6 stays.
 	p.Frames = 0
-	if s := stillSeekFor(&p, 0.34, false); math.Abs(s.threshold-0.125) > 1e-9 {
-		t.Errorf("no Frames: got %+v, want threshold 0.125 (slot 6)", s)
+	if s := stillSeekFor(&p, 0.34, false); math.Abs(s.threshold-0.275) > 1e-9 {
+		t.Errorf("no Frames: got %+v, want threshold 0.275 (slot 6)", s)
 	}
 }
 
@@ -594,6 +608,321 @@ func TestProxyArgs(t *testing.T) {
 		want := proxyTail("[0:v]fps=25,format=rgba[out];[out]fps=15,"+plainScale360+"[outp]", "yuv420p", "10")
 		assertArgs(t, got, want)
 	})
+
+	// A single-frame plan (a still main source; the compiler emits no fps
+	// stage for it, and an animated overlay does not change its length) at a
+	// plan rate above 15 fps gets no fps stage: ffmpeg's fps filter emits
+	// nothing for one frame and libwebp_anim then fails to assemble. An
+	// unknown frame count (0) is not a still and keeps the cap.
+	t.Run("single-frame plan at 25 fps gets no fps stage", func(t *testing.T) {
+		p := testPlan()
+		p.Filter = "[0:v]format=rgba[out]"
+		p.InputArgs = nil
+		p.Frames, p.Duration, p.TrimStart, p.TrimEnd, p.SourceFPS = 1, 0, 0, 0, 0
+		got := ProxyArgs(src, p, 0, 0, "proxy.webp")
+		want := proxyTail("[0:v]format=rgba[out];[out]"+alphaScale360+"[outp]", "yuva420p", "10")
+		assertArgs(t, got, want)
+	})
+	t.Run("unknown frame count keeps the 15 fps cap", func(t *testing.T) {
+		p := testPlan()
+		p.InputArgs = nil
+		p.Frames = 0
+		got := ProxyArgs(src, p, 0, 0, "proxy.webp")
+		want := proxyTail("[0:v]fps=25,format=rgba[out];[out]fps=15,"+alphaScale360+"[outp]", "yuva420p", "10")
+		assertArgs(t, got, want)
+	})
+}
+
+// longReversedPlan is testPlan played backwards over a 30 s trim (1.5..31.5
+// s of a 25 fps source, 750 slots): a reversed proxy of it shows the last
+// maxSeconds of the trimmed source, so only that tail needs decoding.
+func longReversedPlan() *graph.Plan {
+	p := testPlan()
+	p.Filter = reversedFilter
+	p.Reversed = true
+	p.Duration, p.Frames, p.TrimEnd = 30, 750, 31.5
+	p.InputArgs = []string{"-ss", "1.5", "-to", "31.5"}
+	return p
+}
+
+// TestProxyArgs_ReversedTail: a reversed plan longer than the preview is
+// seeked to just before the tail the preview shows — the reversed stills'
+// seek for output time maxSeconds (the seek-back before the source slot
+// shown at maxSeconds, snapped onto the slot grid and, for CFR sources, onto
+// whole source frames after TrimStart) — keeping -to TrimEnd and the -t cap;
+// everything else about the argv is unchanged. Seekable animation sources
+// (gif/apng/avif, trimmed or not) get the plain grid-snapped seek. Forward
+// plans, plans whose demuxer cannot seek (SeekUnsafe / FilterTrim: animated
+// WebP) and short or unknown-length plans keep the plan's own input args.
+func TestProxyArgs_ReversedTail(t *testing.T) {
+	const src = "/data/blobs/ab/abcd.mov"
+	proxyFilter := reversedFilter + ";[out]fps=15," + alphaScale360 + "[outp]"
+	tail := func(dur string) []string {
+		return []string{
+			"-i", src,
+			"-filter_complex", proxyFilter,
+			"-map", "[outp]",
+			"-an", "-sn", "-dn",
+			"-t", dur,
+			"-c:v", "libwebp_anim",
+			"-lossless", "0",
+			"-q:v", "60",
+			"-compression_level", "0",
+			"-pix_fmt", "yuva420p",
+			"-loop", "0",
+			"-map_metadata", "-1",
+			"-f", "webp",
+			"proxy.webp",
+		}
+	}
+	tests := []struct {
+		name       string
+		mod        func(p *graph.Plan)
+		maxSeconds float64
+		lead       []string // argv before "-i"
+		dur        string
+	}{
+		{
+			// t=10 is output slot 250 → source slot 499 (middle 1.5 + 499.5*0.04
+			// = 21.48 s); the 0.14 s seek-back gives 21.34 = slot 496 exactly, a
+			// whole number of 25 fps source frames after TrimStart.
+			name:       "30 s reversed, 10 s preview: seek to the last 10.16 s",
+			maxSeconds: 10,
+			lead:       []string{"-ss", "21.34", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			name:       "default maxSeconds is 10",
+			maxSeconds: 0,
+			lead:       []string{"-ss", "21.34", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			// 5 output slots are 6 source frames: slot 496 snaps down to 495.
+			name:       "30 fps source at 25 fps snaps the seek to whole source frames",
+			mod:        func(p *graph.Plan) { p.SourceFPS = 30 },
+			maxSeconds: 10,
+			lead:       []string{"-ss", "21.3", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			// Speed 2 over 30 source seconds: 375 slots of 0.08 s; t=10 → slot
+			// 250 → source slot 124 (middle 11.46), back 0.18 → 11.28 → slot 122.
+			name: "speed 2",
+			mod: func(p *graph.Plan) {
+				p.Speed, p.Duration, p.Frames = 2, 15, 375
+			},
+			maxSeconds: 10,
+			lead:       []string{"-ss", "11.26", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			// t=2.5 → slot 62 → source slot 687 (middle 29.0), back 0.14 →
+			// 28.86 = slot 684.
+			name:       "a shorter preview seeks later",
+			maxSeconds: 2.5,
+			lead:       []string{"-ss", "28.86", "-to", "31.5"},
+			dur:        "2.5",
+		},
+		{
+			// No trim: the seek counts from 0 and the decode runs to the end.
+			name: "untrimmed source: no -to",
+			mod: func(p *graph.Plan) {
+				p.InputArgs = nil
+				p.TrimStart, p.TrimEnd = 0, 0
+			},
+			maxSeconds: 10,
+			lead:       []string{"-ss", "19.84"},
+			dur:        "10",
+		},
+		{
+			// Without a frame count the last slot follows from the duration.
+			name:       "unknown frame count, known duration",
+			mod:        func(p *graph.Plan) { p.Frames = 0 },
+			maxSeconds: 10,
+			lead:       []string{"-ss", "21.34", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			name: "decoder options survive between the seek and the input",
+			mod: func(p *graph.Plan) {
+				p.InputArgs = []string{"-ss", "1.5", "-c:v", "libvpx-vp9", "-to", "31.5"}
+			},
+			maxSeconds: 10,
+			lead:       []string{"-ss", "21.34", "-to", "31.5", "-c:v", "libvpx-vp9"},
+			dur:        "10",
+		},
+		{
+			// An animation source the compiler trimmed with an input seek: the
+			// plain grid-snapped seek (no source-frame alignment, which would
+			// give 21.3 for this 30 fps cadence).
+			name:       "trimmed animation source (SourceVFR) gets the plain seek",
+			mod:        func(p *graph.Plan) { p.SourceVFR, p.SourceFPS = true, 30 },
+			maxSeconds: 10,
+			lead:       []string{"-ss", "21.34", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			name: "animation source trimmed at the end only",
+			mod: func(p *graph.Plan) {
+				p.SourceVFR = true
+				p.InputArgs = []string{"-to", "30"}
+				p.TrimStart, p.TrimEnd = 0, 30
+			},
+			maxSeconds: 10,
+			lead:       []string{"-ss", "19.84", "-to", "30"},
+			dur:        "10",
+		},
+		{
+			// An untrimmed GIF (a seekable animation source): the plain
+			// grid-snapped seek from 0, no -to (source-frame alignment at this
+			// 30 fps cadence would give 19.8).
+			name: "untrimmed GIF (seekable SourceVFR) gets the plain seek",
+			mod: func(p *graph.Plan) {
+				p.SourceVFR, p.SourceFPS = true, 30
+				p.InputArgs = nil
+				p.TrimStart, p.TrimEnd = 0, 0
+			},
+			maxSeconds: 10,
+			lead:       []string{"-ss", "19.84"},
+			dur:        "10",
+		},
+		// --- unchanged argv ---
+		{
+			// An untrimmed animated WebP: its demuxer decodes nothing after
+			// any -ss, which the plan states (SeekUnsafe without FilterTrim),
+			// so the whole clip is decoded.
+			name: "untrimmed animated WebP (SeekUnsafe) keeps decoding from the start",
+			mod: func(p *graph.Plan) {
+				p.SourceVFR, p.SeekUnsafe = true, true
+				p.InputArgs = nil
+				p.TrimStart, p.TrimEnd = 0, 0
+			},
+			maxSeconds: 10,
+			lead:       nil,
+			dur:        "10",
+		},
+		{
+			// The seek-back reaches TrimStart: the plan's own seek stays.
+			name:       "duration barely above the preview: unchanged",
+			mod:        func(p *graph.Plan) { p.Duration, p.Frames = 10.1, 252 },
+			maxSeconds: 10,
+			lead:       []string{"-ss", "1.5", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			name:       "preview longer than the clip: unchanged",
+			maxSeconds: 60,
+			lead:       []string{"-ss", "1.5", "-to", "31.5"},
+			dur:        "60",
+		},
+		{
+			name: "unknown length: unchanged",
+			mod: func(p *graph.Plan) {
+				p.InputArgs = []string{"-ss", "1.5"}
+				p.Duration, p.Frames, p.TrimEnd = 0, 0, 0
+			},
+			maxSeconds: 10,
+			lead:       []string{"-ss", "1.5"},
+			dur:        "10",
+		},
+		{
+			name:       "forward plan: unchanged",
+			mod:        func(p *graph.Plan) { p.Reversed = false },
+			maxSeconds: 10,
+			lead:       []string{"-ss", "1.5", "-to", "31.5"},
+			dur:        "10",
+		},
+		{
+			// A filter-trimmed plan (animated WebP) cannot be seeked at all.
+			name: "filter-trimmed plan: unchanged",
+			mod: func(p *graph.Plan) {
+				p.FilterTrim, p.SourceVFR = true, true
+				p.InputArgs = nil
+			},
+			maxSeconds: 10,
+			lead:       nil,
+			dur:        "10",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := longReversedPlan()
+			if tc.mod != nil {
+				tc.mod(p)
+			}
+			filter := proxyFilter
+			if !p.Reversed {
+				filter = "[0:v]fps=25,format=rgba[out];[out]fps=15," + alphaScale360 + "[outp]"
+				p.Filter = "[0:v]fps=25,format=rgba[out]"
+			}
+			got := ProxyArgs(src, p, 0, tc.maxSeconds, "proxy.webp")
+			want := append(append([]string{}, tc.lead...), tail(tc.dur)...)
+			want[len(tc.lead)+3] = filter
+			assertArgs(t, got, want)
+		})
+	}
+
+	// Extra inputs follow the (seeked) main input unchanged.
+	p := longReversedPlan()
+	p.ExtraInputs = []graph.ExtraInput{{Source: 1, Path: gifOv, Args: []string{"-stream_loop", "-1"}, Animated: true, Duration: 1.2, Loop: true}}
+	got := ProxyArgs(src, p, 0, 10, "proxy.webp")
+	want := cat([]string{"-ss", "21.34", "-to", "31.5", "-i", src, "-stream_loop", "-1", "-i", gifOv}, tail("10")[2:])
+	assertArgs(t, got, want)
+
+	// The seek is the reversed still's seek for t = maxSeconds at every
+	// length, rate and speed: never after the source slot it needs, on the
+	// grid, source-frame aligned for CFR sources, inside the trim.
+	plans := []graph.Plan{
+		{FPS: 30, SourceFPS: 30, Duration: 40, Speed: 1, Reversed: true, TrimStart: 2, TrimEnd: 42},
+		{FPS: 25, SourceFPS: 30, Duration: 40, Speed: 1, Reversed: true},
+		{FPS: 33.333, SourceFPS: 30, Duration: 40, Frames: 1333, Speed: 1, Reversed: true},
+		{FPS: 25, SourceFPS: 25, Duration: 20, Frames: 500, TrimStart: 1.5, TrimEnd: 41.5, Speed: 2, Reversed: true},
+		{FPS: 10, SourceFPS: 29.97, Duration: 40, Speed: 0.25, Reversed: true},
+		{FPS: 10, SourceFPS: 10, Duration: 35, Frames: 350, TrimStart: 0.5, TrimEnd: 35.5, Speed: 1, Reversed: true, SourceVFR: true},
+		{FPS: 10, SourceFPS: 10, Duration: 35, Frames: 350, Speed: 1, Reversed: true, SourceVFR: true},
+		// Animated WebP, trimmed (FilterTrim) or not (SeekUnsafe alone): never.
+		{FPS: 10, SourceFPS: 10, Duration: 35, Frames: 350, TrimStart: 0.5, TrimEnd: 35.5, Speed: 1, Reversed: true, SourceVFR: true, FilterTrim: true, SeekUnsafe: true},
+		{FPS: 10, SourceFPS: 10, Duration: 35, Frames: 350, Speed: 1, Reversed: true, SourceVFR: true, SeekUnsafe: true},
+	}
+	for _, p := range plans {
+		g := newStillGrid(&p)
+		for _, maxSeconds := range []float64{0.5, 2.5, 10, 30, 39.99, 40, 60} {
+			s, ok := proxySeekFor(&p, maxSeconds)
+			if p.SeekUnsafe || p.FilterTrim {
+				if ok {
+					t.Errorf("%+v maxSeconds=%v: a seek-unsafe plan must not be seeked, got %+v", p, maxSeconds, s)
+				}
+				continue
+			}
+			still := reversedSeekFor(&p, maxSeconds, false)
+			if p.SourceVFR {
+				// The plain seek: the still decodes from TrimStart here.
+				still.start = g.reversedSeekStart(p.SourceFPS, float64(still.index), false)
+			}
+			if ok != (still.start > g.trimStart) || (ok && (s.start != still.start || s.end != still.end)) {
+				t.Errorf("%+v maxSeconds=%v: proxy seek %+v ok=%v, still seek %+v", p, maxSeconds, s, ok, still)
+			}
+			if !ok {
+				continue
+			}
+			slots := (s.start - g.trimStart) / g.period
+			if math.Abs(slots-math.Round(slots)) > 1e-6 {
+				t.Errorf("%+v maxSeconds=%v: start %v is not on the slot grid", p, maxSeconds, s.start)
+			}
+			if k := g.last - math.Min(math.Floor(maxSeconds*g.fps+stillSlotEpsilon), g.last); math.Round(slots) > k {
+				t.Errorf("%+v maxSeconds=%v: seek slot %v is past the source slot %v the preview ends at", p, maxSeconds, slots, k)
+			}
+			if !p.SourceVFR {
+				if err := g.phaseError(p.SourceFPS, math.Round(slots)); err >= seekPhaseTolerance {
+					t.Errorf("%+v maxSeconds=%v: %v slots are %.3g s off a whole source frame", p, maxSeconds, slots, err)
+				}
+			}
+			if p.TrimEnd > 0 && s.start >= p.TrimEnd {
+				t.Errorf("%+v maxSeconds=%v: start %v not before TrimEnd %v", p, maxSeconds, s.start, p.TrimEnd)
+			}
+		}
+	}
 }
 
 func TestRawInputArgs(t *testing.T) {

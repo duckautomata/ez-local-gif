@@ -84,7 +84,7 @@ func TestLookupTools_CoversEveryField(t *testing.T) {
 	for _, spec := range toolSpecs {
 		*spec.field(&probe) = "x"
 	}
-	if probe != (Tools{"x", "x", "x", "x", "x", "x", "x", "x", "x", "x"}) {
+	if probe != (Tools{"x", "x", "x", "x", "x", "x", "x", "x", "x", "x", "x"}) {
 		t.Fatalf("toolSpecs does not cover every Tools field: %+v", probe)
 	}
 }
@@ -385,6 +385,86 @@ func TestRunFFmpeg_Real(t *testing.T) {
 	}
 }
 
+// TestRunFFmpegLog_PrefixAndStderr: the info-level prefix is used, no
+// progress args are appended, and stderr comes back verbatim on success.
+func TestRunFFmpegLog_PrefixAndStderr(t *testing.T) {
+	needSh(t)
+	ff := writeScript(t, t.TempDir(), "ffmpeg",
+		"for a in \"$@\"; do echo \"$a\" >&2; done\necho '[Parsed_bbox_1 @ 0x1] n:0 pts:0 pts_time:0 x1:2 x2:5 y1:3 y2:7 w:4 h:5 crop=4:5:2:3 drawbox=2:3:4:5' >&2\nexit 0\n")
+	out, err := RunFFmpegLog(context.Background(), ff, []string{"-i", "in.png", "-vf", "bbox", "-f", "null", "-"})
+	if err != nil {
+		t.Fatalf("RunFFmpegLog: %v", err)
+	}
+	want := strings.Join([]string{
+		"-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats",
+		"-i", "in.png", "-vf", "bbox", "-f", "null", "-",
+		"[Parsed_bbox_1 @ 0x1] n:0 pts:0 pts_time:0 x1:2 x2:5 y1:3 y2:7 w:4 h:5 crop=4:5:2:3 drawbox=2:3:4:5",
+	}, "\n") + "\n"
+	if out != want {
+		t.Fatalf("stderr:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+// TestRunFFmpegLog_FailureKeepsText: a non-zero exit still returns what was
+// captured, plus the usual error with the stderr tail.
+func TestRunFFmpegLog_FailureKeepsText(t *testing.T) {
+	needSh(t)
+	ff := writeScript(t, t.TempDir(), "ffmpeg", "echo 'Input #0' >&2\necho 'Error opening input' >&2\nexit 2\n")
+	out, err := RunFFmpegLog(context.Background(), ff, []string{"-i", "missing"})
+	if err == nil || !strings.HasPrefix(err.Error(), "ffmpeg exited: exit status 2\n") {
+		t.Fatalf("err = %v, want the exit error with the stderr tail", err)
+	}
+	if out != "Input #0\nError opening input\n" {
+		t.Fatalf("stderr = %q", out)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := RunFFmpegLog(ctx, ff, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled ctx: err = %v", err)
+	}
+}
+
+// TestRunFFmpegLog_Real: with a real ffmpeg the info-level report of a
+// detection filter survives (RunFFmpeg's error level would drop it).
+func TestRunFFmpegLog_Real(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	args := []string{
+		"-f", "lavfi", "-i", "color=c=black:s=64x48:r=5:d=1,format=rgb24",
+		"-vf", "drawbox=x=10:y=8:w=20:h=16:c=white:t=fill,cropdetect=limit=24:round=2:reset=0:skip=0",
+		"-an", "-f", "null", "-",
+	}
+	out, err := RunFFmpegLog(ctx, ff, args)
+	if err != nil {
+		t.Fatalf("RunFFmpegLog: %v", err)
+	}
+	if !strings.Contains(out, "crop=20:16:10:8") {
+		t.Fatalf("stderr lacks the cropdetect report:\n%s", out)
+	}
+	// -nostats drops the periodic progress updates; only ffmpeg's final
+	// summary line remains.
+	if n := strings.Count(out, "frame="); n > 1 {
+		t.Fatalf("-nostats should leave at most the final summary line, got %d:\n%s", n, out)
+	}
+}
+
+// TestVersions_RealFcList: fontconfig's fc-list prints "fontconfig version
+// X" on stdout for --version (verified with 2.15 in the runtime image).
+func TestVersions_RealFcList(t *testing.T) {
+	tools := LookupTools()
+	if tools.FcList == "" {
+		t.Skip("fc-list not on PATH")
+	}
+	got := Tools{FcList: tools.FcList}.Versions(context.Background())["fc-list"]
+	if !strings.HasPrefix(got, "fontconfig version ") {
+		t.Fatalf("fc-list version line = %q", got)
+	}
+}
+
 func TestTailBuffer(t *testing.T) {
 	b := &tailBuffer{max: 16}
 	for _, s := range []string{"aaaa\n", "bbbb\n", "cccc\n", "dddd\n", "eeee\n"} {
@@ -402,6 +482,9 @@ func TestTailBuffer(t *testing.T) {
 	}
 	if got := b.Tail(10); got != "cccc\ndddd\neeee" {
 		t.Fatalf("Tail(10) = %q", got)
+	}
+	if got := b.String(); got != "\ncccc\ndddd\neeee\n" {
+		t.Fatalf("String() = %q", got)
 	}
 	if _, err := b.Write([]byte("f\r\n")); err != nil {
 		t.Fatal(err)

@@ -239,6 +239,110 @@ func TestUnpremultiplyPixels(t *testing.T) {
 	})
 }
 
+// blocksPNG writes a 48x16 PNG of three 16x16 blocks: fully transparent
+// black, half-alpha red stored premultiplied ((128,0,0,128): the straight
+// colour is (255,0,0)) and opaque red.
+func blocksPNG(t *testing.T, path string) {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 48, 16))
+	cols := []color.NRGBA{{}, {R: 128, A: 128}, {R: 255, A: 255}}
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 48; x++ {
+			img.SetNRGBA(x, y, cols[x/16])
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNativeYUVAAlphaIsExact: a ProRes 4444 clip decodes to yuva444p12le with
+// color_range=tv and (made by ffmpeg, like every clip swscale writes) stores
+// its alpha plane on the luma range — 12-bit 256 transparent .. ~3750
+// opaque. The compiler's planar-YUV alpha head unpremultiplies the frames
+// natively and converts them to rgba exactly once, which undoes that
+// symmetrically: alpha comes out exactly 0 / 128 / 255. The former
+// "format=gbrap12le,…,unpremultiply" head copied the alpha plane with a +7
+// drift and no expansion (256→263), and the later gbrap12le→rgba expansion
+// left alpha 1 under every transparent pixel (129 for 128), which made every
+// encoder code the transparent area's colour and Crop to content at
+// threshold 1 find the whole frame.
+func TestNativeYUVAAlphaIsExact(t *testing.T) {
+	ff := ffmpegOrSkip(t)
+	dir := t.TempDir()
+	pngPath, mov := filepath.Join(dir, "blocks.png"), filepath.Join(dir, "blocks.mov")
+	blocksPNG(t, pngPath)
+	proresClip(t, ff, pngPath, mov)
+	info := proresInfo
+	info.Width, info.Height = 48, 16
+	const w = 48
+
+	// checkBlocks asserts the alpha of every pixel of the three blocks (0,
+	// 128 +-1, 255) and the colour at the block centres: red R > 240 for the
+	// half-alpha block when straight (the unpremultiply op), ~128 when the
+	// premultiplied colour is left as stored.
+	checkBlocks := func(t *testing.T, f []byte, halfR int, name string) {
+		t.Helper()
+		for y := 0; y < 16; y++ {
+			for x := 0; x < w; x++ {
+				px := pixel(f, w, x, y)
+				want := []byte{0, 128, 255}[x/16]
+				tol := 0
+				if want == 128 {
+					tol = 1
+				}
+				if !near(px[3], want, tol) {
+					t.Errorf("%s: (%d,%d) = %v, want alpha %d (+-%d)", name, x, y, px, want, tol)
+					return
+				}
+			}
+		}
+		if px := pixel(f, w, 24, 8); !near(px[0], byte(halfR), 8) || px[1] > 16 || px[2] > 16 {
+			t.Errorf("%s: half-alpha block centre %v, want R ~%d, G/B ~0", name, px, halfR)
+		}
+		if px := pixel(f, w, 40, 8); px[0] <= 240 || px[1] > 16 || px[2] > 16 {
+			t.Errorf("%s: opaque block centre %v, want red", name, px)
+		}
+	}
+
+	t.Run("unpremultiply natively, then one format=rgba", func(t *testing.T) {
+		p := compile(t, info, []recipe.Op{{Kind: recipe.OpUnpremultiply}}, recipe.Output{Format: "webp"})
+		if !strings.HasPrefix(p.Filter, "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,") || strings.Contains(p.Filter, "gbrap") {
+			t.Fatalf("filter: %s", p.Filter)
+		}
+		checkBlocks(t, renderMaster(t, ff, mov, p), 255, "unpremultiplied")
+	})
+	t.Run("without the op the head is the bare format=rgba and alpha is exact too", func(t *testing.T) {
+		p := compile(t, info, nil, recipe.Output{Format: "webp"})
+		if !strings.HasPrefix(p.Filter, "[0:v]format=rgba,") {
+			t.Fatalf("filter: %s", p.Filter)
+		}
+		checkBlocks(t, renderMaster(t, ff, mov, p), 128, "as stored")
+	})
+	t.Run("the premultiplied scale chain starts from the exact rgba", func(t *testing.T) {
+		// A pixel-preserving 1:1 scale is skipped by the compiler, so halve
+		// the height: every block keeps its alpha (the scale averages
+		// identical rows) and Crop to content would still see alpha 0.
+		p := compile(t, info, []recipe.Op{{Kind: recipe.OpUnpremultiply}}, recipe.Output{Format: "webp", Width: 48, Height: 8, Fit: "exact"})
+		if !strings.Contains(p.Filter, ",format=rgba,fps=10:round=down,format=gbrap,premultiply=inplace=1,scale=48:8:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]") {
+			t.Fatalf("filter: %s", p.Filter)
+		}
+		f := renderMaster(t, ff, mov, p)
+		for _, pt := range [][3]int{{8, 4, 0}, {24, 4, 128}, {40, 4, 255}} {
+			if px := pixel(f, w, pt[0], pt[1]); !near(px[3], byte(pt[2]), 1) {
+				t.Errorf("scaled (%d,%d) = %v, want alpha %d", pt[0], pt[1], px, pt[2])
+			}
+		}
+		if px := pixel(f, w, 24, 4); px[0] <= 240 {
+			t.Errorf("scaled half-alpha block centre %v, want straight red", px)
+		}
+	})
+}
+
 // compile wraps graph.Compile with a fatal error check.
 func compile(t *testing.T, src recipe.ProbeInfo, ops []recipe.Op, out recipe.Output) *graph.Plan {
 	t.Helper()

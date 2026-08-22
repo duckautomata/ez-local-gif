@@ -11,10 +11,14 @@ into the Go binary by `web/embed.go`.
     npm run build       # → web/dist (index.html + assets/), keeps dist/.gitkeep
     npm run check       # svelte-check (TypeScript + Svelte diagnostics)
     npm test            # vitest unit tests (src/**/*.test.ts, plain Node, no DOM):
-                        #   lib: still, state/buildOutput/buildOps/effectiveFPS, presets, format
-                        #        (timecode, frame grid, drop rates), rules labels, result
-                        #        grouping, drop planning, edit-as-source, api helpers, render reset
-                        #   components: ResultCard / OutputCard rendered with svelte/server (SSR)
+                        #   lib: still, proxy (Play), state/buildOutput/buildOps/effectiveFPS,
+                        #        state.phase3 (op order, overlay assets → sources), overlay
+                        #        (anchor / drag-box maths), eyedropper (pixel mapping), fonts
+                        #        fallback, presets, format (timecode, frame grid, drop rates),
+                        #        rules labels, result grouping, drop planning, edit-as-source,
+                        #        api helpers, render reset
+                        #   components: ResultCard / OutputCard / Preview / TrimCard / CropCard /
+                        #        BackgroundCard / OverlaysPanel rendered with svelte/server (SSR)
     npm run preview     # serve the built dist locally
 
 `npm run dev` proxies `/api`, `/out` and `/healthz` to the Go server at
@@ -29,9 +33,16 @@ into the Go binary by `web/embed.go`.
                                  '/?src=<hash>' startup load + address-bar sync
     src/app.css                  theme + shared controls
     src/lib/api.ts               TS mirror of the Go JSON types + fetch/XHR/SSE client
-                                 (upload of one file or an image sequence, from-result, ?src= helpers)
+                                 (upload of one file or an image sequence, from-result, ?src= helpers,
+                                 Phase 3: /api/fonts, /api/proxy, multi-source stills)
     src/lib/state.svelte.ts      app state (source, ops, output, ui) + buildOps/buildOutput/recipeOps,
-                                 sequence fps/duration, effectiveOps (Optimize sends no ops)
+                                 recipeSources/assetHashes (overlay assets), background/autocrop/reverse
+                                 /overlay cfg, sequence fps/duration, effectiveOps (Optimize sends no ops)
+    src/lib/overlay.ts           text / image overlay cfg + the drag-box geometry (anchor maths,
+                                 footprints, time-range visibility)
+    src/lib/eyedropper.ts        display px → still px mapping, canvas pixel read, hex helpers
+    src/lib/proxy.ts             ProxyPlayer: the on-demand animated preview behind Play (stale state)
+    src/lib/fonts.ts             font families for the Text card (GET /api/fonts, DejaVu Sans fallback)
     src/lib/presets.ts           presets (Emote, Sticker, Chat GIF/WebP/AVIF, Optimize, Frames, Custom),
                                  formats per preset, fit budgets, matte / trim-fringe constants
     src/lib/still.ts             StillScheduler: preview still debounce/abort/object-URL logic (unit-tested)
@@ -42,7 +53,10 @@ into the Go binary by `web/embed.go`.
     src/lib/files.ts             drop planning: one file vs image sequence, natural sort
     src/lib/editsource.ts        "edit as source": open tab → POST /api/sources/from-result → navigate
     src/lib/toast.svelte.ts      toasts
-    src/components/…             UploadZone, ProbeBadge, Preview (+ CropOverlay), ops/* (incl. DelayCard),
+    src/components/…             UploadZone, ProbeBadge, Preview (+ CropOverlay, OverlayLayer drag boxes,
+                                 eyedropper layer, Play/Stop), AnchorGrid, ops/* (Trim, Crop + auto-crop,
+                                 Resize, Fps, Speed + reverse, Background, FlipRotate, Delay,
+                                 OverlaysPanel → TextOverlayCard / ImageOverlayCard + TimeRangeFields),
                                  OutputCard, RenderPanel, ResultCard (+ InChat), DiscordChecks, Header, Toasts
 
 ## Behaviour notes
@@ -125,7 +139,71 @@ into the Go binary by `web/embed.go`.
 - While the Crop card is open the still is requested **without** crop/resize/
   flip/rotate and without output sizing, so the canvas overlay maps display
   pixels straight onto source pixels.
-- Ops are serialised in the order unpremultiply, delay, trim, speed, fps, crop,
-  resize, flip, rotate (the compiler hoists unpremultiply and delay anyway).
+- Ops are serialised in the order unpremultiply, delay, trim, speed, fps,
+  chromakey/colorkey, crop/autocrop, resize, flip, rotate, reverse, then the
+  text/overlay ops in the user's card order (the compiler hoists
+  unpremultiply and delay anyway).
+
+### Phase 3 editing ops
+
+- **Background card** (`app.ops.background`): None · Greenscreen · Bluescreen ·
+  Pick a colour. Green/blue emit `chromakey` (key colour — preset `00ff00` /
+  `0000ff` or custom —, similarity, blend, despill on/off + mix/expand under
+  Advanced); recipe zero values are left out of the params, and because the
+  Go zero value of blend *is* the 0.05 default, the blend slider floors at
+  0.01. Pick a colour emits `colorkey` once a colour was picked: the
+  **eyedropper** (`app.ui.pickColor`) arms a transparent button layer over the
+  preview still, which is requested *without* the key op while armed
+  (`buildOps({keyPreview})`); a click maps display px → still px
+  (`lib/eyedropper.displayToPixel`), reads the pixel through a canvas and
+  stores the hex; the hex field is the keyboard path; Esc cancels.
+- **Crop card**: "Auto-crop to content" (`app.ops.autocrop`: padding, alpha
+  threshold under Advanced for alpha sources) emits `autocrop` instead of the
+  manual `crop`; the rectangle fields are disabled while it is on and the
+  preview leaves crop mode (the server resolves the box; the still shows the
+  result). The header toggle covers both.
+- **Speed card**: "Reverse" (`app.ops.reverse`) emits `reverse` after the
+  geometry ops; the header toggle covers factor and reverse.
+- **Overlays** (`app.ops.overlays`, `lib/overlay.ts`): "+ Add text" / "+ Add
+  image" append cards (stable ids; ▲ ▼ reorder = drawing order, ✕ remove; each
+  card has its own enable toggle). Text: textarea, font from `GET /api/fonts`
+  (`lib/fonts.ts` reduces faces to families; DejaVu Sans is always offered and
+  is the fallback when the endpoint is empty or down), size, colour
+  (RRGGBB[AA]), outline width/colour, box + colour + padding (≥ 1: the Go zero
+  value means the default 8), anchor (3×3 grid — switching keeps the element
+  in place by moving X/Y), X/Y, time range. Image: the asset is an ordinary
+  `POST /api/upload` (pick or drop onto the card); the card keeps the returned
+  `Source`; W/H (0 = natural, one side keeps the aspect), opacity, loop (only
+  offered for animated assets; off → `noLoop`), anchor/X/Y, time range.
+  `recipeSources` = `[main, ...assetHashes]` in first-use order, deduplicated;
+  overlay ops carry `source` = that index, so removing a card re-indexes the
+  rest; disabled / asset-less cards contribute nothing (unit-tested).
+- **Drag to place**: with at least one ready overlay the still is requested
+  with `maxW` 8192 (graph's MaxDim — the server scales to `min(iw, maxW)`, so
+  the still arrives unscaled and its natural size *is* the output canvas).
+  `OverlayLayer` draws one box per overlay active at the scrubber frame
+  (`activeAt`: start ≤ t < end, 0 = whole clip; others are counted in a
+  corner badge — scrub into their range to see them), positioned in % of the
+  canvas so zoom does not matter; dragging moves the anchor point by the
+  pointer delta × (canvas px / display px), clamped so ≥ 8 px stay visible;
+  arrow keys nudge (Shift ×10). The still re-renders through the usual
+  150 ms debounce, so the user sees the real composite. Text boxes are an
+  estimate (0.6 em per char, 1.2 em per line + outline + box padding).
+- **Time ranges** (`TimeRangeFields`): output seconds after trim/speed,
+  half-open `[start, end)` like trim (the frame at exactly `end` is not
+  drawn); "from scrubber" = the frame's start for Start, the point after it
+  for End (last frame → 0 = to the end), both floored to whole µs so they
+  sit on the server's `gte(t+0.0001,S)*lt(t+0.0001,E)` window (adjacent
+  ranges never overlap), "Whole clip" clears both, "▸ go to start" moves the
+  scrubber into the range.
+- **Play** (`lib/proxy.ts` ProxyPlayer): `POST /api/proxy` with
+  `{sources, ops, output, maxW: 360, maxSeconds: 10}` → animated WebP shown in
+  the stage instead of the still; requested **on demand only**; every
+  state change calls `update(req)`, which never fetches but marks the shown
+  proxy **stale** ("changed — Play again") when the recipe key differs;
+  Stop returns to the still and releases the object URL; crop / eyedropper
+  modes stop playback. Memoised server-side like stills.
+- Stills and jobs send `sources` (main + assets) alongside `src`; the server
+  accepts either and checks they agree on the main source.
 - Jobs: `POST /api/jobs` → `EventSource /api/jobs/{id}/events`; if the stream
   cannot be opened or drops, the UI polls `GET /api/jobs/{id}` once a second.

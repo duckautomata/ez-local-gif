@@ -3,6 +3,7 @@ import {
   dropRates,
   fmtLimit,
   fmtTimecode,
+  floorTime,
   FRAME_TOLERANCE,
   frameAt,
   frameCount,
@@ -115,6 +116,32 @@ describe('frame grid', () => {
     expect(trimTime(1.0000006)).toBe(1.000001);
     expect(trimTime(0)).toBe(0);
     expect(Object.is(trimTime(-0.0000001), 0)).toBe(true); // no -0
+  });
+
+  it('floorTime rounds DOWN to whole microseconds and never above its input (overlay Start / End from the grid)', () => {
+    expect(floorTime(2 / 30)).toBe(0.066666); // trimTime gives 0.066667, above frame 2's own time
+    expect(floorTime(1 / 30)).toBe(0.033333); // same as trimTime when that already rounds down
+    expect(floorTime(14 / 30)).toBe(0.466666);
+    expect(floorTime(0.1)).toBe(0.1); // on the grid: kept
+    expect(floorTime(13 / 25)).toBe(0.52);
+    expect(floorTime(1.5)).toBe(1.5);
+    expect(floorTime(3 / 30.303)).toBe(0.099);
+    expect(floorTime(33 / 30.303)).toBe(1.089001);
+    expect(floorTime(1.0000006)).toBe(1); // trimTime would round up to 1.000001
+    expect(floorTime(1.0000004)).toBe(1);
+    expect(floorTime(0)).toBe(0);
+    expect(floorTime(-0.5)).toBe(0);
+    expect(floorTime(NaN)).toBe(0);
+    // every frame start at the usual rates: at most a µs below the grid, never above it, and a whole µs
+    for (const fps of [10, 12.5, 23.976, 24, 25, 29.97, 30, 30.303, 50, 59.94, 60]) {
+      for (let i = 0; i < frameCount(10, fps); i++) {
+        const v = i / fps;
+        const f = floorTime(v);
+        expect(f, `${fps} fps frame ${i}`).toBeLessThanOrEqual(v);
+        expect(v - f, `${fps} fps frame ${i} within a µs`).toBeLessThan(1e-6 + 1e-12);
+        expect(trimTime(f), `${fps} fps frame ${i} whole µs`).toBe(f);
+      }
+    }
   });
 
   it('stillTime asks for the middle of frame i, which the server maps back onto frame i', () => {

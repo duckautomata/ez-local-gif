@@ -37,7 +37,10 @@ export const DECODE_ERROR = 'The preview image could not be decoded';
  * - an error is remembered together with the key it belongs to, so a decode
  *   error of the *displayed* still is not hidden by that same rule;
  * - the previous object URL is revoked only after the next image has loaded
- *   (no flash of a broken image).
+ *   (no flash of a broken image);
+ * - while paused (the still is off the stage because the proxy plays)
+ *   nothing is fetched and the parked URLs are released; resuming fetches
+ *   the latest state once (setPaused).
  */
 export class StillScheduler {
   private readonly view: StillView;
@@ -54,6 +57,8 @@ export class StillScheduler {
   private current: StillRequest | null = null;
   private currentKey = '';
   private revokeOnLoad: string[] = [];
+  /** the still is off the stage: remember requests, fetch nothing */
+  private paused = false;
 
   constructor(view: StillView, deps: StillDeps) {
     this.view = view;
@@ -96,7 +101,31 @@ export class StillScheduler {
       if (this.errorKey !== key) this.clearError();
       return;
     }
+    if (this.paused) return; // remembered in `current`; setPaused(false) schedules it
     this.timer = setTimeout(() => void this.load(key, r), this.debounceMs);
+  }
+
+  /**
+   * setPaused(true) takes the scheduler off duty while the still is not on
+   * the stage (the proxy plays): the debounce timer and an in-flight
+   * request are dropped, the object URLs parked for the next image load are
+   * released now (nothing loads while paused, and none of them is the one
+   * view.url names), and later requests are only remembered — every scrub
+   * or op change used to render a still (at full resolution in overlay
+   * mode) and park its URL until Stop. setPaused(false) fetches the
+   * remembered state once, unless the still on screen already matches it.
+   */
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    if (paused) {
+      if (this.timer !== undefined) clearTimeout(this.timer);
+      this.timer = undefined;
+      this.abortInFlight();
+      this.releaseParked();
+      return;
+    }
+    if (this.current) this.schedule(this.currentKey, this.current);
   }
 
   private async load(key: string, r: StillRequest): Promise<void> {
@@ -147,6 +176,10 @@ export class StillScheduler {
 
   /** imageLoaded: the <img> for view.url has decoded — release the previous URLs. */
   imageLoaded(): void {
+    this.releaseParked();
+  }
+
+  private releaseParked(): void {
     for (const u of this.revokeOnLoad) this.deps.revokeURL(u);
     this.revokeOnLoad = [];
   }
@@ -171,7 +204,6 @@ export class StillScheduler {
     this.abortInFlight();
     if (this.view.url) this.deps.revokeURL(this.view.url);
     this.view.url = null;
-    for (const u of this.revokeOnLoad) this.deps.revokeURL(u);
-    this.revokeOnLoad = [];
+    this.releaseParked();
   }
 }

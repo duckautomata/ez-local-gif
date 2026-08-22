@@ -4,20 +4,25 @@
 // semaphore bounds concurrent encodes.
 //
 // Render pipeline:
-//  1. Look up sources in the store (probe info must exist); touch them so
-//     the sweeper's TTL counts from this use. An image-sequence source is a
-//     blob directory; enc joins graph.Plan.InputPattern onto it.
-//  2. plan := graph.Compile(mainInfo, ops, output). Estimate the RGBA
-//     master (plan.Frames*W*H*4; one frame for the static formats, whose
-//     master is cut to the first frame): refuse renders over
-//     Options.MaxMasterBytes or larger than the scratch filesystem up-front,
-//     otherwise reserve the estimate (plus room for PNG intermediates where
-//     the format needs them) from the scratch budget — see scratch.go.
-//  3. If store.HasResult(hash) → done immediately with the existing manifest.
-//  4. scratch := store.ScratchDir(jobID); render the master with
-//     enc.MasterArgs + ffrun.RunFFmpeg (progress → Percent, using
-//     plan.Frames or plan.Duration for the denominator); scan alpha; fill
-//     enc.Master.
+//  1. Look up every source in the store (probe info must exist); touch them
+//     so the sweeper's TTL counts from this use. An image-sequence source is
+//     a blob directory; enc joins graph.Plan.InputPattern onto it. Sources
+//     after the first are overlay assets (Phase 3, phase3.go) and must be
+//     single files. If store.HasResult(hash) → done immediately with the
+//     existing manifest.
+//  2. Resolve every autocrop op (autocrop.go), then plan :=
+//     graph.CompileWithSources(infos, ops, output) with the overlay input
+//     paths filled in. Estimate the RGBA master (plan.Frames*W*H*4; one
+//     frame for the static formats, whose master is cut to the first
+//     frame): refuse renders over Options.MaxMasterBytes or larger than the
+//     scratch filesystem up-front, otherwise reserve the estimate (plus
+//     room for PNG intermediates where the format needs them) from the
+//     scratch budget — see scratch.go.
+//  3. scratch := store.ScratchDir(jobID); write the drawtext bodies
+//     (plan.TextFiles) into it and bind them (graph.BindTextFiles).
+//  4. Render the master with enc.MasterArgs + ffrun.RunFFmpeg (progress →
+//     Percent, using plan.Frames or plan.Duration for the denominator);
+//     scan alpha; fill enc.Master.
 //  5. Encode per output.Format (encoders.go, frames.go):
 //     gif → enc.GIFArgs then enc.GifsicleArgs (output.Loop restated as
 //     --loopcount); webp → enc.WebPArgs; apng → enc.APNGArgs (RGBA) or,
@@ -57,6 +62,7 @@ import (
 	"time"
 
 	"github.com/duckautomata/ez-local-gif/internal/discordlint"
+	"github.com/duckautomata/ez-local-gif/internal/enc"
 	"github.com/duckautomata/ez-local-gif/internal/ffrun"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
 	"github.com/duckautomata/ez-local-gif/internal/store"
@@ -182,9 +188,34 @@ type Options struct {
 	// estimate does not fit waits for others to finish (cancellable), one
 	// that could never fit fails up-front. 0 = the size of the scratch
 	// filesystem when the platform can tell (the tmpfs shm_size), else
-	// unlimited; < 0 = unlimited.
+	// unlimited; < 0 = unlimited. When it is derived from the filesystem the
+	// still and proxy memo bounds (MaxStillsBytes + MaxProxyBytes) are
+	// subtracted first: the memo dirs live on the same tmpfs.
 	ScratchBudgetBytes int64
+
+	// MaxStillsBytes bounds the still-frame memo directory (<Scratch>/stills)
+	// in bytes, next to the MaxStills entry count: the oldest entries are
+	// evicted before a new one is written. Overlay-mode stills are unscaled
+	// (up to 8192 px wide), so the count alone bounds nothing useful. 0 =
+	// DefaultMaxStillsBytes (256 MiB).
+	MaxStillsBytes int64
+
+	// MaxProxyBytes bounds the proxy memo directory (<Scratch>/proxy) in
+	// bytes, next to MaxProxies (a proxy runs up to MaxProxyWidth px for
+	// MaxProxySeconds). 0 = DefaultMaxProxyBytes (512 MiB).
+	MaxProxyBytes int64
 }
+
+// Memo bounds.
+const (
+	// DefaultMaxStillsBytes is Options.MaxStillsBytes when unset.
+	DefaultMaxStillsBytes = 256 << 20
+	// DefaultMaxProxyBytes is Options.MaxProxyBytes when unset.
+	DefaultMaxProxyBytes = 512 << 20
+	// minPreviewConcurrency is the least size of the preview semaphore
+	// (previewConcurrency): scrubbing must not queue behind a single slot.
+	minPreviewConcurrency = 2
+)
 
 // Tunables.
 const (
@@ -252,10 +283,23 @@ type Manager struct {
 	mu   sync.Mutex
 	jobs map[string]*job
 
-	stillMu sync.Mutex // serialises memo eviction
+	stillMu sync.Mutex // serialises memo eviction and writes (stills and proxies)
+
+	// previewSem bounds the ffmpeg runs of stills and proxies (max(2,
+	// Concurrency)); memo hits never touch it. previews shares one render
+	// among concurrent identical previews, keyed by their memo key.
+	previewSem chan struct{}
+	previews   flight[[]byte]
 
 	versionsOnce sync.Once
 	versions     map[string]string
+
+	// Phase 3: the fc-list result (Fonts) and the in-flight autocrop
+	// detections (detectContentBox).
+	fontsMu   sync.Mutex
+	fonts     []enc.Font
+	fontsDone bool
+	autocrop  flight[recipe.CropParams]
 }
 
 // NewManager wires the store, tools and options.
@@ -270,22 +314,36 @@ func NewManager(st *store.Store, tools ffrun.Tools, opts Options) *Manager {
 	if opts.MaxMasterBytes <= 0 {
 		opts.MaxMasterBytes = DefaultMaxMasterBytes
 	}
+	if opts.MaxStillsBytes <= 0 {
+		opts.MaxStillsBytes = DefaultMaxStillsBytes
+	}
+	if opts.MaxProxyBytes <= 0 {
+		opts.MaxProxyBytes = DefaultMaxProxyBytes
+	}
 	budget := opts.ScratchBudgetBytes
 	switch {
 	case budget < 0:
 		budget = 0 // unlimited
 	case budget == 0:
 		if total, ok := st.ScratchTotal(); ok {
-			budget = total
+			// The still/proxy memos share the tmpfs with the renders: what
+			// they may hold is not available to a master.
+			budget = total - (opts.MaxStillsBytes + opts.MaxProxyBytes)
+			if budget <= 0 {
+				log.Printf("jobs: scratch %s holds %s, no more than the %s the still/proxy memos may hold; renders get the whole filesystem as their budget",
+					st.Scratch, humanBytes(total), humanBytes(opts.MaxStillsBytes+opts.MaxProxyBytes))
+				budget = total
+			}
 		}
 	}
 	m := &Manager{
-		st:      st,
-		tools:   tools,
-		opts:    opts,
-		sem:     make(chan struct{}, opts.Concurrency),
-		scratch: newByteBudget(budget),
-		jobs:    make(map[string]*job),
+		st:         st,
+		tools:      tools,
+		opts:       opts,
+		sem:        make(chan struct{}, opts.Concurrency),
+		scratch:    newByteBudget(budget),
+		jobs:       make(map[string]*job),
+		previewSem: make(chan struct{}, max(minPreviewConcurrency, opts.Concurrency)),
 	}
 	if budget > 0 && budget < opts.MaxMasterBytes {
 		log.Printf("jobs: scratch %s holds %s, less than the %s frame-master cap; larger renders will be refused up-front (raise shm_size or lower EZLG_MAX_MASTER_BYTES)",
@@ -303,6 +361,29 @@ func (m *Manager) MaxMasterBytes() int64 { return m.opts.MaxMasterBytes }
 // ScratchBudgetBytes returns the effective scratch admission budget (0 =
 // unlimited).
 func (m *Manager) ScratchBudgetBytes() int64 { return m.scratch.Limit() }
+
+// PreviewConcurrency returns the preview semaphore size: how many still /
+// proxy ffmpeg runs may be in flight at once (max(2, Concurrency)).
+func (m *Manager) PreviewConcurrency() int { return cap(m.previewSem) }
+
+// MaxStillsBytes returns the effective byte bound of the still memo.
+func (m *Manager) MaxStillsBytes() int64 { return m.opts.MaxStillsBytes }
+
+// MaxProxyBytes returns the effective byte bound of the proxy memo.
+func (m *Manager) MaxProxyBytes() int64 { return m.opts.MaxProxyBytes }
+
+// acquirePreview takes a preview slot (cancellable) and returns its
+// idempotent release. Only the ffmpeg run of a still/proxy holds a slot —
+// never a memo lookup, so cached previews are served at once.
+func (m *Manager) acquirePreview(ctx context.Context) (release func(), err error) {
+	select {
+	case m.previewSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	var once sync.Once
+	return func() { once.Do(func() { <-m.previewSem }) }, nil
+}
 
 // ToolVersions returns the (memoised) tool version map used in manifests
 // and /api/capabilities.
@@ -333,7 +414,7 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames"
 // flags, lint fixes); discordlint.RulesVersion is folded in automatically so
 // rule changes invalidate results too. Recipes themselves keep their
 // content hash (recipe.Recipe.Hash) — only the on-disk result key changes.
-const PipelineVersion = "2026-08-21.1"
+const PipelineVersion = "2026-08-22.3"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what
@@ -344,11 +425,14 @@ func ResultKey(r recipe.Recipe) string {
 }
 
 // Submit validates and enqueues r; returns the job immediately (State
-// queued or, if the result is already on disk, done).
+// queued or, if the result is already on disk, done). A Resolved box a
+// client put into an autocrop op is dropped first (jobs resolves it
+// itself), so the recipe hash and the manifest never depend on it.
 func (m *Manager) Submit(r recipe.Recipe) (Job, error) {
 	if err := r.Validate(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
+	r.Ops = stripAutoCropResolved(r.Ops)
 	if !supportedFormats[strings.ToLower(r.Output.Format)] {
 		return Job{}, fmt.Errorf("%w: unsupported output format %q (supported: %s)", ErrInvalidRecipe, r.Output.Format, supportedFormatList)
 	}

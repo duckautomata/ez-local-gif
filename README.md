@@ -21,7 +21,7 @@ The design, Discord rules and phase plan live in [`docs/DESIGN.md`](docs/DESIGN.
 ## Features
 
 Phase 1 (accepted — renders verified on a private Discord server, see
-[`docs/discord-testkit-results.md`](docs/discord-testkit-results.md)):
+[`docs/reviews/discord-testkit-results.md`](docs/reviews/discord-testkit-results.md)):
 
 - **ProRes 4444 / any video / GIF / animated WebP → Discord-safe GIF and animated WebP** with
   transparency: premultiplied-alpha toggle (on by default for ProRes), matte + 1-bit threshold
@@ -60,6 +60,35 @@ Phase 2:
   so results can be chained from the result card.
 - Result memoisation by recipe hash + pipeline version, TTL / size sweeper for `/data`.
 
+Phase 3 (editing ops, DESIGN.md §4.3 — built and reviewed 2026-08-22):
+
+- **Background removal** — `chromakey` (green/blue screen in YUV 4:4:4 with despill) and
+  `colorkey` (pick any RGB colour with the eyedropper) ops, applied at full resolution before
+  scaling; the result keeps 8-bit alpha in WebP/APNG/AVIF and is matted + thresholded for GIF.
+  On a source that already has alpha (a ProRes 4444 export) the key's matte is intersected with
+  the source alpha instead of replacing it.
+- **Overlays** — `text` (ffmpeg `drawtext` through a text file, any fontconfig family the
+  container knows: DejaVu and Noto Sans/Serif are bundled, `/fonts` can add more; semi-transparent
+  colours are composited through a separate layer), static image and **animated** overlays
+  (`overlay` op on a second uploaded source), each with anchor/position, opacity and a half-open
+  `[start, end)` time range, placed on the final output canvas. Looping: GIF and video assets
+  repeat until the base ends (`-stream_loop -1`); animated WebP/APNG assets loop through
+  `-ignore_loop 0` and so obey their own loop count (a play-once file plays once); a finished
+  overlay holds its last frame (`tpad`), and `noLoop` forces that for every asset.
+- **Reverse** (ffmpeg's `reverse` filter after the output fit — its buffer is bounded by
+  `EZLG_MAX_MASTER_BYTES`), **auto-crop** (crop to the content box of the alpha, detected on the
+  keyed picture and memoised — the default suggestion for emotes), **animated Play preview**
+  (`POST /api/proxy`: a low-res animated WebP of the op stack so keying and timed overlays can be
+  judged in motion; stills and proxies are admitted through a preview semaphore and de-duplicated
+  in flight), **font list** (`GET /api/fonts`).
+- **ProRes alpha head** — `yuva*` sources are unpremultiplied at their native 10/12-bit depth and
+  converted to RGBA once (ffmpeg-made ProRes stores alpha on the luma range; the earlier
+  `gbrap12le` route left transparent pixels at alpha 1 — larger files, a useless auto-crop).
+- **Trim on animated WebP sources** happens in the filtergraph (FFmpeg 9's `webp_anim` demuxer
+  decodes nothing after an input seek); every other source keeps the µs-precise input seek.
+- Multi-source recipes: overlay assets are ordinary uploads listed in `sources` after the main
+  source and referenced by index; `/api/still`, `/api/proxy` and `/api/jobs` all take them.
+
 ## Quick start
 
 ```sh
@@ -73,8 +102,11 @@ docker compose up -d --build          # first build downloads ~150 MB of tools
 `/output` (where the Discord test kit writes; a "Save to /output" UI action is planned for
 Phase 4), `shm_size: 4gb`
 for the frame master, and sane defaults for retention. Uncomment the `/input` bind to pick files
-from a host folder without uploading. Logs: `docker compose logs -f app`. Update:
-`git pull && docker compose up -d --build`.
+from a host folder without uploading, and the `/fonts` bind to offer your own `.ttf`/`.otf`
+files to the text overlay (DejaVu and Noto Sans/Serif are bundled; the list is read once at
+startup, so `docker compose restart app` after adding files — `docker compose exec app fc-cache
+-f` pre-builds fontconfig's cache for a big collection). Logs: `docker compose logs -f app`.
+Update: `git pull && docker compose up -d --build`.
 
 **`./output` ownership (bare-metal Linux, Docker inside a WSL distro):** the container runs as
 uid 1000 (`ezlg`). If `./output` does not exist when you first run `docker compose up`, the Docker
@@ -96,11 +128,12 @@ Everything is optional; set it under `environment:` in `compose.yaml`.
 | `EZLG_MAX_BYTES` | `21474836480` (20 GiB) | Cap on total `/data` size (`0` = none) |
 | `EZLG_MAX_UPLOAD_MB` | `2048` | Maximum upload size |
 | `EZLG_CONCURRENCY` | `max(1, NumCPU/2)` | Concurrent renders |
-| `EZLG_FFMPEG`, `EZLG_FFPROBE`, `EZLG_GIFSICLE`, `EZLG_GIFSKI`, `EZLG_IMG2WEBP`, `EZLG_WEBPINFO`, `EZLG_AVIFENC`, `EZLG_AVIFDEC`, `EZLG_PNGQUANT`, `EZLG_OXIPNG` | found on `PATH` | Override a tool path |
+| `EZLG_MAX_MASTER_BYTES` | `2147483648` (2 GiB) | Cap on one render's RGBA frame master (frames × W × H × 4 at output size): a larger render is refused up-front with a hint (trim / lower fps / resize). Also bounds the `reverse` buffer and refuses reversed previews over it. `0`, negative or unparsable → default; keep it below `shm_size` |
+| `EZLG_FFMPEG`, `EZLG_FFPROBE`, `EZLG_GIFSICLE`, `EZLG_GIFSKI`, `EZLG_IMG2WEBP`, `EZLG_WEBPINFO`, `EZLG_AVIFENC`, `EZLG_AVIFDEC`, `EZLG_PNGQUANT`, `EZLG_OXIPNG`, `EZLG_FC_LIST` | found on `PATH` | Override a tool path (`fc-list` feeds `GET /api/fonts`; without it the font list is empty and text overlays still resolve bundled families by name) |
 
 Volumes / mounts: `/data` (required, keep it on a Linux filesystem), `/output` (optional, rw,
-must be writable by uid 1000 — see Quick start), `/input` (optional, ro), `/dev/shm` sized by
-`shm_size`.
+must be writable by uid 1000 — see Quick start), `/input` (optional, ro), `/fonts` (optional, ro:
+extra fonts for the text overlay, on fontconfig's scan path), `/dev/shm` sized by `shm_size`.
 
 ## HTTP API
 
@@ -113,22 +146,36 @@ recipe schema is `internal/recipe`). `curl` works as-is; browsers are held to sa
 | `POST /api/upload` | multipart `file` → `Source` (`hash`, `name`, `size`, `info` = probe: format, codec, W×H, fps, frames, alpha, kind, premultiplied guess). Several `file` parts that are all images → one **image-sequence** source (optional `delayMs`, default 100). |
 | `POST /api/sources/from-result` | `{"recipeHash": "…", "name": "out.gif"}` → copies that result file into the blob store and probes it → `Source` (**edit as source**) |
 | `GET /api/sources/{hash}` | `Source` |
-| `POST /api/still` | `{"src": hash, "ops": […], "output": {…}, "t": 1.5, "maxW": 480}` → `image/png` preview frame |
-| `POST /api/jobs` | a `Recipe` (`{"v":1,"sources":[hash],"ops":[…],"output":{…}}`) → `202 Job`; the result is served from cache when the same recipe was rendered before |
+| `GET /api/fonts` | `{"fonts": [{"family", "style", "file"}, …]}` — the faces the `text` op can use (`fc-list` inside the container; an empty array without it) |
+| `POST /api/still` | `{"src": hash, "ops": […], "output": {…}, "t": 1.5, "maxW": 480}` → `image/png` preview frame. Recipes with overlay sources send `"sources": [main, overlay, …]` instead of (or agreeing with) `src`; 404 for an unknown source, 409 for one not probed yet |
+| `POST /api/proxy` | `{"sources": [hash, …], "ops": […], "output": {…}, "maxW": 360, "maxSeconds": 10}` → `image/webp`: the animated low-res **Play** preview (first `maxSeconds` of the op stack at ≤ 15 fps, lossy, with alpha); 400 for a missing source |
+| `POST /api/jobs` | a `Recipe` (`{"v":1,"sources":[hash, …],"ops":[…],"output":{…}}`; overlay assets after the main source, referenced by index from `overlay` ops) → `202 Job`; the result is served from cache when the same recipe was rendered before; 400 for a source that is not uploaded, 409 for one not probed yet |
 | `GET /api/jobs/{id}` · `DELETE /api/jobs/{id}` · `GET /api/jobs/{id}/events` | poll, cancel, or follow a job (SSE: `event: progress|done|error`, `data: Event`) |
 | `GET /api/results/{recipeHash}` | the result manifest (`files[]` with `name`, `url`, `bytes`, W×H, frames, fps, `report` = Discord lint, `kind` = `output` / `alternative` / `frame` / `archive`, `desc` = binding fit knob) |
 | `GET /out/{recipeHash}/{name}` | a result file (immutable; `?dl=1` adds `Content-Disposition: attachment` named after the source) |
-| `GET /api/capabilities` | tool versions, Discord byte limits, lint rules version, concurrency, max upload, formats |
+| `GET /api/capabilities` | tool versions, Discord byte limits, lint rules version, concurrency, max upload, formats, `features` (`fit`, `sequence`, `optimize`, `keying`, `overlays`, `proxy`, and `fonts` = whether `/api/fonts` lists anything) |
 | `GET /healthz` | `ok` |
 
 `Output` fields that matter most: `format` (`gif` · `webp` · `apng` · `avif` · `png` · `jpeg` ·
 `frames`), `width`/`height`/`fit`, `fps`, `quality` / `lossless` (webp, avif), `lossy` / `colors`
 / `dither` / `alphaThreshold` / `matte` (gif), `loop`, `fitBytes` (+ `fitKeepSize`,
 `fitKeepFps`), `frameFormat` (frames: `png` · `jpeg` · `webp`), `preset` (UI label: `emote` ·
-`sticker` · `chat-gif` · `chat-webp` · `chat-avif` · `optimize` · `frames` · `custom`) and
-`target` (which Discord rules and byte limit the linter enforces: `emote` · `sticker` ·
-`attachment` · none). `scripts/integration-test.sh` exercises upload, sequence upload, jobs,
-result downloads (`?dl=1`), from-result and the source endpoints.
+`sticker` · `chat` · `optimize` · `frames` · `custom`) and `target` (which Discord rules and byte
+limit the linter enforces: `emote` · `sticker` · `attachment` (+ `-50` / `-100` / `-500` tiers) ·
+none).
+
+Ops (`{"kind": …, "params": {…}}`, see `internal/recipe`): `trim`, `crop`, `resize`, `canvas`,
+`fps`, `speed`, `flip`, `rotate`, `unpremultiply`, `delay` (sequences), and from Phase 3
+`chromakey` (`color`, `similarity`, `blend`, despill knobs), `colorkey` (`color`, `similarity`,
+`blend`), `reverse`, `autocrop` (`threshold`, `padding`), `text` (`text`, `font` = fontconfig
+family, `size`, `color`, `border`, `box`, `anchor`, `x`/`y`, `start`/`end`) and `overlay`
+(`source` = index into `sources`, `width`/`height`, `opacity`, `noLoop`, `anchor`, `x`/`y`,
+`start`/`end`). `scripts/integration-test.sh` covers `POST /api/upload`, `POST
+/api/sources/from-result`, `GET /api/sources/{hash}`, `GET /api/fonts`, `POST /api/still`, `POST
+/api/proxy`, `POST /api/jobs`, `GET /api/jobs/{id}` (polling), `GET /out/{hash}/{name}` (with and
+without `?dl=1`), `GET /api/capabilities` and `GET /healthz`, including the Phase 3 ops; it does
+**not** request `GET /api/results/{recipeHash}`, `DELETE /api/jobs/{id}` or the SSE stream `GET
+/api/jobs/{id}/events`.
 
 ## Running on WSL2 (Windows workstation)
 
@@ -243,13 +290,19 @@ docker compose -f compose.yaml -f compose.dev.yaml run --rm app go test ./...
 # image's EZLG_DATA=/data is deliberately ignored so every re-run really re-renders instead of
 # being answered from the on-disk result cache — then uploads a ProRes clip, renders the Phase 1
 # GIF + WebP, then the Phase 2 cases: emote fit-to-size with alternatives, indexed APNG sticker,
-# animated AVIF, PNG/JPEG stills, frames + zip, 3-PNG image sequence, GIF optimise, edit-as-source)
+# animated AVIF, PNG/JPEG stills, frames + zip, 3-PNG image sequence, GIF optimise, edit-as-source;
+# then the Phase 3 cases: chromakey / colorkey on a green-screen clip (pixel-checked alpha), text
+# overlay, PNG and looping-GIF overlays from a second source (stills prove the GIF overlay is
+# painted and loops rather than holding its last frame), reverse (frame hashes vs the forward
+# export), autocrop (smaller dims), trim on an animated WebP source built from the ProRes clip
+# (exactly 10 frames), the animated proxy (VP8X ANIM), fonts + capability flags)
 docker compose -f compose.yaml -f compose.dev.yaml run --rm -e EZLG_START_SERVER=1 app bash scripts/integration-test.sh
 #   against an already running stack instead:  EZLG_URL=http://localhost:8080 bash scripts/integration-test.sh
 #     (that stack keeps its ezlg-data-dev volume, so repeat recipes are answered from the result
 #      cache — the script warns per cached job and in the summary; wipe the volume (down -v) or
 #      bump jobs.PipelineVersion to force a re-render, or set EZLG_TEST_STRICT=1 to fail on it)
 #   Phase 1 checks only:                       … -e EZLG_TEST_PHASE2=0 …
+#   Phase 1 + 2 only (skip Phase 3):           … -e EZLG_TEST_PHASE3=0 …
 
 # Self-test of the Discord test kit (OUTDIR guard, frame-rate handling, variants, scratch; ~1–2 min)
 docker compose -f compose.yaml -f compose.dev.yaml run --rm app bash scripts/testkit-test.sh
@@ -265,9 +318,10 @@ docker build --target runtime -t ezlg:local --build-arg VERSION=$(git describe -
 ```
 
 Image layout (`Dockerfile`): `web` (npm build) → `gobuild` (static binary, SPA embedded) →
-`tools` (trixie-slim + pinned FFmpeg/gifsicle/libwebp/libavif/pngquant/oxipng/gifski/fonts/tini,
-self-checked at build time by `scripts/check-tools.sh`) → `runtime` (non-root `ezlg`, tini,
-healthcheck) and `dev` (tools + Go + Node, root). Third-party downloads are pinned by URL and
+`tools` (trixie-slim + pinned FFmpeg/gifsicle/libwebp/libavif/pngquant/oxipng/gifski/tini, the
+DejaVu + Noto core fonts with fontconfig and the `/fonts` scan path, self-checked at build time by
+`scripts/check-tools.sh` — tool versions, ffmpeg capabilities, font families, encode/decode
+smoke) → `runtime` (non-root `ezlg`, tini, healthcheck) and `dev` (tools + Go + Node, root). Third-party downloads are pinned by URL and
 sha256 in the `ARG`s at the top of the Dockerfile; `scripts/pin-ffmpeg.sh` prints fresh values
 when the BtbN autobuild tag is pruned (daily tags live ~2 weeks, month-end tags are permanent).
 
@@ -276,7 +330,7 @@ when the BtbN autobuild tag is pruned (daily tags live ~2 weeks, month-end tags 
 Files that look fine in a browser can still break on Discord, which re-encodes every preview
 server-side. The Phase 1 acceptance run was done on 2026-08-19: every variant below was uploaded
 to a private server and the per-file outcome is recorded in
-[`docs/discord-testkit-results.md`](docs/discord-testkit-results.md); the consequences for the
+[`docs/reviews/discord-testkit-results.md`](docs/reviews/discord-testkit-results.md); the consequences for the
 encoders are in [`docs/DESIGN.md` §9a](docs/DESIGN.md). Headlines: the ffmpeg-palette GIF paths
 (with or without gifsicle), lossy (`yuva420p` and `bgra`) and lossless WebP, the 128² emote GIF
 and WebP, the 320² sticker GIF and both APNG stickers all render correctly; gifski's per-frame
@@ -309,16 +363,21 @@ rate differs is resampled — the kit then warns, and its README notes that a pe
 hitch is expected in every file, so pass `--fps <source rate>` for a clean timing check),
 `EZLG_TESTKIT_MAX_PX` caps the chat variants (default 480).
 
-The kit decodes the source once (ProRes is unpremultiplied at its native 10/12-bit depth with the
-same `format=gbrap1Nle,setparams=alpha_mode=premultiplied,unpremultiply` chain the app uses; the
-RGBA masters live on `/dev/shm/ezl-testkit`, or under `$TMPDIR` with a warning when `/dev/shm` is
-Docker's default 64 MiB) and emits every encoder path from `docs/DESIGN.md` §4.2 / §9:
+The kit decodes the source once through the same alpha head as the app's render chain
+(`internal/graph/compile.go`, DESIGN.md §4.1): `yuva*` sources such as ProRes 4444 are
+unpremultiplied natively at their 10/12-bit depth behind the `setparams=alpha_mode=premultiplied`
+tag and converted to rgba once, RGB-decoded sources go through `format=gbrap[1Nle],…,unpremultiply`
+— so the kit's masters carry exactly the alpha a render does (transparent pixels at 0, not the
+alpha 1 the old `gbrap12le` detour left; the self-test checks a corner pixel of the lossless WebP
+and RGBA APNG). The RGBA masters live on `/dev/shm/ezl-testkit`, or under `$TMPDIR` with a warning
+when `/dev/shm` is Docker's default 64 MiB. It emits every encoder path from `docs/DESIGN.md`
+§4.2 / §9:
 ffmpeg palette GIF + `gifsicle -O2` (default), the same coalesced with `gifsicle -U`, gifski
 (local palettes), ffmpeg-only GIF, animated WebP lossy (`yuva420p` and `bgra` input, e / e2) and
 lossless, RGBA APNG, 128×128 emote GIF/WebP fitted under 256 KiB, 320×320 sticker indexed
 8-bit-alpha APNG (i3, the default rung, listed first) / GIF / RGBA APNG fitted under 512 KiB, and
 an animated AVIF with alpha. `output/testkit/README.md` opens with a "results so far" pointer to
-`docs/discord-testkit-results.md`, then says for each file where to upload it (attachment /
+`docs/reviews/discord-testkit-results.md`, then says for each file where to upload it (attachment /
 Server Settings › Emoji / Server Settings › Stickers), lists the client matrix (desktop, web,
 iOS, Android × dark/light theme × autoplay on/off, reduced motion), what to look for (alpha
 survives, no black background, no colour flicker, first-frame still, loops forever, timing) and a
@@ -339,7 +398,7 @@ Checklist for sign-off (per client and theme):
 5. `g` (APNG attachment) is expected to show only its first frame; that is a Discord limitation.
 
 Record findings (client + version, theme, autoplay, screenshot of anything wrong) in
-`docs/discord-testkit-results.md` and their consequences in `docs/DESIGN.md` §9a. Rules the
+`docs/reviews/discord-testkit-results.md` and their consequences in `docs/DESIGN.md` §9a. Rules the
 linter enforces are versioned in `internal/discordlint`.
 
 ## Scripts
@@ -347,12 +406,12 @@ linter enforces are versioned in `internal/discordlint`.
 | Script | Purpose |
 |---|---|
 | `scripts/go.ps1`, `scripts/go.sh` | Run `go …` in `golang:1.26-trixie` with the repo mounted (host has no Go) |
-| `scripts/check-tools.sh` | Print + assert every bundled tool and ffmpeg capability (runs at image build) |
-| `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`), GIF, animated AVIF with alpha (`.avif`: avifenc, or ffmpeg's colour + alpha stream pair without it), or `seq OUTDIR N` = N straight-alpha PNG frames for an image-sequence upload; premultiplied or straight alpha |
+| `scripts/check-tools.sh` | Print + assert every bundled tool, ffmpeg capability (encoders, decoders incl. the libvpx VP8 decoder for VP8-alpha overlays, every filter the graph emits — Phase 3: `tpad`, `reverse`, `lagfun`, `bbox`, `colorchannelmixer`, `setparams`, `blend`, `trim`, `setpts`, … — demuxers, muxers) and font family (DejaVu, Noto; `/fonts` on the scan path; drawtext paints) — runs at image build, so a build lacking something the pipeline relies on fails there, not at render time |
+| `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`), GIF, animated AVIF with alpha (`.avif`: avifenc, or ffmpeg's colour + alpha stream pair without it), `seq OUTDIR N` = N straight-alpha PNG frames for an image-sequence upload, or `green OUT.mov|OUT.mp4` = an opaque 4:4:4 green-screen clip (a bordered square orbiting over `0x00ff00`) for the keying ops; premultiplied or straight alpha |
 | `scripts/discord-testkit.sh` | Emit the Discord render-test matrix + README (see above) |
-| `scripts/testkit-test.sh` | Self-test for the test kit: OUTDIR guard + hint, synthetic clip at the master rate, resample warning, every variant produced, native-depth unpremultiply, /dev/shm scratch (full checks need the toolchain image) |
-| `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one on a throw-away data dir): the 18 Phase 1 checks (ProRes → emote GIF + chat WebP) plus the Phase 2 cases (fit-to-size + alternatives, indexed APNG sticker, AVIF, PNG/JPEG, frames + zip, image sequence, optimise, from-result); `EZLG_TEST_PHASE2=0` for Phase 1 only; jobs answered from the server's result cache are warned about (`EZLG_TEST_STRICT=1` fails on them) |
-| `scripts/integration-test-selftest.sh` | Unit tests for `integration-test.sh` itself (no server/toolchain needed): `EZLG_START_SERVER=1` must ignore an inherited `EZLG_DATA` (else dev-image re-runs are vacuous cache hits), `EZLG_TEST_DATA` override, cached-result detection |
+| `scripts/testkit-test.sh` | Self-test for the test kit: OUTDIR guard + hint, synthetic clip at the master rate, resample warning, every variant produced, the app's yuva alpha head (native-depth unpremultiply, one rgba conversion, transparent corner pixel at alpha 0), /dev/shm scratch (full checks need the toolchain image) |
+| `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one on a throw-away data dir): the 18 Phase 1 checks (ProRes → emote GIF + chat WebP), the Phase 2 cases (fit-to-size + alternatives, indexed APNG sticker, AVIF, PNG/JPEG, frames + zip, image sequence, optimise, from-result) and the Phase 3 cases (chromakey / colorkey on a green-screen clip with pixel-level alpha checks, text overlay, PNG + looping GIF overlays from a second source (`/api/still` pixel checks: the GIF overlay is painted and loops rather than holding its last frame), reverse vs the forward frames export, autocrop, trim on an animated WebP source built from the ProRes clip (exactly 10 frames — FFmpeg 9's `webp_anim` demuxer decodes nothing after an input seek, so the server trims such sources in the filtergraph), `POST /api/proxy`, `GET /api/fonts`, capability flags); `EZLG_TEST_PHASE2=0` for Phase 1 only, `EZLG_TEST_PHASE3=0` to skip Phase 3; jobs answered from the server's result cache are warned about (`EZLG_TEST_STRICT=1` fails on them) |
+| `scripts/integration-test-selftest.sh` | Unit tests for `integration-test.sh` itself (no server/toolchain needed): `EZLG_START_SERVER=1` must ignore an inherited `EZLG_DATA` (else dev-image re-runs are vacuous cache hits), `EZLG_TEST_DATA` override, cached-result detection, the capture-then-grep helpers vs SIGPIPE, and the frames-manifest helpers (first / last frame url must skip `frames.zip` and `delays.json`, with jq and with the grep fallback) |
 | `scripts/pin-ffmpeg.sh` | Print new `FFMPEG_TAG/ASSET/SHA256` ARG lines for a BtbN release tag |
 
 ## Layout

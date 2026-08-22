@@ -11,9 +11,11 @@
     open?: boolean;
     /** hide the enable checkbox (always-on cards) */
     toggle?: boolean;
+    /** extra header controls (reorder / remove buttons of list cards) */
+    actions?: Snippet;
     children: Snippet;
   }
-  let { title, summary = '', enabled = $bindable(false), open = $bindable(false), toggle = true, children }: Props =
+  let { title, summary = '', enabled = $bindable(false), open = $bindable(false), toggle = true, actions, children }: Props =
     $props();
 
   function autoEnable() {
@@ -31,6 +33,7 @@
       <span class="name">{title}</span>
       {#if summary && !open}<span class="op-summary">{summary}</span>{/if}
     </button>
+    {#if actions}<span class="op-actions">{@render actions()}</span>{/if}
   </div>
   {#if open}
     <div class="op-body" oninput={autoEnable} onchange={autoEnable}>
@@ -91,6 +94,11 @@
   }
   .op.enabled {
     border-color: var(--border-strong);
+  }
+  .op-actions {
+    display: inline-flex;
+    gap: 2px;
+    flex: none;
   }
   .op-body {
     padding: 4px 14px 12px 34px;

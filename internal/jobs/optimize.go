@@ -53,6 +53,9 @@ func (m *Manager) renderOptimize(ctx context.Context, j *job, scratch string, sr
 	if len(r.Ops) > 0 {
 		return nil, fmt.Errorf("%w: the optimize preset cannot apply edit ops (%d given); remove them or render as a GIF instead", ErrInvalidRecipe, len(r.Ops))
 	}
+	if len(r.Sources) > 1 {
+		return nil, fmt.Errorf("%w: the optimize preset works on a single GIF source (%d sources given; overlays need a render)", ErrInvalidRecipe, len(r.Sources))
+	}
 	if f := strings.ToLower(out.Format); f != recipe.FormatGIF {
 		return nil, fmt.Errorf("%w: the optimize preset outputs GIF, not %q", ErrInvalidRecipe, out.Format)
 	}

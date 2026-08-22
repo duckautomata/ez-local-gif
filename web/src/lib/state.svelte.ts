@@ -3,6 +3,9 @@
 
 import {
   isAnimatedFormat,
+  type AutoCropParams,
+  type ChromaKeyParams,
+  type ColorKeyParams,
   type CropParams,
   type DelayParams,
   type FitMode,
@@ -10,6 +13,7 @@ import {
   type FPSParams,
   type Op,
   type Output,
+  type OverlayParams,
   type PresetId,
   type ProbeInfo,
   type ResizeParams,
@@ -17,14 +21,26 @@ import {
   type Source,
   type SpeedParams,
   type Target,
+  type TextParams,
   type TrimParams,
 } from './api';
-import { clamp, frameCount, frameSpan, GIF_MAX_FPS, round, snapFPS, trimTime } from './format';
+import { clamp, fitSize, frameCount, frameSpan, GIF_MAX_FPS, round, snapFPS, trimTime } from './format';
+import {
+  isAnimatedAsset,
+  newImageOverlay,
+  newTextOverlay,
+  overlayReady,
+  TEXT_DEFAULTS,
+  type ImageOverlayCfg,
+  type OverlayCfg,
+  type TextOverlayCfg,
+} from './overlay';
 import { defaultOutput, fitsFormat, isSequence, limitKiB, presetAvailable, presetById, type OutputCfg } from './presets';
 
 // isSequence lives in presets.ts (isGifSource needs it there); re-exported so
 // components keep importing it from the state module.
 export { isSequence };
+export type { ImageOverlayCfg, OverlayCfg, TextOverlayCfg };
 
 export type Backdrop = 'checker' | 'dark' | 'white';
 
@@ -66,16 +82,62 @@ export interface DelayCfg {
   ms: number;
 }
 
+/** Key colours of the Greenscreen / Bluescreen modes (recipe.ChromaKeyParams defaults). */
+export const CHROMA_GREEN = '00ff00';
+export const CHROMA_BLUE = '0000ff';
+/** CHROMA_DEFAULTS mirrors recipe.ChromaKeyParams' zero values. */
+export const CHROMA_DEFAULTS = { similarity: 0.2, blend: 0.05, despillMix: 0.6, despillExpand: 0.3 };
+/** COLORKEY_DEFAULTS mirrors recipe.ColorKeyParams' zero values. */
+export const COLORKEY_DEFAULTS = { similarity: 0.1, blend: 0 };
+
+export type BackgroundMode = 'green' | 'blue' | 'pick';
+
+/**
+ * BackgroundCfg: background removal. Greenscreen / Bluescreen key in YUV
+ * (op "chromakey", with despill); "Pick a colour" keys one RGB colour from
+ * the eyedropper (op "colorkey"). Each mode keeps its own tolerances.
+ */
+export interface BackgroundCfg {
+  enabled: boolean;
+  mode: BackgroundMode;
+  /** chroma key colour RRGGBB: CHROMA_GREEN / CHROMA_BLUE, or a custom one */
+  color: string;
+  similarity: number;
+  blend: number;
+  despill: boolean;
+  despillMix: number;
+  despillExpand: number;
+  /** colour picked from the preview (RRGGBB); '' = none yet */
+  pickColor: string;
+  pickSimilarity: number;
+  pickBlend: number;
+}
+
+/** AutoCropCfg: crop to the content box (op "autocrop"); wins over the manual rectangle while on. */
+export interface AutoCropCfg {
+  enabled: boolean;
+  /** px added on every side */
+  padding: number;
+  /** alpha >= threshold counts as content (1..255) */
+  threshold: number;
+}
+
 /** OpsCfg is the editable form of the op stack; buildOps() serialises it. */
 export interface OpsCfg {
   unpremultiply: boolean;
   delay: DelayCfg;
   trim: TrimCfg;
   crop: CropCfg;
+  autocrop: AutoCropCfg;
   resize: ResizeCfg;
   fps: FpsCfg;
   speed: SpeedCfg;
+  /** play backwards (op "reverse", after the geometry) */
+  reverse: boolean;
   flipRotate: FlipRotateCfg;
+  background: BackgroundCfg;
+  /** text / image overlays in their own order (the last draws on top) */
+  overlays: OverlayCfg[];
 }
 
 export interface UiState {
@@ -90,10 +152,30 @@ export interface UiState {
   scrubFrame: number;
   /** true while the Crop card is expanded: the preview shows the full pre-crop frame */
   cropOpen: boolean;
+  /** the eyedropper is armed: the next click on the preview picks the colour to key */
+  pickColor: boolean;
+  /** id of the overlay whose drag box is highlighted (0 = none) */
+  selectedOverlay: number;
 }
 
 /** DEFAULT_DELAY_MS is the sequence frame delay the server assumes when the client sends none. */
 export const DEFAULT_DELAY_MS = 100;
+
+export function defaultBackground(): BackgroundCfg {
+  return {
+    enabled: false,
+    mode: 'green',
+    color: CHROMA_GREEN,
+    similarity: CHROMA_DEFAULTS.similarity,
+    blend: CHROMA_DEFAULTS.blend,
+    despill: true,
+    despillMix: CHROMA_DEFAULTS.despillMix,
+    despillExpand: CHROMA_DEFAULTS.despillExpand,
+    pickColor: '',
+    pickSimilarity: COLORKEY_DEFAULTS.similarity,
+    pickBlend: COLORKEY_DEFAULTS.blend,
+  };
+}
 
 export function defaultOps(info?: ProbeInfo | null): OpsCfg {
   const w = info?.width ?? 0;
@@ -105,19 +187,35 @@ export function defaultOps(info?: ProbeInfo | null): OpsCfg {
     delay: { enabled: false, ms: delayMs },
     trim: { enabled: false, start: 0, end: 0 },
     crop: { enabled: false, x: 0, y: 0, w, h },
+    autocrop: { enabled: false, padding: 0, threshold: 1 },
     resize: { enabled: false, width: 0, height: 0, fit: 'contain' },
     fps: { enabled: false, fps: Math.min(srcFps, GIF_MAX_FPS) },
     speed: { enabled: false, factor: 1 },
+    reverse: false,
     flipRotate: { enabled: false, horizontal: false, vertical: false, degrees: 0 },
+    background: defaultBackground(),
+    overlays: [],
   };
+}
+
+function defaultUi(): UiState {
+  return { backdrop: 'checker', scrubFrame: 0, cropOpen: false, pickColor: false, selectedOverlay: 0 };
 }
 
 export const app = $state({
   source: null as Source | null,
   ops: defaultOps(null),
   output: defaultOutput(),
-  ui: { backdrop: 'checker', scrubFrame: 0, cropOpen: false } as UiState,
+  ui: defaultUi(),
 });
+
+/** resetUi puts the per-source UI flags back (the backdrop choice is kept). */
+function resetUi(): void {
+  app.ui.scrubFrame = 0;
+  app.ui.cropOpen = false;
+  app.ui.pickColor = false;
+  app.ui.selectedOverlay = 0;
+}
 
 /**
  * setSource installs a freshly uploaded source and resets the op stack for
@@ -127,8 +225,7 @@ export const app = $state({
 export function setSource(src: Source | null): void {
   app.source = src;
   app.ops = defaultOps(src?.info ?? null);
-  app.ui.scrubFrame = 0;
-  app.ui.cropOpen = false;
+  resetUi();
   if (!presetAvailable(presetById(app.output.preset), src?.info ?? null)) applyPreset('chat');
 }
 
@@ -141,8 +238,142 @@ export function resetApp(): void {
   app.source = null;
   app.ops = defaultOps(null);
   app.output = defaultOutput();
-  app.ui.scrubFrame = 0;
-  app.ui.cropOpen = false;
+  resetUi();
+}
+
+// ---------------------------------------------------------------------------
+// overlays (Phase 3)
+
+let nextOverlayId = 1;
+
+/** addOverlay appends a text or image card and returns it. */
+export function addOverlay(kind: 'text' | 'image'): OverlayCfg {
+  const o = kind === 'text' ? newTextOverlay(nextOverlayId++) : newImageOverlay(nextOverlayId++);
+  app.ops.overlays.push(o);
+  app.ui.selectedOverlay = o.id;
+  return app.ops.overlays[app.ops.overlays.length - 1];
+}
+
+/** removeOverlay drops the card with that id (a no-op for an unknown id). */
+export function removeOverlay(id: number): void {
+  const i = app.ops.overlays.findIndex((o) => o.id === id);
+  if (i < 0) return;
+  app.ops.overlays.splice(i, 1);
+  if (app.ui.selectedOverlay === id) app.ui.selectedOverlay = 0;
+}
+
+/** moveOverlay shifts a card by delta positions (−1 = up / drawn earlier, +1 = down / drawn later), clamped. */
+export function moveOverlay(id: number, delta: number): void {
+  const list = app.ops.overlays;
+  const i = list.findIndex((o) => o.id === id);
+  if (i < 0) return;
+  const j = clamp(i + delta, 0, list.length - 1);
+  if (j === i) return;
+  const [o] = list.splice(i, 1);
+  list.splice(j, 0, o);
+}
+
+/**
+ * assetHashes lists the blobs the image overlays use, in first-use order
+ * (the order their ops are emitted), deduplicated — these become
+ * recipe.sources[1..] and the overlay ops reference them by index. Cards
+ * that emit no op (disabled, no asset) contribute nothing, so removing a
+ * card re-indexes the rest.
+ */
+export function assetHashes(c: OpsCfg): string[] {
+  const out: string[] = [];
+  for (const o of c.overlays) {
+    if (o.kind !== 'image' || !overlayReady(o) || !o.asset) continue;
+    if (!out.includes(o.asset.hash)) out.push(o.asset.hash);
+  }
+  return out;
+}
+
+/** recipeSources is recipe.sources: the main source, then the assets of effectiveOps (none for Optimize). */
+export function recipeSources(mainHash: string, c: OpsCfg, out: Pick<OutputCfg, 'preset'>): string[] {
+  return [mainHash, ...assetHashes(effectiveOps(c, out))];
+}
+
+/**
+ * chromaKeyOp serialises the Greenscreen / Bluescreen mode; defaults (the
+ * recipe's zero values: similarity 0.2, blend 0.05, despill 0.6 / 0.3) are
+ * left out. A blend of exactly 0 cannot be expressed (the Go zero value is
+ * the default 0.05), which is why the card's blend slider starts at 0.01.
+ */
+function chromaKeyOp(b: BackgroundCfg): Op {
+  const p: ChromaKeyParams = {};
+  if (b.color && b.color !== CHROMA_GREEN) p.color = b.color;
+  if (b.similarity > 0 && b.similarity !== CHROMA_DEFAULTS.similarity) p.similarity = round(clamp(b.similarity, 0.01, 1));
+  if (b.blend > 0 && b.blend !== CHROMA_DEFAULTS.blend) p.blend = round(clamp(b.blend, 0.01, 1));
+  if (!b.despill) p.despillOff = true;
+  else {
+    if (b.despillMix > 0 && b.despillMix !== CHROMA_DEFAULTS.despillMix) p.despillMix = round(clamp(b.despillMix, 0, 1));
+    if (b.despillExpand > 0 && b.despillExpand !== CHROMA_DEFAULTS.despillExpand) p.despillExpand = round(clamp(b.despillExpand, 0, 1));
+  }
+  return Object.keys(p).length ? { kind: 'chromakey', params: p } : { kind: 'chromakey' };
+}
+
+/** colorKeyOp serialises the Pick-a-colour mode (null until a colour was picked). */
+function colorKeyOp(b: BackgroundCfg): Op | null {
+  if (!b.pickColor) return null;
+  const p: ColorKeyParams = { color: b.pickColor };
+  if (b.pickSimilarity > 0 && b.pickSimilarity !== COLORKEY_DEFAULTS.similarity) p.similarity = round(clamp(b.pickSimilarity, 0.01, 1));
+  if (b.pickBlend > 0) p.blend = round(clamp(b.pickBlend, 0, 1));
+  return { kind: 'colorkey', params: p };
+}
+
+/** backgroundOp is the keying op of the Background card (null when off / nothing to key). */
+export function backgroundOp(b: BackgroundCfg): Op | null {
+  if (!b.enabled) return null;
+  return b.mode === 'pick' ? colorKeyOp(b) : chromaKeyOp(b);
+}
+
+/** timeRange adds start/end (output seconds, whole µs like trim bounds) when they are set. */
+function timeRange(p: { start?: number; end?: number }, o: { start: number; end: number }): void {
+  if (o.start > 0) p.start = trimTime(o.start);
+  if (o.end > 0) p.end = trimTime(o.end);
+}
+
+function textOp(o: TextOverlayCfg): Op {
+  const p: TextParams = { text: o.text, x: Math.round(o.x), y: Math.round(o.y) };
+  if (o.font && o.font !== TEXT_DEFAULTS.font) p.font = o.font;
+  if (o.size > 0 && o.size !== TEXT_DEFAULTS.size) p.size = Math.round(o.size);
+  if (o.color && o.color !== TEXT_DEFAULTS.color) p.color = o.color;
+  if (o.border > 0) {
+    p.border = Math.round(o.border);
+    if (o.borderColor && o.borderColor !== TEXT_DEFAULTS.borderColor) p.borderColor = o.borderColor;
+  }
+  if (o.box) {
+    p.box = true;
+    if (o.boxColor && o.boxColor !== TEXT_DEFAULTS.boxColor) p.boxColor = o.boxColor;
+    if (o.boxPad >= 0 && o.boxPad !== TEXT_DEFAULTS.boxPad) p.boxPad = Math.round(o.boxPad);
+  }
+  if (o.anchor !== 'tl') p.anchor = o.anchor;
+  timeRange(p, o);
+  return { kind: 'text', params: p };
+}
+
+function overlayOp(o: ImageOverlayCfg, source: number): Op {
+  const p: OverlayParams = { source, x: Math.round(o.x), y: Math.round(o.y) };
+  if (o.width > 0) p.width = Math.round(o.width);
+  if (o.height > 0) p.height = Math.round(o.height);
+  if (o.opacity > 0 && o.opacity < 1) p.opacity = round(o.opacity);
+  if (!o.loop && isAnimatedAsset(o.asset)) p.noLoop = true;
+  if (o.anchor !== 'tl') p.anchor = o.anchor;
+  timeRange(p, o);
+  return { kind: 'overlay', params: p };
+}
+
+/** overlayOps serialises the overlay cards in their order; image cards index assetHashes. */
+function overlayOps(c: OpsCfg): Op[] {
+  const assets = assetHashes(c);
+  const ops: Op[] = [];
+  for (const o of c.overlays) {
+    if (!overlayReady(o)) continue;
+    if (o.kind === 'text') ops.push(textOp(o));
+    else if (o.asset) ops.push(overlayOp(o, 1 + assets.indexOf(o.asset.hash)));
+  }
+  return ops;
 }
 
 /** applyPreset switches the Output card to a preset (Custom keeps current values). */
@@ -169,13 +400,23 @@ export function opsApply(out: Pick<OutputCfg, 'preset'>): boolean {
   return presetById(out.preset).usesOps;
 }
 
+export interface BuildOpsOptions {
+  /** stop before crop: the still shows the full frame in source pixels for the drag rectangle */
+  cropPreview?: boolean;
+  /** leave the keying op out: the eyedropper needs the original colours */
+  keyPreview?: boolean;
+}
+
 /**
  * buildOps serialises the op configuration in the documented order:
- * unpremultiply, delay, trim, speed, fps, crop, resize, canvas, flip, rotate.
- * With cropPreview the stack stops before crop, so the still shows the full
- * frame in source pixel coordinates for the drag rectangle.
+ * unpremultiply, delay, trim, speed, fps, chromakey/colorkey, crop/autocrop,
+ * resize, canvas, flip, rotate, reverse, then the text/overlay ops in the
+ * user's order. With cropPreview the stack stops before crop, so the still
+ * shows the full frame in source pixel coordinates for the drag rectangle;
+ * with keyPreview the keying op is skipped (the eyedropper picks from the
+ * unkeyed frame).
  */
-export function buildOps(c: OpsCfg, opts: { cropPreview?: boolean } = {}): Op[] {
+export function buildOps(c: OpsCfg, opts: BuildOpsOptions = {}): Op[] {
   const ops: Op[] = [];
   if (c.unpremultiply) ops.push({ kind: 'unpremultiply' });
   if (c.delay.enabled && c.delay.ms > 0) {
@@ -199,9 +440,17 @@ export function buildOps(c: OpsCfg, opts: { cropPreview?: boolean } = {}): Op[] 
     const p: FPSParams = { fps: round(c.fps.fps) };
     ops.push({ kind: 'fps', params: p });
   }
+  // Keying runs at full resolution before any geometry (DESIGN §4.3).
+  const key = opts.keyPreview ? null : backgroundOp(c.background);
+  if (key) ops.push(key);
   if (opts.cropPreview) return ops;
 
-  if (c.crop.enabled && c.crop.w > 0 && c.crop.h > 0) {
+  if (c.autocrop.enabled) {
+    const p: AutoCropParams = {};
+    if (c.autocrop.threshold > 1) p.threshold = clamp(Math.round(c.autocrop.threshold), 1, 255);
+    if (c.autocrop.padding > 0) p.padding = clamp(Math.round(c.autocrop.padding), 0, 1024);
+    ops.push(Object.keys(p).length ? { kind: 'autocrop', params: p } : { kind: 'autocrop' });
+  } else if (c.crop.enabled && c.crop.w > 0 && c.crop.h > 0) {
     const p: CropParams = {
       x: Math.round(c.crop.x),
       y: Math.round(c.crop.y),
@@ -229,7 +478,19 @@ export function buildOps(c: OpsCfg, opts: { cropPreview?: boolean } = {}): Op[] 
       ops.push({ kind: 'rotate', params: p });
     }
   }
+  if (c.reverse) ops.push({ kind: 'reverse' });
+  ops.push(...overlayOps(c));
   return ops;
+}
+
+/** cropActive: a crop op (manual or auto) is part of the stack. */
+export function cropActive(c: OpsCfg): boolean {
+  return c.autocrop.enabled || (c.crop.enabled && c.crop.w > 0 && c.crop.h > 0);
+}
+
+/** hasOverlays: at least one overlay card emits an op (the preview then shows the drag boxes). */
+export function hasOverlays(c: OpsCfg): boolean {
+  return c.overlays.some(overlayReady);
 }
 
 /** NO_OPS is an all-off stack: what the Optimize preset renders and previews with. */
@@ -246,7 +507,7 @@ export function effectiveOps(c: OpsCfg, out: Pick<OutputCfg, 'preset'>): OpsCfg 
 }
 
 /** recipeOps serialises effectiveOps (empty for Optimize). */
-export function recipeOps(c: OpsCfg, out: Pick<OutputCfg, 'preset'>, opts: { cropPreview?: boolean } = {}): Op[] {
+export function recipeOps(c: OpsCfg, out: Pick<OutputCfg, 'preset'>, opts: BuildOpsOptions = {}): Op[] {
   return buildOps(effectiveOps(c, out), opts);
 }
 
@@ -338,6 +599,50 @@ export function buildOutput(c: OutputCfg): Output {
   o.preset = c.preset;
   if (c.target && c.format !== 'frames') o.target = c.target; // frame extraction has no Discord target
   return o;
+}
+
+/**
+ * previewOutput is the part of a recipe output the preview endpoints render
+ * from — format, width, height, fit and fps — mirroring jobs.stillOutput
+ * (internal/jobs/still.go): the server keys its still and proxy memos on
+ * exactly these, so the still / proxy requests carry nothing else and a
+ * change of quality, lossy, colours, dither, matte, loop, fit budget,
+ * preset or target neither re-requests the still nor marks a playing proxy
+ * as changed.
+ */
+export function previewOutput(o: Output): Output {
+  const p: Output = { format: o.format };
+  if (o.width) p.width = o.width;
+  if (o.height) p.height = o.height;
+  if (o.fit) p.fit = o.fit;
+  if (o.fps) p.fps = o.fps;
+  return p;
+}
+
+/**
+ * planCanvas is the output canvas the overlays are drawn on (graph.Plan's
+ * Width × Height, what the preview still measures in overlay mode): the
+ * source frame after crop, resize and a 90° / 270° rotation, then the
+ * Output card's width / height / fit (graph.outputFit: both set → exactly
+ * W×H, since contain pads, cover centre-crops and exact stretches; one set
+ * → scaled to it keeping the aspect; none → as produced). null when it
+ * cannot be known client-side: no source size, or auto-crop on (the server
+ * resolves the content box) without both output dimensions. `c` should be
+ * effectiveOps.
+ */
+export function planCanvas(info: ProbeInfo | null | undefined, c: OpsCfg, out: Pick<OutputCfg, 'width' | 'height' | 'fit'>): { w: number; h: number } | null {
+  if (!info || !(info.width > 0) || !(info.height > 0)) return null;
+  if (out.width > 0 && out.height > 0) return { w: Math.round(out.width), h: Math.round(out.height) };
+  if (c.autocrop.enabled) return null;
+  let w = info.width;
+  let h = info.height;
+  if (c.crop.enabled && c.crop.w > 0 && c.crop.h > 0) {
+    w = Math.round(c.crop.w);
+    h = Math.round(c.crop.h);
+  }
+  if (c.resize.enabled && (c.resize.width > 0 || c.resize.height > 0)) ({ w, h } = fitSize(w, h, c.resize.width, c.resize.height, c.resize.fit));
+  if (c.flipRotate.enabled && (c.flipRotate.degrees === 90 || c.flipRotate.degrees === 270)) [w, h] = [h, w];
+  return fitSize(w, h, out.width, out.height, out.fit);
 }
 
 /**

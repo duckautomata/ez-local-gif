@@ -41,6 +41,7 @@ first_line avifenc  avifenc --version
 first_line avifdec  avifdec --version
 first_line pngquant pngquant --version
 first_line oxipng   oxipng --version
+first_line fc-list  fc-list --version
 first_line tini     tini --version
 # apngdis has no version flag; with no arguments it prints its banner and
 # exits non-zero, so probe the banner text instead.
@@ -73,12 +74,24 @@ have_line() {
 for enc in libwebp_anim apng gif png libaom-av1 libsvtav1 libx264 libvpx-vp9 prores_ks; do
   if have_line -encoders "$enc"; then ok "encoder" "$enc"; else bad "encoder" "$enc missing"; fi
 done
-for dec in prores webp gif apng png vp9 libvpx-vp9 h264; do
+# Decoders: libvpx (VP8) / libvpx-vp9 are the only decoders that expose the
+# alpha of VP8/VP9 WebM (overlay assets and sources force them).
+for dec in prores webp gif apng png vp9 libvpx libvpx-vp9 h264; do
   if have_line -decoders "$dec"; then ok "decoder" "$dec"; else bad "decoder" "$dec missing"; fi
 done
+# Filters: the Phase 1/2 graph (palette, keying, premultiplied scale, pad,
+# fps, tile) plus everything Phase 3 emits — overlay hold (tpad), reverse,
+# autocrop detection (lagfun, bbox, cropdetect), overlay opacity and
+# semi-transparent drawtext layers (colorchannelmixer, color), the alpha_mode
+# tag (setparams), the keying-on-alpha wrapper (split, alphaextract, blend,
+# alphamerge), filter-level trim for animated WebP (trim, setpts) and the
+# flip/rotate ops (transpose, hflip, vflip). A build lacking one of these
+# fails the image build, not a render.
 for flt in palettegen paletteuse chromakey colorkey despill drawtext premultiply unpremultiply \
            alphaextract alphamerge overlay scale pad fps crop tile mpdecimate cropdetect \
-           format split lut geq testsrc2 color; do
+           format split lut geq testsrc2 color \
+           tpad reverse lagfun bbox colorchannelmixer setparams blend trim setpts \
+           transpose hflip vflip; do
   if have_line -filters "$flt"; then ok "filter" "$flt"; else bad "filter" "$flt missing"; fi
 done
 for dmx in webp_anim gif apng mov concat image2 rawvideo; do
@@ -88,11 +101,33 @@ for mux in gif webp apng mp4 webm rawvideo image2; do
   if have_line -muxers "$mux"; then ok "muxer" "$mux"; else bad "muxer" "$mux missing"; fi
 done
 
+echo "== fonts (drawtext font= lookup, GET /api/fonts)"
+# fc-list must enumerate the bundled families under their primary name —
+# the same %{family[0]} the server parses (enc.FcListArgs) — so a renamed
+# font package or a broken fontconfig cache fails the build, not a render.
+# (Captured first: a chatty fc-list under pipefail must not die of SIGPIPE.)
+font_families=$(fc-list --format '%{family[0]}\n' 2>/dev/null | sort -u || true)
+for fam in "DejaVu Sans" "DejaVu Sans Mono" "DejaVu Serif" "Noto Sans" "Noto Serif"; do
+  if grep -qxF "$fam" <<<"$font_families"; then ok "font" "$fam"; else bad "font" "$fam missing (fc-list --format '%{family[0]}')"; fi
+done
+# The optional /fonts bind mount must be on fontconfig's scan path
+# (Dockerfile: /etc/fonts/conf.d/99-ezlg-fonts-mount.conf): fc-cache -v
+# reports every directory it scans as "<dir>: …" (this also refreshes the
+# cache — as the runtime user that lands in its own ~/.cache).
+font_scan=$(fc-cache -v 2>&1 || true)
+if [ -d /fonts ] && grep -qE '^/fonts: ' <<<"$font_scan"; then
+  ok "font-dir" "/fonts on the fontconfig scan path"
+else
+  bad "font-dir" "/fonts is not scanned by fontconfig (missing dir or 99-ezlg-fonts-mount.conf)"
+fi
+
 echo "== functional smoke test"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # 4 RGBA frames with a hard alpha edge → GIF (palette path), WebP (libwebp_anim),
-# APNG, and drawtext through fontconfig (DejaVu). Each must decode again.
+# APNG, and drawtext through fontconfig (DejaVu, then Noto). Each must decode
+# again, and the text frames must differ from the same frame without text
+# (drawtext found a face and painted).
 src="testsrc2=size=64x64:rate=10:duration=0.4,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(hypot(X-32,Y-32),24),255,0)'"
 if ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -filter_complex "[0:v]split[a][b];[a]palettegen=reserve_transparent=1[p];[b][p]paletteuse=alpha_threshold=128" \
@@ -102,12 +137,23 @@ if ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
    && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -c:v apng -plays 0 -f apng "$tmp/t.png" \
    && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
-     -vf "drawtext=font=DejaVu Sans:text=ezlg:fontsize=20:fontcolor=white:x=4:y=4" -frames:v 1 -c:v png "$tmp/text.png"; then
-  ok "encode" "gif / webp / apng / drawtext"
+     -frames:v 1 -c:v png "$tmp/notext.png" \
+   && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
+     -vf "drawtext=font=DejaVu Sans:text=ezlg:fontsize=20:fontcolor=white:x=4:y=4" -frames:v 1 -c:v png "$tmp/text.png" \
+   && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
+     -vf "drawtext=font=Noto Sans:text=ezlg:fontsize=20:fontcolor=white:x=4:y=4" -frames:v 1 -c:v png "$tmp/text-noto.png"; then
+  ok "encode" "gif / webp / apng / drawtext (DejaVu Sans, Noto Sans)"
 else
   bad "encode" "one of the smoke encodes failed"
 fi
-for f in t.gif t.webp t.png text.png; do
+for f in text.png text-noto.png; do
+  if [ -s "$tmp/$f" ] && ! cmp -s "$tmp/$f" "$tmp/notext.png"; then
+    ok "drawtext" "$f differs from the frame without text"
+  else
+    bad "drawtext" "$f is identical to the frame without text (nothing drawn)"
+  fi
+done
+for f in t.gif t.webp t.png text.png text-noto.png; do
   if [ -s "$tmp/$f" ] && ffmpeg -hide_banner -v error -nostdin -i "$tmp/$f" -f null - 2>/dev/null; then
     ok "decode" "$f ($(stat -c %s "$tmp/$f") bytes)"
   else

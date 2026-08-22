@@ -87,15 +87,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Distro tools. Package names verified against Debian 13 (trixie):
 #   gifsicle 1.96, libavif-bin 1.2.1 (avifenc/avifdec; linked against aom,
-#   dav1d, rav1e, svt-av1), pngquant 2.18, apngdis 2.9, fonts-dejavu-core
-#   (drawtext), fontconfig, ca-certificates + curl (downloads, healthcheck),
-#   xz-utils (tar.xz), tini (PID 1). libwebp tools come from Google's static
-#   build below (see LIBWEBP_URL).
+#   dav1d, rav1e, svt-av1), pngquant 2.18, apngdis 2.9, fonts-dejavu-core +
+#   fonts-noto-core (drawtext, Phase 3: DejaVu Sans/Serif/Mono and Noto
+#   Sans/Serif for Latin, Greek, Cyrillic and most other non-CJK scripts),
+#   fontconfig (fc-list behind GET /api/fonts; drawtext's font= lookup),
+#   ca-certificates + curl (downloads, healthcheck), xz-utils (tar.xz), tini
+#   (PID 1). libwebp tools come from Google's static build below (see
+#   LIBWEBP_URL).
+# /fonts is the optional bind mount for the user's own faces (compose.yaml);
+# the fontconfig snippet puts it on the scan path so a family dropped there
+# is named like a bundled one. fc-cache pre-builds the system cache for the
+# bundled fonts; a mounted /fonts is scanned on first use (the non-root
+# runtime user caches it under its home).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       gifsicle libavif-bin pngquant apngdis \
-      fonts-dejavu-core fontconfig ca-certificates curl xz-utils tini \
+      fonts-dejavu-core fonts-noto-core fontconfig ca-certificates curl xz-utils tini \
  && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /fonts \
+ && printf '%s\n' '<?xml version="1.0"?>' '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">' \
+      '<!-- ez-local-gif: the optional /fonts bind mount (see compose.yaml) -->' \
+      '<fontconfig><dir>/fonts</dir></fontconfig>' \
+      > /etc/fonts/conf.d/99-ezlg-fonts-mount.conf \
  && fc-cache -f
 
 # FFmpeg 9.0.1 (ffmpeg + ffprobe only; ffplay is dropped).
@@ -132,10 +145,12 @@ RUN set -eu; cd /tmp; \
     rm -f gifski.tar.xz oxipng.tar.gz
 
 # Helper scripts (Discord testkit, test-clip generator, tool self-check) and
-# the build-time sanity check: every tool must run, and ffmpeg must have the
-# encoders, filters and demuxers the pipeline relies on — a broken download
-# fails here. Phase 2 adds no tools: avifenc/avifdec, pngquant, oxipng and
-# the libwebp CLIs were already part of this stage.
+# the build-time sanity check: every tool must run, ffmpeg must have the
+# encoders, filters and demuxers the pipeline relies on, and fc-list must
+# enumerate the bundled DejaVu / Noto families — a broken download or a
+# renamed font package fails here. Phase 2 adds no tools: avifenc/avifdec,
+# pngquant, oxipng and the libwebp CLIs were already part of this stage;
+# Phase 3 adds fonts-noto-core and the /fonts scan path only.
 COPY scripts/check-tools.sh scripts/make-test-clip.sh scripts/discord-testkit.sh /usr/local/share/ezlg/
 # (sed: survive a CRLF checkout on Windows hosts with core.autocrlf=true)
 RUN sed -i 's/\r$//' /usr/local/share/ezlg/*.sh \
@@ -148,7 +163,7 @@ RUN sed -i 's/\r$//' /usr/local/share/ezlg/*.sh \
 FROM tools AS runtime
 COPY --from=gobuild /out/ezlg /usr/local/bin/ezlg
 RUN useradd --uid 1000 --user-group --create-home --shell /usr/sbin/nologin ezlg \
- && mkdir -p /data /input /output \
+ && mkdir -p /data /input /output /fonts \
  && chown -R ezlg:ezlg /data /input /output
 VOLUME ["/data"]
 EXPOSE 8080

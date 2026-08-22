@@ -103,7 +103,7 @@
       ◂ from scrubber
     </button>
     <label class="field">
-      <span>End (s, 0 = end)</span>
+      <span>End (s, exclusive; 0 = end)</span>
       <NumField bind:value={app.ops.trim.end} min={0} max={dur} step="any" />
     </label>
     <button
@@ -122,7 +122,8 @@
   {/if}
   <p class="hint">
     Selected: {fmtSeconds(range.start)} → {fmtSeconds(range.end)} = {fmtSeconds(range.end - range.start)}{#if framesText}&nbsp;·
-      {`source ${framesText}`}{/if}. The scrubber runs over the trimmed range; “from scrubber” takes the frame under it — its
-    start for Start, the point after it for End (on the last frame: to the end).
+      {`source ${framesText}`}{/if}. Start is inclusive, End exclusive: the frame at End is not included. The scrubber runs over
+    the trimmed range; “from scrubber” takes the frame under it — its start for Start, the point after it for End (on the
+    last frame: to the end).
   </p>
 </OpCard>

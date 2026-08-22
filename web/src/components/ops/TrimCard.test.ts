@@ -106,4 +106,11 @@ describe('TrimCard (SSR)', () => {
     expect(out).toContain('frame 50, 1.96 s of the source');
     expect(out).toContain('End after the last frame (to the end)');
   });
+
+  it('labels End as exclusive (the frame at End is not included), as the overlay time range does', () => {
+    setSource({ ...seqSrc, info: gifInfo, hash: 'd'.repeat(64) });
+    const out = html(gifInfo, true);
+    expect(out).toContain('End (s, exclusive; 0 = end)');
+    expect(out).toContain('Start is inclusive, End exclusive: the frame at End is not included.');
+  });
 });

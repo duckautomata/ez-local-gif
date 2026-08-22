@@ -217,6 +217,66 @@ describe('StillScheduler', () => {
     expect(h.still.displayedKey).toBe('');
   });
 
+  // The proxy plays (review W8): the still <img> is off the stage, so no
+  // still may be fetched for the scrub / op changes meanwhile — each was a
+  // render (full-resolution in overlay mode) whose URL sat parked until the
+  // next image load — and the parked URLs are released right away.
+  it('paused: requests are remembered, not fetched; parked URLs are released; resuming fetches the latest once', async () => {
+    const h = harness();
+    await display(h, 0);
+    await display(h, 0.5); // blob:3 is parked until the next image load
+    h.still.request(req(0.75));
+    await vi.advanceTimersByTimeAsync(150);
+    const c = h.calls[2];
+    expect(h.view.loading).toBe(true);
+
+    h.still.setPaused(true);
+    expect(c.signal.aborted).toBe(true);
+    expect(h.view.loading).toBe(false);
+    expect(h.revoked).toEqual(['blob:3']); // released now, not at the next load
+    expect(h.view.url).toBe('blob:5'); // the last still stays (shown again on Stop)
+    c.resolve(); // the aborted fetch lands anyway: ignored
+    await flush();
+    expect(h.view.url).toBe('blob:5');
+
+    h.still.request(req(1));
+    h.still.request(req(1.25));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.calls).toHaveLength(3); // nothing fetched while paused
+    expect(h.view.loading).toBe(false);
+
+    h.still.setPaused(false);
+    expect(h.calls).toHaveLength(3); // debounced like any request
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.calls).toHaveLength(4);
+    expect(h.calls[3].req.t).toBe(1.25); // the latest state only
+    h.calls[3].resolve();
+    await flush();
+    expect(h.view).toEqual({ url: 'blob:6', loading: false, error: '' });
+    expect(h.revoked).toEqual(['blob:3']); // blob:5 waits for the next load as usual
+    h.still.imageLoaded();
+    expect(h.revoked).toEqual(['blob:3', 'blob:5']);
+  });
+
+  it('resuming with the displayed state fetches nothing; pausing twice is harmless', async () => {
+    const h = harness();
+    await display(h, 0);
+    h.still.setPaused(true);
+    h.still.setPaused(true);
+    h.still.request(B);
+    h.still.request(A); // back to what is on screen
+    h.still.setPaused(false);
+    h.still.setPaused(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.calls).toHaveLength(1);
+    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '' });
+    expect(h.revoked).toEqual([]);
+    // a request while not paused fetches as before
+    h.still.request(B);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.calls).toHaveLength(2);
+  });
+
   it('dispose aborts the in-flight request and releases every object URL', async () => {
     const h = harness();
     await display(h, 0);

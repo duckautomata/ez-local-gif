@@ -38,6 +38,17 @@ services:
       # - ./input:/input:ro
       # - /mnt/c/Users/you/Videos/Resolve Exports:/input:ro   # WSL2 → Windows folder
       # - C:/Users/you/Videos/Resolve Exports:/input:ro       # Docker Desktop on Windows
+      # Optional extra fonts for the text overlay (Phase 3). DejaVu and Noto
+      # Sans/Serif (Latin, Greek, Cyrillic, …) are bundled; drop any .ttf/.otf
+      # into a host folder and bind it read-only at /fonts — fontconfig scans
+      # that path (Dockerfile: 99-ezlg-fonts-mount.conf). The font list is
+      # read once at startup, so `docker compose restart app` after adding
+      # files; for a large collection pre-build fontconfig's cache first so
+      # the first render is not slow:
+      #     docker compose exec app fc-cache -f      # (or: fc-list : family, to check)
+      # Families are referenced by name in the text op ("Noto Serif").
+      # - ./fonts:/fonts:ro
+      # - C:/Windows/Fonts:/fonts:ro                          # Docker Desktop on Windows (all system fonts)
     # The RGBA frame master lives on /dev/shm (1080p RGBA = 8.3 MB/frame). Docker's
     # default 64 MB is far too small. On WSL2 raise `.wslconfig` [wsl2] memory= too.
     shm_size: "4gb"
@@ -47,6 +58,9 @@ services:
       EZLG_MAX_BYTES: "21474836480"    # cap on /data (20 GiB; 0 = none)
       EZLG_MAX_UPLOAD_MB: "2048"       # max upload size
       # EZLG_CONCURRENCY: "8"          # concurrent renders (default NumCPU/2)
+      # EZLG_MAX_MASTER_BYTES: "2147483648"   # cap on one render's RGBA frame master in bytes
+      #                                 # (default 2 GiB; also bounds the reverse buffer and
+      #                                 # reversed previews; keep it below shm_size)
       # EZLG_ADDR: ":8080"             # listen address (also change ports: and the healthcheck)
       # NVIDIA_DRIVER_CAPABILITIES: compute,video,utility   # with the gpu block below
     # -- GPU (not used in v1; see docs/DESIGN.md §6). Uncomment for NVDEC/NVENC/rembg later,

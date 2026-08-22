@@ -19,6 +19,12 @@
 #      grep exits at the match while the tool is still writing (SIGPIPE), so
 #      job_cached must read a large manifest and gif_screen_size a chatty
 #      `gifsicle --info` without reporting a false failure.
+#   5. The frames-manifest helpers (first_frame_url / frame_url_at / frame_urls)
+#      pick the "frame" files only. A frames manifest lists frames.zip
+#      (archive), then delays.json (the timing table, no kind), then the
+#      frames; the grep fallback used to hand back delays.json as the "first
+#      frame", failing the Phase 2 PNG check and the Phase 3 reverse case
+#      whenever jq was absent.
 #
 #   bash scripts/integration-test-selftest.sh
 set -uo pipefail
@@ -136,6 +142,50 @@ if [ "$size" = 128x128 ]; then
   ok "gif_screen_size reads a chatty gifsicle --info (capture, then grep)"
 else
   fail "gif_screen_size got '$size', want 128x128 (SIGPIPE under pipefail?)"
+fi
+
+# ---- 5. frames-manifest helpers on a real-shaped frames job manifest (DS3-1):
+# the archive comes first, then delays.json (kind omitted), then the frames.
+# The helpers must skip both fixed names, with jq and with the grep fallback.
+printf '%s' '{"id":"j4","state":"done","recipeHash":"bbbbbbbbbbbb","result":{"cached":false,"renderMs":42,"files":['\
+'{"name":"frames.zip","url":"/out/bbbbbbbbbbbb/frames.zip","bytes":3000,"format":"zip","kind":"archive","desc":"2 frames (png)","width":160,"height":160,"frames":2,"fps":30,"duration":0.0666},'\
+'{"name":"delays.json","url":"/out/bbbbbbbbbbbb/delays.json","bytes":80,"format":"json","desc":"per-frame timing","frames":2,"fps":30},'\
+'{"name":"f00001.png","url":"/out/bbbbbbbbbbbb/f00001.png","bytes":1500,"format":"png","kind":"frame","index":1,"desc":"frame 1 (0.00 s)","width":160,"height":160,"frames":1},'\
+'{"name":"f00002.png","url":"/out/bbbbbbbbbbbb/f00002.png","bytes":1500,"format":"png","kind":"frame","index":2,"desc":"frame 2 (0.03 s)","width":160,"height":160,"frames":1}'\
+']}}' > "$stmp/frames.json"
+
+frames_helper() { # frames_helper USE_JQ HELPER ARGS... → the helper's stdout
+  local mode=$1; shift
+  (
+    export EZLG_ITEST_FUNCS_ONLY=1
+    # shellcheck disable=SC1090,SC1091  # sourced for its function definitions only
+    . "$itest"
+    # shellcheck disable=SC2034  # read by the helpers, defined in the sourced file
+    use_jq=$mode
+    "$@"
+  )
+}
+check_frames_helpers() { # check_frames_helpers USE_JQ LABEL
+  local mode=$1 label=$2 got want
+  want=/out/bbbbbbbbbbbb/f00001.png
+  got=$(frames_helper "$mode" first_frame_url "$stmp/frames.json")
+  if [ "$got" = "$want" ]; then ok "first_frame_url ($label) skips frames.zip and delays.json"; else fail "first_frame_url ($label) got '$got', want $want"; fi
+  got=$(frames_helper "$mode" frame_url_at "$stmp/frames.json" first)
+  if [ "$got" = "$want" ]; then ok "frame_url_at first ($label) is the first frame"; else fail "frame_url_at first ($label) got '$got', want $want"; fi
+  want=/out/bbbbbbbbbbbb/f00002.png
+  got=$(frames_helper "$mode" frame_url_at "$stmp/frames.json" last)
+  if [ "$got" = "$want" ]; then ok "frame_url_at last ($label) is the last frame"; else fail "frame_url_at last ($label) got '$got', want $want"; fi
+  got=$(frames_helper "$mode" frame_urls "$stmp/frames.json" | tr '\n' ' ')
+  want="/out/bbbbbbbbbbbb/f00001.png /out/bbbbbbbbbbbb/f00002.png "
+  if [ "$got" = "$want" ]; then ok "frame_urls ($label) lists exactly the frame files in order"; else fail "frame_urls ($label) got '$got', want '$want'"; fi
+  got=$(frames_helper "$mode" archive_url "$stmp/frames.json")
+  if [ "$got" = /out/bbbbbbbbbbbb/frames.zip ]; then ok "archive_url ($label) is frames.zip"; else fail "archive_url ($label) got '$got'"; fi
+}
+check_frames_helpers 0 grep
+if command -v jq >/dev/null 2>&1; then
+  check_frames_helpers 1 jq
+else
+  printf '[selftest] note: jq not on PATH — the jq branch of the frames-manifest helpers was not tested\n'
 fi
 
 echo "== integration-test selftest: $pass passed, $failn failed =="

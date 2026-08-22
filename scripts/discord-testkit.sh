@@ -22,7 +22,7 @@
 #            i1 GIF (fallback), i2 RGBA APNG (fps ladder, probe rung)
 #   j  AVIF  avifenc from PNG frames, alpha, infinite repetition
 #
-# Results of the 2026-08-19 run: docs/discord-testkit-results.md (summary and
+# Results of the 2026-08-19 run: docs/reviews/discord-testkit-results.md (summary and
 # the encoder consequences in docs/DESIGN.md §9a).
 #
 # Without SRC a synthetic 3 s 320×320 premultiplied ProRes 4444 clip is made
@@ -31,10 +31,13 @@
 # user SRC whose rate differs from --fps is resampled by ffmpeg's fps filter;
 # the kit then warns and the README notes that a periodic cadence hitch is
 # expected in every file. ProRes sources are treated as premultiplied
-# (DaVinci Resolve default) unless --straight is given; they are
-# unpremultiplied at the source bit depth exactly like the app
-# (format=gbrap10le|gbrap12le|gbrap,setparams=alpha_mode=premultiplied,
-# unpremultiply=inplace=1 — internal/graph/compile.go).
+# (DaVinci Resolve default) unless --straight is given. The alpha head is
+# the app's exactly (internal/graph/compile.go alphaHead): planar YUV-with-
+# alpha sources (ProRes 4444 yuva444p10le/12le, VP9 alpha, lossy WebP) are
+# unpremultiplied natively at the source depth and converted to rgba ONCE
+# ([setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,]format=rgba),
+# RGB-decoded sources through format=gbrap|gbrap10le|gbrap12le,setparams=…,
+# unpremultiply=inplace=1 — so the masters carry the same alpha as a render.
 #
 # OUTDIR must be writable by the current uid. In the runtime container
 # /output is compose.yaml's ./output bind: if the Docker daemon auto-created
@@ -58,7 +61,7 @@ set -euo pipefail
 # ----------------------------------------------------------------------------
 # args / tools
 # ----------------------------------------------------------------------------
-usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 premult=auto
 fps=25
@@ -222,22 +225,51 @@ bits_of() {
     *) echo 8 ;;
   esac
 }
-# Hoisted unpremultiply at the source depth, exactly the app's chain
-# (internal/graph/compile.go): planar GBRA at 10/12 bit for ProRes 4444 (XQ)
-# so the alpha edges are divided before any 8-bit truncation. setparams tags
-# the (untagged) decoded frames premultiplied; without it FFmpeg >= 8
-# auto-inserts premultiply_dynamic in front of unpremultiply and the pair
-# cancels out — the toggle silently becomes a no-op (DESIGN.md §4.3).
+# Alpha head: the hoisted unpremultiply at the source depth, exactly the
+# app's chain (internal/graph/compile.go alphaHead), chosen by the decoded
+# pixel format:
+#   - planar YUV with alpha (yuva444p10le/12le ProRes 4444, yuva420p lossy
+#     WebP, VP8/VP9 alpha — probed as yuv420p, decoded by libvpx as yuva420p):
+#     "[setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,]format=rgba"
+#     — unpremultiply takes yuva* natively at 8/10/12 bit, then ONE conversion
+#     to rgba, never through gbrap: ffmpeg-made ProRes 4444 decodes as
+#     yuva444p12le (range tv) with its alpha on the luma range (12-bit
+#     256..3750); format=gbrap12le copied that plane same-depth (+7, no
+#     expansion) and the later rgba conversion left every transparent pixel at
+#     alpha 1 with full colour underneath — bigger WebP/APNG/AVIF, and an
+#     autocrop at threshold 1 that saw the whole frame. format=rgba off the
+#     yuva frame gives exact 0/128/255 alpha (DESIGN.md §4.1, §9 item 5).
+#     Straight yuva sources take the same single format=rgba.
+#   - RGB-decoded (rgba/bgra/gbrap/pal8…: PNG, GIF, lossless WebP, AVIF):
+#     "format=gbrap|gbrap10le|gbrap12le,setparams=alpha_mode=premultiplied,
+#     unpremultiply=inplace=1" when premultiplied, nothing otherwise.
+# setparams tags the (untagged) decoded frames premultiplied; without it
+# FFmpeg >= 8 auto-inserts premultiply_dynamic in front of unpremultiply and
+# the pair cancels out — the toggle silently becomes a no-op (DESIGN.md §4.3).
 pre=""
-if [ "$premult" = yes ]; then
-  case "$(bits_of "$src_pix")" in
-    10) ufmt=gbrap10le ;;
-    12) ufmt=gbrap12le ;;
-    *)  ufmt=gbrap ;;
-  esac
-  pre="format=${ufmt},setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,"
-  log "unpremultiply at ${ufmt} (source ${src_pix})"
-fi
+unpre="setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,"
+case "$src_pix" in
+  yuv*)
+    if [ "$premult" = yes ]; then
+      pre="${unpre}format=rgba,"
+      log "alpha head: unpremultiply natively at ${src_pix} ($(bits_of "$src_pix")-bit), then format=rgba"
+    else
+      pre="format=rgba,"
+      log "alpha head: format=rgba (straight ${src_pix})"
+    fi
+    ;;
+  *)
+    if [ "$premult" = yes ]; then
+      case "$(bits_of "$src_pix")" in
+        10) ufmt=gbrap10le ;;
+        12) ufmt=gbrap12le ;;
+        *)  ufmt=gbrap ;;
+      esac
+      pre="format=${ufmt},${unpre}"
+      log "alpha head: unpremultiply at ${ufmt} (source ${src_pix})"
+    fi
+    ;;
+esac
 
 # Chat variants are capped at EZLG_TESTKIT_MAX_PX on the long side (Discord's
 # chat default is <= 480 px; a 1080p master would also blow through /dev/shm).
@@ -580,7 +612,7 @@ top-right (GIF thresholds it to opaque-on-matte; WebP/APNG/AVIF should show it t
 ## Results so far
 
 This matrix was uploaded and checked on 2026-08-19; the per-file outcomes live in the repo at
-\`docs/discord-testkit-results.md\` and their consequences for the encoders in \`docs/DESIGN.md\`
+\`docs/reviews/discord-testkit-results.md\` and their consequences for the encoders in \`docs/DESIGN.md\`
 §9a. In short: the palette GIF paths (a, b, d), lossy and lossless WebP (e, e2, f) and both emote
 variants (h1, h2) render correctly; gifski's per-frame palettes (c) do **not** (dark background,
 ghosting); APNG animates only as a server sticker, where the indexed 8-bit-alpha APNG (i3) at
@@ -668,7 +700,7 @@ EOF
   done
   cat <<'EOF'
 
-Record results in `docs/discord-testkit-results.md` (one row per file: attachment / sticker /
+Record results in `docs/reviews/discord-testkit-results.md` (one row per file: attachment / sticker /
 emote outcome + notes) and their consequences in `docs/DESIGN.md` §9a, with client + version,
 theme, autoplay setting and a screenshot of anything that renders wrong.
 EOF

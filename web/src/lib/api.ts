@@ -14,6 +14,8 @@
 //   POST /api/sources/from-result {recipeHash, name}  -> Source ("edit as source")
 //   GET  /api/sources/{hash}                          -> Source
 //   POST /api/still             StillRequest          -> image/png
+//   POST /api/proxy             ProxyRequest          -> image/webp (animated preview, Phase 3)
+//   GET  /api/fonts                                   -> FontsResponse (drawtext faces, Phase 3)
 //   POST /api/jobs              Recipe                -> 202 Job
 //   GET  /api/jobs/{id}                               -> Job
 //   DELETE /api/jobs/{id}                             -> 204
@@ -75,9 +77,76 @@ export type OpKind =
   | 'flip'
   | 'rotate'
   | 'unpremultiply'
-  | 'delay';
+  | 'delay'
+  // Phase 3 editing ops (DESIGN §4.3)
+  | 'chromakey'
+  | 'colorkey'
+  | 'reverse'
+  | 'autocrop'
+  | 'text'
+  | 'overlay';
 
 export type FitMode = 'contain' | 'cover' | 'exact';
+
+/**
+ * Go: recipe.Anchor* — where X/Y sit on a text / image overlay: vertical
+ * then horizontal letter ("tl" top-left is the default, "mc" the middle).
+ */
+export type Anchor = 'tl' | 'tc' | 'tr' | 'ml' | 'mc' | 'mr' | 'bl' | 'bc' | 'br';
+export const ANCHORS: readonly Anchor[] = ['tl', 'tc', 'tr', 'ml', 'mc', 'mr', 'bl', 'bc', 'br'];
+
+/** Go: recipe.ChromaKeyParams — greenscreen / bluescreen keying in YUV plus despill. Zero values: 00ff00, 0.2, 0.05, despill on with 0.6 / 0.3. */
+export interface ChromaKeyParams {
+  color?: string;
+  similarity?: number;
+  blend?: number;
+  despillOff?: boolean;
+  despillMix?: number;
+  despillExpand?: number;
+}
+/** Go: recipe.ColorKeyParams — one RGB colour (the eyedropper's) becomes transparent. Zero values: similarity 0.1, blend 0. */
+export interface ColorKeyParams {
+  color: string;
+  similarity?: number;
+  blend?: number;
+}
+/** Go: recipe.AutoCropParams — crop to the content box; `resolved` is filled by the server and ignored from a client. */
+export interface AutoCropParams {
+  threshold?: number;
+  padding?: number;
+  resolved?: CropParams;
+}
+/** Go: recipe.TextParams — drawtext on the output canvas (coordinates in output pixels). */
+export interface TextParams {
+  text: string;
+  font?: string;
+  size?: number;
+  color?: string;
+  border?: number;
+  borderColor?: string;
+  box?: boolean;
+  boxColor?: string;
+  boxPad?: number;
+  x: number;
+  y: number;
+  anchor?: Anchor;
+  start?: number;
+  end?: number;
+  lineSpacing?: number;
+}
+/** Go: recipe.OverlayParams — Recipe.sources[source] (index >= 1) composited onto the output canvas. */
+export interface OverlayParams {
+  source: number;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  opacity?: number;
+  noLoop?: boolean;
+  anchor?: Anchor;
+  start?: number;
+  end?: number;
+}
 
 /** Go: recipe.DelayParams — per-frame duration of an image sequence (ms, 1..60000). */
 export interface DelayParams {
@@ -126,7 +195,12 @@ export type OpParams =
   | SpeedParams
   | FlipParams
   | RotateParams
-  | DelayParams;
+  | DelayParams
+  | ChromaKeyParams
+  | ColorKeyParams
+  | AutoCropParams
+  | TextParams
+  | OverlayParams;
 
 /** One step of the non-destructive op stack (Go: recipe.Op; params is json.RawMessage). */
 export interface Op {
@@ -291,10 +365,38 @@ export interface JobEvent {
 
 export interface StillRequest {
   src: string;
+  /**
+   * Phase 3: every source the ops reference — the main one first, then the
+   * overlay assets in the order the overlay ops index them (recipe.sources).
+   * Sent alongside `src` (which stays the main source).
+   */
+  sources?: string[];
   ops: Op[];
   output: Output;
   t: number;
   maxW: number;
+}
+
+/** Body of POST /api/proxy (Phase 3): the animated low-res preview behind Play. */
+export interface ProxyRequest {
+  sources: string[];
+  ops: Op[];
+  output: Output;
+  /** at most this wide (server default 360) */
+  maxW: number;
+  /** first N seconds of the output (server default 10) */
+  maxSeconds: number;
+}
+
+/** Go: enc.Font — one drawtext-usable face of the container (GET /api/fonts). */
+export interface Font {
+  family: string;
+  style: string;
+  file: string;
+}
+
+export interface FontsResponse {
+  fonts: Font[] | null;
 }
 
 export interface Capabilities {
@@ -305,6 +407,15 @@ export interface Capabilities {
   concurrency?: number;
   maxUploadBytes?: number;
   formats?: string[] | null;
+  /** every Discord target, in display order (Phase 2) */
+  targets?: string[] | null;
+  /**
+   * What this build can do (server: features()): fit, sequence, optimize
+   * (Phase 2); keying, overlays, proxy, fonts (Phase 3 — "fonts" is true
+   * only when /api/fonts lists a face). Absent on a Phase 1 server; a name
+   * that is absent is off. See lib/capabilities.svelte.ts.
+   */
+  features?: Record<string, boolean> | null;
 }
 
 /** Body of POST /api/sources/from-result. */
@@ -383,10 +494,10 @@ async function requestJSON<T>(url: string, init: RequestInit = {}): Promise<T> {
   }
 }
 
-function jsonInit(method: string, body: unknown, signal?: AbortSignal): RequestInit {
+function jsonInit(method: string, body: unknown, signal?: AbortSignal, accept = 'application/json, image/png'): RequestInit {
   return {
     method,
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json, image/png' },
+    headers: { 'Content-Type': 'application/json', Accept: accept },
     body: JSON.stringify(body),
     signal,
   };
@@ -491,6 +602,22 @@ export function sourceURL(hash: string | null): string {
 export async function fetchStill(req: StillRequest, signal?: AbortSignal): Promise<Blob> {
   const res = await request('/api/still', jsonInit('POST', req, signal));
   return res.blob();
+}
+
+/**
+ * fetchProxy renders the animated low-res preview (lossy WebP with alpha: the
+ * first maxSeconds of the output, at most maxW wide, <= 15 fps) behind the
+ * Play button. Memoised server-side like stills.
+ */
+export async function fetchProxy(req: ProxyRequest, signal?: AbortSignal): Promise<Blob> {
+  const res = await request('/api/proxy', jsonInit('POST', req, signal, 'application/json, image/webp'));
+  return res.blob();
+}
+
+/** getFonts lists the font faces drawtext can use on the server (empty when fc-list is unavailable). */
+export async function getFonts(signal?: AbortSignal): Promise<Font[]> {
+  const res = await requestJSON<FontsResponse>('/api/fonts', { signal });
+  return Array.isArray(res.fonts) ? res.fonts : [];
 }
 
 export function submitJob(recipe: Recipe, signal?: AbortSignal): Promise<Job> {

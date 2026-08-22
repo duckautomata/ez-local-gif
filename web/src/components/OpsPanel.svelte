@@ -2,10 +2,12 @@
   import type { ProbeInfo } from '../lib/api';
   import { presetById } from '../lib/presets';
   import { app, applyPreset, isSequence, opsApply } from '../lib/state.svelte';
+  import BackgroundCard from './ops/BackgroundCard.svelte';
   import CropCard from './ops/CropCard.svelte';
   import DelayCard from './ops/DelayCard.svelte';
   import FlipRotateCard from './ops/FlipRotateCard.svelte';
   import FpsCard from './ops/FpsCard.svelte';
+  import OverlaysPanel from './ops/OverlaysPanel.svelte';
   import ResizeCard from './ops/ResizeCard.svelte';
   import SpeedCard from './ops/SpeedCard.svelte';
   import TrimCard from './ops/TrimCard.svelte';
@@ -58,7 +60,9 @@
     <ResizeCard {info} />
     {#if !still}<FpsCard {info} />{/if}
     {#if !still}<SpeedCard {info} />{/if}
+    <BackgroundCard />
     <FlipRotateCard />
+    <OverlaysPanel {info} />
   {/if}
 </div>
 

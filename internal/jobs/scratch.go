@@ -37,12 +37,56 @@ const (
 )
 
 // masterBytes estimates the RGBA master size of plan; 0 when the frame
-// count is unknown (no source duration).
+// count is unknown (no source duration). 4 B/px is exact for the master
+// (rawvideo rgba) and for the reverse stage's buffer too: the graph pins the
+// frames to rgba right in front of "reverse" ("format=rgba,reverse"), so a
+// reversed render never holds more than Frames x Width x Height x 4 in
+// memory whatever depth the chain carried before it.
 func masterBytes(p *graph.Plan) int64 {
-	if p == nil || p.Frames <= 0 || p.Width <= 0 || p.Height <= 0 {
+	if p == nil {
 		return 0
 	}
-	return int64(p.Frames) * int64(p.Width) * int64(p.Height) * 4
+	return frameBytes(p, p.Frames)
+}
+
+// frameBytes is masterBytes for frames output-sized RGBA frames of plan; 0
+// when the count or the frame size is unknown.
+func frameBytes(p *graph.Plan, frames int) int64 {
+	if p == nil || frames <= 0 || p.Width <= 0 || p.Height <= 0 {
+		return 0
+	}
+	return int64(frames) * int64(p.Width) * int64(p.Height) * 4
+}
+
+// masterCapError is the ErrInvalidRecipe a render or preview gets when what
+// (e.g. "the frame master") would need more than Options.MaxMasterBytes:
+// the figures, the limit, what to do about it and the variable that raises
+// it. The message is shared by the render's admission (admitScratch) and
+// the preview admission of reversed plans (admitReversed).
+func (m *Manager) masterCapError(what string, need int64, frames, width, height int) error {
+	return fmt.Errorf("%w: %s would need %s (%d frames of %dx%d RGBA); the limit is %s — trim the clip, lower the fps or resize the output (or raise EZLG_MAX_MASTER_BYTES)",
+		ErrInvalidRecipe, what, humanBytes(need), frames, width, height, humanBytes(m.opts.MaxMasterBytes))
+}
+
+// admitReversed refuses a still/proxy of a reversed plan whose reverse
+// stage would buffer more than Options.MaxMasterBytes: the filter holds
+// every output-sized RGBA frame it is handed in memory until EOF, which for
+// a preview is frames frames — the whole trimmed clip for a still, the tail
+// the proxy's seek leaves for a proxy (proxyBufferFrames). The preview
+// endpoints hand the plan to ffmpeg straight away, without the render
+// path's scratch admission, so without this check a reversed 1080p clip
+// that the render refuses up-front would still be decoded for its preview.
+// Forward plans buffer nothing and an unknown frame count (0) cannot be
+// checked; what names the preview for the message.
+func (m *Manager) admitReversed(plan *graph.Plan, frames int, what string) error {
+	if plan == nil || !plan.Reversed {
+		return nil
+	}
+	need := frameBytes(plan, frames)
+	if need == 0 || need <= m.opts.MaxMasterBytes {
+		return nil
+	}
+	return m.masterCapError("the reverse buffer of "+what, need, frames, plan.Width, plan.Height)
 }
 
 // scratchReserve is what a render reserves from the scratch budget: the
@@ -169,8 +213,7 @@ func (m *Manager) admitScratch(ctx context.Context, j *job, plan *graph.Plan, fa
 	}
 	desc := fmt.Sprintf("the frame master would need %s (%d frames of %dx%d RGBA)", humanBytes(need), plan.Frames, plan.Width, plan.Height)
 	if need > m.opts.MaxMasterBytes {
-		return nil, fmt.Errorf("%w: %s; the limit is %s — trim the clip, lower the fps or resize the output (or raise EZLG_MAX_MASTER_BYTES)",
-			ErrInvalidRecipe, desc, humanBytes(m.opts.MaxMasterBytes))
+		return nil, m.masterCapError("the frame master", need, plan.Frames, plan.Width, plan.Height)
 	}
 	reserve := scratchReserve(need)
 	if factor > 1 {

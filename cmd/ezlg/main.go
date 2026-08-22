@@ -13,7 +13,12 @@
 //	EZLG_MAX_BYTES       cap on total /data size in bytes (default 20 GiB; 0 = none)
 //	EZLG_MAX_UPLOAD_MB   max upload size            (default 2048)
 //	EZLG_CONCURRENCY     concurrent renders         (default max(1, NumCPU/2))
-//	EZLG_FFMPEG etc.     override tool paths (see ffrun.LookupTools)
+//	EZLG_MAX_MASTER_BYTES cap on one render's RGBA frame master in bytes (default 2 GiB =
+//	                     2147483648; <= 0 keeps the default). A recipe whose master would
+//	                     exceed it is refused up-front (jobs.Options.MaxMasterBytes) — the
+//	                     error names this variable, so it must be a real knob.
+//	EZLG_FFMPEG etc.     override tool paths (see ffrun.LookupTools; EZLG_FC_LIST for the
+//	                     fontconfig fc-list behind GET /api/fonts)
 //
 // On SIGINT/SIGTERM the server stops accepting connections, lets in-flight
 // requests (uploads, stills, downloads) finish, cancels running renders
@@ -103,6 +108,9 @@ type serveConfig struct {
 	maxBytes  int64
 	maxUpload int64
 	conc      int
+	// maxMaster is jobs.Options.MaxMasterBytes (EZLG_MAX_MASTER_BYTES); <= 0
+	// lets the manager apply jobs.DefaultMaxMasterBytes.
+	maxMaster int64
 	drain     time.Duration
 }
 
@@ -115,6 +123,7 @@ func serveConfigFromEnv() serveConfig {
 		maxBytes:  envInt("EZLG_MAX_BYTES", 20<<30),
 		maxUpload: envInt("EZLG_MAX_UPLOAD_MB", 2048) << 20,
 		conc:      int(envInt("EZLG_CONCURRENCY", int64(max(1, runtime.NumCPU()/2)))),
+		maxMaster: envInt("EZLG_MAX_MASTER_BYTES", jobs.DefaultMaxMasterBytes),
 		drain:     drainTimeout,
 	}
 }
@@ -146,12 +155,15 @@ func runServer(ctx context.Context, cfg serveConfig, ln net.Listener) error {
 	if tools.Gifsicle == "" {
 		log.Printf("warning: gifsicle not found; GIF optimisation disabled")
 	}
+	if tools.FcList == "" {
+		log.Printf("warning: fc-list not found; the font list (GET /api/fonts) will be empty — text overlays still resolve bundled families by name")
+	}
 
 	st, err := store.New(cfg.dataRoot, cfg.scratch)
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
 	}
-	jm := jobs.NewManager(st, tools, jobs.Options{Concurrency: cfg.conc})
+	jm := jobs.NewManager(st, tools, jobs.Options{Concurrency: cfg.conc, MaxMasterBytes: cfg.maxMaster})
 
 	h := server.NewServer(server.Config{MaxUploadBytes: cfg.maxUpload, Version: Version}, st, jm, tools, web.Dist())
 	srv := &http.Server{
@@ -184,7 +196,8 @@ func runServer(ctx context.Context, cfg serveConfig, ln net.Listener) error {
 			return err
 		}
 	}
-	log.Printf("ez-local-gif %s listening on %s (data=%s scratch=%s ffmpeg=%s)", Version, ln.Addr(), cfg.dataRoot, cfg.scratch, tools.FFmpeg)
+	log.Printf("ez-local-gif %s listening on %s (data=%s scratch=%s ffmpeg=%s concurrency=%d maxMasterBytes=%d)",
+		Version, ln.Addr(), cfg.dataRoot, cfg.scratch, tools.FFmpeg, jm.Concurrency(), jm.MaxMasterBytes())
 
 	// Serve on its own goroutine: Serve returns ErrServerClosed the instant
 	// Shutdown closes the listener, and the process must not exit then —

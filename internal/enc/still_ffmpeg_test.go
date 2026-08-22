@@ -458,13 +458,12 @@ func indexSequence(t *testing.T, dir string, n, delayMS int) recipe.ProbeInfo {
 // when Frames is below floor(Duration*FPS) because the speed stage
 // truncated the end timestamp, and for a window trimmed on the grid.
 //
-// The speed + resample case is exact for StillArgsFromStart only: setpts
-// truncation pairs source frames (0,1), (2,3), … from the decode origin,
-// and the seeking StillArgs starts the pairing at its seek point, which is
-// a whole number of output slots — one source frame at speed 2 → 20 fps —
-// so an odd seek shows the pair's other frame. A known limitation of the
-// seeking still (speed != 1 combined with an fps change); it must still
-// return a frame.
+// The speed + resample case used to be exact for StillArgsFromStart only:
+// setpts truncation pairs source frames (0,1), (2,3), … from the decode
+// origin, and a seeking still that re-based its timestamps started the
+// pairing at its seek point. Since the seek keeps absolute timestamps
+// (-itsoffset), the pairing is the render's own and both variants are
+// exact; seekExact documents that and keeps the check strict.
 func TestStillReachesLastFrameOfSequence(t *testing.T) {
 	ff := ffmpegOrSkip(t)
 	dir := t.TempDir()
@@ -479,7 +478,7 @@ func TestStillReachesLastFrameOfSequence(t *testing.T) {
 		{"34 frames retimed to 33 ms", []recipe.Op{op(recipe.OpDelay, recipe.DelayParams{MS: 33})}, 34, 1, true},
 		{"trimmed from the scrubber: frames 4..7 at 33 ms", []recipe.Op{op(recipe.OpDelay, recipe.DelayParams{MS: 33}), op(recipe.OpTrim, recipe.TrimParams{Start: 3 / 30.303, End: 7 / 30.303})}, 4, 4, true},
 		{"7 frames at speed 2: 3 master frames (sources 2, 4, 6)", []recipe.Op{op(recipe.OpTrim, recipe.TrimParams{Start: 0, End: 0.7}), op(recipe.OpSpeed, recipe.SpeedParams{Factor: 2})}, 3, 2, true},
-		{"7 frames at speed 2 resampled to 20 fps: 6 master frames", []recipe.Op{op(recipe.OpTrim, recipe.TrimParams{Start: 0, End: 0.7}), op(recipe.OpSpeed, recipe.SpeedParams{Factor: 2}), op(recipe.OpFPS, recipe.FPSParams{FPS: 20})}, 6, 2, false},
+		{"7 frames at speed 2 resampled to 20 fps: 6 master frames", []recipe.Op{op(recipe.OpTrim, recipe.TrimParams{Start: 0, End: 0.7}), op(recipe.OpSpeed, recipe.SpeedParams{Factor: 2}), op(recipe.OpFPS, recipe.FPSParams{FPS: 20})}, 6, 2, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

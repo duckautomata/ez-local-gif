@@ -5,8 +5,9 @@
 // scrub row, never the stage (which contains the Retry button of the error
 // overlay and the crop canvas).
 import { render } from 'svelte/server';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ProbeInfo, Source } from '../lib/api';
+import { resetFeatures, setFeatures } from '../lib/capabilities.svelte';
 import { app, setSource } from '../lib/state.svelte';
 import Preview from './Preview.svelte';
 
@@ -59,6 +60,8 @@ function rangeTag(out: string): string {
 }
 
 describe('Preview (SSR)', () => {
+  afterEach(() => resetFeatures());
+
   it('puts role="slider" on the position readout only, never on the stage (W10)', () => {
     setSource(gifSrc);
     const out = html();
@@ -154,5 +157,50 @@ describe('Preview (SSR)', () => {
     expect(out.match(/role="slider"/g)?.length).toBe(1);
     expect(out).toContain('aria-disabled="true"');
     expect(rangeTag(out)).toContain('disabled');
+  });
+
+  it('offers Play for an animation (on demand), not for a single still frame', () => {
+    setSource(gifSrc);
+    let out = html();
+    const play = () => out.match(/<button[^>]*aria-label="Play an animated preview"[^>]*>/)?.[0] ?? '';
+    expect(play()).toBeTruthy();
+    expect(play()).not.toContain('disabled');
+    expect(out).toContain('▶ Play');
+    expect(out).not.toContain('■ Stop'); // nothing plays until asked
+    // a still source: one frame, nothing to animate
+    setSource({ ...gifSrc, info: { ...gifInfo, fps: 0, duration: 0, frames: 1, isStill: true, kind: 'image' } });
+    out = html();
+    expect(play()).toContain('disabled');
+    // crop mode needs the still on the stage
+    setSource(gifSrc);
+    app.ui.cropOpen = true;
+    out = html();
+    expect(play()).toContain('disabled');
+    expect(out).toContain('Crop mode: full frame shown');
+    // auto-crop on: the preview shows the detected result, so no crop mode
+    app.ops.autocrop.enabled = true;
+    out = html();
+    expect(play()).not.toContain('disabled');
+    expect(out).not.toContain('Crop mode: full frame shown');
+  });
+
+  it('disables Play (with the reason) on a server without /api/proxy — features.proxy off', () => {
+    setSource(gifSrc);
+    const play = (out: string) => out.match(/<button[^>]*aria-label="Play an animated preview"[^>]*>/)?.[0] ?? '';
+    // the flags are optimistic until the server answers: Play is offered
+    expect(play(html())).not.toContain('disabled');
+    expect(play(html())).toContain('rendered on demand');
+    // a Phase 2 server: no proxy feature
+    setFeatures({ features: { fit: true, sequence: true, optimize: true } });
+    let tag = play(html());
+    expect(tag).toContain('disabled');
+    expect(tag).toContain('this server has no /api/proxy');
+    expect(tag).not.toContain('rendered on demand');
+    expect(html()).not.toContain('■ Stop');
+    // a Phase 3 server: back to the normal tooltip
+    setFeatures({ features: { proxy: true } });
+    tag = play(html());
+    expect(tag).not.toContain('disabled');
+    expect(tag).toContain('rendered on demand');
   });
 });

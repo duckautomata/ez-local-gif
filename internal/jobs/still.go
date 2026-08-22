@@ -20,6 +20,14 @@ import (
 	"github.com/duckautomata/ez-local-gif/internal/store"
 )
 
+// stillMemoVersion salts the still memo key (stillKey): bump it whenever
+// enc.StillArgs / StillArgsFromStart or the still path here change what a
+// (sources, ops, output, t, maxW) tuple renders to, or the memo keeps
+// serving frames the old code produced. 1: reversed stills of VFR animation
+// sources decode from TrimStart (enc reversedSeekFor honours
+// Plan.SourceVFR) — the frames memoised before that fix were wrong.
+const stillMemoVersion = "2026-08-22.1"
+
 // Still renders a single preview frame (PNG bytes) for the recipe's op stack
 // at time t seconds, at most maxW pixels wide (0 = 480). Results are
 // memoised in scratch keyed by (recipe hash sans output, t, maxW). Fast
@@ -37,56 +45,119 @@ import (
 //
 // Rendering a still counts as using the source: the blob is touched so the
 // store's sweeper measures its TTL from the last use.
+//
+// Still is StillSources for a single-source recipe.
 func (m *Manager) Still(ctx context.Context, srcHash string, ops []recipe.Op, out recipe.Output, t float64, maxW int) ([]byte, error) {
+	return m.StillSources(ctx, []string{srcHash}, ops, out, t, maxW)
+}
+
+// StillSources (Phase 3) is Still for a recipe with overlay sources: srcs[0]
+// is the main source, srcs[1:] the overlay assets the ops reference by
+// index. Every source is looked up and touched; the memo key covers all of
+// them and the canonical ops (so the text of a text overlay is part of it).
+// Autocrop ops are resolved first (ResolveAutoCrop), text overlays are
+// written to a throw-away scratch dir for the render, and an animated
+// overlay is seeked to the same output time as the main source
+// (enc.StillArgs). An unknown main source is store.ErrNotFound (as for
+// Still); a missing overlay source, a source without probe info or an image
+// sequence in an overlay position is an ErrInvalidRecipe.
+//
+// Admission: a reversed plan is refused (ErrInvalidRecipe, naming
+// EZLG_MAX_MASTER_BYTES) when its reverse stage would buffer more than
+// Options.MaxMasterBytes — the whole trimmed clip in output-sized RGBA
+// frames, as the render's master would (admitReversed). The ffmpeg run
+// takes a preview slot (PreviewConcurrency) and concurrent requests for the
+// same memo key share one run; a memo hit waits for neither.
+func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int) ([]byte, error) {
 	if maxW <= 0 {
 		maxW = DefaultStillWidth
 	}
-	if !recipe.IsHash(srcHash) {
-		return nil, fmt.Errorf("%w: %q is not a source hash", store.ErrNotFound, srcHash)
+	if len(srcs) == 0 {
+		return nil, fmt.Errorf("%w: no sources", ErrInvalidRecipe)
 	}
-	blob, err := m.st.GetBlob(srcHash)
-	if err != nil {
+	if !recipe.IsHash(srcs[0]) {
+		return nil, fmt.Errorf("%w: %q is not a source hash", store.ErrNotFound, srcs[0])
+	}
+	if _, err := m.st.GetBlob(srcs[0]); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, fmt.Errorf("%w: source %s", store.ErrNotFound, short(srcHash))
+			return nil, fmt.Errorf("%w: source %s", store.ErrNotFound, short(srcs[0]))
 		}
 		return nil, err
 	}
-	if blob.Info == nil {
-		return nil, fmt.Errorf("%w: source %s has no probe info; upload it again", ErrInvalidRecipe, short(srcHash))
-	}
-	if err := m.st.TouchBlob(srcHash); err != nil {
-		log.Printf("jobs: touch source %s: %v", short(srcHash), err)
+	ops = stripAutoCropResolved(ops)
+	s, err := m.resolveSources(srcs)
+	if err != nil {
+		return nil, err
 	}
 	subset := stillOutput(out)
-	plan, err := graph.Compile(*blob.Info, ops, subset)
+	plan, err := m.compile(ctx, s, ops, subset)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
+		return nil, err
 	}
-	t = clampStillTime(plan, t, blob.Info.IsStill)
+	if err := m.admitReversed(plan, plan.Frames, "this still"); err != nil {
+		return nil, err
+	}
+	t = clampStillTime(plan, t, s.main().Info.IsStill)
 
-	key, err := stillKey(srcHash, ops, subset, t, maxW)
+	key, err := stillKey(srcs, ops, subset, t, maxW)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
 	memoPath := filepath.Join(m.st.Scratch, stillsDir, key+".png")
-	if data, err := os.ReadFile(memoPath); err == nil && len(data) > 0 {
-		now := time.Now()
-		_ = os.Chtimes(memoPath, now, now) // LRU touch (best effort)
+	if data := readMemo(memoPath); data != nil {
 		return data, nil
 	}
 
 	if m.tools.FFmpeg == "" {
 		return nil, errors.New("ffmpeg is not available on this server")
 	}
-	args := append(append([]string{}, ffmpegPrefix...), enc.StillArgs(blob.Path, plan, t, maxW)...)
-	png, err := ffrun.RunOutput(ctx, m.tools.FFmpeg, args)
+	return m.previews.do(ctx, key, func(ctx context.Context) ([]byte, error) {
+		if data := readMemo(memoPath); data != nil {
+			return data, nil // a previous leader finished while we waited
+		}
+		release, err := m.acquirePreview(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if len(plan.TextFiles) > 0 {
+			dir, cleanup, err := m.st.ScratchDir("still-" + store.RandomID(8))
+			if err != nil {
+				return nil, err
+			}
+			defer cleanup()
+			if plan, err = bindTextFiles(plan, dir); err != nil {
+				return nil, err
+			}
+		}
+		srcPath := s.main().Path
+		png, err := m.renderStill(ctx, enc.StillArgs(srcPath, plan, t, maxW))
+		if err != nil {
+			return nil, err
+		}
+		if len(png) == 0 {
+			// The seek-back missed every frame (a long held last frame, see
+			// enc.StillArgs): decode from the trim start instead.
+			if png, err = m.renderStill(ctx, enc.StillArgsFromStart(srcPath, plan, t, maxW)); err != nil {
+				return nil, err
+			}
+		}
+		if len(png) == 0 {
+			return nil, errors.New("still render produced no image (time outside the clip?)")
+		}
+		m.memoWrite(memoPath, png, MaxStills, m.opts.MaxStillsBytes)
+		return png, nil
+	})
+}
+
+// renderStill runs one still argv (ffmpegPrefix + args) and returns the
+// PNG bytes ffmpeg wrote to stdout.
+func (m *Manager) renderStill(ctx context.Context, args []string) ([]byte, error) {
+	argv := append(append(make([]string, 0, len(ffmpegPrefix)+len(args)), ffmpegPrefix...), args...)
+	png, err := ffrun.RunOutput(ctx, m.tools.FFmpeg, argv)
 	if err != nil {
 		return nil, fmt.Errorf("still render: %w", err)
 	}
-	if len(png) == 0 {
-		return nil, errors.New("still render produced no image (time outside the clip?)")
-	}
-	m.memoStill(memoPath, png)
 	return png, nil
 }
 
@@ -129,66 +200,114 @@ func clampStillTime(plan *graph.Plan, t float64, still bool) float64 {
 	return float64(int64(t*1000+0.5)) / 1000
 }
 
-// stillKey hashes (source, canonical ops, geometry output, t, maxW).
-func stillKey(srcHash string, ops []recipe.Op, out recipe.Output, t float64, maxW int) (string, error) {
-	canon, err := recipe.Recipe{Sources: []string{srcHash}, Ops: ops, Output: out}.Canonical()
+// stillKey hashes (stillMemoVersion, every source, canonical ops, geometry
+// output, t, maxW).
+func stillKey(srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int) (string, error) {
+	return stillKeyV(srcs, ops, out, t, maxW, stillMemoVersion)
+}
+
+// stillKeyV is stillKey with an explicit version salt.
+func stillKeyV(srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int, version string) (string, error) {
+	canon, err := recipe.Recipe{Sources: srcs, Ops: ops, Output: out}.Canonical()
 	if err != nil {
 		return "", err
 	}
 	h := sha256.New()
+	h.Write([]byte("still|" + version + "\n"))
 	h.Write(canon)
 	h.Write([]byte("|t=" + strconv.FormatFloat(t, 'f', 3, 64) + "|w=" + strconv.Itoa(maxW)))
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// memoStill stores png at path (atomically) and evicts the oldest entries
-// beyond MaxStills. Failures are logged, never fatal.
-func (m *Manager) memoStill(path string, png []byte) {
+// readMemo returns a memoised preview file (nil when absent or empty) and
+// touches it so eviction keeps recently used entries (best effort).
+func readMemo(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
+	return data
+}
+
+// memoWrite stores data at path (atomically), first evicting the oldest
+// entries of its directory so that the write leaves at most keep entries
+// holding at most keepBytes (0 = no byte bound) — the memo dirs live on the
+// scratch tmpfs, whose space the renders are budgeted against, so an entry
+// is never written beyond the bound and removed afterwards. A write that
+// still hits ENOSPC (a foreign tenant of the tmpfs, a render of unknown
+// length) empties the directory and retries once: the memo is a cache.
+// Failures are logged, never fatal.
+func (m *Manager) memoWrite(path string, data []byte, keep int, keepBytes int64) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Printf("jobs: stills dir: %v", err)
-		return
-	}
-	tmp, err := os.CreateTemp(dir, ".still-*")
-	if err != nil {
-		log.Printf("jobs: still memo: %v", err)
-		return
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(png); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		log.Printf("jobs: still memo write: %v", err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		log.Printf("jobs: still memo rename: %v", err)
+		log.Printf("jobs: memo dir %s: %v", filepath.Base(dir), err)
 		return
 	}
 	m.stillMu.Lock()
 	defer m.stillMu.Unlock()
-	if err := evictOldest(dir, MaxStills); err != nil {
-		log.Printf("jobs: still memo evict: %v", err)
+	keepCount, room := max(keep-1, 0), int64(0)
+	if keepBytes > 0 {
+		room = keepBytes - int64(len(data))
+		if room <= 0 {
+			keepCount, room = 0, 0 // larger than the whole bound: it lands alone
+		}
+	}
+	if err := evictOldest(dir, keepCount, room); err != nil {
+		log.Printf("jobs: memo evict %s: %v", filepath.Base(dir), err)
+	}
+	err := writeMemoFile(dir, path, data)
+	if err != nil && isNoSpace(err) {
+		if evErr := evictOldest(dir, 0, 0); evErr != nil {
+			log.Printf("jobs: memo evict %s: %v", filepath.Base(dir), evErr)
+		}
+		err = writeMemoFile(dir, path, data)
+	}
+	if err != nil {
+		log.Printf("jobs: memo %s: %v", filepath.Base(dir), err)
 	}
 }
 
+// writeMemoFile writes data to path through a temp file in dir and a rename.
+func writeMemoFile(dir, path string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, ".memo-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("close: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
 // evictOldest removes the oldest regular files in dir until at most keep
-// remain (temp files being written are skipped).
-func evictOldest(dir string, keep int) error {
+// remain (< 0 = no count bound; 0 = remove them all) holding at most
+// keepBytes in total (<= 0 = no byte bound); temp files being written
+// (dot-names) are skipped.
+func evictOldest(dir string, keep int, keepBytes int64) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
 	type ent struct {
 		name  string
+		size  int64
 		mtime time.Time
 	}
 	files := make([]ent, 0, len(entries))
+	var total int64
 	for _, e := range entries {
 		if !e.Type().IsRegular() || e.Name()[0] == '.' {
 			continue
@@ -197,17 +316,28 @@ func evictOldest(dir string, keep int) error {
 		if err != nil {
 			continue
 		}
-		files = append(files, ent{e.Name(), info.ModTime()})
+		files = append(files, ent{e.Name(), info.Size(), info.ModTime()})
+		total += info.Size()
 	}
-	if len(files) <= keep {
+	within := func(n int, total int64) bool {
+		return (keep < 0 || n <= keep) && (keepBytes <= 0 || total <= keepBytes)
+	}
+	if within(len(files), total) {
 		return nil
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].mtime.Before(files[j].mtime) })
 	var errs []error
-	for _, f := range files[:len(files)-keep] {
+	remaining := len(files)
+	for _, f := range files {
+		if within(remaining, total) {
+			break
+		}
 		if err := os.Remove(filepath.Join(dir, f.name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
+			continue
 		}
+		remaining--
+		total -= f.size
 	}
 	return errors.Join(errs...)
 }

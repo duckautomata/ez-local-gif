@@ -151,6 +151,145 @@ func tinyPNG(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
+// TestServeConfigFromEnv: every knob the package comment lists is read from
+// its variable, EZLG_MAX_MASTER_BYTES included — the frame-master refusal
+// (jobs.admitScratch, and the preview paths that reuse its wording) tells
+// the user to raise it, so it has to be a real knob with the manager's
+// default when unset or unparsable.
+func TestServeConfigFromEnv(t *testing.T) {
+	for _, k := range []string{"EZLG_ADDR", "EZLG_DATA", "EZLG_SCRATCH", "EZLG_TTL_HOURS", "EZLG_MAX_BYTES", "EZLG_MAX_UPLOAD_MB", "EZLG_CONCURRENCY", "EZLG_MAX_MASTER_BYTES"} {
+		t.Setenv(k, "")
+	}
+	cfg := serveConfigFromEnv()
+	if cfg.maxMaster != jobs.DefaultMaxMasterBytes {
+		t.Errorf("unset EZLG_MAX_MASTER_BYTES: maxMaster = %d, want the manager's default %d", cfg.maxMaster, int64(jobs.DefaultMaxMasterBytes))
+	}
+	if cfg.addr != ":8080" || cfg.dataRoot != "/data" || cfg.scratch != "/dev/shm/ezl" || cfg.ttl != 24*time.Hour || cfg.maxBytes != 20<<30 || cfg.maxUpload != 2048<<20 || cfg.conc < 1 || cfg.drain != drainTimeout {
+		t.Errorf("defaults = %+v", cfg)
+	}
+
+	t.Setenv("EZLG_MAX_MASTER_BYTES", "1048576")
+	t.Setenv("EZLG_CONCURRENCY", "3")
+	t.Setenv("EZLG_MAX_UPLOAD_MB", "16")
+	cfg = serveConfigFromEnv()
+	if cfg.maxMaster != 1<<20 || cfg.conc != 3 || cfg.maxUpload != 16<<20 {
+		t.Errorf("env = %+v, want maxMaster 1 MiB, conc 3, maxUpload 16 MiB", cfg)
+	}
+
+	// Unparsable values are ignored (logged), not fatal; a non-positive cap
+	// is passed through for the manager to replace with its default.
+	t.Setenv("EZLG_MAX_MASTER_BYTES", "two gigs")
+	if cfg = serveConfigFromEnv(); cfg.maxMaster != jobs.DefaultMaxMasterBytes {
+		t.Errorf("invalid EZLG_MAX_MASTER_BYTES: maxMaster = %d, want the default", cfg.maxMaster)
+	}
+	t.Setenv("EZLG_MAX_MASTER_BYTES", "0")
+	if cfg = serveConfigFromEnv(); cfg.maxMaster != 0 {
+		t.Errorf("EZLG_MAX_MASTER_BYTES=0: maxMaster = %d, want 0 (manager default)", cfg.maxMaster)
+	}
+}
+
+// getJob fetches GET /api/jobs/{id}.
+func getJob(t *testing.T, client *http.Client, base, id string) jobs.Job {
+	t.Helper()
+	resp, err := client.Get(base + "/api/jobs/" + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET job %s: %d %s", id, resp.StatusCode, body)
+	}
+	var job jobs.Job
+	if err := json.Unmarshal(body, &job); err != nil {
+		t.Fatalf("decode job: %v: %s", err, body)
+	}
+	return job
+}
+
+// TestRunServerMaxMasterBytes: the cap configured through serveConfig
+// (EZLG_MAX_MASTER_BYTES) reaches the job manager. A recipe whose RGBA
+// master would exceed it fails up-front with the message that names the
+// variable and never starts an ffmpeg; one under the cap is admitted and
+// does (the fake ffmpeg blocks like a real master render until the server's
+// shutdown kills it).
+func TestRunServerMaxMasterBytes(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := t.TempDir()
+	t.Setenv(fakeToolEnv, "1")
+	t.Setenv(fakeDirEnv, marker)
+	t.Setenv("EZLG_FFMPEG", exe)
+	t.Setenv("EZLG_FFPROBE", exe)
+	cfg := testConfig(t)
+	// The seeded source is 6 frames of 16x12: 4608 bytes of RGBA master at
+	// its natural size, 288 at 4x4 ("contain" makes that 4x3).
+	cfg.maxMaster = 1000
+
+	st, err := store.New(cfg.dataRoot, cfg.scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := st.PutBlob(strings.NewReader("GIF89a not really a gif"), "a.gif")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := recipe.ProbeInfo{Format: "gif", Codec: "gif", PixFmt: "bgra", Bits: 8, Width: 16, Height: 12, FPS: 10, Duration: 0.6, Frames: 6, Kind: recipe.KindAnimation, HasAlpha: true}
+	if err := st.SetBlobInfo(blob.Hash, info); err != nil {
+		t.Fatal(err)
+	}
+
+	base, _, _ := startServer(t, cfg)
+	client := &http.Client{Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+	submit := func(out recipe.Output) jobs.Job {
+		t.Helper()
+		body, _ := json.Marshal(recipe.Recipe{Sources: []string{blob.Hash}, Output: out})
+		resp, err := client.Post(base+"/api/jobs", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("create job: %d %s", resp.StatusCode, raw)
+		}
+		var job jobs.Job
+		if err := json.Unmarshal(raw, &job); err != nil {
+			t.Fatal(err)
+		}
+		return job
+	}
+
+	// Over the cap: refused before any process starts.
+	over := submit(recipe.Output{Format: "gif", Width: 16, Height: 12})
+	var final jobs.Job
+	waitFor(t, 10*time.Second, "the oversize job to finish", func() bool {
+		final = getJob(t, client, base, over.ID)
+		return final.IsFinished()
+	})
+	if final.State != jobs.StateError {
+		t.Fatalf("oversize job = %+v, want state error", final)
+	}
+	for _, want := range []string{"frame master would need 4.5 KiB", "6 frames of 16x12", "the limit is 1000 B", "EZLG_MAX_MASTER_BYTES"} {
+		if !strings.Contains(final.Error, want) {
+			t.Errorf("oversize job error %q does not mention %q", final.Error, want)
+		}
+	}
+	if entries, _ := os.ReadDir(marker); len(entries) != 0 {
+		t.Errorf("the refused render started %d ffmpeg process(es)", len(entries))
+	}
+
+	// Under the cap: admitted, so the (fake) master render is started.
+	under := submit(recipe.Output{Format: "gif", Width: 4, Height: 4})
+	waitFor(t, 10*time.Second, "the admitted render's ffmpeg to start", dirHasEntries(marker))
+	if job := getJob(t, client, base, under.ID); job.IsFinished() {
+		t.Errorf("admitted job finished while its ffmpeg is still blocked: %+v", job)
+	}
+}
+
 // TestRunServerDrainsInFlightUpload: the shutdown signal arrives while an
 // upload is streaming in; the upload must still complete with 200 and only
 // then may runServer return — and it must return well before the drain

@@ -12,7 +12,10 @@
 //   - Builders never fail: out-of-range options are clamped to the documented
 //     ranges and unknown enum values fall back to the documented default, so
 //     the argv is always something ffmpeg accepts. A nil *graph.Plan yields
-//     nil.
+//     nil, as does a plan that is not ready to run (an unbound drawtext
+//     placeholder, an overlay input without a path — see phase3.go).
+//   - Phase 3 (phase3.go): overlay inputs, reversed plans and the autocrop /
+//     font helpers.
 package enc
 
 import (
@@ -83,14 +86,19 @@ type Master struct {
 // directory and the input becomes "-i <srcPath>/<InputPattern>" (the image2
 // demuxer pattern; p.InputArgs carry its -framerate/-start_number). The
 // same holds for StillArgs, StillArgsFromStart and ProxyArgs.
+//
+// Every p.ExtraInputs entry (Phase 3) follows the main input as
+// "[Args...] -i Path"; a plan with an unbound drawtext placeholder or an
+// extra input without Path yields nil (see phase3.go).
 func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
-	if p == nil {
+	if !planUsable(p) {
 		return nil
 	}
 	args := make([]string, 0, len(p.InputArgs)+14)
 	args = append(args, p.InputArgs...)
+	args = append(args, "-i", inputPath(srcPath, p))
+	args = append(args, extraInputArgs(p)...)
 	args = append(args,
-		"-i", inputPath(srcPath, p),
 		"-filter_complex", p.Filter,
 		"-map", outLabel(p),
 		"-an", "-sn", "-dn",
@@ -102,9 +110,9 @@ func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 
 // StillArgs renders the frame the output shows at time t (seconds, output
 // time) at most maxW pixels wide (0 = plan width) as PNG on stdout:
-// [-ss S] … -i src -frames:v 1 -filter_complex "<plan.Filter>;[out]tpad=…,
-// select=…[,scale][outs]" -map [outs] -c:v png -compression_level 1
-// -f image2pipe pipe:1.
+// [-ss S [-itsoffset S-TrimStart]] … -i src [extra inputs] -frames:v 1
+// -filter_complex "<plan.Filter>;[out]tpad=…,select=…[,scale][outs]"
+// -map [outs] -c:v png -compression_level 1 -f image2pipe pipe:1.
 //
 // t is an output-time offset: the wanted source time is TrimStart + t*Speed
 // (Speed <= 0 counts as 1), clamped to >= TrimStart and to just inside the
@@ -114,15 +122,39 @@ func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 // frame period — and is snapped onto the plan's output frame grid
 // (TrimStart + k*Speed/FPS), so the plan's fps stage produces the same frame
 // slots as the real render; a `-ss` at or past the last decodable frame
-// would otherwise yield no image at all near the clip end. The plan filter
-// runs unchanged (its fps stage also gives tpad a frame rate) and is
-// followed by tpad=stop_mode=clone (the last frame is held for t up to
-// Duration and through the fps filter's rounding tail) and a select for the
-// slot displayed at t. When maxW > 0 the selected frame is scaled to at most
-// maxW wide, wrapped in premultiply/unpremultiply when the plan has alpha
-// (the same chain graph uses, so the preview shows no dark fringes the
-// output does not have). -ss is omitted when S == 0 (some animation
-// demuxers, e.g. FFmpeg 9's webp_anim, return nothing after any seek).
+// would otherwise yield no image at all near the clip end. "-itsoffset
+// S-TrimStart" undoes the seek's re-basing of timestamps, so every frame
+// carries the absolute output time the render gives it (the fps grid, any
+// enable='gte(t+0.0001,S)*lt(t+0.0001,E)' window — the half-open [S, E) the
+// graph emits, with its 1e-4 s tolerance — and the overlay inputs, which
+// start at 0 like in the render, see phase3.go, all line up). The plan filter runs
+// unchanged (its fps stage also gives tpad a frame rate) and is followed by
+// tpad=stop_mode=clone (the last frame is held for t up to Duration and
+// through the fps filter's rounding tail) and a select for the slot
+// displayed at t, by its absolute time. When maxW > 0 the selected frame is
+// scaled to at most maxW wide, wrapped in premultiply/unpremultiply when the
+// plan has alpha (the same chain graph uses, so the preview shows no dark
+// fringes the output does not have). -ss is omitted when S == 0, and
+// -itsoffset when S == TrimStart.
+//
+// A plan whose main source cannot be seeked (p.SeekUnsafe: animated WebP —
+// FFmpeg 9's webp_anim demuxer decodes nothing after any input seek) is not
+// seeked at all, by either variant: no -ss, -itsoffset or -to, trimmed or
+// not. A trim on such a source is a filter stage (p.FilterTrim; the graph
+// compiler emits "trim=…,setpts=PTS-STARTPTS" instead of -ss/-to) that cuts
+// the source and rebases the timestamps exactly like an input seek, so a
+// decode from the file's start carries the render's own clock and the
+// select by absolute time (or by index, reversed) holds unchanged; without
+// a trim the file's clock is the render's already. StillArgs therefore
+// decodes such a plan in one run (no empty result to retry from the start).
+//
+// A reversed plan (p.Reversed) is seeked before source time TrimStart +
+// (Duration - t)*Speed the same way, keeps "-to TrimEnd", and selects the
+// wanted frame by index (select='gte(n,j)', j = floor(t*FPS)): the plan's
+// reverse stage hands out the reversed frames with the forward timestamps,
+// so the j-th frame after the seek is the render's j-th frame — on CFR
+// sources. A reversed plan on an animation source (p.SourceVFR: gif, apng,
+// webp, avif) is decoded from TrimStart instead, see reversedSeekFor.
 //
 // Any -ss/-to/-t/-sseof pairs in plan.InputArgs are dropped because the seek
 // replaces them; every other input option (e.g. -c:v libvpx-vp9) is kept.
@@ -133,7 +165,7 @@ func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 // ending in a 2 s hold) yield no image for t inside that hold. Callers
 // should retry an empty result with StillArgsFromStart.
 func StillArgs(srcPath string, p *graph.Plan, t float64, maxW int) []string {
-	if p == nil {
+	if !planUsable(p) {
 		return nil
 	}
 	return stillArgs(srcPath, p, stillSeekFor(p, t, false), maxW)
@@ -143,10 +175,10 @@ func StillArgs(srcPath string, p *graph.Plan, t float64, maxW int) []string {
 // TrimStart (no -ss when that is 0) and lets the plan's fps stage and tpad
 // carry every source frame — including a held last frame — up to t. It is
 // exact (the frame slots are the render's own) but costs a decode of
-// TrimStart..t, so it is meant as the fallback when StillArgs produced no
-// image.
+// TrimStart..t (the whole trimmed clip for a reversed plan), so it is meant
+// as the fallback when StillArgs produced no image.
 func StillArgsFromStart(srcPath string, p *graph.Plan, t float64, maxW int) []string {
-	if p == nil {
+	if !planUsable(p) {
 		return nil
 	}
 	return stillArgs(srcPath, p, stillSeekFor(p, t, true), maxW)
@@ -159,20 +191,31 @@ func stillArgs(srcPath string, p *graph.Plan, s stillSeek, maxW int) []string {
 	f.WriteString(";")
 	f.WriteString(outLabel(p))
 	f.WriteString("tpad=stop_mode=clone:stop_duration=" + formatFloat(s.pad))
-	f.WriteString(",select='gte(t," + formatFloat(s.threshold) + ")'")
+	if s.reversed {
+		f.WriteString(",select='gte(n," + strconv.Itoa(s.index) + ")'")
+	} else {
+		f.WriteString(",select='gte(t," + formatFloat(s.threshold) + ")'")
+	}
 	if maxW > 0 {
 		f.WriteString("," + previewScale(p, maxW))
 	}
 	f.WriteString("[outs]")
 
 	input := stripSeekArgs(p.InputArgs)
-	args := make([]string, 0, len(input)+18)
+	args := make([]string, 0, len(input)+22)
 	if s.start > 0 {
 		args = append(args, "-ss", formatFloat(s.start))
 	}
+	if s.offset > 0 {
+		args = append(args, "-itsoffset", formatFloat(s.offset))
+	}
+	if s.end > s.start {
+		args = append(args, "-to", formatFloat(s.end))
+	}
 	args = append(args, input...)
+	args = append(args, "-i", inputPath(srcPath, p))
+	args = append(args, extraInputArgs(p)...)
 	args = append(args,
-		"-i", inputPath(srcPath, p),
 		"-frames:v", "1",
 		"-filter_complex", f.String(),
 		"-map", "[outs]",
@@ -186,14 +229,39 @@ func stillArgs(srcPath string, p *graph.Plan, s stillSeek, maxW int) []string {
 // (0 = 10) at most maxW wide (0 = 360), fps <= 15, -q:v 60
 // -compression_level 0 -loop 0, to outPath.
 //
-// The plan's input args (including any trim seek) are kept; -t is applied
-// as an output option so it composes with an input-side -to and counts
-// output seconds (i.e. after any speed change). fps=15 is inserted unless
-// the plan already runs at <= 15 fps. The scale to maxW is wrapped in
+// The plan's input args (including any trim seek) are kept, and every
+// extra input follows the main one unchanged; -t is applied as an output
+// option so it composes with an input-side -to and counts output seconds
+// (i.e. after any speed change). fps=15 is inserted unless the plan already
+// runs at <= 15 fps or has exactly one frame (p.Frames == 1: a still main
+// source, with or without an animated overlay — ffmpeg's fps filter needs a
+// second timestamp and emits nothing at all for a single frame, after which
+// libwebp_anim fails with "WebPAnimEncoderAssemble() failed"; Frames 0 is an
+// unknown count and keeps the cap). The scale to maxW is wrapped in
 // premultiply/unpremultiply when the plan has alpha (as graph does for the
 // real render) so the preview shows no dark edge fringes the output lacks.
+//
+// A reversed plan (p.Reversed) shows the LAST maxSeconds of the trimmed
+// source first, yet its reverse stage buffers every frame it is handed, so
+// the main input is seeked to just before that tail (proxySeekFor): "-ss S
+// [-to TrimEnd]" replaces the plan's own seek (every other input option is
+// kept, as for the stills), S being the reversed stills' seek for output
+// time maxSeconds — the usual seek-back before the source slot shown at that
+// time, snapped onto the plan's slot grid and, for CFR video and image
+// sequences, onto a whole number of source frames after TrimStart so the -to
+// cut lands on the render's frame (see reversedSeekFor). The reverse stage
+// stamps the forward timestamps, counted from the seek point, onto the
+// reversed frames, so the proxy still starts at output t=0 with the render's
+// own first frame, the overlay clocks and enable windows keep their absolute
+// output times, and the -t cap stays. Seekable animation sources
+// (p.SourceVFR: gif, apng, avif, trimmed or not) get a plain seek at the
+// computed time — such a preview may be a frame off where the seek lands
+// inside a hold. A plan whose demuxer decodes nothing after a seek
+// (p.SeekUnsafe: animated WebP, which FilterTrim implies) is never seeked;
+// a plan whose length is unknown, or whose tail reaches back to TrimStart
+// anyway, decodes from TrimStart as a forward plan does.
 func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outPath string) []string {
-	if p == nil {
+	if !planUsable(p) {
 		return nil
 	}
 	if maxW <= 0 {
@@ -206,7 +274,7 @@ func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outP
 	f.WriteString(p.Filter)
 	f.WriteString(";")
 	f.WriteString(outLabel(p))
-	if !(p.FPS > 0 && p.FPS <= proxyMaxFPS) {
+	if p.Frames != 1 && !(p.FPS > 0 && p.FPS <= proxyMaxFPS) {
 		f.WriteString("fps=" + strconv.Itoa(proxyMaxFPS) + ",")
 	}
 	f.WriteString(previewScale(p, maxW) + "[outp]")
@@ -215,10 +283,21 @@ func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outP
 	if p.HasAlpha {
 		pix = "yuva420p"
 	}
-	args := make([]string, 0, len(p.InputArgs)+30)
-	args = append(args, p.InputArgs...)
+	input := p.InputArgs
+	var seek []string
+	if s, ok := proxySeekFor(p, maxSeconds); ok {
+		input = stripSeekArgs(p.InputArgs)
+		seek = append(seek, "-ss", formatFloat(s.start))
+		if s.end > s.start {
+			seek = append(seek, "-to", formatFloat(s.end))
+		}
+	}
+	args := make([]string, 0, len(seek)+len(input)+30)
+	args = append(args, seek...)
+	args = append(args, input...)
+	args = append(args, "-i", inputPath(srcPath, p))
+	args = append(args, extraInputArgs(p)...)
 	args = append(args,
-		"-i", inputPath(srcPath, p),
 		"-filter_complex", f.String(),
 		"-map", "[outp]",
 		"-an", "-sn", "-dn",
@@ -589,105 +668,321 @@ func previewScale(p *graph.Plan, maxW int) string {
 
 // stillSeek is the resolved timing of one still render.
 type stillSeek struct {
-	start     float64 // -ss value in source seconds (0 = no seek)
-	threshold float64 // select 'gte(t,threshold)' in output seconds after start
-	pad       float64 // tpad stop_duration in output seconds
+	start  float64 // -ss value in source seconds (0 = no seek)
+	offset float64 // -itsoffset in source seconds: start - TrimStart, so timestamps stay absolute (0 = none; always 0 for reversed plans)
+	end    float64 // -to value in source seconds (0 = none; reversed plans keep TrimEnd)
+	pad    float64 // tpad stop_duration in output seconds
+	// Forward plans select by absolute output time, reversed plans by
+	// frame index after the seek (see StillArgs).
+	reversed  bool
+	threshold float64 // select 'gte(t,threshold)' in output seconds
+	index     int     // select 'gte(n,index)'
 }
 
-// stillSeekFor maps an output-time offset t to the seek StillArgs uses.
+// Reversed-still seek constants.
+const (
+	// maxStillIndex bounds the frame index a reversed still may select when
+	// the plan has no duration or frame count to cap it (a t far past any
+	// real clip); tpad would clone that many frames at most.
+	maxStillIndex = 1 << 20
+	// seekPhaseTolerance (seconds) is how far K output slots may be from a
+	// whole number of source frames for a reversed still to seek there: a
+	// tenth of the microsecond ffmpeg parses -ss/-to at, so the trim cut can
+	// never land on the other side of a source frame than the render's.
+	seekPhaseTolerance = 1e-7
+	// maxPhaseSearch caps the search for the smallest aligned slot count (a
+	// longer alignment period than 1000 slots is not worth seeking for).
+	maxPhaseSearch = 1000
+)
+
+// stillGrid holds the plan facts the seek maths needs, with the defaults
+// applied: a plan without FPS is treated as fallbackFPS, Speed <= 0 as 1.
+type stillGrid struct {
+	speed     float64 // speed factor
+	fps       float64 // output frame rate
+	trimStart float64 // first source second the render decodes
+	srcEnd    float64 // source second the render stops at (0 = unknown)
+	period    float64 // source seconds per output slot (speed/fps)
+	back      float64 // seek-back in source seconds (see seekBefore)
+	last      float64 // the render's last output slot (-1 = unknown)
+}
+
+// newStillGrid derives the grid from p. srcEnd is TrimEnd, else TrimStart +
+// Duration*Speed when the duration is known. The last slot is Plan.Frames-1
+// when the plan knows its frame count (exact for image sequences, where the
+// speed stage truncates the end timestamp and Frames can be below
+// floor(Duration*FPS)), else floor(Duration*FPS)-1 when the duration is
+// known (the fps stage runs round=down, so no slot past that is rendered).
+func newStillGrid(p *graph.Plan) stillGrid {
+	g := stillGrid{speed: p.Speed, fps: p.FPS, trimStart: math.Max(p.TrimStart, 0), last: -1}
+	if !(g.speed > 0) || math.IsInf(g.speed, 0) {
+		g.speed = 1
+	}
+	if !(g.fps > 0) || math.IsInf(g.fps, 0) {
+		g.fps = fallbackFPS
+	}
+	g.period = g.speed / g.fps
+	switch {
+	case p.TrimEnd > 0:
+		g.srcEnd = p.TrimEnd
+	case p.Duration > 0:
+		g.srcEnd = g.trimStart + p.Duration*g.speed
+	}
+	// Seek-back: at least two source frames must lie in [start, target] and
+	// the fps stage must see at least one whole output period of input.
+	g.back = stillUnknownFPSSeekBack
+	if p.SourceFPS > 0 && !math.IsInf(p.SourceFPS, 0) {
+		g.back = math.Max(2/p.SourceFPS, stillMinSeekBack)
+	}
+	g.back += g.period
+	durOut := p.Duration
+	if !(durOut > 0) && p.TrimEnd > 0 {
+		durOut = (p.TrimEnd - g.trimStart) / g.speed
+	}
+	switch {
+	case p.Frames > 0:
+		g.last = float64(p.Frames) - 1
+	case durOut > 0 && !math.IsInf(durOut, 0):
+		g.last = math.Floor(durOut*g.fps+stillSlotEpsilon) - 1
+	}
+	return g
+}
+
+// clampTarget keeps a wanted source time inside [TrimStart, srcEnd -
+// stillEndMargin] (NaN/Inf become TrimStart).
+func (g stillGrid) clampTarget(target float64) float64 {
+	if math.IsNaN(target) || math.IsInf(target, 0) || target < g.trimStart {
+		return g.trimStart
+	}
+	if g.srcEnd > 0 {
+		target = math.Min(target, math.Max(g.srcEnd-stillEndMargin, g.trimStart))
+	}
+	return target
+}
+
+// capSlot caps an output slot at the render's last one: a t at the very end
+// of the clip would otherwise select the slot past it and show a source
+// frame the render's EOF flush drops.
+func (g stillGrid) capSlot(slot float64) float64 {
+	if g.last >= 0 && slot > g.last {
+		return g.last
+	}
+	return slot
+}
+
+// seekBefore returns the seek start for a wanted source time and the number
+// of output slots it lies after TrimStart: the start is the seek-back before
+// the target (never before TrimStart), snapped DOWN onto the slot grid
+// TrimStart + K*Speed/FPS so the fps stage after the seek fills the same
+// slots as the render. fromStart forces TrimStart (K = 0).
+func (g stillGrid) seekBefore(target float64, fromStart bool) (start, slots float64) {
+	if fromStart {
+		return g.trimStart, 0
+	}
+	rawStart := math.Max(g.trimStart, target-g.back)
+	slots = math.Floor((rawStart-g.trimStart)/g.period + stillSlotEpsilon)
+	return g.trimStart + slots*g.period, slots
+}
+
+// stillSeekFor maps an output-time offset t to the seek StillArgs uses
+// (forward plans; reversed plans go through reversedSeekFor).
 //
-// The target source time is TrimStart + t*Speed, clamped to
-// [TrimStart, srcEnd - stillEndMargin] where srcEnd is TrimEnd, else
-// TrimStart + Duration*Speed when the duration is known. The output slot
-// displayed at t is k = floor(tOut*FPS) (tOut = clamped t), capped at the
-// render's last slot — Plan.Frames - 1 when the plan knows its frame count,
-// else floor(Duration*FPS) - 1 when the duration is known (the plan's fps
-// stage runs with round=down, so no slot past that is ever rendered); the
-// seek start
-// is snapped down onto the slot grid, K = floor((target - back -
-// TrimStart)*FPS/Speed) slots after TrimStart, so the fps stage after the
-// seek emits slot j = k-K exactly where the render emits slot k. The select
-// threshold sits half a slot before slot j (robust to float ties) and the
-// tpad clones the last frame for j/FPS + stillPadSlack seconds so an early
-// end of input still yields the (held) last frame. fromStart forces K = 0.
-// A plan without FPS is treated as fallbackFPS.
+// The target source time is TrimStart + t*Speed, clamped into the source.
+// The output slot displayed at t is k = floor(tOut*FPS) (tOut = clamped t),
+// capped at the render's last slot; the seek start is snapped onto the slot
+// grid K slots after TrimStart (seekBefore) and -itsoffset K*Speed/FPS keeps
+// the timestamps absolute, so the fps stage after the seek emits slot k
+// exactly where and WHEN the render emits it. The select threshold sits half
+// a slot before slot k (robust to float ties) and the tpad clones the last
+// frame for (k-K)/FPS + stillPadSlack seconds so an early end of input still
+// yields the (held) last frame.
+//
+// A plan whose demuxer cannot seek (p.SeekUnsafe; FilterTrim implies it) is
+// not seeked at all: the decode starts at the file's beginning and every
+// frame already carries the render's absolute output time — a trim stage
+// (p.FilterTrim) cuts the source at TrimStart..TrimEnd and rebases the
+// timestamps exactly as an input seek would, and an untrimmed plan's clock
+// is the render's as is — so the from-start slot maths apply, without the
+// -ss (see unseeked).
 func stillSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
+	if p.Reversed {
+		return reversedSeekFor(p, t, fromStart)
+	}
 	if !(t > 0) { // also catches NaN
 		t = 0
 	}
-	speed := p.Speed
-	if !(speed > 0) || math.IsInf(speed, 0) {
-		speed = 1
-	}
-	fps := p.FPS
-	if !(fps > 0) || math.IsInf(fps, 0) {
-		fps = fallbackFPS
-	}
-	trimStart := math.Max(p.TrimStart, 0)
-
-	// Wanted source time, kept inside the source.
-	target := trimStart + t*speed
-	if math.IsNaN(target) || math.IsInf(target, 0) {
-		target = trimStart
-	}
-	srcEnd := 0.0
-	switch {
-	case p.TrimEnd > 0:
-		srcEnd = p.TrimEnd
-	case p.Duration > 0:
-		srcEnd = trimStart + p.Duration*speed
-	}
-	if srcEnd > 0 {
-		target = math.Min(target, math.Max(srcEnd-stillEndMargin, trimStart))
-	}
-	tOut := (target - trimStart) / speed // clamped output time
-
-	// Seek-back: at least one source frame must lie in [start, target] and
-	// the fps stage must see at least one whole output period of input.
-	period := speed / fps // source seconds per output frame
-	back := stillUnknownFPSSeekBack
-	if p.SourceFPS > 0 && !math.IsInf(p.SourceFPS, 0) {
-		back = math.Max(2/p.SourceFPS, stillMinSeekBack)
-	}
-	back += period
-	if fromStart {
-		back = math.Inf(1)
-	}
-	rawStart := math.Max(trimStart, target-back)
-
-	// Snap onto the render's slot grid.
-	slots := math.Floor((rawStart-trimStart)/period + stillSlotEpsilon)
-	start := trimStart + slots*period
-	abs := math.Floor(tOut*fps + stillSlotEpsilon) // output slot displayed at t
-	// Cap at the render's last slot: a t at the very end of the clip would
-	// otherwise select the slot past it and show a source frame the render's
-	// EOF flush drops. The plan's Frames is that count when it is known
-	// (exact for image sequences, where the speed stage truncates the end
-	// timestamp and Frames can be below floor(Duration*FPS)); otherwise the
-	// fps stage's round=down puts the last slot at floor(Duration*FPS)-1.
-	durOut := p.Duration
-	if !(durOut > 0) && p.TrimEnd > 0 {
-		durOut = (p.TrimEnd - trimStart) / speed
-	}
-	last := -1.0
-	switch {
-	case p.Frames > 0:
-		last = float64(p.Frames) - 1
-	case durOut > 0 && !math.IsInf(durOut, 0):
-		last = math.Floor(durOut*fps+stillSlotEpsilon) - 1
-	}
-	if last >= 0 && abs > last {
-		abs = last
-	}
-	slot := abs - slots // j: slot after start
-	if slot < 0 {
-		slot = 0
-	}
-	return stillSeek{
+	g := newStillGrid(p)
+	target := g.clampTarget(g.trimStart + t*g.speed)
+	tOut := (target - g.trimStart) / g.speed // clamped output time
+	abs := g.capSlot(math.Floor(tOut*g.fps + stillSlotEpsilon))
+	start, slots := g.seekBefore(target, fromStart || seekUnsafe(p))
+	slot := math.Max(abs-slots, 0) // slots between the seek and the wanted one
+	s := stillSeek{
 		start:     start,
-		threshold: math.Max((slot-0.5)/fps, 0),
-		pad:       slot/fps + stillPadSlack,
+		offset:    slots * g.period,
+		threshold: math.Max((abs-0.5)/g.fps, 0),
+		pad:       slot/g.fps + stillPadSlack,
 	}
+	if seekUnsafe(p) {
+		return s.unseeked()
+	}
+	return s
+}
+
+// seekUnsafe reports whether p's main input must never be seeked: its
+// demuxer decodes nothing after an input seek (graph.Plan.SeekUnsafe), or
+// its trim is a filter stage (graph.Plan.FilterTrim, which the compiler only
+// emits for such demuxers — checked separately so a hand-built plan that
+// sets one flag alone is still handled).
+func seekUnsafe(p *graph.Plan) bool {
+	return p.SeekUnsafe || p.FilterTrim
+}
+
+// unseeked returns s without any input seek (no -ss, -itsoffset or -to): the
+// form for plans whose demuxer cannot seek (seekUnsafe): the trim stage, if
+// any, does the cutting.
+func (s stillSeek) unseeked() stillSeek {
+	s.start, s.offset, s.end = 0, 0, 0
+	return s
+}
+
+// reversedSeekFor is stillSeekFor for a reversed plan. Output slot j =
+// floor(t*FPS) (capped at the render's last slot) shows source slot k =
+// last - j, so the seek lies the usual seek-back before the middle of slot
+// k, snapped onto the grid, and the decode keeps the trim end. The plan's
+// reverse stage then yields the frames from the seek to the end in reverse
+// order with the forward timestamps: the wanted frame is the j-th one
+// whatever K is (the render's j-th frame too), so it is selected by index
+// and the timestamps are not offset.
+//
+// The end matters here (reverse counts from it), and ffmpeg cuts a seeked
+// input at "-to" by a trim DURATION counted from the first frame decoded
+// after the seek (fftools inserts trim=durationi=to-ss; verified), i.e. at
+// TrimEnd + δ where δ is the distance from the seek point to the next
+// source frame. The render's own cut is TrimEnd + δ(TrimStart), so the seek
+// is additionally snapped to a whole number of source frames after
+// TrimStart (alignedSlots) — 5 slots for a 30 fps source at 25 fps, every
+// slot at equal rates — which keeps δ, and with it the decoded frame set,
+// identical. Without such an alignment within seekPhaseTolerance (fractional
+// rates, 29.97 fps sources, an unknown source rate) or without a known last
+// slot (no duration, no frame count) the decode starts at TrimStart exactly
+// like the render's, which is exact at the cost of the whole trimmed clip.
+//
+// Animation sources (p.SourceVFR: gif, apng, webp, avif) are never seeked
+// either, whatever the rates: their frames carry individual delays, so
+// Plan.SourceFPS is only ffmpeg's base-cadence estimate and the alignment
+// above is meaningless, and their demuxers cannot seek into a hold —
+// ffmpeg's accurate seek drops the held frame covering the seek point (its
+// pts is before S), so the decode starts a whole hold after the seek and the
+// frames after it no longer end at the render's last slot, while with a trim
+// end the -to duration (counted from the first decoded frame) cuts one
+// source frame later than the render's. Either way the j-th reversed frame
+// is not the render's (verified on a 10 fps GIF with one 600 ms hold: 2 to
+// 15 wrong stills per clip, none from TrimStart). The aligned seek stays for
+// CFR video and image sequences.
+//
+// A plan whose demuxer cannot seek (p.SeekUnsafe, FilterTrim included) has
+// nothing to seek or cut: the whole file is decoded, a trim stage yields
+// TrimStart..TrimEnd from it, and the reverse stage counts from that cut
+// (or from the file's end), so the index selection holds with no -ss/-to at
+// all.
+func reversedSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
+	if !(t > 0) { // also catches NaN
+		t = 0
+	}
+	g := newStillGrid(p)
+	j := g.capSlot(math.Min(math.Floor(t*g.fps+stillSlotEpsilon), maxStillIndex))
+	s := stillSeek{
+		reversed: true,
+		index:    int(j),
+		pad:      j/g.fps + stillPadSlack,
+		start:    g.trimStart,
+	}
+	if p.TrimEnd > 0 {
+		s.end = p.TrimEnd
+	}
+	if seekUnsafe(p) {
+		return s.unseeked()
+	}
+	if fromStart || p.SourceVFR {
+		return s
+	}
+	s.start = g.reversedSeekStart(p.SourceFPS, j, true)
+	return s
+}
+
+// reversedSeekStart returns the seek start (source seconds) a reversed plan
+// is decoded from for reversed output slot j: the usual seek-back before the
+// middle of source slot last - j, snapped down onto the slot grid
+// (seekBefore) and, with align, onto a whole number of source frames after
+// TrimStart (alignedSlots — see reversedSeekFor for why; without it the
+// seek is the plain grid-snapped time). TrimStart when the last slot is
+// unknown.
+func (g stillGrid) reversedSeekStart(srcFPS, j float64, align bool) float64 {
+	if g.last < 0 {
+		return g.trimStart
+	}
+	k := g.last - j
+	_, slots := g.seekBefore(g.clampTarget(g.trimStart+(k+0.5)*g.period), false)
+	if align {
+		slots = g.alignedSlots(srcFPS, slots)
+	}
+	return g.trimStart + slots*g.period
+}
+
+// proxySeekFor returns the input seek ProxyArgs applies to a reversed plan
+// (see there) and whether there is one: the reversed stills' seek for output
+// time maxSeconds (reversedSeekStart; aligned for CFR sources, plain for
+// seekable animation sources — gif/apng/avif, trimmed or not), when it lies
+// after TrimStart, with the trim end kept for -to. Forward plans, plans
+// whose demuxer cannot seek (seekUnsafe: animated WebP, trimmed or not) and
+// plans of unknown length are never seeked.
+func proxySeekFor(p *graph.Plan, maxSeconds float64) (stillSeek, bool) {
+	if !p.Reversed || seekUnsafe(p) {
+		return stillSeek{}, false
+	}
+	g := newStillGrid(p)
+	j := g.capSlot(math.Min(math.Floor(maxSeconds*g.fps+stillSlotEpsilon), maxStillIndex))
+	start := g.reversedSeekStart(p.SourceFPS, j, !p.SourceVFR)
+	if !(start > g.trimStart) {
+		return stillSeek{}, false
+	}
+	s := stillSeek{reversed: true, start: start}
+	if p.TrimEnd > 0 {
+		s.end = p.TrimEnd
+	}
+	return s, true
+}
+
+// alignedSlots returns the largest K <= kmax for which K output slots span
+// a whole number of source frames (within seekPhaseTolerance), or 0 when
+// there is none up to maxPhaseSearch or the source rate is unknown.
+func (g stillGrid) alignedSlots(srcFPS, kmax float64) float64 {
+	if !(srcFPS > 0) || math.IsInf(srcFPS, 0) || kmax < 1 {
+		return 0
+	}
+	step := 0.0
+	for k := 1.0; k <= math.Min(kmax, maxPhaseSearch); k++ {
+		if g.phaseError(srcFPS, k) < seekPhaseTolerance {
+			step = k
+			break
+		}
+	}
+	if step == 0 {
+		return 0
+	}
+	k := math.Floor(kmax/step) * step
+	if g.phaseError(srcFPS, k) >= seekPhaseTolerance { // float drift over many steps
+		return 0
+	}
+	return k
+}
+
+// phaseError is the distance in seconds from K output slots to the nearest
+// whole number of source frames.
+func (g stillGrid) phaseError(srcFPS, k float64) float64 {
+	frames := k * g.period * srcFPS
+	return math.Abs(frames-math.Round(frames)) / srcFPS
 }
 
 // stripSeekArgs removes input-side seeking/duration options (and their

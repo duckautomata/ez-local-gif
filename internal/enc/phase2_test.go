@@ -649,13 +649,14 @@ func TestInputPattern(t *testing.T) {
 		"-f", "rawvideo", "-pix_fmt", "rgba",
 		"frames.rgba",
 	})
-	// t=0.5 → slot 5; seek-back max(2/10,0.1)+0.1 = 0.3 → 0.2 (slot 2) → 3 slots after the seek.
+	// t=0.5 → slot 5 (threshold 4.5/10); seek-back max(2/10,0.1)+0.1 = 0.3 →
+	// 0.2 (slot 2, the -itsoffset) → 3 slots after the seek.
 	assertArgs(t, StillArgs(dir, p, 0.5, 0), []string{
-		"-ss", "0.2",
+		"-ss", "0.2", "-itsoffset", "0.2",
 		"-f", "image2", "-framerate", "10", "-start_number", "1", "-reinit_filter", "0",
 		"-i", dir + "/%06d.png",
 		"-frames:v", "1",
-		"-filter_complex", stillFilter("[0:v]fps=10:round=down,format=rgba[out]", "1.3", "0.25", ""),
+		"-filter_complex", stillFilter("[0:v]fps=10:round=down,format=rgba[out]", "1.3", "0.45", ""),
 		"-map", "[outs]",
 		"-c:v", "png", "-compression_level", "1",
 		"-f", "image2pipe", "pipe:1",

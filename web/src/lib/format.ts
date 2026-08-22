@@ -99,6 +99,28 @@ export function trimTime(v: number): number {
 }
 
 /**
+ * floorTime rounds a time DOWN to whole microseconds — never above v — for
+ * an overlay's Start / End taken from the frame grid (overlay.scrubberRange).
+ * A trim bound is compared by ffmpeg in whole µs (-ss/-to), so trimTime's
+ * nearest rounding is exact there; an overlay is gated by the graph's
+ * enable='gte(t+T,S)*lt(t+T,E)' (T = graph.enableTolerance, mirrored by
+ * overlay.ACTIVE_TOLERANCE, absorbs the rounding; the floor keeps the
+ * stored bound naming its frame with or without it), where t is the frame's pts × (1/fps) as a
+ * double. A grid time that rounds UP to the µs (2/30 = 0.0666666… →
+ * 0.066667, every third frame at 30 fps, similar at 24/29.97/60) then sits
+ * above the frame's own t: gte fails on that frame, the overlay starts a
+ * frame late, and a one-frame window [2/30, 3/30) draws nothing. Floored,
+ * 0.066666 is at or below frame 2's t and still a whole frame above frame
+ * 1's. On-grid values (13/25 = 0.52) are kept as they are. The result is
+ * a whole number of µs like every recipe time (trimTime leaves it alone).
+ */
+export function floorTime(v: number): number {
+  if (!(v > 0)) return 0;
+  const r = trimTime(v);
+  return r <= v ? r : trimTime(r - 1e-6);
+}
+
+/**
  * frameCount is the number of frames a clip of `duration` seconds has at
  * `fps` (the plan's frame grid): max(1, floor(duration × fps +
  * FRAME_TOLERANCE)); 0 when the rate is unknown. Floor, not round: the

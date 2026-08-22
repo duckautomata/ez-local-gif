@@ -94,61 +94,105 @@ type decodedOp struct {
 func decodeOps(ops []recipe.Op) ([]decodedOp, error) {
 	decoded := make([]decodedOp, 0, len(ops))
 	for i, op := range ops {
-		var params any
-		switch op.Kind {
-		case recipe.OpTrim:
-			params = new(recipe.TrimParams)
-		case recipe.OpCrop:
-			params = new(recipe.CropParams)
-		case recipe.OpResize:
-			params = new(recipe.ResizeParams)
-		case recipe.OpCanvas:
-			params = new(recipe.CanvasParams)
-		case recipe.OpFPS:
-			params = new(recipe.FPSParams)
-		case recipe.OpSpeed:
-			params = new(recipe.SpeedParams)
-		case recipe.OpFlip:
-			params = new(recipe.FlipParams)
-		case recipe.OpRotate:
-			params = new(recipe.RotateParams)
-		case recipe.OpDelay:
-			params = new(recipe.DelayParams)
-		case recipe.OpUnpremultiply:
-			// no params
-		default:
-			return nil, errorf("op %d: unknown op kind %q", i, op.Kind)
+		d, err := decodeOp(i, op)
+		if err != nil {
+			return nil, err
 		}
-		if params != nil && len(bytes.TrimSpace(op.Params)) > 0 {
-			if err := json.Unmarshal(op.Params, params); err != nil {
-				return nil, errorf("op %d (%s): invalid params: %w", i, op.Kind, err)
-			}
-		}
-		decoded = append(decoded, decodedOp{index: i, kind: op.Kind, params: params})
+		decoded = append(decoded, d)
 	}
 	return decoded, nil
+}
+
+// decodeOp decodes the params of op, the i-th op of the recipe (i names it
+// in errors).
+func decodeOp(i int, op recipe.Op) (decodedOp, error) {
+	var params any
+	switch op.Kind {
+	case recipe.OpTrim:
+		params = new(recipe.TrimParams)
+	case recipe.OpCrop:
+		params = new(recipe.CropParams)
+	case recipe.OpResize:
+		params = new(recipe.ResizeParams)
+	case recipe.OpCanvas:
+		params = new(recipe.CanvasParams)
+	case recipe.OpFPS:
+		params = new(recipe.FPSParams)
+	case recipe.OpSpeed:
+		params = new(recipe.SpeedParams)
+	case recipe.OpFlip:
+		params = new(recipe.FlipParams)
+	case recipe.OpRotate:
+		params = new(recipe.RotateParams)
+	case recipe.OpDelay:
+		params = new(recipe.DelayParams)
+	case recipe.OpChromaKey:
+		params = new(recipe.ChromaKeyParams)
+	case recipe.OpColorKey:
+		params = new(recipe.ColorKeyParams)
+	case recipe.OpAutoCrop:
+		params = new(recipe.AutoCropParams)
+	case recipe.OpText:
+		params = new(recipe.TextParams)
+	case recipe.OpOverlay:
+		params = new(recipe.OverlayParams)
+	case recipe.OpUnpremultiply, recipe.OpReverse:
+		// no params
+	default:
+		return decodedOp{}, errorf("op %d: unknown op kind %q", i, op.Kind)
+	}
+	if params != nil && len(bytes.TrimSpace(op.Params)) > 0 {
+		if err := json.Unmarshal(op.Params, params); err != nil {
+			return decodedOp{}, errorf("op %d (%s): invalid params: %w", i, op.Kind, err)
+		}
+	}
+	return decodedOp{index: i, kind: op.Kind, params: params}, nil
 }
 
 // compiler holds the state threaded through the stages: the current frame
 // size, whether the frame carries alpha, and the filter stages emitted so
 // far.
 type compiler struct {
-	src recipe.ProbeInfo
-	out recipe.Output
-	seq *sequence // set for image-sequence sources
+	src  recipe.ProbeInfo   // the main source (srcs[0])
+	srcs []recipe.ProbeInfo // every recipe source; overlays index into it
+	out  recipe.Output
+	seq  *sequence // set for image-sequence sources
 
 	w, h     int  // current frame size
-	hasAlpha bool // current frame carries alpha (source alpha, a merged alpha stream or transparent padding)
+	hasAlpha bool // current frame carries alpha (source alpha, a merged alpha stream, keying or transparent padding)
 	srcAlpha bool // the source pixels carry alpha (in the main stream or a merged alpha stream)
 	// depth is the bit depth of the frames reaching the hoisted unpremultiply:
 	// the source's (src.Bits), or 8 once a head has converted them to rgba.
 	depth int
+	// nativeYUVA is true while the frames reaching the alpha head are the
+	// decoder's planar YUV-with-alpha frames (planarYUVAlpha; cleared by the
+	// heads that convert to rgba): those are unpremultiplied at their native
+	// format and converted to rgba once, never through gbrap (see alphaHead).
+	nativeYUVA bool
 
-	// input is the filter text the stage chain is appended to: mainInput
-	// ("[0:v]") or the alpha-stream merge head (which already ends in ",").
+	// input is the filter text the current stage chain is appended to:
+	// mainInput ("[0:v]"), the alpha-stream merge head (which already ends in
+	// ",") or, once an overlay closed the previous chain, the two pad labels
+	// its composite consumes ("[b1][ov1]").
 	input  string
-	stages []string // filter stages, joined with ","
-	plan   Plan
+	stages []string // filter stages of the current chain, joined with ","
+	// chains are the completed chains (each ending in a pad label), in
+	// filter order, emitted in front of the current one: the main chain up
+	// to an overlay and every overlay's own input chain (Phase 3).
+	chains     []string
+	labels     int              // base labels handed out by closeChain ("[bN]")
+	extras     map[int]extraRef // overlay source index → its ExtraInput (dedupe)
+	ovs        int              // overlay ops compiled so far (labels "[ovN]")
+	keys       int              // alpha-keeping key wrappers emitted so far (labels "[kN…]", see keyKeepingAlpha)
+	layers     int              // translucent text layers emitted so far (labels "[tN]", see textLayers)
+	rgbaCanvas bool             // the canvas was forced to rgba for the final-canvas ops
+	plan       Plan
+}
+
+// extraRef records how an overlay source was registered as an extra input.
+type extraRef struct {
+	index    int  // position in Plan.ExtraInputs
+	infinite bool // the input never ends by construction (-loop 1 / -stream_loop -1)
 }
 
 // sequence holds the resolved facts of an image-sequence source.
@@ -161,22 +205,56 @@ type sequence struct {
 	first, selected int
 }
 
-func newCompiler(src recipe.ProbeInfo, out recipe.Output) *compiler {
+func newCompiler(srcs []recipe.ProbeInfo, out recipe.Output) *compiler {
+	src := srcs[0]
 	return &compiler{
-		src:      src,
-		out:      out,
-		w:        src.Width,
-		h:        src.Height,
-		hasAlpha: src.HasAlpha,
-		srcAlpha: src.HasAlpha,
-		depth:    src.Bits,
-		input:    mainInput,
-		plan:     Plan{OutLabel: outLabel, Speed: 1},
+		src:        src,
+		srcs:       srcs,
+		out:        out,
+		w:          src.Width,
+		h:          src.Height,
+		hasAlpha:   src.HasAlpha,
+		srcAlpha:   src.HasAlpha,
+		depth:      src.Bits,
+		nativeYUVA: planarYUVAlpha(src),
+		input:      mainInput,
+		extras:     map[int]extraRef{},
+		plan:       Plan{OutLabel: outLabel, Speed: 1},
 	}
+}
+
+// planarYUVAlpha reports whether src decodes to a planar YUV format with an
+// alpha plane: a "yuva…" pix_fmt (ProRes 4444 yuva444p10le/12le, lossy WebP
+// yuva420p, …) or a yuv… pix_fmt whose alpha the forced libvpx decoder adds
+// (VP8/VP9 alpha_mode WebM probes as yuv420p and decodes as yuva420p). A
+// source whose alpha lives in a separate stream (AlphaStream > 0) is merged
+// to rgba by its head, which clears the flag on the compiler.
+func planarYUVAlpha(src recipe.ProbeInfo) bool {
+	return src.HasAlpha && strings.HasPrefix(strings.ToLower(strings.TrimSpace(src.PixFmt)), "yuv")
 }
 
 func (c *compiler) emit(stage string) {
 	c.stages = append(c.stages, stage)
+}
+
+// ensureRGBA emits format=rgba unless the current chain already ends in it.
+func (c *compiler) ensureRGBA() {
+	if n := len(c.stages); n > 0 && c.stages[n-1] == "format=rgba" {
+		return
+	}
+	c.emit("format=rgba")
+}
+
+// closeChain terminates the current chain with a fresh base label "[bN]",
+// appends it to the completed chains and returns the label, so a later
+// composite can consume it. The current chain must hold at least one stage
+// (a bare "[0:v][b1]" is not a filterchain).
+func (c *compiler) closeChain() string {
+	c.labels++
+	label := fmt.Sprintf("[b%d]", c.labels)
+	c.chains = append(c.chains, c.input+strings.Join(c.stages, ",")+label)
+	c.input, c.stages = "", nil
+	return label
 }
 
 // singleFrame reports whether the source yields exactly one frame (a still,
@@ -207,14 +285,8 @@ func (c *compiler) sourceFPS() float64 {
 // InputPattern / SourceFPS for image sequences and the merge head for sources
 // whose alpha lives in a separate stream.
 func (c *compiler) source(ops []decodedOp) error {
-	if c.src.AlphaStream < 0 {
-		return errorf("source alpha stream index must be >= 0 (got %d)", c.src.AlphaStream)
-	}
-	if c.src.ColorStream < 0 {
-		return errorf("source colour stream index must be >= 0 (got %d)", c.src.ColorStream)
-	}
-	if c.src.AlphaStream > 0 && c.src.AlphaStream == c.src.ColorStream {
-		return errorf("source alpha stream and colour stream are both v:%d", c.src.AlphaStream)
+	if err := checkStreams(c.src); err != nil {
+		return errorf("%v", err)
 	}
 	if c.src.Kind == recipe.KindSequence {
 		return c.sequenceSource(ops)
@@ -324,7 +396,7 @@ func (c *compiler) sequenceHead(mixed bool) {
 	c.emit("format=rgba")
 	c.emit(fmt.Sprintf("pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000:eval=frame", w, h))
 	c.hasAlpha = true // transparent padding
-	c.depth = 8
+	c.depth, c.nativeYUVA = 8, false
 }
 
 // alphaStreamHead merges a separate single-plane alpha stream (ffmpeg's mov
@@ -340,7 +412,7 @@ func (c *compiler) sequenceHead(mixed bool) {
 func (c *compiler) alphaStreamHead() {
 	c.input = fmt.Sprintf("[0:v:%d]format=rgba[c];[0:v:%d]format=gray[a];[c][a]alphamerge,", c.src.ColorStream, c.src.AlphaStream)
 	c.hasAlpha, c.srcAlpha = true, true
-	c.depth = 8
+	c.depth, c.nativeYUVA = 8, false
 }
 
 // SequenceFPS returns the image2 frame rate for a per-frame delay in
@@ -355,11 +427,12 @@ func SequenceFPS(delayMS int) float64 {
 }
 
 // ---------------------------------------------------------------------------
-// Temporal stages: unpremultiply (hoisted), trim (input args), speed, fps.
+// Temporal stages: the alpha head (hoisted unpremultiply), trim (input args
+// or, for seek-unsafe demuxers, a filter stage), speed, fps.
 // ---------------------------------------------------------------------------
 
 func (c *compiler) temporal(ops []decodedOp) error {
-	c.unpremultiply(ops)
+	c.alphaHead(ops)
 	if c.seq == nil {
 		c.plan.InputArgs = append(c.plan.InputArgs, decoderArgs(c.src)...)
 	}
@@ -372,10 +445,38 @@ func (c *compiler) temporal(ops []decodedOp) error {
 	return c.fps(ops)
 }
 
-// unpremultiply hoists the unpremultiply op to run right after decode (or
-// right after the alpha-stream merge / sequence head), at the frames'
-// native bit depth so 10/12-bit ProRes alpha edges are not truncated to 8
-// bits before the division. It is a no-op for sources without alpha.
+// alphaHead emits the stages that run right after decode (or right after the
+// alpha-stream merge / sequence head) on sources with alpha: the hoisted
+// unpremultiply op, at the frames' native bit depth so 10/12-bit ProRes alpha
+// edges are not truncated to 8 bits before the division, and — for planar
+// YUV-with-alpha sources (nativeYUVA) — the one conversion to rgba that every
+// later stage then works on. It is a no-op for sources without alpha.
+//
+// Two heads, by the decoded pixel format:
+//
+//   - RGB sources (rgba/bgra/argb/gbrap/pal8…: PNG, GIF, lossless WebP, AVIF
+//     after its merge, sequences): "format=gbrap|gbrap10le|gbrap12le,
+//     setparams=alpha_mode=premultiplied,unpremultiply=inplace=1" when the op
+//     is present, nothing otherwise.
+//   - Planar YUV-with-alpha sources (yuva444p10le/12le ProRes 4444, yuva420p
+//     lossy WebP, VP8/VP9 alpha): "[setparams=alpha_mode=premultiplied,
+//     unpremultiply=inplace=1,]format=rgba" — unpremultiply takes yuva420p /
+//     yuva422p10le / yuva444p10le / yuva444p16le … natively, and the alpha
+//     plane of these sources must go through exactly one yuva→rgba
+//     conversion and never through gbrap: ProRes 4444 decodes as
+//     yuva444p12le with color_range=tv and its alpha plane is stored on the
+//     luma range (12-bit 256 transparent .. 3750 opaque — swscale range-
+//     converts alpha together with luma for >8-bit YUV targets when the clip
+//     is made, and symmetrically "format=rgba" off the yuva frame yields the
+//     exact 0..255 alpha back). A same-depth "format=gbrap12le" in front of
+//     the unpremultiply copies the alpha plane with a +7 drift and no
+//     expansion (256→263), and the later gbrap12le(tv)→rgba expansion then
+//     leaves alpha 1 under every fully transparent pixel (and 129 for 128):
+//     every encoder had to code the full unpremultiplied colour of those
+//     pixels (bigger WebP/APNG/AVIF, worse fit results) and Crop to content
+//     at threshold 1 found the whole frame. Measured on FFmpeg 9.0.1:
+//     the native head gives alpha 0 / 128 / 255 exactly and RGB within 1 of
+//     the gbrap chain (alpha_ffmpeg_test.go checks it).
 //
 // FFmpeg >= 8 negotiates AVFrame.alpha_mode across filter links:
 // unpremultiply declares its input premultiplied, while decoders (ProRes,
@@ -386,7 +487,7 @@ func (c *compiler) temporal(ops []decodedOp) error {
 // pixel-exact on FFmpeg 9.0.1 (see alpha_ffmpeg_test.go). Its position
 // relative to the format stage does not matter (the auto-inserted format
 // conversion passes alpha_mode through); it sits next to its consumer.
-func (c *compiler) unpremultiply(ops []decodedOp) {
+func (c *compiler) alphaHead(ops []decodedOp) {
 	if !c.srcAlpha {
 		return
 	}
@@ -394,17 +495,16 @@ func (c *compiler) unpremultiply(ops []decodedOp) {
 		if d.kind != recipe.OpUnpremultiply {
 			continue
 		}
-		format := "gbrap"
-		switch c.depth {
-		case 10:
-			format = "gbrap10le"
-		case 12:
-			format = "gbrap12le"
+		if !c.nativeYUVA {
+			c.emit("format=" + gbrapFormat(c.depth))
 		}
-		c.emit("format=" + format)
 		c.emit("setparams=alpha_mode=premultiplied")
 		c.emit("unpremultiply=inplace=1")
-		return
+		break
+	}
+	if c.nativeYUVA {
+		c.emit("format=rgba")
+		c.depth, c.nativeYUVA = 8, false
 	}
 }
 
@@ -489,13 +589,26 @@ func (c *compiler) trim(ops []decodedOp) error {
 			return err
 		}
 	}
+	c.plan.TrimStart, c.plan.TrimEnd = start, end
+	if c.seq == nil && seekUnsafeDemuxer(c.src.Format) {
+		// FFmpeg 9's webp_anim demuxer decodes nothing after an input seek:
+		// cut in the graph instead and rebase the clock like -ss would (the
+		// plan is SeekUnsafe, see assemble; FilterTrim marks the stage).
+		stage := "trim=start=" + fnum6(start)
+		if end > 0 {
+			stage += ":end=" + fnum6(end)
+		}
+		c.emit(stage)
+		c.emit("setpts=PTS-STARTPTS")
+		c.plan.FilterTrim = true
+		return nil
+	}
 	if start > 0 {
 		c.plan.InputArgs = append(c.plan.InputArgs, "-ss", fnum6(start))
 	}
 	if end > 0 {
 		c.plan.InputArgs = append(c.plan.InputArgs, "-to", fnum6(end))
 	}
-	c.plan.TrimStart, c.plan.TrimEnd = start, end
 	return nil
 }
 
@@ -674,6 +787,8 @@ func (c *compiler) geometry(ops []decodedOp) error {
 		switch p := d.params.(type) {
 		case *recipe.CropParams:
 			err = c.crop(d, p)
+		case *recipe.AutoCropParams:
+			err = c.autocrop(d, p)
 		case *recipe.ResizeParams:
 			err = c.resize(d, p)
 		case *recipe.CanvasParams:
@@ -833,20 +948,42 @@ func (c *compiler) outputFit() error {
 	return nil
 }
 
-// finish appends the terminal format=rgba, assembles the filter text,
-// derives duration/frame count and applies the size limits to the final
-// frame (which catches an oversized source that no op shrinks) and to the
-// expected master.
+// finish is assemble plus the render limits: the final frame must be within
+// checkFrame (which catches an oversized source that no op shrinks) and the
+// expected master within MaxMasterBytes.
 func (c *compiler) finish() (*Plan, error) {
 	if err := checkFrame(c.w, c.h); err != nil {
 		return nil, errorf("output %v; add a resize", err)
 	}
-	c.emit("format=rgba")
+	p, err := c.assemble()
+	if err != nil {
+		return nil, err
+	}
+	if bytes := float64(p.Width) * float64(p.Height) * 4 * float64(p.Frames); bytes > MaxMasterBytes {
+		return nil, errorf("expected master (%dx%d x %d frames = %.1f GiB) exceeds the %d GiB limit; trim, lower the fps or resize",
+			p.Width, p.Height, p.Frames, bytes/(1<<30), MaxMasterBytes>>30)
+	}
+	return p, nil
+}
+
+// assemble appends the terminal format=rgba (unless the chain already ends
+// in one, e.g. a yuva still whose alpha head is its only stage), assembles
+// the filter text (the completed chains, then the current one ending in
+// [out], joined with ";") and derives the output facts: size, alpha, source
+// rate, duration and frame count. It applies no size limit (finish does;
+// CompileDetect deliberately skips them).
+func (c *compiler) assemble() (*Plan, error) {
+	c.ensureRGBA()
 	p := &c.plan
-	p.Filter = c.input + strings.Join(c.stages, ",") + outLabel
+	chains := append(c.chains, c.input+strings.Join(c.stages, ",")+outLabel)
+	p.Filter = strings.Join(chains, ";")
 	p.Width, p.Height = c.w, c.h
 	p.HasAlpha = c.hasAlpha
 	p.SourceFPS = c.sourceFPS()
+	p.SourceVFR = c.seq == nil && c.src.Kind == recipe.KindAnimation
+	// The demuxer cannot be seeked at all (trimmed: FilterTrim; untrimmed:
+	// the preview renderers must still decode from the start).
+	p.SeekUnsafe = c.seq == nil && seekUnsafeDemuxer(c.src.Format)
 	switch {
 	case c.singleFrame():
 		p.Duration, p.Frames = 0, 1
@@ -879,10 +1016,6 @@ func (c *compiler) finish() (*Plan, error) {
 		// the microsecond rounding of the seek args (see its doc); >= 1 so a
 		// sub-frame clip still plans a frame.
 		p.Frames = max(1, int(math.Floor(p.Duration*p.FPS+FrameTolerance)))
-	}
-	if bytes := float64(p.Width) * float64(p.Height) * 4 * float64(p.Frames); bytes > MaxMasterBytes {
-		return nil, errorf("expected master (%dx%d x %d frames = %.1f GiB) exceeds the %d GiB limit; trim, lower the fps or resize",
-			p.Width, p.Height, p.Frames, bytes/(1<<30), MaxMasterBytes>>30)
 	}
 	return p, nil
 }

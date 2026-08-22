@@ -13,7 +13,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -43,6 +42,10 @@ var ffmpegPrefix = []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "erro
 // ffmpegProgressArgs is appended when progress reporting is requested.
 var ffmpegProgressArgs = []string{"-progress", "pipe:1", "-nostats", "-stats_period", "0.2"}
 
+// ffmpegLogPrefix is the prefix of RunFFmpegLog: like ffmpegPrefix but at
+// info level (filters report there) without the periodic stats line.
+var ffmpegLogPrefix = []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats"}
+
 // Tools holds resolved binary paths. Empty string = not available.
 type Tools struct {
 	FFmpeg   string
@@ -55,6 +58,9 @@ type Tools struct {
 	Avifdec  string
 	Pngquant string
 	Oxipng   string
+	// FcList (Phase 3) is fontconfig's fc-list, used to enumerate the font
+	// families drawtext can use (EZLG_FC_LIST / "fc-list" on PATH).
+	FcList string
 }
 
 // toolSpec describes one external tool: its PATH name (also the key used by
@@ -81,6 +87,7 @@ var toolSpecs = []toolSpec{
 	{"avifdec", "EZLG_AVIFDEC", []string{"--version"}, func(t *Tools) *string { return &t.Avifdec }},
 	{"pngquant", "EZLG_PNGQUANT", []string{"--version"}, func(t *Tools) *string { return &t.Pngquant }},
 	{"oxipng", "EZLG_OXIPNG", []string{"--version"}, func(t *Tools) *string { return &t.Oxipng }},
+	{"fc-list", "EZLG_FC_LIST", []string{"--version"}, func(t *Tools) *string { return &t.FcList }},
 }
 
 // LookupTools resolves each tool from the environment variable EZLG_<NAME>
@@ -202,6 +209,23 @@ func RunFFmpeg(ctx context.Context, ffmpeg string, args []string, onProgress fun
 	return RunTo(ctx, ffmpeg, argv, stdout)
 }
 
+// RunFFmpegLog (Phase 3) runs ffmpeg like RunFFmpeg without progress
+// reporting, but at "-loglevel info" (plus -nostats) and returns what it
+// wrote to stderr — the last 64 KiB of it, as RunCapture keeps — for
+// invocations whose result is a log report rather than a file:
+// enc.CropDetectArgs' cropdetect/bbox lines are logged at info level, which
+// RunFFmpeg's -loglevel error would silence (both detectors accumulate, so
+// the last lines are what enc.ParseCropDetect needs). The captured text is
+// returned on failure too, alongside the usual error (which carries the
+// stderr tail); cancellation returns ctx.Err().
+func RunFFmpegLog(ctx context.Context, ffmpeg string, args []string) (string, error) {
+	argv := make([]string, 0, len(ffmpegLogPrefix)+len(args))
+	argv = append(argv, ffmpegLogPrefix...)
+	argv = append(argv, args...)
+	tail, err := runProcess(ctx, ffmpeg, argv, io.Discard)
+	return tail.String(), err
+}
+
 // RunOutput runs an arbitrary tool and returns its stdout. stderr is
 // captured and included in the error on non-zero exit. Cancelling ctx kills
 // the process. Like exec.Cmd.Output, whatever stdout was captured before a
@@ -240,36 +264,8 @@ func toolName(bin string) string {
 }
 
 func runTo(ctx context.Context, bin string, args []string, w io.Writer) error {
-	if bin == "" {
-		return errors.New("ffrun: no binary path given")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	name := toolName(bin)
-	stderr := &tailBuffer{max: stderrTailBytes}
-
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdout = w
-	cmd.Stderr = stderr
-	cmd.WaitDelay = waitDelay
-	setSysProcAttr(cmd)
-	cmd.Cancel = func() error { return killTree(cmd) }
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	err := cmd.Wait()
-	if err == nil {
-		return nil
-	}
-	if cerr := ctx.Err(); cerr != nil {
-		return cerr
-	}
-	if tail := stderr.Tail(stderrTailLines); tail != "" {
-		return fmt.Errorf("%s exited: %w\n%s", name, err, tail)
-	}
-	return fmt.Errorf("%s exited: %w", name, err)
+	_, err := runProcess(ctx, bin, args, w)
+	return err
 }
 
 // tailBuffer is an io.Writer that keeps only the last max bytes written.
@@ -297,6 +293,13 @@ func (b *tailBuffer) Write(p []byte) (int, error) {
 	}
 	b.buf = append(b.buf, p...)
 	return len(p), nil
+}
+
+// String returns everything the buffer holds (the last max bytes written).
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 // Tail returns the last n lines written (CR/LF trimmed), or "". When the

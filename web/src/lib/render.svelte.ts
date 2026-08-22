@@ -11,7 +11,7 @@ import {
   type Recipe,
   type Result,
 } from './api';
-import { app, buildOutput, recipeOps } from './state.svelte';
+import { app, buildOutput, recipeOps, recipeSources } from './state.svelte';
 import { toast } from './toast.svelte';
 
 export interface RenderState {
@@ -35,13 +35,17 @@ let stopWatch: (() => void) | null = null;
 // while POST /api/jobs was in flight) cannot revive the old job.
 let generation = 0;
 
-/** currentRecipe builds the recipe for the current source, ops and output (no ops for Optimize). */
+/**
+ * currentRecipe builds the recipe for the current source, ops and output (no
+ * ops for Optimize): sources = the main source, then the overlay assets in
+ * the order the overlay ops index them.
+ */
 export function currentRecipe(): Recipe | null {
   const src = app.source;
   if (!src) return null;
   return {
     v: RECIPE_VERSION,
-    sources: [src.hash],
+    sources: recipeSources(src.hash, app.ops, app.output),
     ops: recipeOps(app.ops, app.output),
     output: buildOutput(app.output),
   };

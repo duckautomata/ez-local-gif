@@ -22,6 +22,35 @@
 #               than the input
 #   from-result POST /api/sources/from-result on the Phase 1 GIF → 200 + hash,
 #               GET /api/sources/{hash} → 200
+#
+# Phase 3 (editing ops; needs Phase 2's forward frames export):
+#   caps/fonts  features.keying/overlays/proxy/fonts true; GET /api/fonts lists
+#               DejaVu Sans and Noto Sans
+#   chromakey   a green-screen clip (make-test-clip.sh green) keyed with the
+#               chromakey op → emote GIF: report.ok, report.hasAlpha, frame 0
+#               has transparent AND opaque pixels, corner pixel transparent
+#   colorkey    the same clip through the colorkey op → chat WebP: report.ok,
+#               VP8X ALPHA flag, corner pixel transparent
+#   text        drawtext op (font "DejaVu Sans") → GIF renders; the still with
+#               the op differs from the plain still (something was painted)
+#   overlay-png a 48×48 RGBA PNG uploaded as a second source → overlay op →
+#               WebP renders; the "sources" still with/without it differ
+#   overlay-gif a 0.5 s GIF as a second source over the 2 s clip (looping) →
+#               GIF with as many frames as the forward export (> the overlay's);
+#               stills via "sources": the overlay is painted at t=0.8 (differs
+#               from the plain still), looping and noLoop agree at t=0.3 and
+#               differ at t=0.8 (the overlay looped rather than holding)
+#   reverse     frames export of the reversed clip: first/last frames are the
+#               forward export's last/first (sha256, else PSNR ≥ 50 dB)
+#   autocrop    trim 0–0.1 s + autocrop → PNG smaller than the 160×160 source
+#   webp-trim   an animated WebP built from the ProRes clip in the test (10 fps,
+#               2 s, libwebp_anim -loop 0) → trim 0.5–1.5 s, frames export →
+#               job done with exactly (1.5-0.5)×10 = 10 frame files (FFmpeg 9's
+#               webp_anim demuxer decodes nothing after an input seek, so the
+#               server must trim such sources in the filtergraph: 0 frames =
+#               it seeked, 20 = the trim was ignored)
+#   proxy       POST /api/proxy → image/webp, VP8X ANIM flag, canvas ≤ maxW,
+#               > 1 frame
 # Exit status is non-zero if anything fails; a summary is printed at the end.
 #
 #   EZLG_URL=http://localhost:8080 scripts/integration-test.sh
@@ -50,7 +79,8 @@
 #                       warning only, so EZLG_URL runs against a long-lived
 #                       stack still pass
 #   EZLG_TEST_TIMEOUT   seconds to wait for each job (default 120)
-#   EZLG_TEST_PHASE2    0 → run the Phase 1 checks only (default 1)
+#   EZLG_TEST_PHASE2    0 → run the Phase 1 checks only (default 1; also skips Phase 3)
+#   EZLG_TEST_PHASE3    0 → skip the Phase 3 checks (default 1)
 #   EZLG_TEST_KEEP      1 → keep the temp dir (printed at the end)
 #   EZLG_FFMPEG / EZLG_FFPROBE / EZLG_GIFSICLE / EZLG_WEBPINFO / EZLG_AVIFDEC
 #                       tool overrides (avifdec, unzip and jq are optional:
@@ -62,6 +92,7 @@ url=${EZLG_URL:-http://localhost:8080}
 url=${url%/}
 timeout=${EZLG_TEST_TIMEOUT:-120}
 phase2=${EZLG_TEST_PHASE2:-1}
+phase3=${EZLG_TEST_PHASE3:-1}
 ffmpeg=${EZLG_FFMPEG:-ffmpeg}
 ffprobe=${EZLG_FFPROBE:-ffprobe}
 gifsicle=${EZLG_GIFSICLE:-gifsicle}
@@ -175,9 +206,40 @@ archive_url() { # url of the "archive" file (frames.zip)
   else job_urls "$1" | grep -E '\.zip$' | head -n 1
   fi
 }
+# A frames manifest holds exactly frames.zip (kind "archive"), delays.json (the
+# per-frame timing table, no kind) and then the frame files in order, so the
+# grep fallbacks select the frames by excluding the two fixed names (a plain
+# `grep -v .zip` used to hand back delays.json as the "first frame").
+frame_urls() { # frame_urls FILE → urls of the "frame" files, in manifest order
+  if [ "$use_jq" = 1 ]; then jq -r '.result.files[]? | select(.kind == "frame") | .url // empty' "$1" 2>/dev/null
+  else job_urls "$1" | grep -vE '/(frames\.zip|delays\.json)$'
+  fi
+}
 first_frame_url() { # url of the first "frame" file
-  if [ "$use_jq" = 1 ]; then jq -r 'first(.result.files[]? | select(.kind == "frame")) | .url // empty' "$1" 2>/dev/null
-  else job_urls "$1" | grep -vE '\.zip$' | head -n 1
+  frame_urls "$1" | head -n 1
+}
+frame_url_at() { # frame_url_at FILE first|last → url of the first / last "frame" file
+  if [ "$2" = first ]; then frame_urls "$1" | head -n 1
+  else frame_urls "$1" | tail -n 1
+  fi
+}
+primary_has_alpha() { # true if the primary file's report says hasAlpha (the rendered frames carry transparency)
+  if [ "$use_jq" = 1 ]; then
+    jq -e 'first(.result.files[]? | select((.kind // "") == "" or .kind == "output")) | .report.hasAlpha == true' "$1" >/dev/null 2>&1
+  else
+    # The primary file is listed first, and nothing before the files carries a hasAlpha key.
+    local s; s=$(stripped "$1")
+    [ "$(grep -oE '"hasAlpha":(true|false)' <<<"$s" | head -n 1)" = '"hasAlpha":true' ]
+  fi
+}
+fonts_has() { # fonts_has FILE FAMILY → true if GET /api/fonts lists the family (exact name)
+  if [ "$use_jq" = 1 ]; then jq -e --arg f "$2" 'any(.fonts[]?; .family == $f)' "$1" >/dev/null 2>&1
+  else grep -qF "\"family\":\"$2\"" "$1" # Go's encoder writes no spaces around ':' (the family itself may hold spaces)
+  fi
+}
+features_true() { # features_true FILE NAME → true if /api/capabilities says features.NAME == true
+  if [ "$use_jq" = 1 ]; then jq -e --arg f "$2" '.features[$f] == true' "$1" >/dev/null 2>&1
+  else stripped "$1" | grep -qF "\"$2\":true"
   fi
 }
 
@@ -234,6 +296,30 @@ gif_frames() { # gif_frames FILE → frame count (gifsicle, else ffprobe)
   if have "$gifsicle"; then n=$("$gifsicle" --info "$1" 2>/dev/null | sed -nE 's/^.* ([0-9]+) images?.*/\1/p' | head -n 1); fi
   [ -n "$n" ] || n=$("$ffprobe" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 "$1" 2>/dev/null | head -n 1)
   echo "${n:-0}"
+}
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+# Pixel-level alpha checks (frame 0, decoded by ffmpeg as straight RGBA; the
+# gif / webp decoders report transparent pixels as alpha 0). Every pipeline
+# stage reads its whole input, so nothing here can die of SIGPIPE.
+alpha_counts() { # alpha_counts FILE → "opaque transparent": pixels of frame 0 with alpha 255 / 0
+  local vals
+  vals=$("$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=rgba,alphaextract" -f rawvideo -pix_fmt gray - 2>/dev/null \
+         | od -An -v -tu1 | tr -s ' \n' '\n' | grep -v '^$' || true)
+  printf '%s %s\n' "$(grep -cx 255 <<<"$vals")" "$(grep -cx 0 <<<"$vals")"
+}
+corner_alpha() { # corner_alpha FILE → alpha (0..255) of pixel (0,0) of frame 0
+  "$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=rgba,crop=1:1:0:0" -f rawvideo -pix_fmt rgba - 2>/dev/null \
+    | od -An -tu1 | awk '{print $4}'
+}
+psnr_of() { # psnr_of A B → average PSNR between two images in dB ("inf" when identical; "" on failure)
+  local out
+  out=$("$ffmpeg" -v info -nostdin -i "$1" -i "$2" -lavfi "[0:v]format=rgba[a];[1:v]format=rgba[b];[a][b]psnr" -f null - 2>&1 || true)
+  sed -nE 's/.*PSNR.* average:([0-9.]+|inf).*/\1/p' <<<"$out" | tail -n 1
+}
+frames_match() { # frames_match A B → 0 when the two images are identical (sha256) or near enough (PSNR ≥ 50 dB)
+  [ "$(sha_of "$1")" = "$(sha_of "$2")" ] && return 0
+  local p; p=$(psnr_of "$1" "$2")
+  [ "$p" = inf ] || { [ -n "$p" ] && awk -v p="$p" 'BEGIN { exit !(p >= 50) }'; }
 }
 avif_frames() { # avif_frames FILE → frame count of an (animated) AVIF
   # ffmpeg's mov demuxer exposes an animated AVIF as up to four streams: the
@@ -322,6 +408,11 @@ fetch_primary() { # fetch_primary NAME EXT → downloads the primary file to out
   [ -n "$furl" ] || { fail "job $name has no result files"; return 1; }
   out_file[$name]="$tmp/out_$name.$ext"
   download "$furl" "${out_file[$name]}"
+}
+still_png() { # still_png OUT JSON → 0 when POST /api/still answered 200 with a PNG body (message is the caller's)
+  local out=$1 body=$2 code
+  code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' --data "$body" "$url/api/still")
+  [ "$code" = 200 ] && [ "$(magic_hex "$out" 8)" = "89504e470d0a1a0a" ]
 }
 
 # Selftest hook: integration-test-selftest.sh sources this file with
@@ -598,6 +689,277 @@ if [ -n "$rhash" ] && [ -n "$rname" ]; then
   fi
 else
   fail "from-result: no recipeHash / file name from the Phase 1 gif job"
+fi
+
+if [ "$phase3" != 1 ]; then
+  summary
+  [ "$failn" -eq 0 ]
+  exit
+fi
+
+# =============================================================================
+# Phase 3: keying, text / image / animated overlays, reverse, autocrop, the
+# animated proxy, fonts
+# =============================================================================
+log "phase 3: capabilities + fonts"
+code=$(curl -sS -o "$tmp/caps.json" -w '%{http_code}' --max-time 30 "$url/api/capabilities")
+if [ "$code" = 200 ]; then
+  for feat in keying overlays proxy fonts; do
+    if features_true "$tmp/caps.json" "$feat"; then ok "capabilities: features.$feat == true"; else fail "capabilities: features.$feat is not true"; fi
+  done
+else
+  fail "GET /api/capabilities → $code"
+fi
+code=$(curl -sS -o "$tmp/fonts.json" -w '%{http_code}' --max-time 30 "$url/api/fonts")
+if [ "$code" = 200 ]; then
+  ok "GET /api/fonts → 200"
+  for fam in "DejaVu Sans" "Noto Sans"; do
+    if fonts_has "$tmp/fonts.json" "$fam"; then ok "fonts: lists \"$fam\""; else fail "fonts: \"$fam\" not listed: $(head -c 300 "$tmp/fonts.json")"; fi
+  done
+else
+  fail "GET /api/fonts → $code"
+fi
+
+log "phase 3: extra sources (green-screen clip, overlay PNG, 0.5 s overlay GIF, animated WebP from the ProRes clip)"
+green_hash=""; png_hash=""; ov_hash=""; webp_hash=""
+if bash "$here/make-test-clip.sh" green "$tmp/green.mov" 2 160x160 >/dev/null 2>&1 && [ -s "$tmp/green.mov" ]; then
+  if code=$(upload "$tmp/upload_green.json" -F "file=@$tmp/green.mov"); then ok "POST /api/upload (green-screen clip) → 200"; else fail "POST /api/upload (green-screen clip) → $code"; fi
+  green_hash=$(json_str "$tmp/upload_green.json" '.hash' hash)
+  [[ "$green_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "green-screen upload response has no sha256 hash"; green_hash=""; }
+else
+  fail "make-test-clip.sh green (green-screen clip) failed"
+fi
+if bash "$here/make-test-clip.sh" seq "$tmp/ovseq" 1 48x48 >/dev/null 2>&1 && [ -s "$tmp/ovseq/f00001.png" ]; then
+  if code=$(upload "$tmp/upload_png.json" -F "file=@$tmp/ovseq/f00001.png"); then ok "POST /api/upload (overlay PNG) → 200"; else fail "POST /api/upload (overlay PNG) → $code"; fi
+  png_hash=$(json_str "$tmp/upload_png.json" '.hash' hash)
+  [[ "$png_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "overlay PNG upload response has no sha256 hash"; png_hash=""; }
+else
+  fail "make-test-clip.sh seq (overlay PNG) failed"
+fi
+if bash "$here/make-test-clip.sh" "$tmp/ov.gif" 0.5 48x48 >/dev/null 2>&1 && [ -s "$tmp/ov.gif" ]; then
+  if code=$(upload "$tmp/upload_ov.json" -F "file=@$tmp/ov.gif"); then ok "POST /api/upload (overlay GIF) → 200"; else fail "POST /api/upload (overlay GIF) → $code"; fi
+  ov_hash=$(json_str "$tmp/upload_ov.json" '.hash' hash)
+  [[ "$ov_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "overlay GIF upload response has no sha256 hash"; ov_hash=""; }
+else
+  fail "make-test-clip.sh (0.5 s overlay GIF) failed"
+fi
+# An animated WebP source for the trim case: the 2 s ProRes clip at 10 fps
+# through libwebp_anim (the app's own encoder path, -loop 0) = 20 frames, so
+# a 0.5–1.5 s trim must yield exactly 10. FFmpeg 9's webp_anim demuxer decodes
+# nothing after an input seek; the server trims such sources in the
+# filtergraph instead of with -ss/-to.
+webp_n=0
+if "$ffmpeg" -hide_banner -loglevel error -nostdin -y -i "$tmp/src.mov" -vf "fps=10,format=yuva420p" \
+     -c:v libwebp_anim -lossless 0 -q:v 80 -compression_level 4 -loop 0 -map_metadata -1 -f webp "$tmp/src.webp" 2>"$tmp/src_webp.err" \
+   && [ -s "$tmp/src.webp" ]; then
+  webp_n=$("$ffprobe" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 "$tmp/src.webp" 2>/dev/null | head -n 1)
+  if [ "${webp_n:-0}" = 20 ]; then ok "animated WebP source has 20 frames (2 s at 10 fps)"; else fail "animated WebP source has '${webp_n:-?}' frames, want 20"; fi
+  if code=$(upload "$tmp/upload_webp.json" -F "file=@$tmp/src.webp"); then ok "POST /api/upload (animated WebP) → 200"; else fail "POST /api/upload (animated WebP) → $code"; fi
+  webp_hash=$(json_str "$tmp/upload_webp.json" '.hash' hash)
+  if [[ "$webp_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    kind=$(json_str "$tmp/upload_webp.json" '.info.kind' kind)
+    if [ "$kind" = animation ]; then ok "animated WebP upload → info.kind == animation"; else fail "animated WebP upload → info.kind '$kind', want animation"; fi
+  else
+    fail "animated WebP upload response has no sha256 hash"; webp_hash=""
+  fi
+else
+  fail "ffmpeg could not build the animated WebP source: $(head -c 300 "$tmp/src_webp.err")"
+fi
+
+# ---- submit every Phase 3 job up front
+text_op='{"kind":"text","params":{"text":"ezlg","font":"DejaVu Sans","size":40,"color":"ffffff","border":2,"borderColor":"000000","x":8,"y":8}}'
+ov_png_op='{"kind":"overlay","params":{"source":1,"x":4,"y":4}}'
+ov_gif_op='{"kind":"overlay","params":{"source":1,"x":100,"y":100}}'
+recipe[text]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"','"$text_op"'],"output":{"format":"gif","preset":"custom","target":"attachment"}}'
+recipe[reverse]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"',{"kind":"reverse"}],"output":{"format":"frames","frameFormat":"png","preset":"frames"}}'
+recipe[autocrop]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"',{"kind":"trim","params":{"start":0,"end":0.1}},{"kind":"autocrop","params":{"threshold":1}}],"output":{"format":"png","preset":"custom"}}'
+phase3_jobs=(text reverse autocrop)
+if [ -n "$green_hash" ]; then
+  recipe[chromakey]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"chromakey","params":{"color":"00ff00"}}],"output":{"format":"gif","width":128,"height":128,"fit":"contain","fps":20,"preset":"emote","target":"emote"}}'
+  recipe[colorkey]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"colorkey","params":{"color":"00ff00","similarity":0.1}}],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
+  phase3_jobs+=(chromakey colorkey)
+fi
+if [ -n "$png_hash" ]; then
+  recipe[overlay-png]='{"v":1,"sources":["'"$hash"'","'"$png_hash"'"],"ops":['"$unp"','"$ov_png_op"'],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
+  phase3_jobs+=(overlay-png)
+fi
+if [ -n "$ov_hash" ]; then
+  recipe[overlay-gif]='{"v":1,"sources":["'"$hash"'","'"$ov_hash"'"],"ops":['"$unp"','"$ov_gif_op"'],"output":{"format":"gif","preset":"custom","target":"attachment"}}'
+  phase3_jobs+=(overlay-gif)
+fi
+if [ -n "$webp_hash" ]; then
+  recipe[webp-trim]='{"v":1,"sources":["'"$webp_hash"'"],"ops":[{"kind":"trim","params":{"start":0.5,"end":1.5}}],"output":{"format":"frames","frameFormat":"png","preset":"frames"}}'
+  phase3_jobs+=(webp-trim)
+fi
+for name in "${phase3_jobs[@]}"; do
+  submit_job "$name" || true
+done
+
+# ---- chromakey: green screen → transparent emote GIF
+name=chromakey
+if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name gif; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  if primary_has_alpha "$tmp/poll_$name.json"; then ok "$name: report.hasAlpha == true (background keyed out)"; else fail "$name: report.hasAlpha != true"; fi
+  read -r opaque transparent <<<"$(alpha_counts "$f")"
+  ca=$(corner_alpha "$f")
+  if [ "${transparent:-0}" -gt 0 ] && [ "${opaque:-0}" -gt 0 ] && [ "${ca:-255}" = 0 ]; then
+    ok "$name: frame 0 has $transparent transparent + $opaque opaque pixels, corner transparent"
+  else
+    fail "$name: frame 0 alpha: opaque=${opaque:-?} transparent=${transparent:-?} corner=${ca:-?} (want both kinds, corner 0)"
+  fi
+  if have "$gifsicle" && [ "$(gif_screen_size "$f")" = 128x128 ]; then ok "$name: gif is 128x128"; else fail "$name: gif is not 128x128"; fi
+  if [ "$(fsize "$f")" -le 262144 ]; then ok "$name: ≤ 262144 bytes (emote budget)"; else fail "$name: $(fsize "$f") bytes > 262144"; fi
+fi
+
+# ---- colorkey: pick-a-colour key → chat WebP with alpha
+name=colorkey
+if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name webp; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  if primary_has_alpha "$tmp/poll_$name.json"; then ok "$name: report.hasAlpha == true"; else fail "$name: report.hasAlpha != true"; fi
+  if have "$webpinfo"; then
+    winfo=$("$webpinfo" "$f" 2>&1 || true)
+    vp8x_alpha=$(awk '/Chunk VP8X/ {x=1} x && /Alpha:/ {print $2; exit}' <<<"$winfo")
+    if [ "$vp8x_alpha" = 1 ]; then ok "$name: webp VP8X ALPHA flag set"; else fail "$name: webp VP8X ALPHA flag missing"; fi
+  fi
+  read -r opaque transparent <<<"$(alpha_counts "$f")"
+  ca=$(corner_alpha "$f")
+  if [ "${transparent:-0}" -gt 0 ] && [ "${opaque:-0}" -gt 0 ] && [ "${ca:-255}" = 0 ]; then
+    ok "$name: frame 0 has $transparent transparent + $opaque opaque pixels, corner transparent"
+  else
+    fail "$name: frame 0 alpha: opaque=${opaque:-?} transparent=${transparent:-?} corner=${ca:-?} (want both kinds, corner 0)"
+  fi
+fi
+
+# ---- text overlay (drawtext via textfile, fontconfig family)
+name=text
+if finish_job $name && fetch_primary $name gif; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
+  plain='{"src":"'"$hash"'","ops":['"$unp"'],"output":{"format":"gif"},"t":0.5,"maxW":160}'
+  withtext='{"src":"'"$hash"'","ops":['"$unp"','"$text_op"'],"output":{"format":"gif"},"t":0.5,"maxW":160}'
+  if still_png "$tmp/still_plain.png" "$plain" && still_png "$tmp/still_text.png" "$withtext"; then
+    if ! cmp -s "$tmp/still_plain.png" "$tmp/still_text.png"; then ok "$name: still with the text op differs from the plain still (drawtext painted)"; else fail "$name: still with the text op is identical to the plain still"; fi
+  else
+    fail "$name: POST /api/still (plain / with text) did not answer with a PNG"
+  fi
+fi
+
+# ---- static image overlay from a second source
+name=overlay-png
+if [ -n "$png_hash" ] && finish_job $name && fetch_primary $name webp; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: webp decodes (ffmpeg)"; else fail "$name: webp does not decode"; fi
+  plain='{"sources":["'"$hash"'"],"ops":['"$unp"'],"output":{"format":"webp"},"t":0.5,"maxW":160}'
+  withov='{"sources":["'"$hash"'","'"$png_hash"'"],"ops":['"$unp"','"$ov_png_op"'],"output":{"format":"webp"},"t":0.5,"maxW":160}'
+  if still_png "$tmp/still_noov.png" "$plain" && still_png "$tmp/still_ov.png" "$withov"; then
+    if ! cmp -s "$tmp/still_noov.png" "$tmp/still_ov.png"; then ok "$name: \"sources\" still with the overlay differs from the plain still"; else fail "$name: still with the overlay is identical to the plain still"; fi
+  else
+    fail "$name: POST /api/still with \"sources\" (plain / with overlay) did not answer with a PNG"
+  fi
+fi
+
+# ---- looping animated overlay: a 0.5 s GIF over the 2 s clip
+name=overlay-gif
+if [ -n "$ov_hash" ] && finish_job $name && fetch_primary $name gif; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
+  n=$(gif_frames "$f"); ov_n=$(gif_frames "$tmp/ov.gif")
+  if [ "${n:-0}" -gt "${ov_n:-0}" ]; then ok "$name: $n frames > the overlay's own $ov_n (the overlay did not cut the clip short: the base decides the length)"; else fail "$name: $n frames, overlay has $ov_n — the overlay cut the clip short?"; fi
+  if [ "${n_frames:-0}" -gt 0 ]; then
+    if [ "${n:-0}" = "$n_frames" ]; then ok "$name: frame count == forward frames export ($n)"; else fail "$name: $n frames, forward export has $n_frames"; fi
+  fi
+  # Pixel checks through POST /api/still. The frame counts above hold for the
+  # base clip alone (overlay … shortest=1 lets the base decide the length
+  # whatever the overlay does), so they cannot tell a dropped, transparent,
+  # off-canvas or non-looping overlay. The overlay's timeline starts at the
+  # output's t=0, so at t=0.8 the 0.5 s GIF has wrapped once when it loops
+  # (overlay time 0.3 s) and shows its held last frame under noLoop, while at
+  # t=0.3 both modes show the same (first-play) overlay frame.
+  ov_hold_op='{"kind":"overlay","params":{"source":1,"x":100,"y":100,"noLoop":true}}'
+  still_ovg() { # still_ovg OUT T [OVERLAY_OP] → POST /api/still with "sources" [clip, overlay GIF] (message is the caller's)
+    local ops=$unp
+    [ -z "${3:-}" ] || ops="$unp,$3"
+    still_png "$1" '{"sources":["'"$hash"'","'"$ov_hash"'"],"ops":['"$ops"'],"output":{"format":"gif"},"t":'"$2"',"maxW":160}'
+  }
+  if still_ovg "$tmp/still_ovg_plain8.png" 0.8 \
+     && still_ovg "$tmp/still_ovg_loop8.png" 0.8 "$ov_gif_op" && still_ovg "$tmp/still_ovg_hold8.png" 0.8 "$ov_hold_op" \
+     && still_ovg "$tmp/still_ovg_loop3.png" 0.3 "$ov_gif_op" && still_ovg "$tmp/still_ovg_hold3.png" 0.3 "$ov_hold_op"; then
+    if ! cmp -s "$tmp/still_ovg_plain8.png" "$tmp/still_ovg_loop8.png"; then ok "$name: still at t=0.8 with the overlay differs from the plain still (overlay painted)"; else fail "$name: still at t=0.8 with the overlay is identical to the plain still (overlay dropped, transparent or off-canvas?)"; fi
+    if frames_match "$tmp/still_ovg_loop3.png" "$tmp/still_ovg_hold3.png"; then ok "$name: t=0.3: looping and noLoop stills agree (same overlay frame during the first play)"; else fail "$name: t=0.3: looping and noLoop stills differ (PSNR $(psnr_of "$tmp/still_ovg_loop3.png" "$tmp/still_ovg_hold3.png") dB) — the first play is not the same in both modes"; fi
+    if ! frames_match "$tmp/still_ovg_loop8.png" "$tmp/still_ovg_hold8.png"; then ok "$name: t=0.8: looping still differs from the noLoop one (the 0.5 s overlay looped instead of holding its last frame)"; else fail "$name: t=0.8: looping and noLoop stills match (PSNR $(psnr_of "$tmp/still_ovg_loop8.png" "$tmp/still_ovg_hold8.png") dB) — the overlay held its last frame instead of looping?"; fi
+  else
+    fail "$name: POST /api/still with \"sources\" (plain / looping / noLoop overlay at t=0.3 and 0.8) did not answer with a PNG"
+  fi
+fi
+
+# ---- reverse: the frames export mirrors the forward one
+name=reverse
+if finish_job $name; then
+  n_rev=$(files_of_kind "$tmp/poll_$name.json" frame)
+  if [ "${n_rev:-0}" -ge 2 ] && [ "${n_rev:-0}" = "${n_frames:-0}" ]; then ok "$name: $n_rev frame files (== forward export)"; else fail "$name: ${n_rev:-0} frame files, forward export has ${n_frames:-?}"; fi
+  rf=$(frame_url_at "$tmp/poll_$name.json" first); rl=$(frame_url_at "$tmp/poll_$name.json" last)
+  ff0=$(frame_url_at "$tmp/poll_frames.json" first); fl=$(frame_url_at "$tmp/poll_frames.json" last)
+  if [ -n "$rf" ] && [ -n "$rl" ] && [ -n "$ff0" ] && [ -n "$fl" ] \
+     && download "$rf" "$tmp/rev_first.png" && download "$rl" "$tmp/rev_last.png" \
+     && download "$ff0" "$tmp/fwd_first.png" && download "$fl" "$tmp/fwd_last.png"; then
+    if ! frames_match "$tmp/fwd_first.png" "$tmp/fwd_last.png"; then ok "$name: forward first and last frames differ (a reversal is detectable)"; else fail "$name: forward first and last frames are identical — cannot tell a reversal"; fi
+    if frames_match "$tmp/rev_first.png" "$tmp/fwd_last.png"; then ok "$name: first frame == forward last frame"; else fail "$name: first frame != forward last frame (PSNR $(psnr_of "$tmp/rev_first.png" "$tmp/fwd_last.png") dB)"; fi
+    if frames_match "$tmp/rev_last.png" "$tmp/fwd_first.png"; then ok "$name: last frame == forward first frame"; else fail "$name: last frame != forward first frame (PSNR $(psnr_of "$tmp/rev_last.png" "$tmp/fwd_first.png") dB)"; fi
+  else
+    fail "$name: could not download the first/last frames of both exports"
+  fi
+fi
+
+# ---- autocrop: crop to the content box (alpha) of the trimmed clip
+name=autocrop
+if finish_job $name && fetch_primary $name png; then
+  f=${out_file[$name]}
+  d=$(dims_of "$f"); w=${d%x*}; h=${d#*x}
+  if [ "${w:-0}" -gt 0 ] && [ "$w" -lt 160 ] && [ "${h:-0}" -gt 0 ] && [ "$h" -lt 160 ]; then ok "$name: $d is smaller than the 160x160 source"; else fail "$name: dims '$d', want both sides < 160"; fi
+  if [ "${w:-0}" -ge 96 ] && [ "${h:-0}" -ge 96 ]; then ok "$name: $d keeps the content (both sides ≥ 96)"; else fail "$name: $d is too small — cropped into the content?"; fi
+  if [ "$(magic_hex "$f" 8)" = "89504e470d0a1a0a" ]; then ok "$name: PNG signature"; else fail "$name: not a PNG"; fi
+fi
+
+# ---- trim on an animated WebP source (filter-level trim: webp_anim cannot be seeked)
+name=webp-trim
+if [ -n "$webp_hash" ] && finish_job $name; then
+  n_wt=$(files_of_kind "$tmp/poll_$name.json" frame)
+  if [ "${n_wt:-0}" = 10 ]; then
+    ok "$name: trim 0.5–1.5 s of the 10 fps WebP → exactly 10 frame files"
+  else
+    fail "$name: ${n_wt:-0} frame files, want exactly 10 = (1.5-0.5) s × 10 fps (0: the demuxer was seeked and decoded nothing; ${webp_n:-20}: the trim was ignored)"
+  fi
+  furl=$(first_frame_url "$tmp/poll_$name.json")
+  if [ -n "$furl" ] && download "$furl" "$tmp/webp_trim_f1.png"; then
+    if [ "$(magic_hex "$tmp/webp_trim_f1.png" 8)" = "89504e470d0a1a0a" ] && [ "$(dims_of "$tmp/webp_trim_f1.png")" = 160x160 ]; then ok "$name: first frame is a 160x160 PNG"; else fail "$name: first frame is not a 160x160 PNG ($(dims_of "$tmp/webp_trim_f1.png"))"; fi
+  fi
+fi
+
+# ---- animated proxy (the Play preview)
+log "phase 3: animated proxy (POST /api/proxy)"
+code=$(curl -sS -o "$tmp/proxy.webp" -D "$tmp/proxy.headers" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' \
+         --data '{"sources":["'"$hash"'"],"ops":['"$unp"'],"output":{"format":"gif"},"maxW":120,"maxSeconds":1}' "$url/api/proxy")
+if [ "$code" = 200 ]; then
+  ok "POST /api/proxy → 200 ($(fsize "$tmp/proxy.webp") bytes)"
+  if grep -qi '^content-type: *image/webp' "$tmp/proxy.headers"; then ok "proxy: Content-Type image/webp"; else fail "proxy: Content-Type is not image/webp: $(grep -i '^content-type' "$tmp/proxy.headers")"; fi
+  if "$ffmpeg" -v error -nostdin -i "$tmp/proxy.webp" -f null - 2>/dev/null; then ok "proxy: decodes (ffmpeg)"; else fail "proxy: does not decode"; fi
+  if have "$webpinfo"; then
+    winfo=$("$webpinfo" "$tmp/proxy.webp" 2>&1 || true)
+    anim=$(awk '/Chunk VP8X/ {x=1} x && /Animation:/ {print $2; exit}' <<<"$winfo")
+    if [ "$anim" = 1 ]; then ok "proxy: VP8X ANIM flag set"; else fail "proxy: VP8X ANIM flag missing"; fi
+  fi
+  d=$(dims_of "$tmp/proxy.webp"); w=${d%x*}
+  if [ "${w:-0}" -gt 0 ] && [ "$w" -le 120 ]; then ok "proxy: width $w ≤ maxW 120 ($d)"; else fail "proxy: dims '$d', want width ≤ 120"; fi
+  n=$("$ffprobe" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1:nk=1 "$tmp/proxy.webp" 2>/dev/null | head -n 1)
+  if [ "${n:-0}" -gt 1 ]; then ok "proxy: animated ($n frames)"; else fail "proxy: '${n:-?}' frame(s) — not animated"; fi
+else
+  cat "$tmp/proxy.webp" >&2
+  fail "POST /api/proxy → $code"
 fi
 
 summary
