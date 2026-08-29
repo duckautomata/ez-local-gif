@@ -8,6 +8,7 @@ import {
   type ColorKeyParams,
   type CropParams,
   type DelayParams,
+  type FeatherParams,
   type FitMode,
   type FlipParams,
   type FPSParams,
@@ -113,6 +114,17 @@ export interface BackgroundCfg {
   pickBlend: number;
 }
 
+/**
+ * FeatherCfg: Gaussian blur of the alpha plane (op "feather") — softens the
+ * transparency edge after keying / on rough 1-bit GIF alpha. The radius is a
+ * sigma in SOURCE pixels (the graph hoists the stage before any geometry, so
+ * it scales down with the output).
+ */
+export interface FeatherCfg {
+  enabled: boolean;
+  radius: number;
+}
+
 /** AutoCropCfg: crop to the content box (op "autocrop"); wins over the manual rectangle while on. */
 export interface AutoCropCfg {
   enabled: boolean;
@@ -136,12 +148,26 @@ export interface OpsCfg {
   reverse: boolean;
   flipRotate: FlipRotateCfg;
   background: BackgroundCfg;
+  /** soft transparency edge (op "feather", emitted right after the keying op) */
+  feather: FeatherCfg;
   /** text / image overlays in their own order (the last draws on top) */
   overlays: OverlayCfg[];
 }
 
 export interface UiState {
   backdrop: Backdrop;
+  /**
+   * Backdrop of the Result card — separate from the preview's, judged
+   * against Discord dark first, and kept across re-renders / "Render again"
+   * (the card remounts per render; review R1).
+   */
+  resultBackdrop: Backdrop;
+  /**
+   * Locked crop aspect ratio as w/h (> 0 = the Crop card's "Lock ratio" is
+   * on; 0 = free). Purely a UI constraint on the rectangle — never part of
+   * the recipe / crop op payload (review R2).
+   */
+  cropRatio: number;
   /**
    * Scrubber position as a 0-based frame index on the plan's frame grid
    * (planFrames / planFPS — output time after trim and speed). The preview
@@ -194,12 +220,16 @@ export function defaultOps(info?: ProbeInfo | null): OpsCfg {
     reverse: false,
     flipRotate: { enabled: false, horizontal: false, vertical: false, degrees: 0 },
     background: defaultBackground(),
+    feather: { enabled: false, radius: FEATHER_DEFAULT },
     overlays: [],
   };
 }
 
+/** FEATHER_DEFAULT mirrors recipe.FeatherParams' zero value (radius 0 = 3). */
+export const FEATHER_DEFAULT = 3;
+
 function defaultUi(): UiState {
-  return { backdrop: 'checker', scrubFrame: 0, cropOpen: false, pickColor: false, selectedOverlay: 0 };
+  return { backdrop: 'checker', resultBackdrop: 'dark', cropRatio: 0, scrubFrame: 0, cropOpen: false, pickColor: false, selectedOverlay: 0 };
 }
 
 export const app = $state({
@@ -209,12 +239,39 @@ export const app = $state({
   ui: defaultUi(),
 });
 
-/** resetUi puts the per-source UI flags back (the backdrop choice is kept). */
+/** resetUi puts the per-source UI flags back (the backdrop choices are kept). */
 function resetUi(): void {
   app.ui.scrubFrame = 0;
   app.ui.cropOpen = false;
+  app.ui.cropRatio = 0;
   app.ui.pickColor = false;
   app.ui.selectedOverlay = 0;
+}
+
+/**
+ * setCropRatioLock turns the Crop card's "Lock ratio" on — capturing the
+ * current rectangle's w:h as the locked ratio — or off (review R2). The lock
+ * lives in UI state only; the crop op payload never carries it.
+ */
+export function setCropRatioLock(on: boolean): void {
+  const c = app.ops.crop;
+  app.ui.cropRatio = on ? (c.w > 0 && c.h > 0 ? c.w / c.h : 1) : 0;
+}
+
+/**
+ * centerSquareCrop sets the manual crop to the largest centred square of a
+ * width×height frame (handy for emotes); a locked ratio follows to 1:1.
+ */
+export function centerSquareCrop(width: number, height: number): void {
+  const s = Math.min(width, height);
+  app.ops.crop = {
+    enabled: true,
+    x: Math.floor((width - s) / 2),
+    y: Math.floor((height - s) / 2),
+    w: s,
+    h: s,
+  };
+  if (app.ui.cropRatio > 0) app.ui.cropRatio = 1;
 }
 
 /**
@@ -409,9 +466,10 @@ export interface BuildOpsOptions {
 
 /**
  * buildOps serialises the op configuration in the documented order:
- * unpremultiply, delay, trim, speed, fps, chromakey/colorkey, crop/autocrop,
- * resize, canvas, flip, rotate, reverse, then the text/overlay ops in the
- * user's order. With cropPreview the stack stops before crop, so the still
+ * unpremultiply, delay, trim, speed, fps, chromakey/colorkey, feather,
+ * crop/autocrop, resize, canvas, flip, rotate, reverse, then the
+ * text/overlay ops in the user's order. With cropPreview the stack stops
+ * before crop, so the still
  * shows the full frame in source pixel coordinates for the drag rectangle;
  * with keyPreview the keying op is skipped (the eyedropper picks from the
  * unkeyed frame).
@@ -443,6 +501,13 @@ export function buildOps(c: OpsCfg, opts: BuildOpsOptions = {}): Op[] {
   // Keying runs at full resolution before any geometry (DESIGN §4.3).
   const key = opts.keyPreview ? null : backgroundOp(c.background);
   if (key) ops.push(key);
+  // Feather sits with the keying stages (the graph hoists it right after the
+  // keys, before any geometry — review R4), so it is emitted after the key op
+  // and before crop/autocrop; the crop preview shows it too.
+  if (c.feather.enabled && c.feather.radius > 0) {
+    const p: FeatherParams = { radius: round(clamp(c.feather.radius, 0.1, 50)) };
+    ops.push({ kind: 'feather', params: p });
+  }
   if (opts.cropPreview) return ops;
 
   if (c.autocrop.enabled) {

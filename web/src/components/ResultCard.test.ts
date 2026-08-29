@@ -4,6 +4,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import type { Check, Result, ResultFile } from '../lib/api';
+import { app } from '../lib/state.svelte';
 import ResultCard from './ResultCard.svelte';
 
 function file(name: string, extra: Partial<ResultFile> = {}): ResultFile {
@@ -150,6 +151,19 @@ describe('ResultCard (SSR)', () => {
     expect(out).toContain('gifsicle: lossy 30 · 256 colours');
     expect(out).not.toContain('<b>Fit:</b>');
     expect(out).not.toContain('Fit search ran');
+  });
+
+  it('renders the backdrop from app.ui.resultBackdrop, so the choice survives a re-render remount (review R1)', () => {
+    // the card holds no backdrop state of its own: two fresh renders (the
+    // remount "Render again" causes) follow whatever app.ui carries
+    app.ui.resultBackdrop = 'dark';
+    let out = html(result([file('out.gif', { kind: 'output', report: null })]));
+    expect(out).toContain('stage backdrop-dark');
+    app.ui.resultBackdrop = 'white';
+    out = html(result([file('out.gif', { kind: 'output', report: null })]));
+    expect(out).toContain('stage backdrop-white');
+    expect(out).not.toContain('stage backdrop-dark');
+    app.ui.resultBackdrop = 'dark';
   });
 
   it('a static PNG whose recipe carries fitBytes never claims a fit ran (the server ignores it)', () => {

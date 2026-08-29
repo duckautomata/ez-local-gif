@@ -2,7 +2,11 @@
   // Canvas overlay drawn on top of the still while the Crop card is open.
   // The still shows the full pre-crop frame, so display pixels map linearly
   // onto source pixels: src = display * (srcW / clientWidth). Drag on empty
-  // space to draw a new rectangle; drag inside the rectangle to move it.
+  // space to draw a new rectangle, drag inside the rectangle to move it, and
+  // drag a corner or edge handle to resize (review R3) — with the Crop
+  // card's "Lock ratio" on, drawing and resizing preserve the locked ratio
+  // (app.ui.cropRatio; review R2). The geometry lives in lib/croprect.ts.
+  import { cursorFor, drawRect, hitHandle, resizeRect, type Handle, type Rect } from '../lib/croprect';
   import { app } from '../lib/state.svelte';
 
   interface Props {
@@ -18,12 +22,24 @@
 
   type Drag =
     | { mode: 'draw'; ax: number; ay: number }
-    | { mode: 'move'; ox: number; oy: number; w: number; h: number };
+    | { mode: 'move'; ox: number; oy: number; w: number; h: number }
+    | { mode: 'resize'; handle: Handle; start: Rect };
   let drag: Drag | null = null;
-  let hoverMove = $state(false);
+  let hover = $state<'move' | Handle | null>(null);
 
   const crop = $derived(app.ops.crop);
   const rect = $derived(crop.enabled && crop.w > 0 && crop.h > 0 ? crop : null);
+  const ratio = $derived(app.ui.cropRatio);
+  // Handle hit tolerance: ~7 DISPLAY pixels, converted per axis into source
+  // pixels so handles stay grabbable at any zoom.
+  const HANDLE_TOL = 7;
+  const tolX = $derived(cw > 0 ? (HANDLE_TOL * srcW) / cw : 0);
+  const tolY = $derived(ch > 0 ? (HANDLE_TOL * srcH) / ch : 0);
+  const cursor = $derived.by(() => {
+    const h = drag ? (drag.mode === 'resize' ? drag.handle : drag.mode === 'move' ? 'move' : null) : hover;
+    if (h === null) return 'crosshair';
+    return h === 'move' ? 'move' : cursorFor(h);
+  });
 
   // Track the displayed size of the image (zoom / layout changes / new still).
   $effect(() => {
@@ -69,7 +85,7 @@
     ctx.strokeRect(x - 0.5, y - 0.5, w + 1, h + 1);
     ctx.strokeStyle = '#fff';
     ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-    // corner ticks
+    // corner ticks + edge-midpoint ticks (the resize handles)
     ctx.fillStyle = '#fff';
     const s = 6;
     for (const [px, py] of [
@@ -77,6 +93,10 @@
       [x + w - s, y],
       [x, y + h - s],
       [x + w - s, y + h - s],
+      [x + (w - s) / 2, y],
+      [x + (w - s) / 2, y + h - s],
+      [x, y + (h - s) / 2],
+      [x + w - s, y + (h - s) / 2],
     ]) {
       ctx.fillRect(px, py, s, s);
     }
@@ -113,7 +133,10 @@
       // synthetic / already-released pointer: dragging still works via bubbling moves
     }
     const p = toSrc(e);
-    if (inside(p) && rect) {
+    const handle = rect ? hitHandle(rect, p, tolX, tolY) : null;
+    if (handle && rect) {
+      drag = { mode: 'resize', handle, start: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } };
+    } else if (inside(p) && rect) {
       drag = { mode: 'move', ox: p.x - rect.x, oy: p.y - rect.y, w: rect.w, h: rect.h };
     } else {
       drag = { mode: 'draw', ax: p.x, ay: p.y };
@@ -123,16 +146,16 @@
   function onMove(e: PointerEvent) {
     const p = toSrc(e);
     if (!drag) {
-      hoverMove = inside(p);
+      hover = rect ? (hitHandle(rect, p, tolX, tolY) ?? (inside(p) ? 'move' : null)) : null;
       return;
     }
     if (drag.mode === 'draw') {
-      const x0 = Math.round(Math.min(drag.ax, p.x));
-      const y0 = Math.round(Math.min(drag.ay, p.y));
-      const x1 = Math.round(Math.max(drag.ax, p.x));
-      const y1 = Math.round(Math.max(drag.ay, p.y));
-      if (x1 - x0 < 1 || y1 - y0 < 1) return;
-      app.ops.crop = { enabled: true, x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+      if (Math.abs(p.x - drag.ax) < 1 && Math.abs(p.y - drag.ay) < 1) return;
+      app.ops.crop = { enabled: true, ...drawRect({ x: drag.ax, y: drag.ay }, p, ratio, srcW, srcH) };
+    } else if (drag.mode === 'resize') {
+      // resize from the rectangle at drag start, so crossing the anchor
+      // flips the rectangle instead of inverting w/h
+      app.ops.crop = { enabled: true, ...resizeRect(drag.start, drag.handle, p, ratio, srcW, srcH) };
     } else {
       const x = Math.round(Math.min(Math.max(0, p.x - drag.ox), srcW - drag.w));
       const y = Math.round(Math.min(Math.max(0, p.y - drag.oy), srcH - drag.h));
@@ -154,7 +177,7 @@
 <canvas
   bind:this={canvas}
   class="crop-overlay"
-  class:move={hoverMove}
+  style:cursor
   style:width="{cw}px"
   style:height="{ch}px"
   onpointerdown={onDown}
@@ -162,7 +185,7 @@
   onpointerup={onUp}
   onpointercancel={onUp}
   onlostpointercapture={onUp}
-  aria-label="Crop rectangle: drag to draw, drag inside to move"
+  aria-label="Crop rectangle: drag to draw, drag inside to move, drag an edge or corner to resize"
 ></canvas>
 
 <style>
@@ -172,8 +195,5 @@
     top: 0;
     cursor: crosshair;
     touch-action: none;
-  }
-  .crop-overlay.move {
-    cursor: move;
   }
 </style>

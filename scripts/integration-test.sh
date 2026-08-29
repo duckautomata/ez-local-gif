@@ -31,6 +31,11 @@
 #               has transparent AND opaque pixels, corner pixel transparent
 #   colorkey    the same clip through the colorkey op → chat WebP: report.ok,
 #               VP8X ALPHA flag, corner pixel transparent
+#   feather     chromakey + feather (radius 3) on the same clip → chat WebP:
+#               frame 0 has ≥ 300 pixels with alpha strictly between 32 and
+#               224 (the blurred edge band — background is 0 and subject 255,
+#               so every in-between value sits on the subject's edge), and
+#               ≥ 10× as many as the unfeathered colorkey WebP has
 #   text        drawtext op (font "DejaVu Sans") → GIF renders; the still with
 #               the op differs from the plain still (something was painted)
 #   overlay-png a 48×48 RGBA PNG uploaded as a second source → overlay op →
@@ -310,6 +315,13 @@ alpha_counts() { # alpha_counts FILE → "opaque transparent": pixels of frame 0
 corner_alpha() { # corner_alpha FILE → alpha (0..255) of pixel (0,0) of frame 0
   "$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=rgba,crop=1:1:0:0" -f rawvideo -pix_fmt rgba - 2>/dev/null \
     | od -An -tu1 | awk '{print $4}'
+}
+alpha_mid_count() { # alpha_mid_count FILE → pixels of frame 0 with alpha strictly between 32 and 224
+  # On the green-screen clip the keyed background is alpha 0 and the subject
+  # 255, so every in-between value sits on the subject's edge: a feathered
+  # (gblur'd) edge yields a wide band of them, a hard key (almost) none.
+  "$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=rgba,alphaextract" -f rawvideo -pix_fmt gray - 2>/dev/null \
+    | od -An -v -tu1 | awk '{ for (i = 1; i <= NF; i++) if ($i > 32 && $i < 224) n++ } END { print n + 0 }'
 }
 psnr_of() { # psnr_of A B → average PSNR between two images in dB ("inf" when identical; "" on failure)
   local out
@@ -698,8 +710,8 @@ if [ "$phase3" != 1 ]; then
 fi
 
 # =============================================================================
-# Phase 3: keying, text / image / animated overlays, reverse, autocrop, the
-# animated proxy, fonts
+# Phase 3: keying (+ feather), text / image / animated overlays, reverse,
+# autocrop, the animated proxy, fonts
 # =============================================================================
 log "phase 3: capabilities + fonts"
 code=$(curl -sS -o "$tmp/caps.json" -w '%{http_code}' --max-time 30 "$url/api/capabilities")
@@ -777,7 +789,8 @@ phase3_jobs=(text reverse autocrop)
 if [ -n "$green_hash" ]; then
   recipe[chromakey]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"chromakey","params":{"color":"00ff00"}}],"output":{"format":"gif","width":128,"height":128,"fit":"contain","fps":20,"preset":"emote","target":"emote"}}'
   recipe[colorkey]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"colorkey","params":{"color":"00ff00","similarity":0.1}}],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
-  phase3_jobs+=(chromakey colorkey)
+  recipe[feather]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"chromakey","params":{"color":"00ff00"}},{"kind":"feather","params":{"radius":3}}],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
+  phase3_jobs+=(chromakey colorkey feather)
 fi
 if [ -n "$png_hash" ]; then
   recipe[overlay-png]='{"v":1,"sources":["'"$hash"'","'"$png_hash"'"],"ops":['"$unp"','"$ov_png_op"'],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
@@ -829,6 +842,32 @@ if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name webp; then
     ok "$name: frame 0 has $transparent transparent + $opaque opaque pixels, corner transparent"
   else
     fail "$name: frame 0 alpha: opaque=${opaque:-?} transparent=${transparent:-?} corner=${ca:-?} (want both kinds, corner 0)"
+  fi
+fi
+
+# ---- feather: chromakey + feather → intermediate alpha at the subject's edge
+name=feather
+if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name webp; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  mid=$(alpha_mid_count "$f")
+  # A sigma-3 gblur on the alpha of the 160×160 clip's ~53 px square puts well
+  # over 1000 frame-0 pixels strictly between 32 and 224 (measured ~1268); a
+  # hard key leaves ~0. 300 keeps a wide margin either way.
+  if [ "${mid:-0}" -ge 300 ]; then
+    ok "$name: frame 0 has $mid pixels with alpha strictly between 32 and 224 (feathered edge)"
+  else
+    fail "$name: frame 0 has only ${mid:-0} pixels with intermediate alpha, want ≥ 300 — the edge was not feathered"
+  fi
+  # The colorkey case above is the same clip keyed to WebP *without* feather:
+  # its edge must be (almost) hard — far fewer intermediate pixels.
+  if [ -s "${out_file[colorkey]:-}" ]; then
+    base_mid=$(alpha_mid_count "${out_file[colorkey]}")
+    if [ $((${base_mid:-0} * 10)) -le "${mid:-0}" ]; then
+      ok "$name: unfeathered colorkey WebP has only ${base_mid:-0} intermediate-alpha pixels (≤ a tenth of the feathered $mid)"
+    else
+      fail "$name: unfeathered colorkey WebP has ${base_mid:-0} intermediate-alpha pixels vs $mid feathered — feather made no difference"
+    fi
   fi
 fi
 

@@ -25,9 +25,10 @@ import (
 // runs ffmpeg over the main source through enc.CropDetectPlanArgs on the
 // detection plan graph.CompileDetect compiles from the stack's detection
 // ops — the source head, unpremultiply, trim/delay/speed/fps and,
-// crucially, the keying ops — so the box is found on the picture the crop
-// is applied to: a green-screen clip with Background removal resolves to
-// its subject, not to the full (opaque) frame the raw source shows. The box
+// crucially, the keying and feather ops — so the box is found on the
+// picture the crop is applied to: a green-screen clip with Background
+// removal resolves to its subject, not to the full (opaque) frame the raw
+// source shows, and a feathered edge grows the box by its faded ring. The box
 // is read off the alpha plane when the plan's frames carry alpha (source
 // alpha or keying; alpha at or above the threshold is content), off the
 // picture otherwise (non-black borders, cropdetect). The raw detected box
@@ -83,6 +84,8 @@ var geometryOps = map[string]bool{
 // and the crop is applied to: the kinds graph.CompileDetect applies (the
 // compiler runs them in front of the geometry wherever they sit in the
 // stack, so their position relative to the autocrop does not matter).
+// Feather belongs here exactly like keying: its alpha blur changes which
+// pixels reach the threshold, growing the box by the soft edge's fade.
 // Every other kind is either refused in front of the autocrop (geometryOps)
 // or invisible to the crop (reverse only reorders frames; text and overlays
 // are drawn on the output canvas after it) and is left out of the detection
@@ -90,12 +93,13 @@ var geometryOps = map[string]bool{
 var detectionOps = map[string]bool{
 	recipe.OpDelay: true, recipe.OpUnpremultiply: true,
 	recipe.OpTrim: true, recipe.OpSpeed: true, recipe.OpFPS: true,
-	recipe.OpChromaKey: true, recipe.OpColorKey: true,
+	recipe.OpChromaKey: true, recipe.OpColorKey: true, recipe.OpFeather: true,
 }
 
 // ResolveAutoCrop runs the content-box detection for the main source of r
 // (enc.CropDetectPlanArgs over the detection plan of the stack's detection
-// ops — trimmed, keyed —, alpha plane when those frames carry alpha) and
+// ops — trimmed, keyed, feathered —, alpha plane when those frames carry
+// alpha) and
 // returns the ops with every OpAutoCrop carrying a Resolved
 // crop: the detected box grown by Padding on each side and clamped to the
 // source frame; a fully transparent/flat clip resolves to the full frame.
@@ -182,12 +186,13 @@ func decodeAutoCrop(idx int, op recipe.Op) (recipe.AutoCropParams, error) {
 
 // autocropDetectionOps returns the ops of the WHOLE stack that shape the
 // picture the detection reads (detectionOps: trim, delay, speed, fps,
-// unpremultiply and the keying ops, in stack order) and refuses geometry
-// ops in front of the autocrop, whose frame the detection could not see.
-// Detection ops behind the autocrop count too: the compiler hoists them in
-// front of the geometry regardless of where they sit, so [autocrop,
+// unpremultiply, the keying ops and feather, in stack order) and refuses
+// geometry ops in front of the autocrop, whose frame the detection could
+// not see. Detection ops behind the autocrop count too: the compiler hoists
+// them in front of the geometry regardless of where they sit, so [autocrop,
 // colorkey] renders the keyed picture and must be cropped by a box found on
-// the keyed picture. Geometry ops behind the autocrop are fine (the crop is
+// the keyed picture (and [autocrop, feather] by a box found on the
+// feathered one). Geometry ops behind the autocrop are fine (the crop is
 // applied first). ops is the full stack, idx the autocrop's index.
 func autocropDetectionOps(ops []recipe.Op, idx int) ([]recipe.Op, error) {
 	var pre []recipe.Op

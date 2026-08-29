@@ -25,6 +25,9 @@
 #      frames; the grep fallback used to hand back delays.json as the "first
 #      frame", failing the Phase 2 PNG check and the Phase 3 reverse case
 #      whenever jq was absent.
+#   6. alpha_mid_count (the Phase 3 feather case) counts only alpha values
+#      strictly between 32 and 224 — 32 and 224 themselves are out — checked
+#      against an ffmpeg stub that emits a known raw alpha plane.
 #
 #   bash scripts/integration-test-selftest.sh
 set -uo pipefail
@@ -186,6 +189,27 @@ if command -v jq >/dev/null 2>&1; then
   check_frames_helpers 1 jq
 else
   printf '[selftest] note: jq not on PATH — the jq branch of the frames-manifest helpers was not tested\n'
+fi
+
+# ---- 6. alpha_mid_count (the feather case) on a known alpha plane, via an
+# ffmpeg stub that prints the raw gray bytes the real decode pipeline would:
+# of 0, 32, 33, 128, 223, 224, 255 only 33/128/223 are *strictly* between
+# 32 and 224, so the count must be exactly 3.
+cat > "$stmp/bin/ffmpeg" <<'SH'
+#!/usr/bin/env bash
+printf '\x00\x20\x21\x80\xdf\xe0\xff'
+SH
+chmod +x "$stmp/bin/ffmpeg"
+got=$(
+  export EZLG_ITEST_FUNCS_ONLY=1 EZLG_FFMPEG="$stmp/bin/ffmpeg"
+  # shellcheck disable=SC1090,SC1091  # sourced for its function definitions only
+  . "$itest"
+  alpha_mid_count ignored.webp
+)
+if [ "$got" = 3 ]; then
+  ok "alpha_mid_count counts only alpha strictly between 32 and 224 (3 of 0,32,33,128,223,224,255)"
+else
+  fail "alpha_mid_count got '$got', want 3 (bounds must be exclusive)"
 fi
 
 echo "== integration-test selftest: $pass passed, $failn failed =="

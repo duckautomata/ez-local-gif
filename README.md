@@ -67,6 +67,10 @@ Phase 3 (editing ops, DESIGN.md §4.3 — built and reviewed 2026-08-22):
   scaling; the result keeps 8-bit alpha in WebP/APNG/AVIF and is matted + thresholded for GIF.
   On a source that already has alpha (a ProRes 4444 export) the key's matte is intersected with
   the source alpha instead of replacing it.
+- **Feather (soft edge)** — the `feather` op Gaussian-blurs the alpha edge (radius in source
+  pixels, default 3; the soft band is ≈ 2–3× the radius), applied right after keying and before
+  any geometry so it scales down with the output size; skipped on frames that carry no alpha.
+  GIF thresholds the softened edge back to 1-bit — use WebP/APNG/AVIF to keep it.
 - **Overlays** — `text` (ffmpeg `drawtext` through a text file, any fontconfig family the
   container knows: DejaVu and Noto Sans/Serif are bundled, `/fonts` can add more; semi-transparent
   colours are composited through a separate layer), static image and **animated** overlays
@@ -88,6 +92,10 @@ Phase 3 (editing ops, DESIGN.md §4.3 — built and reviewed 2026-08-22):
   decodes nothing after an input seek); every other source keeps the µs-precise input seek.
 - Multi-source recipes: overlay assets are ordinary uploads listed in `sources` after the main
   source and referenced by index; `/api/still`, `/api/proxy` and `/api/jobs` all take them.
+- Phase 3 review fixes ([`docs/reviews/phase3-review.md`](docs/reviews/phase3-review.md)): the
+  crop rectangle gained 8 edge/corner resize handles and a "Lock ratio" checkbox (constrains
+  resizes, new rectangles and the W/H inputs), the Result card's backdrop choice persists across
+  renders, and the Feather op above.
 
 ## Quick start
 
@@ -167,7 +175,8 @@ none).
 Ops (`{"kind": …, "params": {…}}`, see `internal/recipe`): `trim`, `crop`, `resize`, `canvas`,
 `fps`, `speed`, `flip`, `rotate`, `unpremultiply`, `delay` (sequences), and from Phase 3
 `chromakey` (`color`, `similarity`, `blend`, despill knobs), `colorkey` (`color`, `similarity`,
-`blend`), `reverse`, `autocrop` (`threshold`, `padding`), `text` (`text`, `font` = fontconfig
+`blend`), `feather` (`radius` = Gaussian sigma in source pixels, 0 = the default 3), `reverse`,
+`autocrop` (`threshold`, `padding`), `text` (`text`, `font` = fontconfig
 family, `size`, `color`, `border`, `box`, `anchor`, `x`/`y`, `start`/`end`) and `overlay`
 (`source` = index into `sources`, `width`/`height`, `opacity`, `noLoop`, `anchor`, `x`/`y`,
 `start`/`end`). `scripts/integration-test.sh` covers `POST /api/upload`, `POST
@@ -291,7 +300,8 @@ docker compose -f compose.yaml -f compose.dev.yaml run --rm app go test ./...
 # being answered from the on-disk result cache — then uploads a ProRes clip, renders the Phase 1
 # GIF + WebP, then the Phase 2 cases: emote fit-to-size with alternatives, indexed APNG sticker,
 # animated AVIF, PNG/JPEG stills, frames + zip, 3-PNG image sequence, GIF optimise, edit-as-source;
-# then the Phase 3 cases: chromakey / colorkey on a green-screen clip (pixel-checked alpha), text
+# then the Phase 3 cases: chromakey / colorkey on a green-screen clip (pixel-checked alpha),
+# chromakey + feather (the WebP edge carries intermediate alpha; the unfeathered one does not), text
 # overlay, PNG and looping-GIF overlays from a second source (stills prove the GIF overlay is
 # painted and loops rather than holding its last frame), reverse (frame hashes vs the forward
 # export), autocrop (smaller dims), trim on an animated WebP source built from the ProRes clip
@@ -406,11 +416,11 @@ linter enforces are versioned in `internal/discordlint`.
 | Script | Purpose |
 |---|---|
 | `scripts/go.ps1`, `scripts/go.sh` | Run `go …` in `golang:1.26-trixie` with the repo mounted (host has no Go) |
-| `scripts/check-tools.sh` | Print + assert every bundled tool, ffmpeg capability (encoders, decoders incl. the libvpx VP8 decoder for VP8-alpha overlays, every filter the graph emits — Phase 3: `tpad`, `reverse`, `lagfun`, `bbox`, `colorchannelmixer`, `setparams`, `blend`, `trim`, `setpts`, … — demuxers, muxers) and font family (DejaVu, Noto; `/fonts` on the scan path; drawtext paints) — runs at image build, so a build lacking something the pipeline relies on fails there, not at render time |
+| `scripts/check-tools.sh` | Print + assert every bundled tool, ffmpeg capability (encoders, decoders incl. the libvpx VP8 decoder for VP8-alpha overlays, every filter the graph emits — Phase 3: `tpad`, `reverse`, `lagfun`, `bbox`, `colorchannelmixer`, `setparams`, `blend`, `gblur` (feather), `trim`, `setpts`, … — demuxers, muxers) and font family (DejaVu, Noto; `/fonts` on the scan path; drawtext paints) — runs at image build, so a build lacking something the pipeline relies on fails there, not at render time |
 | `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`), GIF, animated AVIF with alpha (`.avif`: avifenc, or ffmpeg's colour + alpha stream pair without it), `seq OUTDIR N` = N straight-alpha PNG frames for an image-sequence upload, or `green OUT.mov|OUT.mp4` = an opaque 4:4:4 green-screen clip (a bordered square orbiting over `0x00ff00`) for the keying ops; premultiplied or straight alpha |
 | `scripts/discord-testkit.sh` | Emit the Discord render-test matrix + README (see above) |
 | `scripts/testkit-test.sh` | Self-test for the test kit: OUTDIR guard + hint, synthetic clip at the master rate, resample warning, every variant produced, the app's yuva alpha head (native-depth unpremultiply, one rgba conversion, transparent corner pixel at alpha 0), /dev/shm scratch (full checks need the toolchain image) |
-| `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one on a throw-away data dir): the 18 Phase 1 checks (ProRes → emote GIF + chat WebP), the Phase 2 cases (fit-to-size + alternatives, indexed APNG sticker, AVIF, PNG/JPEG, frames + zip, image sequence, optimise, from-result) and the Phase 3 cases (chromakey / colorkey on a green-screen clip with pixel-level alpha checks, text overlay, PNG + looping GIF overlays from a second source (`/api/still` pixel checks: the GIF overlay is painted and loops rather than holding its last frame), reverse vs the forward frames export, autocrop, trim on an animated WebP source built from the ProRes clip (exactly 10 frames — FFmpeg 9's `webp_anim` demuxer decodes nothing after an input seek, so the server trims such sources in the filtergraph), `POST /api/proxy`, `GET /api/fonts`, capability flags); `EZLG_TEST_PHASE2=0` for Phase 1 only, `EZLG_TEST_PHASE3=0` to skip Phase 3; jobs answered from the server's result cache are warned about (`EZLG_TEST_STRICT=1` fails on them) |
+| `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one on a throw-away data dir): the 18 Phase 1 checks (ProRes → emote GIF + chat WebP), the Phase 2 cases (fit-to-size + alternatives, indexed APNG sticker, AVIF, PNG/JPEG, frames + zip, image sequence, optimise, from-result) and the Phase 3 cases (chromakey / colorkey on a green-screen clip with pixel-level alpha checks, chromakey + feather (the WebP's edge carries intermediate alpha, the unfeathered render (almost) none), text overlay, PNG + looping GIF overlays from a second source (`/api/still` pixel checks: the GIF overlay is painted and loops rather than holding its last frame), reverse vs the forward frames export, autocrop, trim on an animated WebP source built from the ProRes clip (exactly 10 frames — FFmpeg 9's `webp_anim` demuxer decodes nothing after an input seek, so the server trims such sources in the filtergraph), `POST /api/proxy`, `GET /api/fonts`, capability flags); `EZLG_TEST_PHASE2=0` for Phase 1 only, `EZLG_TEST_PHASE3=0` to skip Phase 3; jobs answered from the server's result cache are warned about (`EZLG_TEST_STRICT=1` fails on them) |
 | `scripts/integration-test-selftest.sh` | Unit tests for `integration-test.sh` itself (no server/toolchain needed): `EZLG_START_SERVER=1` must ignore an inherited `EZLG_DATA` (else dev-image re-runs are vacuous cache hits), `EZLG_TEST_DATA` override, cached-result detection, the capture-then-grep helpers vs SIGPIPE, and the frames-manifest helpers (first / last frame url must skip `frames.zip` and `delays.json`, with jq and with the grep fallback) |
 | `scripts/pin-ffmpeg.sh` | Print new `FFMPEG_TAG/ASSET/SHA256` ARG lines for a BtbN release tag |
 

@@ -5,7 +5,7 @@
 import { render } from 'svelte/server';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ProbeInfo, Source } from '../../lib/api';
-import { app, buildOps, setSource } from '../../lib/state.svelte';
+import { app, buildOps, setCropRatioLock, setSource } from '../../lib/state.svelte';
 import CropCard from './CropCard.svelte';
 
 const gifInfo: ProbeInfo = {
@@ -64,7 +64,7 @@ describe('CropCard (SSR)', () => {
     for (const tag of rectInputs(out)) expect(tag).not.toContain('disabled');
     expect(out).toMatch(/<button[^>]*>Centre square<\/button>/);
     expect(out).not.toMatch(/<button[^>]*disabled[^>]*>Centre square/);
-    expect(out).toContain('Drag on the preview to draw the rectangle');
+    expect(out).toContain('Drag on the preview to draw, drag inside to move, drag an edge or corner to resize.');
     app.ops.autocrop = { enabled: true, padding: 4, threshold: 64 };
     out = html(gifInfo, true);
     expect(rectInputs(out)).toHaveLength(4);
@@ -127,7 +127,32 @@ describe('CropCard (SSR)', () => {
     // manual crop: the drag hint, nothing about keying
     app.ops.autocrop.enabled = false;
     out = html(gifInfo, true);
-    expect(out).toContain('Drag on the preview to draw the rectangle');
+    expect(out).toContain('Drag on the preview to draw, drag inside to move, drag an edge or corner to resize.');
     expect(out).not.toContain('background removal;');
+  });
+
+  it('Lock ratio (review R2): off by default, shows the captured ratio, disabled with auto-crop', () => {
+    let out = html(gifInfo, true);
+    let lock = out.match(/<input[^>]*aria-label="Lock crop aspect ratio"[^>]*>/)?.[0] ?? '';
+    expect(lock).toBeTruthy();
+    expect(lock).not.toContain('checked');
+    expect(out).toContain('Lock ratio');
+    expect(out).not.toContain('Lock ratio (');
+    // capturing the full-frame 160×120 box shows the reduced 4:3
+    app.ops.crop = { enabled: true, x: 0, y: 0, w: 160, h: 120 };
+    setCropRatioLock(true);
+    out = html(gifInfo, true);
+    lock = out.match(/<input[^>]*aria-label="Lock crop aspect ratio"[^>]*>/)?.[0] ?? '';
+    expect(lock).toContain('checked');
+    expect(out).toContain('Lock ratio (4:3)');
+    // an unclean ratio falls back to N.NN:1
+    app.ops.crop = { enabled: true, x: 0, y: 0, w: 127, h: 96 };
+    setCropRatioLock(true);
+    expect(html(gifInfo, true)).toContain('Lock ratio (1.32:1)');
+    // auto-crop disables the lock control like the rest of the rectangle row
+    app.ops.autocrop.enabled = true;
+    out = html(gifInfo, true);
+    lock = out.match(/<input[^>]*aria-label="Lock crop aspect ratio"[^>]*>/)?.[0] ?? '';
+    expect(lock).toContain('disabled');
   });
 });

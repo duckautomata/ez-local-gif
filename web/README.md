@@ -123,7 +123,9 @@ into the Go binary by `web/embed.go`.
   delays for 30 fps with exact timing; `gifDelays` renders that hint).
 - Result card: the primary file (size badge vs limit, fit summary from its
   `desc`, "as seen in chat" thumbnails — emote 22/48 px, sticker 160 px, dark and
-  light — Discord checks with friendly rule labels), up to two fit alternatives
+  light — Discord checks with friendly rule labels; the preview backdrop choice
+  is app-level UI state, so it persists across re-renders instead of resetting
+  to dark — Phase 3 review fix), up to two fit alternatives
   as small cards, a lazy thumbnail grid with per-frame downloads + "Download all
   (zip)" for frame extraction. Every file has Download / Open / "Edit as source"
   (opens a tab synchronously, POSTs `/api/sources/from-result`, navigates it to
@@ -161,9 +163,19 @@ into the Go binary by `web/embed.go`.
   threshold under Advanced for alpha sources) emits `autocrop` instead of the
   manual `crop`; the rectangle fields are disabled while it is on and the
   preview leaves crop mode (the server resolves the box; the still shows the
-  result). The header toggle covers both.
+  result). The header toggle covers both. The manual rectangle has 8 resize
+  handles (edges + corners) and a "Lock ratio" checkbox that captures the
+  current w:h and constrains handle resizes, newly dragged rectangles and the
+  W/H inputs (Phase 3 review fixes).
 - **Speed card**: "Reverse" (`app.ops.reverse`) emits `reverse` after the
   geometry ops; the header toggle covers factor and reverse.
+- **Feather** — "Feather — N px (soft edge ≈ 2–3×N)": emits the `feather` op
+  (radius = Gaussian sigma in **source** pixels, 0.1–50, default 3). The server
+  blurs only the alpha plane, right after keying and before any geometry, so
+  the softness scales down with the output size; it skips the stage when the
+  frame carries no alpha at that point (e.g. an opaque source with no key
+  before it). GIF output thresholds the soft edge back to 1-bit —
+  WebP/APNG/AVIF keep it.
 - **Overlays** (`app.ops.overlays`, `lib/overlay.ts`): "+ Add text" / "+ Add
   image" append cards (stable ids; ▲ ▼ reorder = drawing order, ✕ remove; each
   card has its own enable toggle). Text: textarea, font from `GET /api/fonts`

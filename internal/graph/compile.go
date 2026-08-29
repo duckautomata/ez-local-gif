@@ -130,6 +130,8 @@ func decodeOp(i int, op recipe.Op) (decodedOp, error) {
 		params = new(recipe.ChromaKeyParams)
 	case recipe.OpColorKey:
 		params = new(recipe.ColorKeyParams)
+	case recipe.OpFeather:
+		params = new(recipe.FeatherParams)
 	case recipe.OpAutoCrop:
 		params = new(recipe.AutoCropParams)
 	case recipe.OpText:

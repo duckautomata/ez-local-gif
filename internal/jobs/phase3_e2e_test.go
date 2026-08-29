@@ -310,6 +310,80 @@ func TestRenderKeying(t *testing.T) {
 	}
 }
 
+// TestRenderFeatherSoftEdge: a feather op with a colorkey blurs ONLY the
+// alpha plane, so the rendered frames carry intermediate alpha in a narrow
+// band around the keyed subject — and nowhere else — while the same recipe
+// without feather keys a hard, binary edge (colorkey with blend 0). Frame 0
+// of a frames export is checked pixel by pixel; the subject there is the
+// red 16x12 square at (8,18).
+func TestRenderFeatherSoftEdge(t *testing.T) {
+	e := newE2E(t)
+	if v := ffmpegMajor(t, e.tools); v > 0 && v < 9 {
+		t.Skipf("the feather e2e needs FFmpeg 9 (have %d)", v)
+	}
+	feather := recipe.Op{Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":2}`)}
+	requireGraphOp(t, feather)
+	steps := e.lavfi("steps.mov", greenSteps, "rgb24")
+	frame0 := func(ops []recipe.Op) image.Image {
+		t.Helper()
+		r := recipe.Recipe{Sources: []string{steps.Hash}, Ops: ops, Output: recipe.Output{Format: "frames"}}
+		fin := e.run(r)
+		return decodePNG(t, e.resultBytes(r, e.frameFiles(fin)[0].Name))
+	}
+	alpha8 := func(img image.Image, x, y int) int {
+		_, _, _, a := img.At(x, y).RGBA()
+		return int(a >> 8)
+	}
+	// scan counts the pixels with intermediate alpha (strictly between 32
+	// and 224) and, of those, the ones farther than 8 px from the subject
+	// square (there must be none: the feather is a local edge effect).
+	scan := func(img image.Image) (mid, far int) {
+		b := img.Bounds()
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				a := alpha8(img, x, y)
+				if a <= 32 || a >= 224 {
+					continue
+				}
+				mid++
+				if x > 32 || y < 10 || y > 38 {
+					far++
+				}
+			}
+		}
+		return mid, far
+	}
+
+	soft := frame0([]recipe.Op{colorKeyGreen, feather})
+	if b := soft.Bounds(); b.Dx() != 64 || b.Dy() != 48 {
+		t.Fatalf("feathered frame is %dx%d, want 64x48", b.Dx(), b.Dy())
+	}
+	mid, far := scan(soft)
+	if mid == 0 {
+		t.Error("feathered render has no intermediate alpha at the subject edge")
+	}
+	if far != 0 {
+		t.Errorf("%d intermediate-alpha pixels far from the subject edge", far)
+	}
+	// The subject's centre stays (nearly) opaque red, the far screen fully
+	// transparent: the blur fades the edge, it does not wash out the frame.
+	if a := alpha8(soft, 16, 24); a < 224 {
+		t.Errorf("subject centre alpha = %d, want >= 224", a)
+	}
+	if got := classify(soft.At(16, 24)); got != "red" {
+		t.Errorf("subject centre = %s, want red", got)
+	}
+	if a := alpha8(soft, 56, 8); a > 32 {
+		t.Errorf("far screen alpha = %d, want <= 32", a)
+	}
+
+	// Without feather the key edge is hard: no intermediate alpha anywhere.
+	hard := frame0([]recipe.Op{colorKeyGreen})
+	if mid, _ := scan(hard); mid != 0 {
+		t.Errorf("unfeathered render has %d intermediate-alpha pixels, want none", mid)
+	}
+}
+
 // TestRenderTextOverlay: drawtext via a text file changes pixels inside
 // the text box and nowhere else.
 func TestRenderTextOverlay(t *testing.T) {
@@ -692,6 +766,45 @@ func TestAutoCropDetection(t *testing.T) {
 			}
 		})
 	}
+
+	// Feather in the stack: the alpha blur fades the keyed edge outwards, so
+	// at threshold 1 the detected box covers the keyed box and grows past it
+	// by roughly the feather radius. [autocrop, feather] and [feather,
+	// autocrop] are one detection (the compiler hoists feather with the
+	// keying), so the second order resolves from the first one's memo — no
+	// ffmpeg — exactly like the keying-behind-autocrop cases above.
+	t.Run("green-screen clip, keyed and feathered: the box grows", func(t *testing.T) {
+		feather := recipe.Op{Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":2}`)}
+		requireGraphOp(t, feather)
+		base := recipe.CropParams{X: 8, Y: 18, W: 26, H: 12} // the unfeathered keyed box (asserted above)
+		got, err := e.m.ResolveAutoCrop(e.ctx, steps.Hash, []recipe.Op{colorKeyGreen, feather, autocropOp(`{}`)})
+		if err != nil {
+			t.Fatalf("ResolveAutoCrop: %v", err)
+		}
+		box := resolvedBox(t, got)
+		if box.X > base.X || box.Y > base.Y || box.X+box.W < base.X+base.W || box.Y+box.H < base.Y+base.H {
+			t.Errorf("feathered box %+v does not cover the keyed box %+v on every side", box, base)
+		}
+		if box.W*box.H <= base.W*base.H {
+			t.Errorf("feathered box %+v is not larger than the keyed box %+v", box, base)
+		}
+		noFF := NewManager(e.st, ffrun.Tools{}, Options{})
+		behind, err := noFF.ResolveAutoCrop(e.ctx, steps.Hash, []recipe.Op{colorKeyGreen, autocropOp(`{}`), feather})
+		if err != nil {
+			t.Fatalf("feather behind the autocrop must hit the same memo: %v", err)
+		}
+		if b := resolvedBox(t, behind); b != box {
+			t.Errorf("feather behind the autocrop resolved %+v, want %+v", b, box)
+		}
+		// The unfeathered stack keeps its own memo entry: same box as before.
+		plain, err := noFF.ResolveAutoCrop(e.ctx, steps.Hash, []recipe.Op{colorKeyGreen, autocropOp(`{}`)})
+		if err != nil {
+			t.Fatalf("unfeathered memo hit without ffmpeg: %v", err)
+		}
+		if b := resolvedBox(t, plain); b != base {
+			t.Errorf("unfeathered box changed to %+v, want %+v", b, base)
+		}
+	})
 
 	// Memo: the entries exist, and a manager without any ffmpeg resolves
 	// the same ops from them.

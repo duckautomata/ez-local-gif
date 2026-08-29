@@ -5,6 +5,7 @@
   import BackgroundCard from './ops/BackgroundCard.svelte';
   import CropCard from './ops/CropCard.svelte';
   import DelayCard from './ops/DelayCard.svelte';
+  import FeatherCard from './ops/FeatherCard.svelte';
   import FlipRotateCard from './ops/FlipRotateCard.svelte';
   import FpsCard from './ops/FpsCard.svelte';
   import OverlaysPanel from './ops/OverlaysPanel.svelte';
@@ -61,6 +62,7 @@
     {#if !still}<FpsCard {info} />{/if}
     {#if !still}<SpeedCard {info} />{/if}
     <BackgroundCard />
+    <FeatherCard />
     <FlipRotateCard />
     <OverlaysPanel {info} />
   {/if}

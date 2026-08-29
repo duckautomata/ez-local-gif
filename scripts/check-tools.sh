@@ -84,13 +84,13 @@ done
 # autocrop detection (lagfun, bbox, cropdetect), overlay opacity and
 # semi-transparent drawtext layers (colorchannelmixer, color), the alpha_mode
 # tag (setparams), the keying-on-alpha wrapper (split, alphaextract, blend,
-# alphamerge), filter-level trim for animated WebP (trim, setpts) and the
-# flip/rotate ops (transpose, hflip, vflip). A build lacking one of these
-# fails the image build, not a render.
+# alphamerge), the feather op's alpha-plane blur (gblur), filter-level trim
+# for animated WebP (trim, setpts) and the flip/rotate ops (transpose, hflip,
+# vflip). A build lacking one of these fails the image build, not a render.
 for flt in palettegen paletteuse chromakey colorkey despill drawtext premultiply unpremultiply \
            alphaextract alphamerge overlay scale pad fps crop tile mpdecimate cropdetect \
            format split lut geq testsrc2 color \
-           tpad reverse lagfun bbox colorchannelmixer setparams blend trim setpts \
+           tpad reverse lagfun bbox colorchannelmixer setparams blend trim setpts gblur \
            transpose hflip vflip; do
   if have_line -filters "$flt"; then ok "filter" "$flt"; else bad "filter" "$flt missing"; fi
 done

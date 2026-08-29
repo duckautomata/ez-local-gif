@@ -57,6 +57,7 @@ var (
 
 func chromakey(p recipe.ChromaKeyParams) recipe.Op { return op(recipe.OpChromaKey, p) }
 func colorkey(p recipe.ColorKeyParams) recipe.Op   { return op(recipe.OpColorKey, p) }
+func feather(r float64) recipe.Op                  { return op(recipe.OpFeather, recipe.FeatherParams{Radius: r}) }
 func autocrop(p recipe.AutoCropParams) recipe.Op   { return op(recipe.OpAutoCrop, p) }
 func reverse() recipe.Op                           { return op(recipe.OpReverse, nil) }
 func text(p recipe.TextParams) recipe.Op           { return op(recipe.OpText, p) }
@@ -69,9 +70,12 @@ func resolved(x, y, w, h int) recipe.Op {
 
 // Stage text shared by the goldens.
 const (
-	ckDefault  = "format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05,despill=type=green:mix=0.6:expand=0.3"
-	ckNoSpill  = "format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05"
-	ckWhite    = "format=rgba,colorkey=color=0xffffff:similarity=0.1:blend=0"
+	ckDefault = "format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05,despill=type=green:mix=0.6:expand=0.3"
+	ckNoSpill = "format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05"
+	ckWhite   = "format=rgba,colorkey=color=0xffffff:similarity=0.1:blend=0"
+	// featherDef is the feather stage at the default radius 3: gbrap orders
+	// the planes G,B,R,A, so planes=8 blurs only the alpha plane.
+	featherDef = "format=gbrap,gblur=sigma=3:planes=8,format=rgba"
 	ovComposit = "overlay=x=0:y=0:format=auto:shortest=1:eof_action=repeat"
 	hold       = "tpad=stop_mode=clone:stop=-1"
 	text1      = "drawtext=textfile=__EZLG_TEXT_1__:expansion=none:font=DejaVu Sans:fontsize=32:fontcolor=0xffffff:x=0:y=0"
@@ -245,6 +249,76 @@ func TestCompilePhase3(t *testing.T) {
 				Width:  240, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
 				ExtraInputs: []ExtraInput{{Source: 1, Args: []string{"-loop", "1"}}},
 				TextFiles:   []TextFile{{Placeholder: "__EZLG_TEXT_1__", Content: "Hi"}},
+			},
+		},
+
+		// --- feather --------------------------------------------------------
+		{
+			// gbrap orders the planes G,B,R,A, so planes=8 blurs only the
+			// alpha plane; the stage follows the key wrapper it softens.
+			name: "feather at the default radius follows a wrapped key on a prores source",
+			srcs: []recipe.ProbeInfo{prores}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{}), feather(0)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckDefault+",format=rgba") + "," + featherDef + "[out]",
+				Width:  1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
+			},
+		},
+		{
+			name: "colorkey then feather with an explicit radius",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff"}), feather(1.5)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=gbrap,gblur=sigma=1.5:planes=8,format=rgba[out]",
+				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
+			},
+		},
+		{
+			name: "feather on an alpha source without a key blurs the source alpha (radius 0 = the default 3)",
+			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{feather(0)}, out: gif(),
+			want: Plan{
+				Filter: "[0:v]fps=20:round=down," + featherDef + "[out]",
+				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
+			},
+		},
+		{
+			// Blurring a constant opaque plane is a no-op that would waste
+			// two conversions, so the stage is dropped entirely.
+			name: "feather on an opaque source without keys is skipped entirely",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{feather(5)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down,format=rgba[out]",
+				Width:  1280, Height: 720, FPS: 29.97, Duration: 10, Frames: 299,
+			},
+		},
+		{
+			name: "feather ops interleave with the keys in stack order on an alpha source",
+			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{feather(2), colorkey(recipe.ColorKeyParams{Color: "313338"}), feather(4)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=20:round=down,format=gbrap,gblur=sigma=2:planes=8,format=rgba," +
+					keyWrapped(1, "format=rgba,colorkey=color=0x313338:similarity=0.1:blend=0") +
+					",format=gbrap,gblur=sigma=4:planes=8,format=rgba[out]",
+				Width: 480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
+			},
+		},
+		{
+			// The frame in front of the key is still opaque, so the first
+			// feather has nothing to blur; the one after the key softens its
+			// matte.
+			name: "on an opaque source a feather before the key is skipped, one after it applies",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{feather(2), chromakey(recipe.ChromaKeyParams{DespillOff: true}), feather(2)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down," + ckNoSpill + ",format=gbrap,gblur=sigma=2:planes=8,format=rgba[out]",
+				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
+			},
+		},
+		{
+			// The radius is in SOURCE pixels: the stage precedes every
+			// geometry op wherever it sits in the stack, so the softness
+			// scales with the image.
+			name: "feather is hoisted in front of the geometry wherever it sits in the stack",
+			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{crop(0, 0, 240, 270), feather(1)}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=20:round=down,format=gbrap,gblur=sigma=1:planes=8,format=rgba,crop=240:270:0:0:exact=1,format=rgba[out]",
+				Width:  240, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
 			},
 		},
 
@@ -882,6 +956,12 @@ func TestCompilePhase3Errors(t *testing.T) {
 		{"colorkey colour with alpha", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffffff"})}, "op 0 (colorkey): key colour"},
 		{"colorkey blend above 1", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff", Blend: 1.01})}, "op 0 (colorkey): blend must be between 0 and 1 (got 1.01)"},
 		{"keying invalid params json", []recipe.ProbeInfo{h264}, []recipe.Op{rawOp(recipe.OpChromaKey, `{"similarity":"lots"}`)}, "op 0 (chromakey): invalid params"},
+		// feather (validated on the opaque h264 source, where the stage would
+		// be skipped: the params are checked either way)
+		{"feather radius above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{feather(51)}, "op 0 (feather): radius must be between 0.1 and 50 px (got 51)"},
+		{"feather radius below the minimum", []recipe.ProbeInfo{h264}, []recipe.Op{feather(0.05)}, "op 0 (feather): radius must be between 0.1 and 50 px (got 0.05)"},
+		{"feather radius negative", []recipe.ProbeInfo{h264}, []recipe.Op{feather(-3)}, "op 0 (feather): radius must be between 0.1 and 50 px (got -3)"},
+		{"feather invalid params json", []recipe.ProbeInfo{h264}, []recipe.Op{rawOp(recipe.OpFeather, `{"radius":"soft"}`)}, "op 0 (feather): invalid params"},
 		// text
 		{"text empty", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{})}, "op 0 (text): text is required"},
 		{"text whitespace only", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: " \n\t"})}, "op 0 (text): text is required"},
@@ -1305,6 +1385,25 @@ func TestCompileDetect(t *testing.T) {
 			want: Plan{
 				Filter: alphaHead1 + "format=rgba[out]",
 				Width:  64, Height: 64, FPS: 10, HasAlpha: true, Frames: 1,
+			},
+		},
+		{
+			// A feather changes which alpha exceeds the autocrop threshold,
+			// so the detection plan carries the gblur stage exactly like the
+			// render (the unresolved autocrop itself is ignored, as always).
+			name: "feather after a wrapped key is part of the detection plan",
+			srcs: []recipe.ProbeInfo{prores}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{DespillOff: true}), feather(2), autocrop(recipe.AutoCropParams{Threshold: 8})},
+			want: Plan{
+				Filter: "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckNoSpill+",format=rgba") + ",format=gbrap,gblur=sigma=2:planes=8,format=rgba[out]",
+				Width:  1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
+			},
+		},
+		{
+			name: "feather on an opaque source is skipped in the detection plan too",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{feather(3)},
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down,format=rgba[out]",
+				Width:  1280, Height: 720, FPS: 29.97, Duration: 10, Frames: 299,
 			},
 		},
 	}

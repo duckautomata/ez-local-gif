@@ -84,7 +84,9 @@ export type OpKind =
   | 'reverse'
   | 'autocrop'
   | 'text'
-  | 'overlay';
+  | 'overlay'
+  // Phase 4 (review R4)
+  | 'feather';
 
 export type FitMode = 'contain' | 'cover' | 'exact';
 
@@ -109,6 +111,16 @@ export interface ColorKeyParams {
   color: string;
   similarity?: number;
   blend?: number;
+}
+/**
+ * Go: recipe.FeatherParams — Gaussian blur of the alpha plane (soft
+ * transparency edge). `radius` is the sigma in SOURCE pixels; 0 (the Go zero
+ * value) means the default 3, valid 0.1..50. The graph hoists the stage with
+ * the keying ops, before any geometry, so the radius scales down with the
+ * output; it skips the stage entirely when the frame carries no alpha there.
+ */
+export interface FeatherParams {
+  radius?: number;
 }
 /** Go: recipe.AutoCropParams — crop to the content box; `resolved` is filled by the server and ignored from a client. */
 export interface AutoCropParams {
@@ -200,7 +212,8 @@ export type OpParams =
   | ColorKeyParams
   | AutoCropParams
   | TextParams
-  | OverlayParams;
+  | OverlayParams
+  | FeatherParams;
 
 /** One step of the non-destructive op stack (Go: recipe.Op; params is json.RawMessage). */
 export interface Op {

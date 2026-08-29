@@ -58,7 +58,17 @@
 //     key's matte instead of overwritten, which makes the filter a
 //     multi-chain graph "…,split[k1][k1m];[k1m]alphaextract[k1a0];[k1]<key>,
 //     split[k1k][k1km];[k1km]alphaextract[k1a1];[k1a0][k1a1]blend=
-//     all_mode=multiply[k1a];[k1k][k1a]alphamerge,…", see keyKeepingAlpha)
+//     all_mode=multiply[k1a];[k1k][k1a]alphamerge,…", see keyKeepingAlpha;
+//     feather ops are hoisted into this same group and interleave with the
+//     keys in their stack order — each emits "format=gbrap,gblur=sigma=R:
+//     planes=8,format=rgba" (gbrap orders the planes G,B,R,A, so planes=8
+//     blurs only the alpha plane; the 8-bit gbrap↔rgba conversions are
+//     lossless plane repacks), R being the Gaussian sigma in SOURCE pixels —
+//     the stage precedes the geometry, so the softness scales with the image
+//     (a 3 px feather on a 720 px source is ~0.5 px after a 128 px emote
+//     fit) — and the stage is skipped entirely while the frame carries no
+//     alpha at that point (blurring a constant opaque plane is a no-op that
+//     would waste two conversions; see compiler.feather))
 //     → the geometry ops in the order given (crop — including a resolved
 //     autocrop —, premultiplied lanczos scale, canvas pad, flip/rotate; each
 //     sees the frame size produced by the previous one) → output fit
@@ -136,7 +146,7 @@
 //     box must be found on the frames the crop will apply to — the source
 //     frame after keying, before any geometry. CompileDetect compiles only
 //     the stages in front of the geometry (source head, unpremultiply,
-//     trim/speed/fps, keying) into a plan with the same contract (InputArgs,
+//     trim/speed/fps, keying, feather) into a plan with the same contract (InputArgs,
 //     a Filter ending in "[out]" at format=rgba, Width x Height = the source
 //     frame) and no ExtraInputs/TextFiles; jobs appends its sampling and
 //     bbox/cropdetect stages after "[out]". Its frames are never materialised,
@@ -324,25 +334,28 @@ func CompileWithSources(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Out
 
 // detectOps are the op kinds CompileDetect applies: everything the stage
 // order puts in front of the geometry (the source head's delay, the alpha
-// head's hoisted unpremultiply, the temporal stages and the keying).
+// head's hoisted unpremultiply, the temporal stages, the keying and the
+// feather — a feather changes which alpha exceeds the autocrop threshold, so
+// the detection must see it exactly like the render does).
 var detectOps = map[string]bool{
 	recipe.OpDelay: true, recipe.OpUnpremultiply: true,
 	recipe.OpTrim: true, recipe.OpSpeed: true, recipe.OpFPS: true,
-	recipe.OpChromaKey: true, recipe.OpColorKey: true,
+	recipe.OpChromaKey: true, recipe.OpColorKey: true, recipe.OpFeather: true,
 }
 
 // CompileDetect compiles the detection plan of the autocrop op: only the
 // stages that precede the geometry — the source head (image sequence /
 // separate alpha stream), the hoisted unpremultiply, trim / speed / fps and
-// the keying ops — so the frames it yields are in SOURCE coordinates, keyed
-// exactly as the render keys them (keying runs before any crop or scale,
-// see CompileWithSources). jobs runs it, with its own sampling and
-// bbox/cropdetect stages appended after "[out]", to find the content box of
-// a keyed clip; the box then becomes the op's Resolved crop.
+// the keying and feather ops — so the frames it yields are in SOURCE
+// coordinates, keyed and feathered exactly as the render keys them (both run
+// before any crop or scale, see CompileWithSources; a feather changes which
+// alpha exceeds the autocrop threshold). jobs runs it, with its own sampling
+// and bbox/cropdetect stages appended after "[out]", to find the content box
+// of a keyed clip; the box then becomes the op's Resolved crop.
 //
 // ops are the ops in front of the autocrop op: those of the kinds in
-// detectOps (delay, unpremultiply, trim, speed, fps, chromakey, colorkey)
-// are applied in the usual stage order and validated like Compile does
+// detectOps (delay, unpremultiply, trim, speed, fps, chromakey, colorkey,
+// feather) are applied in the usual stage order and validated like Compile does
 // (errors name the op by its index in ops); every other kind — geometry,
 // reverse, text, overlay, an autocrop itself, even an unknown kind — is
 // ignored, params unread. srcs is the recipe's source list (only srcs[0],

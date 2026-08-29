@@ -136,10 +136,11 @@ func TestDecodeAutoCropAndDetectionOps(t *testing.T) {
 		{Kind: recipe.OpOverlay, Params: json.RawMessage(`{"source":1}`)},
 		{Kind: recipe.OpFPS, Params: json.RawMessage(`{"fps":10}`)},
 		{Kind: recipe.OpColorKey, Params: json.RawMessage(`{"color":"0000ff"}`)},
+		{Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":2}`)},
 		{Kind: recipe.OpResize, Params: json.RawMessage(`{"width":32}`)},
 	}
 	pre, err := autocropDetectionOps(ops, 6)
-	want := strings.Join([]string{recipe.OpTrim, recipe.OpUnpremultiply, recipe.OpChromaKey, recipe.OpDelay, recipe.OpSpeed, recipe.OpFPS, recipe.OpColorKey}, ",")
+	want := strings.Join([]string{recipe.OpTrim, recipe.OpUnpremultiply, recipe.OpChromaKey, recipe.OpDelay, recipe.OpSpeed, recipe.OpFPS, recipe.OpColorKey, recipe.OpFeather}, ",")
 	if err != nil || kinds(pre) != want {
 		t.Errorf("detection ops = %v (%v); want %v", kinds(pre), err, want)
 	}
@@ -225,11 +226,13 @@ func TestAutocropKey(t *testing.T) {
 		t.Error("key depends on params formatting")
 	}
 	chroma := recipe.Op{Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"00ff00"}`)}
+	feather := recipe.Op{Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":2}`)}
 	for name, other := range map[string]func() (string, error){
 		"threshold": func() (string, error) { return autocropKey(src, []recipe.Op{trim}, 2) },
 		"ops":       func() (string, error) { return autocropKey(src, nil, 1) },
 		"source":    func() (string, error) { return autocropKey(strings.Repeat("b", 64), []recipe.Op{trim}, 1) },
 		"keying":    func() (string, error) { return autocropKey(src, []recipe.Op{trim, chroma}, 1) },
+		"feather":   func() (string, error) { return autocropKey(src, []recipe.Op{trim, feather}, 1) },
 		"key colour": func() (string, error) {
 			return autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"0000ff"}`)}}, 1)
 		},
@@ -243,6 +246,11 @@ func TestAutocropKey(t *testing.T) {
 	}
 	if _, err := autocropKey(src, []recipe.Op{{Kind: recipe.OpTrim, Params: json.RawMessage(`{bad`)}}, 1); !errors.Is(err, ErrInvalidRecipe) {
 		t.Errorf("bad params: %v", err)
+	}
+	// The feather radius is in the key too (a wider feather is a wider box).
+	kFeather, _ := autocropKey(src, []recipe.Op{trim, feather}, 1)
+	if k2, err := autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":5}`)}}, 1); err != nil || k2 == kFeather {
+		t.Errorf("key ignores the feather radius (%v)", err)
 	}
 	// The key is versioned (a bump discards memo entries the old detection
 	// wrote) and carries no padding: that is arithmetic on the raw box.

@@ -30,6 +30,15 @@ const (
 	// MinSimilarity is the smallest accepted key similarity (ffmpeg's own
 	// minimum is 1e-5; anything below 0.01 keys nothing in practice).
 	MinSimilarity = 0.01
+
+	// Feather (recipe.FeatherParams): the default Gaussian sigma and its
+	// bounds, in source pixels.
+	defaultFeatherRadius = 3.0
+	// MinFeatherRadius and MaxFeatherRadius bound a feather op's radius
+	// (below 0.1 the blur is invisible; above 50 the gblur IIR passes cost
+	// real time for an edge wider than any Discord asset).
+	MinFeatherRadius = 0.1
+	MaxFeatherRadius = 50.0
 	// MaxAutoCropPadding bounds recipe.AutoCropParams.Padding.
 	MaxAutoCropPadding = 1024
 
@@ -66,11 +75,12 @@ const (
 const overlayHold = "tpad=stop_mode=clone:stop=-1"
 
 // ---------------------------------------------------------------------------
-// Keying: full resolution, right after the temporal stages, before any crop
-// or scale (DESIGN.md §4.1).
+// Keying and feather: full resolution, right after the temporal stages,
+// before any crop or scale (DESIGN.md §4.1).
 // ---------------------------------------------------------------------------
 
-// keying applies every chromakey / colorkey op in the order given. Each key
+// keying applies every chromakey / colorkey / feather op in the order given
+// (the feather ops interleave with the keys per their stack order). Each key
 // is emitted bare while the frames are opaque and through keyKeepingAlpha
 // once they carry alpha (source alpha, a merged alpha stream, transparent
 // sequence padding or an earlier key): ffmpeg's chromakey and colorkey
@@ -88,11 +98,45 @@ func (c *compiler) keying(ops []decodedOp) error {
 			err = c.chromaKey(d, p)
 		case *recipe.ColorKeyParams:
 			err = c.colorKey(d, p)
+		case *recipe.FeatherParams:
+			err = c.feather(d, p)
 		}
 		if err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// feather softens the alpha edge (recipe.FeatherParams): "format=gbrap,
+// gblur=sigma=R:planes=8,format=rgba". gbrap orders the planes G,B,R,A, so
+// planes=8 (bit 3) blurs only the alpha plane and the colour is untouched;
+// the 8-bit gbrap↔rgba conversions on either side are lossless plane repacks
+// (no range hazard — unlike the >8-bit gbrap copies alphaHead avoids). R is
+// the Gaussian sigma in source pixels, printed like the other float knobs
+// (fnum); 0 means defaultFeatherRadius, anything else must lie in
+// [MinFeatherRadius, MaxFeatherRadius]. The stage sits with the keying ops,
+// before any geometry, so the softness scales with the image (a 3 px feather
+// on a 720 px source is ~0.5 px after a 128 px emote fit).
+//
+// On frames that carry no alpha at this point — an opaque source with no key
+// in front of the op in the stack — the stage is skipped entirely: a blur of
+// a constant opaque plane is a no-op that would waste the two conversions.
+// The params are validated either way.
+func (c *compiler) feather(d decodedOp, p *recipe.FeatherParams) error {
+	r := p.Radius
+	if r == 0 {
+		r = defaultFeatherRadius
+	}
+	if math.IsNaN(r) || math.IsInf(r, 0) || r < MinFeatherRadius || r > MaxFeatherRadius {
+		return opErrorf(d, "radius must be between %s and %s px (got %s)", fexact(MinFeatherRadius), fexact(MaxFeatherRadius), fexact(p.Radius))
+	}
+	if !c.hasAlpha {
+		return nil
+	}
+	c.emit("format=gbrap")
+	c.emit("gblur=sigma=" + fnum(r) + ":planes=8")
+	c.emit("format=rgba")
 	return nil
 }
 

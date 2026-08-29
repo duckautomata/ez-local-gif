@@ -5,7 +5,7 @@
   import { fitsFormat } from '../lib/presets';
   import { startRender } from '../lib/render.svelte';
   import { descLine, groupFiles, isFramesResult, isImageFormat, sizeState } from '../lib/result';
-  import type { Backdrop } from '../lib/state.svelte';
+  import { app } from '../lib/state.svelte';
   import { toast } from '../lib/toast.svelte';
   import BackdropToggle from './BackdropToggle.svelte';
   import DiscordChecks from './DiscordChecks.svelte';
@@ -17,8 +17,10 @@
   }
   let { result, running }: Props = $props();
 
-  // Judge transparency against Discord dark first; independent of the source preview.
-  let backdrop = $state<Backdrop>('dark');
+  // Judge transparency against Discord dark first; independent of the source
+  // preview. Lives in app.ui (not here): the card remounts on every render,
+  // and the choice must survive "Render again" (review R1).
+  const backdrop = $derived(app.ui.resultBackdrop);
   let showTools = $state(false);
   let showRecipe = $state(false);
   /** names of files whose "edit as source" request is in flight */
@@ -100,7 +102,7 @@
             ? `${(result.renderMs / 1000).toFixed(1)} s`
             : `${result.renderMs} ms`}{/if}
       </span>
-      {#if !framesResult}<BackdropToggle bind:value={backdrop} />{/if}
+      {#if !framesResult}<BackdropToggle bind:value={app.ui.resultBackdrop} />{/if}
     </div>
   </div>
 

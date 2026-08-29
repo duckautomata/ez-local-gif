@@ -1,7 +1,8 @@
 <script lang="ts">
   import type { ProbeInfo } from '../../lib/api';
+  import { heightForWidth, ratioLabel, widthForHeight } from '../../lib/croprect';
   import { clamp } from '../../lib/format';
-  import { app, backgroundOp } from '../../lib/state.svelte';
+  import { app, backgroundOp, centerSquareCrop, setCropRatioLock } from '../../lib/state.svelte';
   import NumField from '../NumField.svelte';
   import OpCard from '../OpCard.svelte';
 
@@ -14,6 +15,8 @@
 
   const crop = $derived(app.ops.crop);
   const auto = $derived(app.ops.autocrop);
+  /** the locked w:h aspect ratio (> 0 = "Lock ratio" on; review R2) */
+  const lockedRatio = $derived(app.ui.cropRatio);
   // Keying runs before the detection (DESIGN §4.3: keying precedes all
   // geometry), so with a Background op on auto-crop finds the box of what is
   // left after background removal — and that content has alpha whatever the
@@ -69,19 +72,37 @@
     c.x = clamp(Math.round(c.x), 0, info.width - c.w);
     c.y = clamp(Math.round(c.y), 0, info.height - c.h);
   }
+  /** an edited W drags H along while the ratio is locked (H = round(W / ratio)). */
+  function onWidth() {
+    fix();
+    if (lockedRatio > 0) {
+      app.ops.crop.h = heightForWidth(app.ops.crop.w, lockedRatio, info.height);
+      fix();
+    }
+  }
+  /** an edited H drags W along while the ratio is locked (W = round(H × ratio)). */
+  function onHeight() {
+    fix();
+    if (lockedRatio > 0) {
+      app.ops.crop.w = widthForHeight(app.ops.crop.h, lockedRatio, info.width);
+      fix();
+    }
+  }
+  /**
+   * The lock is a UI constraint, not part of the op — like onAutoChange it
+   * must not fall through to the card's auto-enable, so both events are
+   * handled (idempotently) and stopped.
+   */
+  function onLockChange(e: Event & { currentTarget: HTMLInputElement }) {
+    setCropRatioLock(e.currentTarget.checked);
+    e.stopPropagation();
+  }
   /** resetCrop clears the crop: op off, rectangle back to the full frame. */
   function resetCrop() {
     app.ops.crop = { enabled: false, x: 0, y: 0, w: info.width, h: info.height };
   }
   function centerSquare() {
-    const s = Math.min(info.width, info.height);
-    app.ops.crop = {
-      enabled: true,
-      x: Math.floor((info.width - s) / 2),
-      y: Math.floor((info.height - s) / 2),
-      w: s,
-      h: s,
-    };
+    centerSquareCrop(info.width, info.height);
   }
 </script>
 
@@ -111,8 +132,12 @@
   <div class="row" class:off={auto.enabled}>
     <label class="field"><span>X</span><NumField bind:value={app.ops.crop.x} min={0} max={info.width - 1} small onchange={fix} disabled={auto.enabled} /></label>
     <label class="field"><span>Y</span><NumField bind:value={app.ops.crop.y} min={0} max={info.height - 1} small onchange={fix} disabled={auto.enabled} /></label>
-    <label class="field"><span>Width</span><NumField bind:value={app.ops.crop.w} min={1} max={info.width} small onchange={fix} disabled={auto.enabled} /></label>
-    <label class="field"><span>Height</span><NumField bind:value={app.ops.crop.h} min={1} max={info.height} small onchange={fix} disabled={auto.enabled} /></label>
+    <label class="field"><span>Width</span><NumField bind:value={app.ops.crop.w} min={1} max={info.width} small onchange={onWidth} disabled={auto.enabled} /></label>
+    <label class="field"><span>Height</span><NumField bind:value={app.ops.crop.h} min={1} max={info.height} small onchange={onHeight} disabled={auto.enabled} /></label>
+    <label class="inline" title="Keep the current aspect ratio while drawing, resizing and editing W/H (X/Y and moves are unaffected)">
+      <input type="checkbox" checked={lockedRatio > 0} oninput={onLockChange} onchange={onLockChange} disabled={auto.enabled} aria-label="Lock crop aspect ratio" />
+      <span>{lockedRatio > 0 ? `Lock ratio (${ratioLabel(lockedRatio)})` : 'Lock ratio'}</span>
+    </label>
     <button type="button" class="sm" onclick={centerSquare} disabled={auto.enabled} title="Largest centred square (handy for emotes)">Centre square</button>
     <button type="button" class="sm ghost" onclick={resetCrop} disabled={auto.enabled} title="Clear the crop — back to the full {info.width}×{info.height} frame" aria-label="Reset crop">Reset crop</button>
   </div>
@@ -129,8 +154,8 @@
       {/if}
       Emotes render at ~22 px — cropping to content makes them readable.
     {:else}
-      Drag on the preview to draw the rectangle, drag inside it to move. Coordinates are source pixels (before resize,
-      flip and rotate). The preview shows the full frame while this card is open.
+      Drag on the preview to draw, drag inside to move, drag an edge or corner to resize. Coordinates are source
+      pixels (before resize, flip and rotate). The preview shows the full frame while this card is open.
     {/if}
   </p>
 </OpCard>

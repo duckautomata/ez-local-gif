@@ -125,10 +125,36 @@ const (
 	OpChromaKey = "chromakey" // ChromaKeyParams — greenscreen/bluescreen keying in YUV 4:4:4 + despill
 	OpColorKey  = "colorkey"  // ColorKeyParams — make one RGB colour (eyedropper) transparent
 	OpReverse   = "reverse"   // no params — play backwards (after the geometry stages; trim applies in source time)
+	OpBounce    = "bounce"    // Phase 4, no params — forward then backward ("ping-pong"): frames and duration double; emitted after the output fit like reverse; stills/proxies of a bounced plan are never seeked
 	OpAutoCrop  = "autocrop"  // AutoCropParams — crop to the content bounding box (resolved by jobs before compiling)
 	OpText      = "text"      // TextParams — drawtext overlay
 	OpOverlay   = "overlay"   // OverlayParams — image / animated image / video overlay from Recipe.Sources[Source]
 )
+
+// OpFeather (Phase 3 review) softens the frame's alpha edge (FeatherParams).
+// Like the keying ops it runs at full resolution: the compiler hoists it into
+// the keying group, right after the keys, before any geometry.
+const OpFeather = "feather"
+
+// FeatherParams softens the alpha edge with a Gaussian blur of the alpha
+// plane only (a "feather" / "soft edge"); the colour planes are untouched.
+// Radius is the Gaussian sigma in SOURCE pixels: 0 means the default 3,
+// anything else must lie in 0.1..50 (a compile error otherwise). The visible
+// soft edge spans roughly 2-3x Radius, which is how the UI labels the knob
+// ("Feather — N px (soft edge ≈ 2–3×N)").
+//
+// The stage is hoisted with the keying ops: it is emitted right after them,
+// before any geometry (crop/autocrop/resize/canvas/flip/rotate), wherever it
+// sits in the stack, and several feather ops interleave with the keys in
+// their stack order. Because it precedes the geometry, the radius scales
+// with the image — a 3 px feather on a 720 px source is ~0.5 px after a
+// 128 px emote fit. On frames that carry no alpha at that point (an opaque
+// source with no key in front of it in the stack) the stage is skipped
+// entirely: blurring a constant opaque plane changes nothing and would waste
+// two format conversions. Its params are validated either way.
+type FeatherParams struct {
+	Radius float64 `json:"radius,omitempty"`
+}
 
 // ChromaKeyParams keys out a colour in YUV (soft edges). Zero values:
 // Color "00ff00", Similarity 0.2 (0.01..1), Blend 0.05 (0..1), Despill
@@ -307,6 +333,8 @@ const (
 	FormatPNG    = "png"    // Phase 2, static
 	FormatJPEG   = "jpeg"   // Phase 2, static (flattened onto Matte)
 	FormatFrames = "frames" // Phase 2, frame extraction (FrameFormat per frame + frames.zip)
+	FormatMP4    = "mp4"    // Phase 4, opaque video: H.264 yuv420p, CRF quality/fit knob, +faststart, flattened onto Matte, even dims
+	FormatWebM   = "webm"   // Phase 4, opaque video: VP9 yuv420p, CRF quality/fit knob, flattened onto Matte, even dims
 )
 
 // IsAnimatedFormat reports whether f can hold more than one frame.
