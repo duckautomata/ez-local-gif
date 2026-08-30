@@ -10,7 +10,76 @@ on:
     workflow_dispatch:
 
 jobs:
+    # Mirrors the `go` job in test.yml — keep the steps identical in both files.
+    go-test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+            - name: Setup Go
+              uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+              with:
+                  go-version-file: "go.mod"
+
+            - name: Format Check
+              run: |
+                  unformatted=$(gofmt -l ./cmd ./internal)
+                  if [ -n "$unformatted" ]; then
+                      echo "gofmt needed on:"
+                      echo "$unformatted"
+                      exit 1
+                  fi
+
+            - name: Vet
+              run: go vet ./...
+
+            # Tests that need real ffmpeg/gifsicle/... skip themselves when the
+            # tool is not on PATH; do NOT install ffmpeg here (ubuntu ships an
+            # old major, the code targets FFmpeg 9 — clean skips are correct).
+            - name: Run Tests
+              run: go test ./...
+
+    # Mirrors the `web` job in test.yml — keep the steps identical in both files.
+    web-test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+        defaults:
+            run:
+                working-directory: web
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+            - name: Setup Node.js
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: "22"
+
+            - name: Install Dependencies
+              run: npm ci
+
+            - name: Verify Package Signatures
+              run: npm audit signatures --min-release-age=0
+
+            - name: Svelte Check
+              run: npm run check
+
+            - name: Run Tests
+              run: npm test -- --run
+
+            - name: Build Static Files
+              run: npm run build
+
     build-push:
+        needs: [go-test, web-test]
         runs-on: ubuntu-latest
         timeout-minutes: 45
         permissions:
@@ -29,8 +98,8 @@ jobs:
             - name: Login to Docker Hub
               uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
               with:
-                  username: ${{ secrets.DOCKERHUB_USERNAME }}
-                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_TOKEN }}
 
             - name: Build and Push Runtime Image
               uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

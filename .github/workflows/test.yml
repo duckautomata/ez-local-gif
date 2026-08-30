@@ -7,10 +7,9 @@ concurrency:
 on:
     pull_request:
         branches: ["master"]
-    push:
-        branches: ["master"]
 
 jobs:
+    # Mirrored as `go-test` in docker-image.yml — keep the steps identical in both files.
     go:
         runs-on: ubuntu-latest
         timeout-minutes: 15
@@ -44,6 +43,7 @@ jobs:
             - name: Run Tests
               run: go test ./...
 
+    # Mirrored as `web-test` in docker-image.yml — keep the steps identical in both files.
     web:
         runs-on: ubuntu-latest
         timeout-minutes: 10

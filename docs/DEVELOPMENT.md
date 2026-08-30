@@ -95,12 +95,14 @@ when the BtbN autobuild tag is pruned (daily tags live ~2 weeks, month-end tags 
 
 ## CI
 
-`.github/workflows/docker-image.yml` builds the `runtime` target on every push to `master` (and
-on manual dispatch) and pushes it to Docker Hub as `duckautomata/ez-local-gif:latest`, stamping
-the binary with the short commit SHA via the `VERSION` build-arg. The workflow needs two
-repository Actions secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access
-token with Read & Write scope). The Docker Hub repository `duckautomata/ez-local-gif` is created
-on the first push.
+`.github/workflows/test.yml` runs the full test suite on every pull request: gofmt/vet/`go test`
+for the Go side, and `npm run check` / `npm test` / `npm run build` for `web/`.
+`.github/workflows/docker-image.yml` runs on every push to `master` (and on manual dispatch):
+it repeats the same two test jobs and, only once both pass, builds the `runtime` target and
+pushes it to Docker Hub as `duckautomata/ez-local-gif:latest`, stamping the binary with the
+short commit SHA via the `VERSION` build-arg. The workflow needs two repository Actions
+secrets: `DOCKER_USERNAME` and `DOCKER_TOKEN` (a Docker Hub access token with Read & Write
+scope). The Docker Hub repository `duckautomata/ez-local-gif` is created on the first push.
 
 ## Discord acceptance test
 
