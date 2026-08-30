@@ -42,7 +42,7 @@
 # OUTDIR must be writable by the current uid. In the runtime container
 # /output is compose.yaml's ./output bind: if the Docker daemon auto-created
 # that folder it is root-owned and uid 1000 cannot write to it — the kit
-# stops early with a chown hint (README.md "Troubleshooting").
+# stops early with a chown hint (docs/USAGE.md "Troubleshooting").
 #
 # Scratch (the RGBA masters, ~W×H×4 bytes per frame) goes to
 # /dev/shm/ezl-testkit when /dev/shm is writable and has ≥ 256 MiB free

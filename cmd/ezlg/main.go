@@ -282,6 +282,6 @@ func runServer(ctx context.Context, cfg serveConfig, ln net.Listener) error {
 func runTestkit(args []string) error {
 	fmt.Println("Phase 1: the Discord test-variant generator is a bash script baked into the image. Run it with:")
 	fmt.Println("  docker compose run --rm --entrypoint bash app /usr/local/share/ezlg/discord-testkit.sh /output/testkit")
-	fmt.Println("(compose.yaml mounts ./output:/output; see README.md 'Discord acceptance test')")
+	fmt.Println("(compose.yaml mounts ./output:/output; see docs/DEVELOPMENT.md 'Discord acceptance test')")
 	return nil
 }

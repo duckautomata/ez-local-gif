@@ -16,7 +16,7 @@
 #
 # The Go server is not auto-restarted on edits: `docker compose ... restart app`
 # (or run everything by hand in `... run --rm --service-ports app bash`, see
-# README.md "Development loop").
+# docs/DEVELOPMENT.md "Development loop").
 #
 # The dev container runs as root, so on Linux / WSL-distro hosts everything it
 # writes into a bind mount is root-owned. That is why /data and /output get
