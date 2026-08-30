@@ -25,8 +25,9 @@ import (
 // a blob — or several "file" parts that together form an image sequence:
 // every part must be a still image the image2 demuxer can open (png, jpeg,
 // webp, bmp or tiff — by extension, or by content when the name has no
-// recognised image extension; gif and avif have no image2 codec mapping, so
-// they are refused as sequence frames and upload one at a time), all frames
+// recognised image extension; gif and avif have no image2 codec mapping, and
+// animated WebP/APNG content is caught by sniffAnimated, so all of those are
+// refused as sequence frames and upload one at a time), all frames
 // must share one effective extension (the image2 pattern), and the frames
 // are ordered naturally by file name ("frame2.png" before "frame10.png")
 // whatever order the client sent them in. The optional "delayMs" field
@@ -104,10 +105,15 @@ type uploadPart struct {
 }
 
 // newUploadPart derives a part's sequence facts from its client name and
-// leading bytes.
+// leading bytes. Animated content (animated WebP, APNG) is never
+// sequence-eligible whatever its extension says: image2 would silently
+// decode only the first frame, so like gif/avif it uploads one at a time.
 func newUploadPart(fileName string, head []byte) uploadPart {
 	name := lastPathElement(fileName)
 	p := uploadPart{name: name, storeName: name}
+	if sniffAnimated(head) {
+		return p
+	}
 	if ext := store.SanitizeExt(name); sequenceImageExts[ext] {
 		p.seqExt = ext
 	} else if sniffed := sniffImage(head); sequenceImageExts[sniffed] {
@@ -307,7 +313,7 @@ func checkSequencePart(p uploadPart, empty bool, i int) error {
 		return badUpload("file %d (%s) is empty", i, p.name)
 	}
 	if p.seqExt == "" {
-		return badUpload("several files are uploaded as an image sequence, but file %d (%s) is not an image the sequence pipeline can read (png, jpeg, webp, bmp, tiff); upload videos and animations (gif, avif) one at a time", i, p.name)
+		return badUpload("several files are uploaded as an image sequence, but file %d (%s) is not an image the sequence pipeline can read (png, jpeg, webp, bmp, tiff); upload videos and animations (gif, avif, animated webp, apng) one at a time", i, p.name)
 	}
 	return nil
 }
@@ -376,6 +382,58 @@ func sniffImage(head []byte) string {
 		return "avif"
 	}
 	return ""
+}
+
+// sniffAnimated reports whether head is animated image content that must not
+// become a sequence frame: an animated WebP (VP8X Animation flag or an ANIM
+// chunk) or an APNG (acTL before the first IDAT). It mirrors the client-side
+// sniff in web/src/lib/files.ts (sniffAnimated; SNIFF_HEAD_BYTES there ==
+// sniffLen here), so the browser's drop classification and this backstop
+// agree on the same leading bytes.
+func sniffAnimated(head []byte) bool {
+	return isAnimatedWebP(head) || isAPNG(head)
+}
+
+// isAnimatedWebP walks the RIFF chunks of a WebP head looking for a VP8X
+// chunk with the Animation feature bit (0x02 in the flags byte, file offset
+// 20) or an ANIM chunk. Chunks cut off by the sniff window end the walk.
+func isAnimatedWebP(head []byte) bool {
+	if len(head) < 12 || !bytes.Equal(head[:4], []byte("RIFF")) || !bytes.Equal(head[8:12], []byte("WEBP")) {
+		return false
+	}
+	for off := 12; off+8 <= len(head); {
+		size := int(binary.LittleEndian.Uint32(head[off+4 : off+8]))
+		switch string(head[off : off+4]) {
+		case "VP8X":
+			// The feature flags byte is the first payload byte.
+			if off+8 < len(head) && head[off+8]&0x02 != 0 {
+				return true
+			}
+		case "ANIM":
+			return true
+		}
+		off += 8 + size + size&1 // payloads are padded to even length
+	}
+	return false
+}
+
+// isAPNG walks the PNG chunks of a head looking for acTL before the first
+// IDAT/IEND, so acTL bytes inside another chunk's data never misfire.
+func isAPNG(head []byte) bool {
+	if !bytes.HasPrefix(head, []byte("\x89PNG\r\n\x1a\n")) {
+		return false
+	}
+	for off := 8; off+8 <= len(head); {
+		length := int(binary.BigEndian.Uint32(head[off : off+4]))
+		switch string(head[off+4 : off+8]) {
+		case "acTL":
+			return true
+		case "IDAT", "IEND":
+			return false
+		}
+		off += 12 + length // length + type + data + crc
+	}
+	return false
 }
 
 // isAVIF reports whether head opens with an ISOBMFF ftyp box whose major or

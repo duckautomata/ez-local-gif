@@ -236,8 +236,12 @@ func Generic(format string, masterFPS float64, w, h int, keepSize, keepFPS bool)
 // 0, harsh 2); jpeg → 100-quality 10..80.
 //
 // Additions: png (static, pngquant) shares the apng colour-step knob; jpeg
-// probes mild 20 (q80) / harsh 60 (q40); any other format gets a generic
-// "level" knob 0..100 (mild 20, harsh 70). Names are the Knob* constants.
+// probes mild 20 (q80) / harsh 60 (q40); mp4/webm (Phase 4) search the
+// encoder CRF itself — x264 12..40 (mild 18), vp9 15..55 (mild 30), the
+// value going verbatim into enc.MP4Options.CRF / enc.WebMOptions.CRF (a
+// video fit ladder is a single knob-only rung: []Rung{{Format: format}});
+// any other format gets a generic "level" knob 0..100 (mild 20, harsh 70).
+// Names are the Knob* constants.
 // Ladder-built APNG/PNG rungs with an explicit palette carry a per-rung
 // Rung.Knob override bounding the steps by their own colours (a 64-colour
 // rung is a single probe), so the search never quantises below 64.

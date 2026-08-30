@@ -11,12 +11,21 @@
 //	EZLG_SCRATCH         scratch (tmpfs) root      (default "/dev/shm/ezl", falls back to $TMPDIR/ezl)
 //	EZLG_TTL_HOURS       delete blobs/results older than this (default 24; 0 = never)
 //	EZLG_MAX_BYTES       cap on total /data size in bytes (default 20 GiB; 0 = none)
-//	EZLG_MAX_UPLOAD_MB   max upload size            (default 2048)
+//	EZLG_MAX_UPLOAD_MB   max upload size            (default 2048); also caps what one
+//	                     POST /api/sources/from-input pick may ingest from /input
+//	                     (jobs.Options.MaxUploadBytes) — an over-limit pick is a 413
+//	                     like an upload of the same bytes
 //	EZLG_CONCURRENCY     concurrent renders         (default max(1, NumCPU/2))
 //	EZLG_MAX_MASTER_BYTES cap on one render's RGBA frame master in bytes (default 2 GiB =
 //	                     2147483648; <= 0 keeps the default). A recipe whose master would
 //	                     exceed it is refused up-front (jobs.Options.MaxMasterBytes) — the
 //	                     error names this variable, so it must be a real knob.
+//	EZLG_OUTPUT          "Save to /output" directory (default "/output"); checked once at
+//	                     startup — when it is missing or not writable the save feature is
+//	                     off (capabilities features.outputSave false, the endpoint answers 503)
+//	EZLG_INPUT           read-only "pick from /input" directory (default "/input"); checked
+//	                     once at startup like EZLG_OUTPUT (features.inputPick); the listing
+//	                     itself is read per request
 //	EZLG_FFMPEG etc.     override tool paths (see ffrun.LookupTools; EZLG_FC_LIST for the
 //	                     fontconfig fc-list behind GET /api/fonts)
 //
@@ -111,6 +120,11 @@ type serveConfig struct {
 	// maxMaster is jobs.Options.MaxMasterBytes (EZLG_MAX_MASTER_BYTES); <= 0
 	// lets the manager apply jobs.DefaultMaxMasterBytes.
 	maxMaster int64
+	// outputDir/inputDir are jobs.Options.OutputDir/InputDir (EZLG_OUTPUT /
+	// EZLG_INPUT, Phase 4); the manager disables the matching feature when
+	// the directory is not usable at startup.
+	outputDir string
+	inputDir  string
 	drain     time.Duration
 }
 
@@ -124,6 +138,8 @@ func serveConfigFromEnv() serveConfig {
 		maxUpload: envInt("EZLG_MAX_UPLOAD_MB", 2048) << 20,
 		conc:      int(envInt("EZLG_CONCURRENCY", int64(max(1, runtime.NumCPU()/2)))),
 		maxMaster: envInt("EZLG_MAX_MASTER_BYTES", jobs.DefaultMaxMasterBytes),
+		outputDir: envStr("EZLG_OUTPUT", "/output"),
+		inputDir:  envStr("EZLG_INPUT", "/input"),
 		drain:     drainTimeout,
 	}
 }
@@ -163,9 +179,27 @@ func runServer(ctx context.Context, cfg serveConfig, ln net.Listener) error {
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
 	}
-	jm := jobs.NewManager(st, tools, jobs.Options{Concurrency: cfg.conc, MaxMasterBytes: cfg.maxMaster})
+	// One resolved upload cap for both layers: the HTTP upload path
+	// (server.Config.MaxUploadBytes) and the /input picker's ingest
+	// (jobs.Options.MaxUploadBytes) must agree, or a pick could ingest what
+	// an upload of the same bytes would refuse with 413. NewServer would
+	// substitute the default itself for a <= 0 value; resolving it here
+	// keeps the manager on the identical number.
+	maxUpload := cfg.maxUpload
+	if maxUpload <= 0 {
+		maxUpload = server.DefaultMaxUploadBytes
+	}
+	jm := jobs.NewManager(st, tools, jobs.Options{
+		Concurrency:    cfg.conc,
+		MaxMasterBytes: cfg.maxMaster,
+		OutputDir:      cfg.outputDir,
+		InputDir:       cfg.inputDir,
+		MaxUploadBytes: maxUpload,
+	})
+	log.Printf("phase 4 file exchange: save to %s = %v (EZLG_OUTPUT), pick from %s = %v (EZLG_INPUT)",
+		cfg.outputDir, jm.OutputSaveEnabled(), cfg.inputDir, jm.InputPickEnabled())
 
-	h := server.NewServer(server.Config{MaxUploadBytes: cfg.maxUpload, Version: Version}, st, jm, tools, web.Dist())
+	h := server.NewServer(server.Config{MaxUploadBytes: maxUpload, Version: Version}, st, jm, tools, web.Dist())
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,

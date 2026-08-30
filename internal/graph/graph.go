@@ -15,7 +15,8 @@
 //     (recipe.ProbeInfo.AlphaStream > 0, e.g. AVIF): those start with
 //     "[0:v:0]format=rgba[c];[0:v:N]format=gray[a];[c][a]alphamerge," and
 //     the chain follows; a key applied to frames that already carry alpha
-//     (keyKeepingAlpha) and every overlay (below) add chains of their own.
+//     (keyKeepingAlpha), every bounce op (its split/reverse/concat, see
+//     below) and every overlay (below) add chains of their own.
 //     The last chain always ends in "[out]", so consumers that append to
 //     the filter (";[out]…") work either way.
 //   - Image sequences (recipe.KindSequence, ProbeInfo.Sequence set) are read
@@ -72,11 +73,20 @@
 //     → the geometry ops in the order given (crop — including a resolved
 //     autocrop —, premultiplied lanczos scale, canvas pad, flip/rotate; each
 //     sees the frame size produced by the previous one) → output fit
-//     (Output.Width/Height/Fit) → reverse (Phase 3: ffmpeg's reverse filter,
+//     (Output.Width/Height/Fit) → reverse and bounce (Phase 3/4, one group
+//     preserving their stack order: reverse is ffmpeg's reverse filter,
 //     emitted as "format=rgba,reverse" after the output fit, so the filter —
 //     which holds every frame until EOF — buffers frames at the output size
 //     and at 4 B/px, which MaxMasterBytes (and jobs' master estimate)
-//     bounds) → the final-canvas ops (Phase 3: text and overlays in the
+//     bounds; each bounce op (Phase 4) closes the chain into a split and
+//     concatenates the frames with their own reversal — "format=rgba,
+//     split[fN][rN];[rN]reverse[rrN];[fN][rrN]concat=n=2:v=1:a=0," and the
+//     chain continues — doubling Frames and Duration (Plan.Bounced is set;
+//     the reverse branch buffers at the output size and 4 B/px exactly like
+//     a plain reverse). A bounce yields a palindrome, which a reverse leaves
+//     bit-identical, so only the reverse parity in front of the first bounce
+//     emits a reverse filter; reverse ops behind a bounce are dropped
+//     (see compiler.reverse)) → the final-canvas ops (Phase 3: text and overlays in the
 //     order given, on the output canvas, which is forced to rgba first) →
 //     format=rgba. Apart from the webp_anim case above, trim never becomes a
 //     filter: it is expressed as -ss/-to input seek args (source time,
@@ -244,8 +254,24 @@ type Plan struct {
 	ExtraInputs []ExtraInput
 	// Reversed is true when a reverse op is in the chain: output time t
 	// corresponds to source time TrimStart + (Duration - t)*Speed, which the
-	// still/proxy seek logic must honour.
+	// still/proxy seek logic must honour. (With bounce ops in the stack only
+	// the reverse parity in front of the first bounce counts — a bounce
+	// yields a palindrome, which further reverses leave unchanged — and
+	// Reversed then reports the direction of the forward half.)
 	Reversed bool
+
+	// Phase 4.
+
+	// Bounced is true when the chain holds at least one bounce op: the
+	// master plays forward then mirrored ("ping-pong"), and Duration and
+	// Frames are already doubled per bounce. Stills/proxies of a bounced
+	// plan must NEVER seek the input: an output time t < D maps forward
+	// onto the source and t >= D maps mirrored (D being the pre-bounce
+	// duration), so no single -ss/-to lands the wanted frame — enc treats
+	// Bounced like SeekUnsafe (decode from the start / TrimStart and pick
+	// the frame by output time). That rule is enc's to implement; this flag
+	// only reports the fact.
+	Bounced bool
 	// TextFiles lists every text op's body in filter order. The compiler
 	// emits "textfile=<Placeholder>" (a token of letters, digits and
 	// underscores; once per drawtext stage the op compiles to — a translucent
@@ -325,7 +351,9 @@ func CompileWithSources(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Out
 	if err := c.outputFit(); err != nil {
 		return nil, err
 	}
-	c.reverse(decoded)
+	if err := c.reverse(decoded); err != nil {
+		return nil, err
+	}
 	if err := c.finalCanvas(decoded); err != nil {
 		return nil, err
 	}
@@ -353,12 +381,16 @@ var detectOps = map[string]bool{
 // and bbox/cropdetect stages appended after "[out]", to find the content box
 // of a keyed clip; the box then becomes the op's Resolved crop.
 //
-// ops are the ops in front of the autocrop op: those of the kinds in
-// detectOps (delay, unpremultiply, trim, speed, fps, chromakey, colorkey,
-// feather) are applied in the usual stage order and validated like Compile does
-// (errors name the op by its index in ops); every other kind — geometry,
-// reverse, text, overlay, an autocrop itself, even an unknown kind — is
-// ignored, params unread. srcs is the recipe's source list (only srcs[0],
+// ops are the stack's detection-kind ops, wherever they sit relative to the
+// autocrop: the compiler hoists every kind in detectOps (delay,
+// unpremultiply, trim, speed, fps, chromakey, colorkey, feather) in front of
+// the geometry regardless of its position in the stack, so a key or feather
+// BEHIND the autocrop shapes the rendered picture too and must shape the
+// detected box — jobs' autocropDetectionOps collects them from the whole
+// stack. The detectOps kinds are applied in the usual stage order and
+// validated like Compile does (errors name the op by its index in ops);
+// every other kind — geometry, reverse, text, overlay, an autocrop itself,
+// even an unknown kind — is ignored, params unread. srcs is the recipe's source list (only srcs[0],
 // the main source, is read; the overlay sources are irrelevant without
 // overlay ops). There is no Output: the fps is the fps op's, else the
 // source's, capped at MaxFPS.

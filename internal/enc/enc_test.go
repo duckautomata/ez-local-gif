@@ -384,6 +384,18 @@ func TestStillArgsFromStart(t *testing.T) {
 		assertArgs(t, got, want)
 	})
 
+	t.Run("unknown length huge t caps the slot at maxStillIndex", func(t *testing.T) {
+		// No TrimEnd/Duration/Frames: nothing clamps t, so the slot cap
+		// (1<<20, as for reversed stills) has to bound the tpad/select work:
+		// threshold (2^20 - 0.5)/25 = 41943.02, pad 2^20/25 + 1 = 41944.04.
+		p := testPlan()
+		p.InputArgs = nil
+		p.TrimStart, p.TrimEnd, p.Duration, p.Frames = 0, 0, 0, 0
+		got := StillArgsFromStart(src, p, 1e9, 0)
+		want := stillTail(stillFilter(planFilter, "41944.04", "41943.02", ""))
+		assertArgs(t, got, want)
+	})
+
 	t.Run("nil plan", func(t *testing.T) {
 		if got := StillArgsFromStart(src, nil, 1, 480); got != nil {
 			t.Fatalf("nil plan: got %v, want nil", got)

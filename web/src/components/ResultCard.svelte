@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { downloadURL, type Result, type ResultFile } from '../lib/api';
+  import { downloadURL, isVideoFormat, messageOf, saveResult, type Result, type ResultFile } from '../lib/api';
+  import { caps } from '../lib/capabilities.svelte';
   import { browserTabOpener, editAsSource } from '../lib/editsource';
   import { fmtBytes, fmtKiB, fmtNum, fmtSeconds } from '../lib/format';
   import { fitsFormat } from '../lib/presets';
@@ -43,6 +44,26 @@
   // Discord target a finite count is a legitimate choice, not a warning.
   const loopCount = $derived(result.recipe.output.loop ?? 0);
   const nothing = $derived((result.files ?? []).length === 0);
+
+  // "Save to /output" (Phase 4, features.outputSave): POST
+  // /api/results/{recipeHash}/save {file} — the server picks a
+  // collision-safe name in the mounted /output directory and returns it.
+  const canSave = $derived(caps.features.outputSave);
+  let saving = $state<Record<string, boolean>>({});
+  let savedAs = $state<Record<string, string>>({});
+  async function save(f: ResultFile) {
+    if (saving[f.name]) return;
+    saving[f.name] = true;
+    try {
+      const name = await saveResult(result.recipeHash, f.name);
+      savedAs[f.name] = name;
+      toast.success(`Saved to /output as ${name}`);
+    } catch (e) {
+      toast.error(`Save to /output failed: ${messageOf(e)}`);
+    } finally {
+      delete saving[f.name];
+    }
+  }
 
   const openTab = browserTabOpener();
   async function edit(f: ResultFile) {
@@ -90,7 +111,17 @@
     <button type="button" onclick={() => void edit(f)} disabled={!!editing[f.name]} title="Register this file as a source and open it in a new tab">
       {editing[f.name] ? 'Opening…' : 'Edit as source ↗'}
     </button>
+    {@render saveBtn(f)}
   </div>
+{/snippet}
+
+{#snippet saveBtn(f: ResultFile)}
+  {#if canSave}
+    <button type="button" onclick={() => void save(f)} disabled={!!saving[f.name]} title="Write this file into the server's /output directory (collision-safe name)">
+      {saving[f.name] ? 'Saving…' : 'Save to /output'}
+    </button>
+    {#if savedAs[f.name]}<span class="hint saved" title="Saved into /output">→ /output/{savedAs[f.name]}</span>{/if}
+  {/if}
 {/snippet}
 
 <section class="card result">
@@ -116,6 +147,9 @@
       <div class="stage backdrop-{backdrop}">
         {#if isImageFormat(f.format)}
           <img src={f.url} alt="Rendered {f.format}" draggable="true" />
+        {:else if isVideoFormat(f.format)}
+          <!-- svelte-ignore a11y_media_has_caption -- generated clips have no audio track (-an) -->
+          <video src={f.url} controls loop muted playsinline></video>
         {:else}
           <span class="muted">{f.name}</span>
         {/if}
@@ -154,6 +188,7 @@
         <button type="button" onclick={() => void edit(f)} disabled={!!editing[f.name]} title="Register this file as a source and open it in a new tab">
           {editing[f.name] ? 'Opening…' : 'Edit as source ↗'}
         </button>
+        {@render saveBtn(f)}
         <button type="button" onclick={() => void startRender()} disabled={running}>Render again</button>
         <span class="hint">Drag the image straight into Discord to upload it.</span>
       </div>
@@ -297,6 +332,14 @@
     max-width: 100%;
     max-height: calc(60vh - 26px);
     display: block;
+  }
+  .stage video {
+    max-width: 100%;
+    max-height: calc(60vh - 26px);
+    display: block;
+  }
+  .saved {
+    align-self: center;
   }
   .stage.small {
     min-height: 90px;

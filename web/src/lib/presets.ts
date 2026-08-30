@@ -1,6 +1,6 @@
 // Discord presets, targets and limits (docs/DESIGN.md §5.1, §5.4, §9a).
 
-import type { Dither, FitMode, FrameFormat, OutputFormat, PresetId, ProbeInfo, Target } from './api';
+import { isVideoFormat, type Dither, type FitMode, type FrameFormat, type OutputFormat, type PresetId, type ProbeInfo, type Target } from './api';
 
 /**
  * TargetDef is one row of the Discord-target table, mirroring
@@ -72,6 +72,94 @@ export function limitKiB(t: string | null | undefined): number {
   return b > 0 ? Math.floor(b / 1024) : 0;
 }
 
+/**
+ * formatAllowedForTarget: whether a format can even be requested with a
+ * Discord target. MP4 / WebM are attachment-or-nothing (video can never be an
+ * emote or sticker — the server refuses those recipes with a 400, DESIGN
+ * §5.3); every other format goes with every target (the linter judges the
+ * sensible-ness, e.g. APNG emotes still fail their check).
+ */
+export function formatAllowedForTarget(f: OutputFormat, t: Target): boolean {
+  if (!isVideoFormat(f)) return true;
+  return t !== 'emote' && t !== 'sticker';
+}
+
+/** targetDefsFor lists the Discord-target rows offered for a format (video: none + attachment tiers only). */
+export function targetDefsFor(f: OutputFormat): readonly TargetDef[] {
+  return TARGET_DEFS.filter((d) => formatAllowedForTarget(f, d.id));
+}
+
+/**
+ * gifskiAllowed: the gifski HQ encoder applies only to GIF output with no
+ * Discord target or an attachment tier — never emote/sticker (gifski's local
+ * palettes broke on Discord emotes in the verification matrix; the server
+ * refuses the combination with a 400) and never for the gifsicle-only
+ * Optimize preset (no re-encode happens there). buildOutput drops `encoder`
+ * when this is false, so a stale toggle can never produce a refused recipe.
+ */
+export function gifskiAllowed(o: Pick<OutputCfg, 'format' | 'target'> & Partial<Pick<OutputCfg, 'preset'>>): boolean {
+  if (o.preset === 'optimize') return false;
+  return o.format === 'gif' && (o.target === '' || isAttachmentTarget(o.target));
+}
+
+/** The gifski --quality the server uses for Output.quality 0 (DESIGN §4.2). */
+export const DEFAULT_GIFSKI_QUALITY = 90;
+
+/** VideoCRF describes the CRF knob of an opaque video export (Output.quality IS the CRF for mp4/webm). */
+export interface VideoCRF {
+  /** highest CRF the encoder accepts (harshest) */
+  max: number;
+  /** the server default when Output.quality is 0 */
+  default: number;
+  label: string;
+}
+
+/** videoCRF returns the CRF knob description for mp4/webm (null for every other format). */
+export function videoCRF(f: OutputFormat): VideoCRF | null {
+  switch (f) {
+    case 'mp4':
+      return { max: 51, default: 20, label: 'x264 CRF' };
+    case 'webm':
+      return { max: 63, default: 30, label: 'VP9 CRF' };
+    default:
+      return null;
+  }
+}
+
+/**
+ * reseedQuality keeps Output.quality meaningful across a Format switch
+ * (WEB-6): for mp4/webm the field IS the encoder CRF (0 = the server
+ * default), for webp/avif/jpeg (and gifski) it is a 1..100 quality — a value
+ * carried across that domain boundary silently lands somewhere absurd (an
+ * AVIF quality 60 kept as VP9 CRF 60 is near-worst; a video CRF-default 0
+ * kept as a 1..100 quality is below the slider's own minimum). Crossing INTO
+ * video resets to 0 (the default CRF, as chatFormat seeds); between the two
+ * video formats a CRF is kept unless it exceeds the new encoder's max;
+ * crossing OUT of video re-seeds the destination's chat default. Moves
+ * within the 1..100 domain keep the value (a preset's own onFormat has
+ * already run and wins). Call it AFTER the format changed, with the format
+ * the switch left.
+ */
+export function reseedQuality(o: OutputCfg, prevFormat: OutputFormat): void {
+  const wasVideo = isVideoFormat(prevFormat);
+  if (isVideoFormat(o.format)) {
+    const c = videoCRF(o.format);
+    if (!wasVideo || !c || o.quality > c.max || o.quality < 0) o.quality = 0;
+    return;
+  }
+  if (!wasVideo) return;
+  switch (o.format) {
+    case 'avif':
+      o.quality = 60;
+      break;
+    case 'gif':
+      o.quality = 0; // the ffmpeg palette ignores it; gifski's 0 = its default 90
+      break;
+    default:
+      o.quality = 80; // webp / jpeg (0 would sit below the sliders' min of 1)
+  }
+}
+
 export const FORMAT_LABEL: Record<OutputFormat, string> = {
   gif: 'GIF',
   webp: 'WebP (animated)',
@@ -80,6 +168,8 @@ export const FORMAT_LABEL: Record<OutputFormat, string> = {
   png: 'PNG (static)',
   jpeg: 'JPEG (static)',
   frames: 'Frames (zip + grid)',
+  mp4: 'MP4 (H.264 video)',
+  webm: 'WebM (VP9 video)',
 };
 
 /**
@@ -95,6 +185,8 @@ export const FORMAT_HINT: Record<OutputFormat, string> = {
   png: 'First frame as RGBA PNG: pngquant to the palette when set, then oxipng — no fit search for a static PNG.',
   jpeg: 'First frame, no alpha: transparent areas are flattened onto the matte (Advanced).',
   frames: 'One file per frame after the op stack, plus frames.zip (stored) and delays.json; the result shows a thumbnail grid.',
+  mp4: 'libx264 yuv420p, faststart, no audio — no alpha: transparency is flattened onto the matte (Advanced); odd dimensions are made even. Plays inline as an attachment.',
+  webm: 'libvpx-vp9 yuv420p, no audio — Discord ignores WebM alpha, so it is flattened onto the matte (Advanced); odd dimensions are made even.',
 };
 
 export const FRAME_FORMATS: { id: FrameFormat; label: string }[] = [
@@ -118,9 +210,11 @@ export interface OutputCfg {
   lossy: number; // gifsicle --lossy 0..200
   alphaThreshold: number; // 1..255; TRIM_FRINGE_THRESHOLD = "trim fringe"
   matte: string; // RRGGBB without '#'
-  // webp / avif / jpeg
-  quality: number; // 1..100
+  // webp / avif / jpeg: 1..100; gifski --quality 1..100 (0 = 90); mp4/webm: the CRF (0 = server default)
+  quality: number;
   lossless: boolean;
+  /** Phase 4, GIF only: '' = ffmpeg palette (default), 'gifski' = gifski HQ (never emote/sticker) */
+  encoder: '' | 'gifski';
   /**
    * Loop count with GIF NETSCAPE semantics: 0 = loop forever, N > 0 = play
    * N+1 times. Only honoured for target '' (no Discord target): every Discord
@@ -145,10 +239,11 @@ export const TRIM_FRINGE_THRESHOLD = 180;
 /**
  * Formats the server's fit-to-size engine can search — mirrors
  * internal/jobs/fit.go fitFormats (DESIGN §5.4: static PNG has no fit ladder,
- * frame extraction never fits). The server ignores fitBytes for the rest, so
- * buildOutput never emits it for them and the Output card hides the fit row.
+ * frame extraction never fits; mp4/webm search the CRF knob, Phase 4). The
+ * server ignores fitBytes for the rest, so buildOutput never emits it for
+ * them and the Output card hides the fit row.
  */
-export const FIT_FORMATS: ReadonlySet<OutputFormat> = new Set<OutputFormat>(['gif', 'webp', 'apng', 'avif', 'jpeg']);
+export const FIT_FORMATS: ReadonlySet<OutputFormat> = new Set<OutputFormat>(['gif', 'webp', 'apng', 'avif', 'jpeg', 'mp4', 'webm']);
 
 /** fitsFormat reports whether the fit-to-size engine applies to the format. */
 export function fitsFormat(f: OutputFormat): boolean {
@@ -216,7 +311,8 @@ function setFit(o: OutputCfg, enabled: boolean, kib?: number, keepSize = false, 
 /**
  * chatFormat seeds the quality-first chat defaults of a format: GIF
  * sierra2_4a + lossy 20, WebP q 80, AVIF q 60 (the former chat-gif /
- * chat-webp / chat-avif presets).
+ * chat-webp / chat-avif presets); MP4 / WebM start at the server-default
+ * CRF (quality 0 = 20 / 30, Phase 4).
  */
 function chatFormat(o: OutputCfg, format: OutputFormat): void {
   switch (format) {
@@ -231,6 +327,11 @@ function chatFormat(o: OutputCfg, format: OutputFormat): void {
       break;
     case 'avif':
       o.quality = 60;
+      o.lossless = false;
+      break;
+    case 'mp4':
+    case 'webm':
+      o.quality = 0; // = the server-default CRF (20 / 30)
       o.lossless = false;
       break;
   }
@@ -294,9 +395,9 @@ export const PRESETS: PresetDef[] = [
   {
     id: 'chat',
     label: 'Chat',
-    hint: 'Chat attachment at the source size and fps, quality first. Pick the format: GIF plays everywhere, WebP / AVIF keep soft alpha.',
+    hint: 'Chat attachment at the source size and fps, quality first. Pick the format: GIF plays everywhere, WebP / AVIF keep soft alpha, MP4 / WebM for long opaque clips.',
     locksSize: false,
-    formats: ['gif', 'webp', 'avif'],
+    formats: ['gif', 'webp', 'avif', 'mp4', 'webm'],
     target: 'attachment',
     usesOps: true,
     formatHints: {
@@ -366,7 +467,7 @@ export const PRESETS: PresetDef[] = [
     label: 'Custom',
     hint: 'Everything editable; with no Discord target the loop count is editable too.',
     locksSize: false,
-    formats: ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames'],
+    formats: ['gif', 'webp', 'apng', 'avif', 'mp4', 'webm', 'png', 'jpeg', 'frames'],
     target: '',
     usesOps: true,
     apply() {
@@ -410,6 +511,7 @@ export function defaultOutput(): OutputCfg {
     matte: DEFAULT_MATTE,
     quality: 80,
     lossless: false,
+    encoder: '',
     loop: 0,
     fitEnabled: false,
     fitKiB: DEFAULT_FIT_KIB,

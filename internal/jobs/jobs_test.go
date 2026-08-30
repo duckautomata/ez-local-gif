@@ -122,10 +122,10 @@ func TestSubmitValidation(t *testing.T) {
 		t.Errorf("no sources: err = %v", err)
 	}
 	src := strings.Repeat("a", 64)
-	if _, err := m.Submit(recipe.Recipe{Sources: []string{src}, Output: recipe.Output{Format: "mp4"}}); !errors.Is(err, ErrInvalidRecipe) {
+	if _, err := m.Submit(recipe.Recipe{Sources: []string{src}, Output: recipe.Output{Format: "tiff"}}); !errors.Is(err, ErrInvalidRecipe) {
 		t.Errorf("unsupported format: err = %v", err)
 	}
-	for _, f := range []string{"gif", "webp", "apng", "avif", "png", "jpeg", "frames"} {
+	for _, f := range []string{"gif", "webp", "apng", "avif", "png", "jpeg", "frames", "mp4", "webm"} {
 		if !supportedFormats[f] {
 			t.Errorf("format %q must be supported", f)
 		}

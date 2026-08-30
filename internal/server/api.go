@@ -53,7 +53,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"concurrency":    conc,
 		"maxUploadBytes": s.cfg.MaxUploadBytes,
 		"formats":        outputFormats(),
-		"features":       features(len(s.fonts(ctx)) > 0),
+		"features":       s.features(len(s.fonts(ctx)) > 0, versions),
 	})
 }
 
@@ -98,11 +98,12 @@ func validateTarget(target string) error {
 }
 
 // outputFormats lists the recipe.Output formats this build renders, in the
-// order the UI offers them.
+// order the UI offers them (mp4/webm are the Phase 4 opaque video exports).
 func outputFormats() []string {
 	return []string{
 		recipe.FormatGIF, recipe.FormatWebP, recipe.FormatAPNG, recipe.FormatAVIF,
 		recipe.FormatPNG, recipe.FormatJPEG, recipe.FormatFrames,
+		recipe.FormatMP4, recipe.FormatWebM,
 	}
 }
 
@@ -112,11 +113,29 @@ func outputFormats() []string {
 // colorkey ops), overlays (text / overlay ops, extra "sources"), the
 // animated Play preview (POST /api/proxy) and — only when the container can
 // enumerate faces, i.e. GET /api/fonts is non-empty — the font picker.
-// Every flag but "fonts" is a property of this build.
-func features(fonts bool) map[string]bool {
+// Phase 4: the /input picker and the /output save (the job manager's
+// startup directory checks, DESIGN.md §4.4) and the gifski HQ GIF encoder —
+// flagged from versions (the capabilities tool map, ffrun.Tools.Versions),
+// i.e. only when the resolved binary actually answered its version probe.
+// A bare resolved path is not enough: an EZLG_GIFSKI override is used
+// verbatim without an existence check (ffrun.LookupTools), so a typo'd path
+// would otherwise advertise an encoder whose every render fails at exec
+// time; the probe hides it instead. "feather" and "bounce" name the Phase 4
+// op kinds explicitly so the SPA can gate those cards without inferring
+// support from the formats list (web capabilities.svelte.ts
+// phase4OpsOffered). Every flag but those four is a property of this build.
+func (s *Server) features(fonts bool, versions map[string]string) map[string]bool {
+	inputPick, outputSave := false, false
+	if s.jm != nil {
+		inputPick = s.jm.InputPickEnabled()
+		outputSave = s.jm.OutputSaveEnabled()
+	}
 	return map[string]bool{
 		"fit": true, "sequence": true, "optimize": true,
 		"keying": true, "overlays": true, "proxy": true, "fonts": fonts,
+		"feather": true, "bounce": true,
+		"inputPick": inputPick, "outputSave": outputSave,
+		"gifski": versions["gifski"] != "",
 	}
 }
 
@@ -860,6 +879,8 @@ var resultContentTypes = map[string]string{
 	".avif": "image/avif",
 	".jpg":  "image/jpeg",
 	".jpeg": "image/jpeg",
+	".mp4":  "video/mp4",
+	".webm": "video/webm",
 	".zip":  "application/zip",
 	".json": "application/json; charset=utf-8",
 }

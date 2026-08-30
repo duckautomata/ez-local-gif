@@ -17,6 +17,27 @@
 //	                                the manifest lists; not frames.zip) into the blob store under its
 //	                                name, probes it, → 200 recipe.Source ("edit as source"); 404 when the
 //	                                result or the file does not exist
+//	GET  /api/input                 Phase 4: {"files": [{"name","size","mtime"}, …]} — the pickable files
+//	                                of the mounted /input dir (flat, decodable extensions only, name-
+//	                                sorted, capped at jobs.MaxInputFiles; mtime is RFC 3339; always an
+//	                                array, never null; read per request, so new files show up without a
+//	                                restart); 503 when no usable input dir was found at startup
+//	                                (capabilities features.inputPick false) and when the dir stopped
+//	                                being usable afterwards (unmounted / unreadable — same message)
+//	POST /api/sources/from-input    Phase 4: {"name": "clip.mov"} → ingests that /input file exactly like
+//	                                an upload (blob store, sha256 dedupe — a file that was also uploaded
+//	                                yields the same hash — then probe) → 200 recipe.Source. name must
+//	                                EXACTLY match a GET /api/input entry: an unknown name or a traversal
+//	                                attempt ("../x") is a 404; 503 when the picker is off or /input
+//	                                stopped being usable after startup
+//	POST /api/results/{recipeHash}/save
+//	                                Phase 4: {"file": "<manifest name>", "name": "<optional base>"} →
+//	                                copies that result file into the mounted /output dir under a
+//	                                collision-safe name (base.ext, base-2.ext, …; the base defaults to
+//	                                the ?dl=1 download name) → 200 {"name": "<final name>"} — 409 never
+//	                                happens. 404 for an unknown result or a file the manifest does not
+//	                                list; 503 when saving is off (features.outputSave false) or /output
+//	                                stopped being usable after startup (unmounted, unwritable, full)
 //	GET  /api/fonts                 Phase 3: {"fonts": [{"family","style","file"}, …]} — faces drawtext can use
 //	                                (fc-list inside the container; empty list when unavailable; always an
 //	                                array, never null; Cache-Control: no-cache)
@@ -57,10 +78,15 @@
 //	                                a Level-3 boosted server, Nitro),
 //	                                "rulesVersion": "...", "version": "...", "concurrency": N,
 //	                                "maxUploadBytes": N,
-//	                                "formats": ["gif","webp","apng","avif","png","jpeg","frames"],
+//	                                "formats": ["gif","webp","apng","avif","png","jpeg","frames","mp4","webm"],
 //	                                "features": {"fit": true, "sequence": true, "optimize": true,
 //	                                "keying": true, "overlays": true, "proxy": true,
-//	                                "fonts": <true iff /api/fonts lists at least one face>}}
+//	                                "fonts": <true iff /api/fonts lists at least one face>,
+//	                                "feather": true, "bounce": true (the Phase 4 op kinds, named so
+//	                                the SPA can gate those cards on older servers),
+//	                                "inputPick": <true iff the /input dir was readable at startup>,
+//	                                "outputSave": <true iff the /output dir was writable at startup>,
+//	                                "gifski": <true iff the gifski binary answered its version probe>}}
 //	GET  /healthz                   "ok"
 //	GET  /*                         embedded SPA: real files as-is; extension-less paths fall back
 //	                                to index.html (client routes); paths with a file extension or
@@ -86,8 +112,9 @@
 // browser marks as coming from another site — Sec-Fetch-Site: cross-site,
 // or an Origin whose host is not this server's — are refused with 403, and
 // the JSON endpoints (/api/still, /api/proxy, /api/jobs,
-// /api/sources/from-result) require Content-Type application/json (415
-// otherwise). The SPA's own requests and header-less clients such as curl
+// /api/sources/from-result, /api/sources/from-input,
+// /api/results/{recipeHash}/save) require Content-Type application/json
+// (415 otherwise). The SPA's own requests and header-less clients such as curl
 // are unaffected.
 //
 // Lifecycle: NewServer returns a *Server whose Shutdown cancels every render
@@ -260,7 +287,9 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /api/capabilities", s.handleCapabilities)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/sources/from-result", s.handleSourceFromResult)
+	mux.HandleFunc("POST /api/sources/from-input", s.handleSourceFromInput)
 	mux.HandleFunc("GET /api/sources/{hash}", s.handleGetSource)
+	mux.HandleFunc("GET /api/input", s.handleListInput)
 	mux.HandleFunc("GET /api/fonts", s.handleFonts)
 	mux.HandleFunc("POST /api/still", s.handleStill)
 	mux.HandleFunc("POST /api/proxy", s.handleProxy)
@@ -269,6 +298,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("DELETE /api/jobs/{id}", s.handleCancelJob)
 	mux.HandleFunc("GET /api/jobs/{id}/events", s.handleJobEvents)
 	mux.HandleFunc("GET /api/results/{hash}", s.handleGetResult)
+	mux.HandleFunc("POST /api/results/{hash}/save", s.handleSaveResult)
 	mux.HandleFunc("GET /out/{hash}/{name}", s.handleOutFile)
 	// Anything else under /api is a JSON 404 (never the SPA fallback).
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

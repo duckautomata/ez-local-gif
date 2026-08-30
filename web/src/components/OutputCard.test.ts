@@ -244,10 +244,14 @@ describe('OutputCard (SSR)', () => {
     expect(html()).not.toContain('above the');
   });
 
-  it('never mentions gifski', () => {
-    for (const p of PRESETS) {
-      applyPreset(p.id);
-      expect(html().toLowerCase(), p.id).not.toContain('gifski');
+  it('mentions gifski only where it is allowed: gif with target none/attachment, never emote/sticker/Optimize', () => {
+    // Phase 4: the encoder toggle lives in Advanced for eligible outputs…
+    applyPreset('chat'); // gif + attachment
+    expect(html().toLowerCase()).toContain('gifski');
+    // …and stays away from emote/sticker targets and the no-re-encode Optimize
+    for (const id of ['emote', 'sticker', 'optimize', 'frames'] as const) {
+      applyPreset(id);
+      expect(html().toLowerCase(), id).not.toContain('gifski');
     }
   });
 });

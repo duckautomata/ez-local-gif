@@ -64,12 +64,17 @@ func newEnv(t *testing.T, cfg Config, ui fstest.MapFS) *env {
 
 func newEnvWithTools(t *testing.T, cfg Config, ui fstest.MapFS, tools ffrun.Tools) *env {
 	t.Helper()
+	return newEnvWithOptions(t, cfg, ui, tools, jobs.Options{Concurrency: 1})
+}
+
+func newEnvWithOptions(t *testing.T, cfg Config, ui fstest.MapFS, tools ffrun.Tools, opts jobs.Options) *env {
+	t.Helper()
 	root := t.TempDir()
 	st, err := store.New(filepath.Join(root, "data"), filepath.Join(root, "scratch"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	jm := jobs.NewManager(st, tools, jobs.Options{Concurrency: 1})
+	jm := jobs.NewManager(st, tools, opts)
 	if cfg.Version == "" {
 		cfg.Version = "test"
 	}
@@ -271,23 +276,33 @@ func TestCapabilities(t *testing.T) {
 	if caps.RulesVersion != discordlint.RulesVersion || caps.Version != "v9" || caps.Concurrency != 1 || caps.MaxUploadBytes != 12345 {
 		t.Errorf("caps = %+v", caps)
 	}
-	if strings.Join(caps.Formats, ",") != "gif,webp,apng,avif,png,jpeg,frames" {
+	if strings.Join(caps.Formats, ",") != "gif,webp,apng,avif,png,jpeg,frames,mp4,webm" {
 		t.Errorf("formats = %v", caps.Formats)
 	}
 	for _, f := range caps.Formats {
-		if !recipe.IsAnimatedFormat(f) && !recipe.IsStaticFormat(f) && f != recipe.FormatFrames {
+		if !recipe.IsAnimatedFormat(f) && !recipe.IsStaticFormat(f) && !recipe.IsVideoFormat(f) && f != recipe.FormatFrames {
 			t.Errorf("format %q is not a recipe.Format* constant", f)
 		}
 	}
-	// Phase 2 + Phase 3 flags; "fonts" is the only one that depends on the
-	// host (TestFontsEndpoint ties it to the font list).
-	for _, f := range []string{"fit", "sequence", "optimize", "keying", "overlays", "proxy"} {
+	// Phase 2 + Phase 3 flags and the Phase 4 op kinds; "fonts" is the only
+	// one of them that depends on the host (TestFontsEndpoint ties it to the
+	// font list).
+	for _, f := range []string{"fit", "sequence", "optimize", "keying", "overlays", "proxy", "feather", "bounce"} {
 		if !caps.Features[f] {
 			t.Errorf("features[%q] = false, want true (%v)", f, caps.Features)
 		}
 	}
-	if _, ok := caps.Features["fonts"]; !ok || len(caps.Features) != 7 {
-		t.Errorf("features = %v, want exactly fit/sequence/optimize/keying/overlays/proxy/fonts", caps.Features)
+	// Phase 4 flags: no input/output dir was configured for this manager and
+	// gifski mirrors the version-probed toolchain (the flag comes from the
+	// same probe that fills caps.Tools, not from a bare resolved path).
+	if caps.Features["inputPick"] || caps.Features["outputSave"] {
+		t.Errorf("inputPick/outputSave = true without configured dirs (%v)", caps.Features)
+	}
+	if got, want := caps.Features["gifski"], e.jm.ToolVersions()["gifski"] != ""; got != want {
+		t.Errorf("features[gifski] = %v, want %v (tools.Gifski = %q, probed %q)", got, want, e.tools.Gifski, e.jm.ToolVersions()["gifski"])
+	}
+	if _, ok := caps.Features["fonts"]; !ok || len(caps.Features) != 12 {
+		t.Errorf("features = %v, want exactly fit/sequence/optimize/keying/overlays/proxy/fonts/feather/bounce/inputPick/outputSave/gifski", caps.Features)
 	}
 }
 
@@ -657,11 +672,24 @@ func TestCreateJobValidation(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("unprobed source: %d %s", resp.StatusCode, body)
 	}
-	// Unsupported format (mp4 arrives in Phase 4) → 400 from the manager.
+	// Unsupported format → 400 from the manager (mp4/webm are supported
+	// since Phase 4, so a format the pipeline never renders stands in).
 	h := putProbedSource(t, e, "a.gif", tinyGIF(t))
-	resp, body = e.postJSON(t, "/api/jobs", recipe.Recipe{Sources: []string{h}, Output: recipe.Output{Format: "mp4"}})
+	resp, body = e.postJSON(t, "/api/jobs", recipe.Recipe{Sources: []string{h}, Output: recipe.Output{Format: "tiff"}})
 	if resp.StatusCode != 400 {
 		t.Errorf("unsupported format: %d %s", resp.StatusCode, body)
+	}
+	// Phase 4 refusals happen at Submit, before any work: video formats
+	// never target emote/sticker, and neither does the gifski encoder.
+	for _, out := range []recipe.Output{
+		{Format: "mp4", Target: "emote"},
+		{Format: "webm", Target: "sticker"},
+		{Format: "gif", Encoder: "gifski", Target: "emote"},
+	} {
+		resp, body = e.postJSON(t, "/api/jobs", recipe.Recipe{Sources: []string{h}, Output: out})
+		if resp.StatusCode != 400 {
+			t.Errorf("output %+v: %d %s, want 400", out, resp.StatusCode, body)
+		}
 	}
 }
 

@@ -53,7 +53,12 @@ services:
       # would leave root-owned ./output/testkit that the uid-1000 runtime
       # container can no longer reuse. (Add /output-dev/ to .gitignore if it
       # is not there yet; it is excluded from the build context via .dockerignore.)
+      # "Save to /output" (Phase 4) writes here too when using the dev server.
       - ./output-dev:/output
+      # Optional read-only source folder for the /input picker (Phase 4), same
+      # as in compose.yaml (the dev container reads it as root, so ownership
+      # does not matter here):
+      # - ./input:/input:ro
     environment:
       EZLG_DATA: /data
       EZLG_SCRATCH: /dev/shm/ezl

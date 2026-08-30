@@ -157,7 +157,7 @@ func tinyPNG(t *testing.T) []byte {
 // the user to raise it, so it has to be a real knob with the manager's
 // default when unset or unparsable.
 func TestServeConfigFromEnv(t *testing.T) {
-	for _, k := range []string{"EZLG_ADDR", "EZLG_DATA", "EZLG_SCRATCH", "EZLG_TTL_HOURS", "EZLG_MAX_BYTES", "EZLG_MAX_UPLOAD_MB", "EZLG_CONCURRENCY", "EZLG_MAX_MASTER_BYTES"} {
+	for _, k := range []string{"EZLG_ADDR", "EZLG_DATA", "EZLG_SCRATCH", "EZLG_TTL_HOURS", "EZLG_MAX_BYTES", "EZLG_MAX_UPLOAD_MB", "EZLG_CONCURRENCY", "EZLG_MAX_MASTER_BYTES", "EZLG_INPUT", "EZLG_OUTPUT"} {
 		t.Setenv(k, "")
 	}
 	cfg := serveConfigFromEnv()
@@ -167,13 +167,23 @@ func TestServeConfigFromEnv(t *testing.T) {
 	if cfg.addr != ":8080" || cfg.dataRoot != "/data" || cfg.scratch != "/dev/shm/ezl" || cfg.ttl != 24*time.Hour || cfg.maxBytes != 20<<30 || cfg.maxUpload != 2048<<20 || cfg.conc < 1 || cfg.drain != drainTimeout {
 		t.Errorf("defaults = %+v", cfg)
 	}
+	// Phase 4 file exchange: the defaults are the compose mount points; a
+	// missing dir is fine (the manager just turns the feature off).
+	if cfg.inputDir != "/input" || cfg.outputDir != "/output" {
+		t.Errorf("input/output defaults = %q / %q, want /input and /output", cfg.inputDir, cfg.outputDir)
+	}
 
 	t.Setenv("EZLG_MAX_MASTER_BYTES", "1048576")
 	t.Setenv("EZLG_CONCURRENCY", "3")
 	t.Setenv("EZLG_MAX_UPLOAD_MB", "16")
+	t.Setenv("EZLG_INPUT", "/mnt/pick")
+	t.Setenv("EZLG_OUTPUT", "/mnt/save")
 	cfg = serveConfigFromEnv()
 	if cfg.maxMaster != 1<<20 || cfg.conc != 3 || cfg.maxUpload != 16<<20 {
 		t.Errorf("env = %+v, want maxMaster 1 MiB, conc 3, maxUpload 16 MiB", cfg)
+	}
+	if cfg.inputDir != "/mnt/pick" || cfg.outputDir != "/mnt/save" {
+		t.Errorf("input/output overrides = %q / %q", cfg.inputDir, cfg.outputDir)
 	}
 
 	// Unparsable values are ignored (logged), not fatal; a non-positive cap
@@ -185,6 +195,52 @@ func TestServeConfigFromEnv(t *testing.T) {
 	t.Setenv("EZLG_MAX_MASTER_BYTES", "0")
 	if cfg = serveConfigFromEnv(); cfg.maxMaster != 0 {
 		t.Errorf("EZLG_MAX_MASTER_BYTES=0: maxMaster = %d, want 0 (manager default)", cfg.maxMaster)
+	}
+}
+
+// TestRunServerInOutWiring: the configured input/output dirs (EZLG_INPUT /
+// EZLG_OUTPUT) reach the job manager, so the capabilities flags flip on and
+// GET /api/input lists the mounted files.
+func TestRunServerInOutWiring(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(fakeToolEnv, "1")
+	t.Setenv("EZLG_FFMPEG", exe)
+	t.Setenv("EZLG_FFPROBE", exe)
+	cfg := testConfig(t)
+	cfg.inputDir = t.TempDir()
+	cfg.outputDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(cfg.inputDir, "clip.gif"), []byte("GIF89a-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	base, _, _ := startServer(t, cfg)
+	resp, err := http.Get(base + "/api/capabilities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var caps struct {
+		Features map[string]bool `json:"features"`
+	}
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatalf("decode capabilities: %v: %s", err, body)
+	}
+	if !caps.Features["inputPick"] || !caps.Features["outputSave"] {
+		t.Errorf("features = %v, want inputPick and outputSave true", caps.Features)
+	}
+
+	resp, err = http.Get(base + "/api/input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"name":"clip.gif"`) {
+		t.Errorf("GET /api/input = %d %s, want the mounted clip.gif", resp.StatusCode, body)
 	}
 }
 

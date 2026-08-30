@@ -37,12 +37,20 @@ func capsFeatures(t *testing.T, e *env) map[string]bool {
 }
 
 func TestFeatures(t *testing.T) {
+	e := newEnv(t, Config{}, nil)
+	versions := e.jm.ToolVersions()
 	for _, fonts := range []bool{false, true} {
 		want := map[string]bool{
 			"fit": true, "sequence": true, "optimize": true,
 			"keying": true, "overlays": true, "proxy": true, "fonts": fonts,
+			"feather": true, "bounce": true,
+			// Phase 4 flags: this env has no input/output dirs, and gifski
+			// mirrors the version-probed toolchain (TestCapabilitiesInOut
+			// covers the enabled side, TestGifskiFeatureProbed the resolved-
+			// but-unrunnable one).
+			"inputPick": false, "outputSave": false, "gifski": versions["gifski"] != "",
 		}
-		if got := features(fonts); !maps.Equal(got, want) {
+		if got := e.s.features(fonts, versions); !maps.Equal(got, want) {
 			t.Errorf("features(%v) = %v, want %v", fonts, got, want)
 		}
 	}

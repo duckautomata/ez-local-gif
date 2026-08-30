@@ -34,6 +34,13 @@ const (
 	// MaxMasterBytes caps the expected RGBA master (Width*Height*4*Frames)
 	// when the frame count is known.
 	MaxMasterBytes = 8 << 30
+	// MaxBounces caps the bounce ops in one recipe. Each bounce nests
+	// another split/reverse/concat stage whose reverse branch buffers a
+	// full copy of the clip, so the structure itself grows exponentially —
+	// and for sources whose frame count is unknown (Frames 0) the byte
+	// caps cannot see that. The UI offers a single bounce; 8 is already
+	// far past anything useful.
+	MaxBounces = 8
 )
 
 // Image-sequence frame delays (the "delay" op and recipe.SequenceInfo.DelayMS),
@@ -82,7 +89,8 @@ func opErrorf(d decodedOp, format string, args ...any) error {
 }
 
 // decodedOp is an Op whose params have been decoded into the recipe struct
-// for its kind (params is nil for OpUnpremultiply).
+// for its kind (params is nil for the no-param kinds: unpremultiply, reverse,
+// bounce).
 type decodedOp struct {
 	index  int
 	kind   string
@@ -138,7 +146,7 @@ func decodeOp(i int, op recipe.Op) (decodedOp, error) {
 		params = new(recipe.TextParams)
 	case recipe.OpOverlay:
 		params = new(recipe.OverlayParams)
-	case recipe.OpUnpremultiply, recipe.OpReverse:
+	case recipe.OpUnpremultiply, recipe.OpReverse, recipe.OpBounce:
 		// no params
 	default:
 		return decodedOp{}, errorf("op %d: unknown op kind %q", i, op.Kind)
@@ -187,6 +195,7 @@ type compiler struct {
 	ovs        int              // overlay ops compiled so far (labels "[ovN]")
 	keys       int              // alpha-keeping key wrappers emitted so far (labels "[kN…]", see keyKeepingAlpha)
 	layers     int              // translucent text layers emitted so far (labels "[tN]", see textLayers)
+	bounces    int              // bounce ops emitted so far (labels "[fN]"/"[rN]"/"[rrN]", see bounce); each doubles Duration and Frames in assemble
 	rgbaCanvas bool             // the canvas was forced to rgba for the final-canvas ops
 	plan       Plan
 }
@@ -997,7 +1006,7 @@ func (c *compiler) assemble() (*Plan, error) {
 		// retimes it (34 frames at 33 ms are 34 master frames, whatever
 		// 34/30.303*30.303 comes to in floating point).
 		if c.seq.count <= 0 {
-			return p, nil // unknown
+			break // unknown
 		}
 		p.Duration = float64(c.seq.selected) / c.seq.rate / p.Speed
 		p.Frames = sequenceFrames(c.seq.selected, p.Speed, c.seq.rate, p.FPS)
@@ -1007,7 +1016,7 @@ func (c *compiler) assemble() (*Plan, error) {
 	default:
 		dur := c.sourceDuration()
 		if dur <= 0 {
-			return p, nil // unknown
+			break // unknown
 		}
 		end := p.TrimEnd
 		if end <= 0 {
@@ -1019,6 +1028,23 @@ func (c *compiler) assemble() (*Plan, error) {
 		// sub-frame clip still plans a frame.
 		p.Frames = max(1, int(math.Floor(p.Duration*p.FPS+FrameTolerance)))
 	}
+	// Each bounce (Phase 4) doubles the output: applied after the
+	// trim/speed/fps math above — so a trim doubles the trimmed length — and
+	// before finish's MaxMasterBytes check, which therefore measures the
+	// doubled frame count. An unknown Duration/Frames (0) stays unknown.
+	// The doubling saturates at MaxInt instead of wrapping: a crafted
+	// container can probe to enough frames that even MaxBounces doublings
+	// overflow int, and a wrapped (negative or zero) count would slip past
+	// finish's byte check; saturated, the check rejects the plan.
+	for range c.bounces {
+		p.Duration *= 2
+		if p.Frames > math.MaxInt/2 {
+			p.Frames = math.MaxInt
+		} else {
+			p.Frames *= 2
+		}
+	}
+	p.Bounced = c.bounces > 0
 	return p, nil
 }
 

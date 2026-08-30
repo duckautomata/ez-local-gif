@@ -26,6 +26,8 @@ synthetic alpha channel:
 | `ff_still.jpg` | `ffmpeg -f lavfi -i $SRC -frames:v 1 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p` — baseline JPEG |
 | `ff_still_alpha.avif` | `avifenc -s 10 -q 50 --qalpha 90 -y 420 ff_still.png` (libavif in the runtime image) — `avif` brand, ispe 64x64, auxC alpha item |
 | `ff_still_opaque.avif` | `ffmpeg -f lavfi -i $SRC -frames:v 1 -c:v libaom-av1 -crf 40 -cpu-used 8 -pix_fmt yuv420p -f avif` — `avif` brand, no alpha |
+| `ff_2frame.mp4` | `ffmpeg -f lavfi -i $SRC -frames:v 2 -c:v libx264 -preset veryfast -crf 30 -pix_fmt yuv420p -movflags +faststart -an` — ftyp isom, faststart (moov before mdat), avc1, 64x64, 2 frames / 0.2 s |
+| `ff_2frame.webm` | `ffmpeg -f lavfi -i $SRC -frames:v 2 -c:v libvpx-vp9 -crf 40 -b:v 0 -cpu-used 8 -row-mt 1 -pix_fmt yuv420p -an` — EBML DocType webm, V_VP9, 64x64, 2 SimpleBlocks / 0.2 s |
 
 Edge-case GIFs (missing GCE, disposal 0/3, missing NETSCAPE, delay 0, comment
 extension, local colour table, wrong LSD background index, …) are built in Go
@@ -35,3 +37,8 @@ frames outside the canvas, acTL after IDAT, missing IEND, hidden default
 image, bad sequence numbers, truncation, …) are byte surgery on
 `ff_rgba.apng` or synthetic chunk lists with dummy pixel data (see
 `fixtures_apng_test.go`); CRCs are recomputed so the variants stay valid PNGs.
+Edge-case MP4s/WebMs (wrong brand or DocType, moov after mdat, missing boxes,
+odd dimensions, wrong codec, unknown-size Segment, trailing garbage, …) are
+synthetic box/EBML streams built in Go (see `fixtures_video_test.go`);
+`video_ffmpeg_test.go` additionally re-encodes fresh 2-frame files with the
+host ffmpeg when one is on PATH.

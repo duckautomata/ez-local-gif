@@ -299,6 +299,14 @@ type isoBox struct {
 // isoBoxes splits b into sequential boxes (size, type, optional largesize).
 // It stops silently at the first malformed box.
 func isoBoxes(b []byte) []isoBox {
+	out, _ := isoBoxesConsumed(b)
+	return out
+}
+
+// isoBoxesConsumed is isoBoxes plus the number of bytes that parsed as
+// boxes, so callers (the MP4 container check) can detect a truncated or
+// garbage tail.
+func isoBoxesConsumed(b []byte) ([]isoBox, int) {
 	var out []isoBox
 	pos := 0
 	for len(b)-pos >= 8 {
@@ -310,18 +318,18 @@ func isoBoxes(b []byte) []isoBox {
 			size = uint64(len(b) - pos)
 		case 1:
 			if len(b)-pos < 16 {
-				return out
+				return out, pos
 			}
 			size = binary.BigEndian.Uint64(b[pos+8:])
 			hdr = 16
 		}
 		if size < uint64(hdr) || size > uint64(len(b)-pos) {
-			return out
+			return out, pos
 		}
 		out = append(out, isoBox{typ: typ, payload: b[pos+hdr : pos+int(size)]})
 		pos += int(size)
 	}
-	return out
+	return out, pos
 }
 
 // findBox returns the first box of the given type.

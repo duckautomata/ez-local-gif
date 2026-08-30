@@ -133,8 +133,9 @@ func CropDetectArgs(srcPath string, inputArgs []string, alpha bool, threshold in
 const cropDetectOutLabel = "[det]"
 
 // CropDetectPlanArgs is CropDetectArgs over a compiled detection plan
-// (graph.CompileDetect: the ops in front of the autocrop — trim, speed, fps,
-// keying — at the source frame size) instead of the raw source, so the box is
+// (graph.CompileDetect: the stack's detection-kind ops — trim, speed, fps,
+// keying, feather — hoisted in front of the geometry wherever they sit, at
+// the source frame size) instead of the raw source, so the box is
 // found on the picture the crop is applied to: with a chromakey/colorkey op
 // in front of the autocrop, a green-screen clip resolves to the subject's box
 // where the raw-source path (opaque picture, cropdetect) reports the full

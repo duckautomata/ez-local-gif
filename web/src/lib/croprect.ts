@@ -198,6 +198,27 @@ export function widthForHeight(h: number, ratio: number, srcW: number): number {
 }
 
 /**
+ * sizeForWidth resolves the ratio-locked pair for an edited width: H =
+ * heightForWidth(w). When that H had to clamp at the frame edge, W is
+ * re-derived from the clamped H — the typed value shrinks so the pair always
+ * keeps the locked ratio, instead of the lock silently breaking against the
+ * frame (WEB-11: 160×120, lock 2:1, typed H 120 must become 160×80, not
+ * 160×120). An unclamped edit keeps the typed value exactly.
+ */
+export function sizeForWidth(w: number, ratio: number, srcW: number, srcH: number): { w: number; h: number } {
+  const h = heightForWidth(w, ratio, srcH);
+  if (Math.round(w / ratio) !== h) w = widthForHeight(h, ratio, srcW);
+  return { w, h };
+}
+
+/** sizeForHeight is sizeForWidth's mirror for an edited height. */
+export function sizeForHeight(h: number, ratio: number, srcW: number, srcH: number): { w: number; h: number } {
+  const w = widthForHeight(h, ratio, srcW);
+  if (Math.round(h * ratio) !== w) h = heightForWidth(w, ratio, srcH);
+  return { w, h };
+}
+
+/**
  * ratioLabel prints a locked ratio for the "Lock ratio" label: a reduced
  * clean fraction when one with small terms exists ("4:3", "16:9", "1:1"),
  * else two decimals against 1 ("1.33:1"). '' for no lock.

@@ -2,7 +2,7 @@
 // resizing with and without a locked ratio, clamping, flip-past-anchor, the
 // ratio-locked draw and the W/H / label helpers of the Crop card.
 import { describe, expect, it } from 'vitest';
-import { cursorFor, drawRect, heightForWidth, hitHandle, ratioLabel, resizeRect, widthForHeight, type Handle, type Rect } from './croprect';
+import { cursorFor, drawRect, heightForWidth, hitHandle, ratioLabel, resizeRect, sizeForHeight, sizeForWidth, widthForHeight, type Handle, type Rect } from './croprect';
 
 const r: Rect = { x: 10, y: 10, w: 40, h: 30 }; // corners (10,10)..(50,40)
 
@@ -161,6 +161,25 @@ describe('W/H helpers of the locked Crop card inputs', () => {
     expect(heightForWidth(400, 1, 100)).toBe(100); // clamped to the frame
     expect(widthForHeight(500, 3, 200)).toBe(200);
     expect(heightForWidth(1, 50, 100)).toBe(1); // never below 1
+  });
+
+  // WEB-11: when the derived dimension clamps at the frame edge the typed
+  // one shrinks with it, so the pair always keeps the locked ratio (the lock
+  // label stays honest and later handle drags do not jump the box).
+  it('sizeForWidth / sizeForHeight keep the locked ratio through a frame clamp', () => {
+    // the finding's scenario: 160×120, lock 2:1, typed H 120 → 160×80 (not 160×120)
+    expect(sizeForHeight(120, 2, 160, 120)).toEqual({ w: 160, h: 80 });
+    // same clamp from the width side: typed W 160 at 1:2 on 160×120 → 60×120
+    expect(sizeForWidth(160, 0.5, 160, 120)).toEqual({ w: 60, h: 120 });
+    // the clamp floor: a huge ratio pins H at 1 and W follows it
+    expect(sizeForWidth(10, 50, 160, 120)).toEqual({ w: 50, h: 1 });
+  });
+
+  it('sizeForWidth / sizeForHeight keep an unclamped typed value exactly', () => {
+    expect(sizeForWidth(100, 2, 160, 120)).toEqual({ w: 100, h: 50 });
+    expect(sizeForHeight(45, 4 / 3, 160, 120)).toEqual({ w: 60, h: 45 });
+    // rounding alone (no frame clamp) never rewrites the typed value
+    expect(sizeForWidth(101, 2, 160, 120)).toEqual({ w: 101, h: 51 });
   });
 });
 

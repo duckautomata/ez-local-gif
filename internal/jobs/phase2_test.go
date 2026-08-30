@@ -244,7 +244,8 @@ func TestKnobMapping(t *testing.T) {
 	if got := knobDesc("png", fit.Rung{Colors: 128}, recipe.Output{}, 1); got != "palette 128 → 64" {
 		t.Errorf("png palette desc = %q", got)
 	}
-	if knobName("gif") != "lossy" || knobName("apng") != "colour step" || knobName("png") != "colour step" || knobName("avif") != "quality knob" {
+	if knobName("gif", recipe.Output{}) != "lossy" || knobName("apng", recipe.Output{}) != "colour step" ||
+		knobName("png", recipe.Output{}) != "colour step" || knobName("avif", recipe.Output{}) != "quality knob" {
 		t.Error("knobName")
 	}
 	// A truecolour probe rung (RGBA APNG, lossless WebP) carries no knob desc.

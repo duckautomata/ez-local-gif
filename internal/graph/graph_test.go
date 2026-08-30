@@ -1491,6 +1491,9 @@ func checkPlan(t *testing.T, got, want *Plan) {
 	if got.SourceVFR != want.SourceVFR {
 		t.Errorf("SourceVFR got %v want %v", got.SourceVFR, want.SourceVFR)
 	}
+	if got.Bounced != want.Bounced {
+		t.Errorf("Bounced got %v want %v", got.Bounced, want.Bounced)
+	}
 	if got.FilterTrim != want.FilterTrim {
 		t.Errorf("FilterTrim got %v want %v", got.FilterTrim, want.FilterTrim)
 	}

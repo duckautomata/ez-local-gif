@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { isAbortError, messageOf, upload, type UploadHandle } from '../lib/api';
-  import { planDrop, sequenceDelayOverride, sequenceFps } from '../lib/files';
+  import { isAbortError, listInput, messageOf, sourceFromInput, upload, type InputFile, type UploadHandle } from '../lib/api';
+  import { batch, exitBatch, startBatch } from '../lib/batch.svelte';
+  import { caps } from '../lib/capabilities.svelte';
+  import { planDropSniffed, sequenceDelayOverride, sequenceFps } from '../lib/files';
   import { fmtBytes, fmtNum } from '../lib/format';
   import { resetRender } from '../lib/render.svelte';
   import { app, DEFAULT_DELAY_MS, setSource } from '../lib/state.svelte';
@@ -22,7 +24,7 @@
   let delayMs = $state(DEFAULT_DELAY_MS);
 
   const percent = $derived(total > 0 ? Math.min(100, (loaded / total) * 100) : 0);
-  const compact = $derived(app.source !== null && !uploading);
+  const compact = $derived((app.source !== null || batch.active) && !uploading);
   const seqFps = $derived(sequenceFps(delayMs));
 
   async function send(files: File[]) {
@@ -48,8 +50,9 @@
       // A new source replaces the old one: drop the previous job/result (and
       // its progress subscription) first so nothing rendered from a different
       // file stays on screen; the preview is keyed on the source hash and
-      // remounts (App.svelte).
+      // remounts (App.svelte). A single upload also leaves batch mode.
       resetRender();
+      exitBatch();
       setSource(src);
       const seq = src.info.sequence;
       const what = seq ? `sequence of ${seq.count} frames` : src.name;
@@ -74,12 +77,71 @@
     }
   }
 
-  /** accept turns a dropped/picked/pasted file list into one upload. */
-  function accept(list: FileList | File[] | null | undefined) {
-    const plan = planDrop(list ? Array.from(list) : []);
+  /** files of a mixed drop (images + others) waiting for the user's choice */
+  let mixed = $state<{ images: File[]; files: File[] } | null>(null);
+
+  /** enter batch mode with one row per file (Phase 4). */
+  function startFiles(files: File[]) {
+    mixed = null;
+    resetRender();
+    setSource(null); // fresh state for a fresh drop, like a single upload
+    void startBatch(files);
+  }
+
+  /**
+   * accept turns a dropped/picked/pasted file list into one upload, an image
+   * sequence, a batch (≥ 2 video/animation files) or — for a mixed drop — an
+   * inline question. Sequence-eligible files are head-sniffed first so an
+   * animated WebP / APNG never silently becomes a first-frame slideshow.
+   */
+  async function accept(list: FileList | File[] | null | undefined) {
+    const plan = await planDropSniffed(list ? Array.from(list) : []);
     if (plan.note) toast.info(plan.note);
+    if (plan.kind !== 'mixed') mixed = null;
     if (plan.kind === 'single') void send([plan.file]);
     else if (plan.kind === 'sequence') void send(plan.files);
+    else if (plan.kind === 'batch') startFiles(plan.files);
+    else if (plan.kind === 'mixed') mixed = { images: plan.images, files: plan.files };
+  }
+
+  // ---- "…or pick from /input" (Phase 4, features.inputPick) --------------
+  const inputPick = $derived(caps.features.inputPick);
+  let inputOpen = $state(false);
+  let inputLoading = $state(false);
+  let inputFiles = $state<InputFile[]>([]);
+  let inputError = $state('');
+  let ingesting = $state('');
+
+  async function toggleInput() {
+    inputOpen = !inputOpen;
+    if (!inputOpen) return;
+    inputLoading = true;
+    inputError = '';
+    try {
+      inputFiles = await listInput();
+    } catch (e) {
+      inputError = messageOf(e);
+      inputFiles = [];
+    } finally {
+      inputLoading = false;
+    }
+  }
+
+  async function pickInput(f: InputFile) {
+    if (ingesting) return;
+    ingesting = f.name;
+    try {
+      const src = await sourceFromInput(f.name);
+      resetRender();
+      exitBatch();
+      setSource(src);
+      inputOpen = false;
+      toast.success(`Loaded ${f.name} from /input (${fmtBytes(src.size)})`);
+    } catch (e) {
+      toast.error(`Could not load ${f.name}: ${messageOf(e)}`);
+    } finally {
+      ingesting = '';
+    }
   }
 
   function cancel() {
@@ -93,7 +155,7 @@
   function onDrop(e: DragEvent) {
     e.preventDefault();
     dragging = false;
-    accept(e.dataTransfer?.files);
+    void accept(e.dataTransfer?.files);
   }
 
   function onDragOver(e: DragEvent) {
@@ -106,7 +168,7 @@
     const input = e.currentTarget as HTMLInputElement;
     const files = input.files ? Array.from(input.files) : [];
     input.value = '';
-    accept(files);
+    void accept(files);
   }
 
   // Ctrl+V of a file (e.g. copied from Explorer) or an image bitmap.
@@ -128,7 +190,7 @@
       if (files.length === 0) return;
       e.preventDefault();
       // Pasted bitmaps come in as "image.png" — give them a timestamped name.
-      accept(files.map((f) => (f.name ? f : new File([f], `pasted-${Date.now()}.png`, { type: f.type }))));
+      void accept(files.map((f) => (f.name ? f : new File([f], `pasted-${Date.now()}.png`, { type: f.type }))));
     };
     window.addEventListener('paste', onPaste);
     return () => window.removeEventListener('paste', onPaste);
@@ -167,7 +229,7 @@
   {:else if compact}
     <div class="row between">
       <span class="muted small">
-        Drop or paste (<kbd>Ctrl</kbd>+<kbd>V</kbd>) another file — or several png/jpeg/webp/bmp/tiff images for a sequence — to
+        Drop or paste (<kbd>Ctrl</kbd>+<kbd>V</kbd>) another file — several images = a sequence, several videos = a batch — to
         replace the source, or
       </span>
       <span class="row tight">
@@ -195,6 +257,63 @@
         <NumField bind:value={delayMs} min={1} max={60000} small />
         <span>ms{#if seqFps > 0}&nbsp;→ {fmtNum(seqFps)} fps{/if} (changeable later in the Delay card)</span>
       </label>
+      <p class="hint">Several videos / animations = a batch: the same preset rendered for each file.</p>
+    </div>
+  {/if}
+
+  {#if mixed && !uploading}
+    {@const m = mixed}
+    {@const others = m.files.length - m.images.length}
+    <div class="mixed note">
+      <p>
+        That drop mixes {m.images.length} image{m.images.length === 1 ? '' : 's'} with {others} other file{others === 1 ? '' : 's'} —
+        what did you mean?
+      </p>
+      <div class="row choices">
+        <button type="button" class="sm primary" onclick={() => startFiles(m.files)}>Batch all {m.files.length} files</button>
+        {#if m.images.length >= 2}
+          <button
+            type="button"
+            class="sm"
+            onclick={() => {
+              mixed = null;
+              void send(m.images);
+            }}
+          >
+            Use the {m.images.length} images as one sequence
+          </button>
+        {/if}
+        <button type="button" class="sm ghost" onclick={() => (mixed = null)}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if inputPick && !uploading}
+    <div class="inputpick">
+      <button type="button" class="sm ghost" onclick={() => void toggleInput()} aria-expanded={inputOpen}>
+        {inputOpen ? 'Hide /input' : '…or pick from /input'}
+      </button>
+      {#if inputOpen}
+        {#if inputLoading}
+          <p class="hint">Listing /input…</p>
+        {:else if inputError}
+          <p class="note error">/input: {inputError}</p>
+        {:else if inputFiles.length === 0}
+          <p class="hint">No decodable files in /input.</p>
+        {:else}
+          <ul class="inlist" aria-label="Files in /input">
+            {#each inputFiles as f (f.name)}
+              <li>
+                <button type="button" class="infile" onclick={() => void pickInput(f)} disabled={!!ingesting} title="Load {f.name} as the source">
+                  <span class="iname" title={f.name}>{ingesting === f.name ? `Loading ${f.name}…` : f.name}</span>
+                  <span class="muted small">{fmtBytes(f.size)}</span>
+                  <span class="muted small">{new Date(f.mtime).toLocaleString()}</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
     </div>
   {/if}
 </div>
@@ -278,6 +397,49 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  .mixed {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .choices {
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .inputpick {
+    margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-start;
+  }
+  .inlist {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    max-height: 240px;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .infile {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 3px 8px;
+  }
+  .infile .iname {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .name {
     overflow: hidden;

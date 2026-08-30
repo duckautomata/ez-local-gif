@@ -14,6 +14,7 @@ const (
 	KnobLossy      = "lossy"       // gif: gifsicle --lossy N
 	KnobQuality    = "quality"     // webp/avif/jpeg: encoder quality = 100 - knob
 	KnobColourStep = "colour step" // apng/png: palette halvings below the rung's colours, floored at 64 (256 → 128 → 64)
+	KnobCRF        = "crf"         // mp4/webm (Phase 4): the encoder CRF itself (larger = smaller file), enc.MP4Options.CRF / enc.WebMOptions.CRF
 	KnobLevel      = "level"       // unknown formats: abstract 0..100 harshness
 )
 
@@ -30,6 +31,17 @@ func knobFor(format string) Knob {
 		return Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}
 	case recipe.FormatJPEG:
 		return Knob{Min: 10, Max: 80, Mild: 20, Harsh: 60, Name: KnobQuality}
+	case recipe.FormatMP4:
+		// libx264 CRF searched directly (monotonic on log size): 12..40,
+		// mild default 18 here, but jobs.fitKnob overrides Mild with the
+		// effective CRF (Output.Quality-as-CRF, default enc.DefaultX264CRF
+		// = 20) and extends Min down to it when milder. The knob value goes
+		// verbatim into enc.MP4Options.CRF.
+		return Knob{Min: 12, Max: 40, Mild: 18, Harsh: 40, Name: KnobCRF}
+	case recipe.FormatWebM:
+		// libvpx-vp9 CRF 15..55, mild probe 30 (≈ the default quality),
+		// harsh 55. Verbatim into enc.WebMOptions.CRF.
+		return Knob{Min: 15, Max: 55, Mild: 30, Harsh: 55, Name: KnobCRF}
 	default:
 		return Knob{Min: 0, Max: 100, Mild: 20, Harsh: 70, Name: KnobLevel}
 	}

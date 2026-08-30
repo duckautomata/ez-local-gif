@@ -18,6 +18,7 @@ import {
   presetAvailable,
   PRESETS,
   presetById,
+  reseedQuality,
   TARGET_DEFS,
   TARGET_LABEL,
   targetLabel,
@@ -148,7 +149,7 @@ describe('presets', () => {
 
   it('Chat: one preset, GIF by default, attachment target, fit off, source size — the format select re-seeds the quality', () => {
     const p = presetById('chat');
-    expect(p.formats).toEqual(['gif', 'webp', 'avif']);
+    expect(p.formats).toEqual(['gif', 'webp', 'avif', 'mp4', 'webm']); // Phase 4: video for chat
     expect(p.locksSize).toBe(false);
     const o = applied('chat');
     expect(o).toMatchObject({ format: 'gif', target: 'attachment', width: 0, height: 0, fps: 0, colors: 256, dither: 'sierra2_4a', lossy: 20, fitEnabled: false });
@@ -252,8 +253,65 @@ describe('presets', () => {
     expect(defaultOutput()).toMatchObject({ preset: 'chat', format: 'gif', target: 'attachment', fitEnabled: false, loop: 0 });
   });
 
-  it('FIT_FORMATS mirrors the server fit engine (internal/jobs/fit.go fitFormats)', () => {
-    expect([...FIT_FORMATS].sort()).toEqual(['apng', 'avif', 'gif', 'jpeg', 'webp']);
+  it('FIT_FORMATS mirrors the server fit engine (internal/jobs/fit.go fitFormats; Phase 4 adds the video CRF knob)', () => {
+    expect([...FIT_FORMATS].sort()).toEqual(['apng', 'avif', 'gif', 'jpeg', 'mp4', 'webm', 'webp']);
     for (const f of OUTPUT_FORMATS) expect(fitsFormat(f), f).toBe(f !== 'png' && f !== 'frames');
+  });
+});
+
+// WEB-6: Output.quality means 1..100 for webp/avif/jpeg (and gifski) but IS
+// the encoder CRF for mp4/webm — a value crossing that domain boundary on a
+// Format switch must be re-seeded, never silently reinterpreted.
+describe('reseedQuality (Custom format switches, quality ↔ CRF domains)', () => {
+  function out(format: (typeof OUTPUT_FORMATS)[number], quality: number) {
+    const o = defaultOutput();
+    o.format = format;
+    o.quality = quality;
+    return o;
+  }
+
+  it('entering a video format from a 1..100 format resets to 0 (the default CRF)', () => {
+    // the finding's leak: avif q 60 → WebM used to be kept as VP9 CRF 60
+    const o = out('webm', 60);
+    reseedQuality(o, 'avif');
+    expect(o.quality).toBe(0);
+    const m = out('mp4', 20); // ≤ the CRF max, still a foreign domain
+    reseedQuality(m, 'webp');
+    expect(m.quality).toBe(0);
+  });
+
+  it('leaving a video format re-seeds the destination quality default', () => {
+    // the finding's other leak: mp4 quality 0 (CRF default) → webp kept a 0
+    // below the slider's own 1..100 minimum
+    const w = out('webp', 0);
+    reseedQuality(w, 'mp4');
+    expect(w.quality).toBe(80);
+    const a = out('avif', 30);
+    reseedQuality(a, 'webm');
+    expect(a.quality).toBe(60);
+    const j = out('jpeg', 0);
+    reseedQuality(j, 'mp4');
+    expect(j.quality).toBe(80);
+    const g = out('gif', 28);
+    reseedQuality(g, 'mp4');
+    expect(g.quality).toBe(0); // the ffmpeg palette ignores it; gifski's 0 = its default 90
+  });
+
+  it('video → video keeps a CRF that fits, clamps one past the new max to 0', () => {
+    const o = out('webm', 45);
+    reseedQuality(o, 'mp4'); // x264 CRF 45 is a valid VP9 CRF
+    expect(o.quality).toBe(45);
+    const m = out('mp4', 60); // VP9 CRF 60 is past x264's max 51
+    reseedQuality(m, 'webm');
+    expect(m.quality).toBe(0);
+  });
+
+  it('moves within the 1..100 domain keep the value', () => {
+    const o = out('avif', 92);
+    reseedQuality(o, 'webp');
+    expect(o.quality).toBe(92);
+    const g = out('gif', 33);
+    reseedQuality(g, 'webp');
+    expect(g.quality).toBe(33);
   });
 });

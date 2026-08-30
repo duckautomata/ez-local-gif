@@ -339,7 +339,7 @@ func unitParam(name string, v, def, lo float64) (float64, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Autocrop (resolved by jobs) and reverse.
+// Autocrop (resolved by jobs), reverse and bounce (Phase 4).
 // ---------------------------------------------------------------------------
 
 // autocrop applies the Resolved crop exactly like a crop op at its position
@@ -359,9 +359,30 @@ func (c *compiler) autocrop(d decodedOp, p *recipe.AutoCropParams) error {
 	return c.crop(d, p.Resolved)
 }
 
-// reverse emits ffmpeg's reverse filter when an odd number of reverse ops
-// is in the stack (two cancel out), after the geometry stages AND the
-// output fit, and before the final-canvas ops. The filter holds every input
+// reverse compiles the {reverse, bounce} group — both ops sit after the
+// geometry stages AND the output fit and before the final-canvas ops (the
+// bounce's reverse branch buffers frames exactly like a plain reverse, so
+// the same placement bounds its memory; see below). The group preserves the
+// ops' stack order, reduced by two identities: reverse ops in front of the
+// first bounce compose by parity (two cancel out, as before), and every
+// reverse op behind a bounce is dropped — a bounce yields a palindrome
+// (forward then mirrored), and reversing a palindrome reproduces it
+// bit-identically (the reverse filter reuses the forward timestamps;
+// "reverse of a bounce equals the bounce", DESIGN §7 / phase4 design). What
+// remains is at most one reverse filter followed by every bounce op's
+// stage, in order (see compiler.bounce).
+//
+// A bounce op is refused on still/single-frame sources — there is nothing
+// to play backwards, and doubling a single frame is never what the user
+// meant (unlike reverse, whose silent no-op there changes nothing). At most
+// MaxBounces bounce ops are accepted per recipe: every bounce nests another
+// split/reverse/concat stage whose reverse branch buffers a full copy of
+// the clip, and for sources with an unknown frame count the byte caps
+// cannot bound that exponential growth.
+//
+// The reverse filter itself is emitted when an odd number of reverse ops
+// precedes the first bounce (or is in the stack, without bounces), after
+// the geometry stages AND the output fit. The filter holds every input
 // frame in memory until EOF, so it must see the frames at their final size:
 // after the output fit the frame is exactly Plan.Width x Plan.Height (no
 // later stage changes the size), which MaxMasterBytes bounds — Output.
@@ -383,19 +404,66 @@ func (c *compiler) autocrop(d decodedOp, p *recipe.AutoCropParams) error {
 // reason to convert yet would otherwise be buffered at 8 B/px). The stages
 // after the reverse are final-canvas ops and the terminal format=rgba, all
 // on rgba anyway, so the rendered pixels are identical.
-func (c *compiler) reverse(ops []decodedOp) {
-	n := 0
+func (c *compiler) reverse(ops []decodedOp) error {
+	parity, bounces := 0, 0
 	for _, d := range ops {
-		if d.kind == recipe.OpReverse {
-			n++
+		switch d.kind {
+		case recipe.OpReverse:
+			if bounces == 0 {
+				parity++ // reverses behind a bounce are the identity
+			}
+		case recipe.OpBounce:
+			if c.src.IsStill {
+				return opErrorf(d, "the source is a still image and cannot be bounced")
+			}
+			if c.singleFrame() {
+				return opErrorf(d, "the source has a single frame and cannot be bounced")
+			}
+			bounces++
+			if bounces > MaxBounces {
+				return opErrorf(d, "at most %d bounce ops per recipe", MaxBounces)
+			}
 		}
 	}
-	if n%2 == 0 || c.singleFrame() {
-		return
+	if parity%2 == 1 && !c.singleFrame() {
+		c.ensureRGBA()
+		c.emit("reverse")
+		c.plan.Reversed = true
 	}
+	for range bounces {
+		c.bounce()
+	}
+	return nil
+}
+
+// bounce emits the N-th bounce op ("ping-pong", DESIGN §7): the chain is
+// pinned to rgba — both buffered copies then cost exactly 4 B/px, like the
+// reverse buffer — and closed into a split, one copy is reversed, and the
+// two are concatenated forward-then-backward (the full 2N frames; the
+// duplicated turnaround frame is kept deliberately, simple and predictable):
+//
+//	<chain so far>,format=rgba,split[fN][rN];
+//	[rN]reverse[rrN];
+//	[fN][rrN]concat=n=2:v=1:a=0,…
+//
+// The chain continues from the concat — the final-canvas ops and the
+// terminal format=rgba follow as usual, so the last chain still ends in
+// [out]. Frames and Duration double per bounce (assemble applies the
+// doubling after the trim/speed/fps math, so finish's MaxMasterBytes check
+// measures the doubled count); the split/reverse branch buffers the
+// pre-bounce frames at the output size, which that cap bounds exactly like
+// a plain reverse's buffer.
+func (c *compiler) bounce() {
+	c.bounces++
+	n := c.bounces
 	c.ensureRGBA()
-	c.emit("reverse")
-	c.plan.Reversed = true
+	c.emit("split")
+	c.chains = append(c.chains,
+		fmt.Sprintf("%s%s[f%d][r%d]", c.input, strings.Join(c.stages, ","), n, n),
+		fmt.Sprintf("[r%d]reverse[rr%d]", n, n),
+	)
+	c.input, c.stages = fmt.Sprintf("[f%d][rr%d]", n, n), nil
+	c.emit("concat=n=2:v=1:a=0")
 }
 
 // ---------------------------------------------------------------------------

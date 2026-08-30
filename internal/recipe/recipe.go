@@ -125,7 +125,7 @@ const (
 	OpChromaKey = "chromakey" // ChromaKeyParams — greenscreen/bluescreen keying in YUV 4:4:4 + despill
 	OpColorKey  = "colorkey"  // ColorKeyParams — make one RGB colour (eyedropper) transparent
 	OpReverse   = "reverse"   // no params — play backwards (after the geometry stages; trim applies in source time)
-	OpBounce    = "bounce"    // Phase 4, no params — forward then backward ("ping-pong"): frames and duration double; emitted after the output fit like reverse; stills/proxies of a bounced plan are never seeked
+	OpBounce    = "bounce"    // Phase 4, no params — forward then backward ("ping-pong"): frames and duration double; emitted after the output fit like reverse; stills/proxies of a bounced plan are never seeked; at most graph.MaxBounces per recipe
 	OpAutoCrop  = "autocrop"  // AutoCropParams — crop to the content bounding box (resolved by jobs before compiling)
 	OpText      = "text"      // TextParams — drawtext overlay
 	OpOverlay   = "overlay"   // OverlayParams — image / animated image / video overlay from Recipe.Sources[Source]
@@ -133,7 +133,8 @@ const (
 
 // OpFeather (Phase 3 review) softens the frame's alpha edge (FeatherParams).
 // Like the keying ops it runs at full resolution: the compiler hoists it into
-// the keying group, right after the keys, before any geometry.
+// the keying group, interleaved with the keys in stack order, before any
+// geometry.
 const OpFeather = "feather"
 
 // FeatherParams softens the alpha edge with a Gaussian blur of the alpha
@@ -143,10 +144,12 @@ const OpFeather = "feather"
 // soft edge spans roughly 2-3x Radius, which is how the UI labels the knob
 // ("Feather — N px (soft edge ≈ 2–3×N)").
 //
-// The stage is hoisted with the keying ops: it is emitted right after them,
-// before any geometry (crop/autocrop/resize/canvas/flip/rotate), wherever it
-// sits in the stack, and several feather ops interleave with the keys in
-// their stack order. Because it precedes the geometry, the radius scales
+// The stage is hoisted with the keying ops, before any geometry
+// (crop/autocrop/resize/canvas/flip/rotate), wherever it sits in the stack;
+// within that group it keeps its stack position, interleaved with the keys
+// in stack order — [feather, colorkey] blurs the source alpha and the key
+// then re-hardens the keyed edge, while [colorkey, feather] softens the
+// keyed matte. Because it precedes the geometry, the radius scales
 // with the image — a 3 px feather on a 720 px source is ~0.5 px after a
 // 128 px emote fit. On frames that carry no alpha at that point (an opaque
 // source with no key in front of it in the stack) the stage is skipped
@@ -337,10 +340,27 @@ const (
 	FormatWebM   = "webm"   // Phase 4, opaque video: VP9 yuv420p, CRF quality/fit knob, flattened onto Matte, even dims
 )
 
-// IsAnimatedFormat reports whether f can hold more than one frame.
+// IsAnimatedFormat reports whether f is an animated IMAGE format (one that
+// can hold more than one frame). The Phase 4 video formats (mp4/webm) also
+// hold many frames but are deliberately NOT included: every IsAnimatedFormat
+// call site is about image-format behaviour (palettes, loop counts, alpha)
+// that video must never enter — dispatch video with IsVideoFormat instead.
 func IsAnimatedFormat(f string) bool {
 	switch f {
 	case FormatGIF, FormatWebP, FormatAPNG, FormatAVIF:
+		return true
+	}
+	return false
+}
+
+// IsVideoFormat reports whether f is one of the Phase 4 opaque video export
+// formats (mp4/webm): multi-frame like the animated image formats, but
+// encoded by the video tails (flattened onto Matte, yuv420p, CRF quality
+// knob), linted by discordlint.LintVideo, and valid only for target "" or
+// the attachment tiers — never emote/sticker.
+func IsVideoFormat(f string) bool {
+	switch f {
+	case FormatMP4, FormatWebM:
 		return true
 	}
 	return false
@@ -371,7 +391,13 @@ type Output struct {
 	FPS float64 `json:"fps,omitempty"` // 0 = source fps (capped/snapped per format)
 
 	// Quality knobs. Which apply depends on Format.
-	Quality        int    `json:"quality,omitempty"`        // webp/avif 1..100 (0 = 80)
+	//
+	// Quality: webp/avif/jpeg 1..100 (0 = the format default, e.g. webp 80).
+	// mp4/webm: the value IS the encoder CRF, lower = better (0 = the
+	// default, 20 x264 / 30 vp9; capped at 51/63) — NOT a 1..100 scale.
+	// gif with Encoder "gifski": gifski --quality 1..100 (0 = 90, see
+	// Encoder).
+	Quality        int    `json:"quality,omitempty"`
 	Lossless       bool   `json:"lossless,omitempty"`       // webp
 	Lossy          int    `json:"lossy,omitempty"`          // gif: gifsicle --lossy N, 0 = off, typical 20..200
 	Colors         int    `json:"colors,omitempty"`         // gif/apng palette size 2..256 (0 = 256)
@@ -394,6 +420,15 @@ type Output struct {
 	// FrameFormat applies to FormatFrames: "png" (default, RGBA), "jpeg"
 	// (flattened onto Matte, Quality), "webp" (lossless).
 	FrameFormat string `json:"frameFormat,omitempty"`
+
+	// Encoder selects an alternative encoder for Format "gif" (Phase 4,
+	// the Advanced "Encoder" toggle): "" = the default ffmpeg palette
+	// pipeline, "gifski" = the gifski HQ encoder (per-frame local palettes,
+	// slow; Quality is gifski's --quality 1..100, 0 = 90). "gifski" is only
+	// valid with Format "gif" and Target "" or an attachment tier — never
+	// emote/sticker, whose local palettes break on Discord (jobs refuses the
+	// combination). Any other value is invalid.
+	Encoder string `json:"encoder,omitempty"`
 
 	// Preset is informational for the UI ("emote", "sticker", "chat-gif",
 	// "chat" (formerly chat-gif/chat-webp/chat-avif), "optimize", "frames",

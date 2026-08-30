@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isAnimatedFormat, isHash, isStaticFormat, OUTPUT_FORMATS, sourceHashFromSearch, sourceURL } from './api';
+import { isAnimatedFormat, isHash, isStaticFormat, isVideoFormat, OUTPUT_FORMATS, sourceHashFromSearch, sourceURL } from './api';
 
 const HASH = '0123456789abcdef'.repeat(4);
 
@@ -25,10 +25,13 @@ describe('source URL round trip', () => {
 });
 
 describe('format classes', () => {
-  it('mirror recipe.IsAnimatedFormat / IsStaticFormat', () => {
+  it('mirror recipe.IsAnimatedFormat / IsStaticFormat / discordlint.IsVideoFormat', () => {
     expect(OUTPUT_FORMATS.filter(isAnimatedFormat)).toEqual(['gif', 'webp', 'apng', 'avif']);
     expect(OUTPUT_FORMATS.filter(isStaticFormat)).toEqual(['png', 'jpeg']);
+    expect(OUTPUT_FORMATS.filter(isVideoFormat)).toEqual(['mp4', 'webm']);
     expect(isAnimatedFormat('frames')).toBe(false);
     expect(isStaticFormat('frames')).toBe(false);
+    expect(isAnimatedFormat('mp4')).toBe(false); // video: no loop semantics, no animated-format rules
+    expect(isVideoFormat('webp')).toBe(false);
   });
 });

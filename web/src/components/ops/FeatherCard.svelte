@@ -3,6 +3,7 @@
   // transparency edge. The op is emitted right after the Background (keying)
   // op and before the geometry (buildOps / the graph's hoisting), so the
   // radius is in source pixels and scales down with the output.
+  import { phase4OpsOffered } from '../../lib/capabilities.svelte';
   import { fmtNum } from '../../lib/format';
   import { app } from '../../lib/state.svelte';
   import NumField from '../NumField.svelte';
@@ -17,10 +18,16 @@
   // svelte-ignore state_referenced_locally -- the prop only seeds the initial state
   let open = $state(initialOpen);
   const cfg = $derived(app.ops.feather);
-  const summary = $derived(cfg.enabled ? `${fmtNum(cfg.radius)} px soft edge` : 'off');
+  // An older server (pre-Phase-4) rejects the feather op with a 400: the
+  // card stays, with a notice — like the Background / Overlays gates (WEB-7).
+  const supported = $derived(phase4OpsOffered());
+  const summary = $derived(cfg.enabled ? `${fmtNum(cfg.radius)} px soft edge` : supported ? 'off' : 'off — not supported by this server');
 </script>
 
 <OpCard title="Feather" {summary} bind:enabled={app.ops.feather.enabled} bind:open>
+  {#if !supported}
+    <p class="note">This server does not support feathering (an older ezlg) — the feather op will be rejected at render; update the server.</p>
+  {/if}
   <label class="field">
     <span>Feather — {fmtNum(cfg.radius)} px (soft edge ≈ 2–3×{fmtNum(cfg.radius)})</span>
     <span class="row tight">

@@ -22,11 +22,20 @@
 // colour type / palette. Static images (PNG, JPEG, WebP, AVIF) only have
 // their header read for dimensions and alpha.
 //
-// Rule ids are the Rule* constants in gif.go, webp.go, apng.go and
-// static.go; every rule is reported (passing or not) so the UI can show a
-// stable checklist, except target-specific rules (sticker/emote/attachment),
-// the byte limit when the target has none, and gif.first-frame-visible when
-// frame 0 cannot be decoded.
+// Video (MP4, WebM — Phase 4) is checked structurally and never rewritten:
+// MP4 as top-level ISO-BMFF boxes (ftyp brand, moov before mdat for
+// faststart, moov/trak/stsd for the codec and coded size, mvhd/stts for
+// duration and frame count), WebM as EBML elements (DocType, Segment
+// Info/Tracks, SimpleBlock counting). Video uploads exist on Discord only
+// as chat attachments; emote and sticker targets fail
+// video.attachment-only.
+//
+// Rule ids are the Rule* constants in gif.go, webp.go, apng.go, static.go
+// and video.go; every rule is reported (passing or not) so the UI can show
+// a stable checklist, except target-specific rules
+// (sticker/emote/attachment), the byte limit when the target has none,
+// gif.first-frame-visible when frame 0 cannot be decoded, and
+// video.faststart when moov or mdat is missing.
 //
 // Loop counts (gif.netscape-loop / webp.loop-forever) depend on the target:
 // Discord targets (IsDiscord: emote, sticker and every attachment tier)
@@ -157,7 +166,7 @@ type Check struct {
 // Report summarises a lint run.
 type Report struct {
 	RulesVersion string  `json:"rulesVersion"` // bump when rules change; stamped into results
-	Format       string  `json:"format"`       // "gif" | "webp" | "apng" | "png" (LintAPNG: plain PNG; LintStatic) | "jpeg" | "avif"
+	Format       string  `json:"format"`       // "gif" | "webp" | "apng" | "png" (LintAPNG: plain PNG; LintStatic) | "jpeg" | "avif" | "mp4" | "webm" (LintVideo)
 	Target       Target  `json:"target"`
 	Bytes        int64   `json:"bytes"`
 	Limit        int64   `json:"limit"` // from Limit(Target); 0 = none
@@ -202,6 +211,9 @@ type Report struct {
 //	              as errors) key on IsDiscord: an unrecognised target string
 //	              now behaves like TargetNone instead of a cap-less Discord
 //	              target.
+//
+// LintVideo (the video.* rules, Phase 4) is additive — it covers formats
+// no earlier build could lint — so it did not bump the version.
 const RulesVersion = "2026-08-19.4"
 
 // ErrNotImplemented was returned by the pre-implementation stubs. It is
@@ -209,4 +221,5 @@ const RulesVersion = "2026-08-19.4"
 var ErrNotImplemented = errors.New("discordlint: not implemented")
 
 // LintGIF is implemented in gif.go, LintWebP in webp.go, LintAPNG in apng.go
-// (PNG chunk parser in png.go) and LintStatic in static.go.
+// (PNG chunk parser in png.go), LintStatic in static.go and LintVideo in
+// video.go (MP4 probe in mp4.go, WebM probe in webm.go).

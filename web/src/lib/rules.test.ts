@@ -45,13 +45,15 @@ const APNG = [
   'apng.indexed',
 ];
 const STATIC = ['static.size-limit', 'static.emote-dims', 'static.sticker', 'static.format'];
+// Phase 4: internal/discordlint video.go (mp4/webm structural lint)
+const VIDEO = ['video.container', 'video.faststart', 'video.codec', 'video.dims', 'video.duration', 'video.size-limit', 'video.attachment-only'];
 // internal/jobs: the render pipeline's alpha check and the fit engine's
 // fit.target (RuleFitTarget) — the one rule users hit when a fit fails.
 const JOBS = ['render.alpha', 'fit.target'];
 
 describe('ruleLabel', () => {
   it('has a friendly label for every known rule id', () => {
-    for (const id of [...GIF, ...WEBP, ...APNG, ...STATIC, ...JOBS]) {
+    for (const id of [...GIF, ...WEBP, ...APNG, ...STATIC, ...VIDEO, ...JOBS]) {
       const label = ruleLabel(id);
       expect(label, id).not.toBe(id);
       expect(label.length, id).toBeGreaterThan(4);
@@ -62,7 +64,7 @@ describe('ruleLabel', () => {
     expect(ruleLabel('')).toBe('');
   });
   it('lists exactly the rules it knows', () => {
-    expect(new Set(knownRules())).toEqual(new Set([...GIF, ...WEBP, ...APNG, ...STATIC, ...JOBS]));
+    expect(new Set(knownRules())).toEqual(new Set([...GIF, ...WEBP, ...APNG, ...STATIC, ...VIDEO, ...JOBS]));
   });
   it('labels the jobs-level fit rule and the apng.indexed check for both outcomes', () => {
     expect(ruleLabel('fit.target')).toBe('Fit-to-size budget reached');

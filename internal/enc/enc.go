@@ -156,6 +156,17 @@ func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 // sources. A reversed plan on an animation source (p.SourceVFR: gif, apng,
 // webp, avif) is decoded from TrimStart instead, see reversedSeekFor.
 //
+// A bounced plan (p.Bounced, Phase 4: forward-then-mirrored, Duration and
+// Frames already doubled) is never seeked past the render's own input
+// window, forward or reversed, by either variant: the bounce stage buffers
+// its input until EOF and mirrors it, so the decode is exactly the render's
+// "-ss TrimStart -to TrimEnd" (no seek-back, no -itsoffset — the clock is
+// the render's already) and the frame is selected by absolute output time
+// (forward; the concat's second half carries the continued timestamps) or
+// by index (reversed) as usual. A bounced plan whose demuxer cannot seek
+// (SeekUnsafe/FilterTrim, e.g. a bounced animated WebP) stays entirely
+// unseeked as below.
+//
 // Any -ss/-to/-t/-sseof pairs in plan.InputArgs are dropped because the seek
 // replaces them; every other input option (e.g. -c:v libvpx-vp9) is kept.
 // The output label is always [outs].
@@ -259,7 +270,11 @@ func stillArgs(srcPath string, p *graph.Plan, s stillSeek, maxW int) []string {
 // inside a hold. A plan whose demuxer decodes nothing after a seek
 // (p.SeekUnsafe: animated WebP, which FilterTrim implies) is never seeked;
 // a plan whose length is unknown, or whose tail reaches back to TrimStart
-// anyway, decodes from TrimStart as a forward plan does.
+// anyway, decodes from TrimStart as a forward plan does. A bounced plan
+// (p.Bounced, Phase 4) is never seeked either, reversed or not: its bounce
+// stage buffers the whole trimmed clip and mirrors it, so the plan's own
+// InputArgs (trim seek included) are passed through unchanged and the -t
+// cap alone limits the preview.
 func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outPath string) []string {
 	if !planUsable(p) {
 		return nil
@@ -681,7 +696,8 @@ type stillSeek struct {
 
 // Reversed-still seek constants.
 const (
-	// maxStillIndex bounds the frame index a reversed still may select when
+	// maxStillIndex bounds the output slot any still may select (forward,
+	// bounced or reversed — forward plans cap the slot, not seconds) when
 	// the plan has no duration or frame count to cap it (a t far past any
 	// real clip); tpad would clone that many frames at most.
 	maxStillIndex = 1 << 20
@@ -713,6 +729,11 @@ type stillGrid struct {
 // speed stage truncates the end timestamp and Frames can be below
 // floor(Duration*FPS)), else floor(Duration*FPS)-1 when the duration is
 // known (the fps stage runs round=down, so no slot past that is rendered).
+// A bounced plan carries the doubling in Duration/Frames when they are
+// known; when neither is and the duration falls back to the trim window,
+// that fallback is doubled too — the output timeline of a bounced plan is
+// twice the trim window, and an undoubled last slot would clamp
+// mirrored-half stills to the forward half.
 func newStillGrid(p *graph.Plan) stillGrid {
 	g := stillGrid{speed: p.Speed, fps: p.FPS, trimStart: math.Max(p.TrimStart, 0), last: -1}
 	if !(g.speed > 0) || math.IsInf(g.speed, 0) {
@@ -738,6 +759,14 @@ func newStillGrid(p *graph.Plan) stillGrid {
 	durOut := p.Duration
 	if !(durOut > 0) && p.TrimEnd > 0 {
 		durOut = (p.TrimEnd - g.trimStart) / g.speed
+		if p.Bounced {
+			// The output timeline of a bounced plan is twice the trim
+			// window; Duration/Frames carry the doubling when known, so
+			// this fallback must double too or g.last clamps mirrored-half
+			// stills to the forward half. (g.srcEnd stays TrimEnd — the
+			// source-time clamp is not doubled.)
+			durOut *= 2
+		}
 	}
 	switch {
 	case p.Frames > 0:
@@ -789,7 +818,8 @@ func (g stillGrid) seekBefore(target float64, fromStart bool) (start, slots floa
 //
 // The target source time is TrimStart + t*Speed, clamped into the source.
 // The output slot displayed at t is k = floor(tOut*FPS) (tOut = clamped t),
-// capped at the render's last slot; the seek start is snapped onto the slot
+// capped at the render's last slot and at maxStillIndex (a plan of unknown
+// length cannot cap by duration); the seek start is snapped onto the slot
 // grid K slots after TrimStart (seekBefore) and -itsoffset K*Speed/FPS keeps
 // the timestamps absolute, so the fps stage after the seek emits slot k
 // exactly where and WHEN the render emits it. The select threshold sits half
@@ -814,8 +844,23 @@ func stillSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 	g := newStillGrid(p)
 	target := g.clampTarget(g.trimStart + t*g.speed)
 	tOut := (target - g.trimStart) / g.speed // clamped output time
-	abs := g.capSlot(math.Floor(tOut*g.fps + stillSlotEpsilon))
-	start, slots := g.seekBefore(target, fromStart || seekUnsafe(p))
+	if p.Bounced {
+		// The output timeline of a bounced plan is TWICE the source window
+		// (forward half then mirrored half), so the source-time clamp above
+		// would cap t at the forward half's end; clamp in output time
+		// instead (Duration and Frames are already doubled in the plan) —
+		// the slot maths below then select the mirrored half's frames by
+		// their (continued) absolute timestamps.
+		tOut = t
+		if p.Duration > 0 {
+			tOut = math.Min(tOut, math.Max(p.Duration-stillEndMargin, 0))
+		}
+	}
+	// The maxStillIndex cap bounds the SLOT (mirroring reversedSeekFor), so a
+	// huge t on a plan of unknown length cannot ask tpad/select to grind
+	// through tens of millions of cloned frames.
+	abs := g.capSlot(math.Min(math.Floor(tOut*g.fps+stillSlotEpsilon), maxStillIndex))
+	start, slots := g.seekBefore(target, fromStart || seekUnsafe(p) || p.Bounced)
 	slot := math.Max(abs-slots, 0) // slots between the seek and the wanted one
 	s := stillSeek{
 		start:     start,
@@ -823,8 +868,24 @@ func stillSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 		threshold: math.Max((abs-0.5)/g.fps, 0),
 		pad:       slot/g.fps + stillPadSlack,
 	}
-	if seekUnsafe(p) {
+	switch {
+	case seekUnsafe(p):
 		return s.unseeked()
+	case p.Bounced:
+		// A bounced plan (Phase 4) is never seeked past the render's own
+		// input window: the bounce stage buffers its input until EOF and
+		// mirrors it, so the decode must cover exactly TrimStart..TrimEnd —
+		// a seek-back after TrimStart would drop frames from BOTH halves,
+		// and a decode past TrimEnd would put the wrong frames into the
+		// mirrored half. The seek is therefore the plan's own trim window
+		// (-ss TrimStart with no -itsoffset — the render's clock starts
+		// there too — and -to TrimEnd), the from-start slot maths above
+		// (slots = 0) select by absolute output time as usual, and the
+		// concat's second half carries the continued timestamps D..2D.
+		if p.TrimEnd > 0 {
+			s.end = p.TrimEnd
+		}
+		return s
 	}
 	return s
 }
@@ -904,7 +965,11 @@ func reversedSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 	if seekUnsafe(p) {
 		return s.unseeked()
 	}
-	if fromStart || p.SourceVFR {
+	if fromStart || p.SourceVFR || p.Bounced {
+		// Bounced (Phase 4): decode the whole trimmed clip (-ss TrimStart
+		// -to TrimEnd, the render's own window) — the bounce buffers to
+		// input EOF and mirrors it, so a later seek would corrupt both
+		// halves; the j-th output frame is the render's j-th either way.
 		return s
 	}
 	s.start = g.reversedSeekStart(p.SourceFPS, j, true)
@@ -938,7 +1003,7 @@ func (g stillGrid) reversedSeekStart(srcFPS, j float64, align bool) float64 {
 // whose demuxer cannot seek (seekUnsafe: animated WebP, trimmed or not) and
 // plans of unknown length are never seeked.
 func proxySeekFor(p *graph.Plan, maxSeconds float64) (stillSeek, bool) {
-	if !p.Reversed || seekUnsafe(p) {
+	if !p.Reversed || seekUnsafe(p) || p.Bounced {
 		return stillSeek{}, false
 	}
 	g := newStillGrid(p)

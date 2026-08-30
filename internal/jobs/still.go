@@ -62,10 +62,11 @@ func (m *Manager) Still(ctx context.Context, srcHash string, ops []recipe.Op, ou
 // Still); a missing overlay source, a source without probe info or an image
 // sequence in an overlay position is an ErrInvalidRecipe.
 //
-// Admission: a reversed plan is refused (ErrInvalidRecipe, naming
-// EZLG_MAX_MASTER_BYTES) when its reverse stage would buffer more than
-// Options.MaxMasterBytes — the whole trimmed clip in output-sized RGBA
-// frames, as the render's master would (admitReversed). The ffmpeg run
+// Admission: a reversed or bounced plan is refused (ErrInvalidRecipe,
+// naming EZLG_MAX_MASTER_BYTES) when its reverse/bounce stage would buffer
+// more than Options.MaxMasterBytes — the whole (for bounce: doubled)
+// trimmed clip in output-sized RGBA frames, as the render's master would
+// (admitReversed). The ffmpeg run
 // takes a preview slot (PreviewConcurrency) and concurrent requests for the
 // same memo key share one run; a memo hit waits for neither.
 func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int) ([]byte, error) {

@@ -287,12 +287,21 @@ func parseGIFFacts(data []byte) (gifFacts, error) {
 // with every N-th frame dropped (N in 2..4, i.e. 1/2, 2/3 or 3/4 of the
 // source rate, within 5 %), since the optimiser never resamples time.
 func dropEveryN(srcFPS, wantFPS float64) (int, error) {
+	return dropEveryNTol(srcFPS, wantFPS, optimizeFPSTolerance)
+}
+
+// dropEveryNTol is dropEveryN with the relative fps tolerance as a
+// parameter: the optimize preset keeps its forgiving 5 % window, while the
+// lossless fast path matches with the much tighter fastPathFPSTolerance
+// (a near-miss there falls through to the decode pipeline's exact resample
+// instead of silently rendering a different frame rate).
+func dropEveryNTol(srcFPS, wantFPS, tol float64) (int, error) {
 	if wantFPS <= 0 || srcFPS <= 0 || wantFPS >= srcFPS {
 		return 0, nil
 	}
 	for n := optimizeMinDrop; n <= optimizeMaxDrop; n++ {
 		kept := srcFPS * float64(n-1) / float64(n)
-		if math.Abs(wantFPS-kept) <= optimizeFPSTolerance*kept {
+		if math.Abs(wantFPS-kept) <= tol*kept {
 			return n, nil
 		}
 	}

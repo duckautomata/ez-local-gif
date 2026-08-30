@@ -1,23 +1,30 @@
 <script lang="ts">
-  import { isAnimatedFormat, type Dither, type FitMode, type Target } from '../lib/api';
+  import { isAnimatedFormat, isVideoFormat, type Dither, type FitMode, type OutputFormat, type Target } from '../lib/api';
+  import { batch } from '../lib/batch.svelte';
+  import { caps, formatOffered } from '../lib/capabilities.svelte';
   import { dropRates, fitSize, fmtLimit, fmtNum, gifDelays, MAX_FPS, normalizeHex } from '../lib/format';
   import {
     DEFAULT_ALPHA_THRESHOLD,
+    DEFAULT_GIFSKI_QUALITY,
     DEFAULT_MATTE,
     fitKiBFor,
     fitsFormat,
     FORMAT_LABEL,
+    formatAllowedForTarget,
     formatHint,
     formatsFor,
     FRAME_FORMATS,
+    gifskiAllowed,
     limitKiB,
     limitOf,
     presetAvailable,
     PRESETS,
     presetById,
-    TARGET_DEFS,
+    reseedQuality,
+    targetDefsFor,
     targetLabel,
     TRIM_FRINGE_THRESHOLD,
+    videoCRF,
     WHITE_MATTE,
   } from '../lib/presets';
   import {
@@ -50,8 +57,29 @@
   // internal/fit stickerAPNGSteps) and RGBA truecolour is never tried, so the
   // colour select is a fit-off knob.
   const apngFitLocked = $derived(out.format === 'apng' && out.fitEnabled);
-  const formats = $derived(formatsFor(preset, out.format));
+  // MP4 / WebM are offered only when the target allows them (never emote /
+  // sticker) AND the server encodes them (capabilities "formats" — an older
+  // ezlg degrades to the Phase 3 list); the current format always stays
+  // selectable so nothing jumps under the user. In batch mode 'frames' is
+  // never offered (WEB-4): a frames result has no primary file, so a batch
+  // row could not show or save it (enterBatch also clears a pre-selected
+  // Frames output, so the current format is never 'frames' here).
+  const formats = $derived(
+    formatsFor(preset, out.format).filter(
+      (f: OutputFormat) =>
+        !(batch.active && f === 'frames') && (f === out.format || (formatAllowedForTarget(f, out.target) && (!isVideoFormat(f) || formatOffered(f)))),
+    ),
+  );
   const formatLocked = $derived(formats.length <= 1);
+  const video = $derived(isVideoFormat(out.format));
+  const crf = $derived(videoCRF(out.format));
+  // The Discord-target rows a video format cannot use (emote/sticker) are
+  // left out of the dropdown entirely — the pair is unrepresentable.
+  const targetDefs = $derived(targetDefsFor(out.format));
+  // gifski HQ encoder (Phase 4): GIF with target none/attachment only, and
+  // only when the server has it (features.gifski).
+  const gifskiOffered = $derived(gifskiAllowed(out) && caps.features.gifski);
+  const gifskiOn = $derived(out.format === 'gif' && out.encoder === 'gifski' && gifskiAllowed(out));
 
   // Frame size entering the output stage (after crop / resize) — for the hint.
   const stackSize = $derived.by(() => {
@@ -132,10 +160,17 @@
   }
 
   // A format switch within a preset re-seeds that format's quality defaults
-  // (Chat: lossy 20 GIF / q 80 WebP / q 60 AVIF) without resetting the rest.
-  function onFormatChange() {
+  // (Chat: lossy 20 GIF / q 80 WebP / q 60 AVIF / CRF-default video) without
+  // resetting the rest. For mp4/webm the quality field IS the CRF, so a
+  // quality crossing the video ↔ 1..100 domain boundary in either direction
+  // is re-seeded (reseedQuality, WEB-6) — which needs the format the switch
+  // left, hence value= + onchange instead of bind:value.
+  function onFormatChange(e: Event) {
+    const prev = out.format;
+    app.output.format = (e.currentTarget as HTMLSelectElement).value as OutputFormat;
     preset.onFormat?.(app.output, out.format);
     normalizeColors();
+    reseedQuality(app.output, prev);
   }
   /** GIF always has a palette: a "0 = truecolour" left over from APNG/PNG becomes 256. */
   function normalizeColors() {
@@ -162,17 +197,22 @@
   const fitLimitKiB = $derived(limitKiB(out.target));
   const fitOverLimit = $derived(out.fitEnabled && fitLimitKiB > 0 && out.fitKiB * 1024 > limit);
 
-  // The Advanced fold: matte, alpha threshold / trim fringe, dither, loop —
-  // only the rows that apply to the format; collapsed by default with a
-  // one-line summary of the current values.
+  // The Advanced fold: encoder (gifski), matte, alpha threshold / trim
+  // fringe, dither, loop — only the rows that apply to the format; collapsed
+  // by default with a one-line summary of the current values. The gifski
+  // encoder quantises itself, so its GIF hides the ffmpeg-palette rows
+  // (threshold / dither / matte); mp4/webm keep the matte (they are
+  // flattened onto it) but hide every alpha-only knob.
   let advOpen = $state(false);
-  const advMatte = $derived(usesMatte(out) && withOps);
-  const advThreshold = $derived(out.format === 'gif' && withOps);
-  const advDither = $derived(out.format === 'gif');
+  const advEncoder = $derived(out.format === 'gif' && gifskiOffered);
+  const advMatte = $derived(usesMatte(out) && withOps && !gifskiOn);
+  const advThreshold = $derived(out.format === 'gif' && withOps && !gifskiOn);
+  const advDither = $derived(out.format === 'gif' && !gifskiOn);
   const advLoop = $derived(animated);
-  const hasAdvanced = $derived(advMatte || advThreshold || advDither || advLoop);
+  const hasAdvanced = $derived(advEncoder || advMatte || advThreshold || advDither || advLoop);
   const advSummary = $derived.by(() => {
     const parts: string[] = [];
+    if (gifskiOn) parts.push('encoder gifski');
     if (advMatte) parts.push(`matte #${out.matte}`);
     if (advThreshold) parts.push(trimFringe ? 'trim fringe' : `alpha threshold ${out.alphaThreshold}`);
     if (advDither) parts.push(`dither ${out.dither}`);
@@ -188,13 +228,18 @@
     <span class="lbl">Use for</span>
     <div class="chips presets" role="group" aria-label="Use for">
       {#each PRESETS as p (p.id)}
-        {@const ok = presetAvailable(p, info)}
+        {@const framesInBatch = batch.active && p.id === 'frames'}
+        {@const ok = presetAvailable(p, info) && !framesInBatch}
         <button
           type="button"
           class="chip"
           aria-pressed={out.preset === p.id}
           disabled={!ok}
-          title={ok ? p.hint : (p.unavailableHint ?? p.hint)}
+          title={framesInBatch
+            ? 'Frames has no single output file, so batch rows cannot offer it — open a file in the editor to extract frames'
+            : ok
+              ? p.hint
+              : (p.unavailableHint ?? p.hint)}
           onclick={() => applyPreset(p.id)}
         >
           {p.label}
@@ -209,7 +254,7 @@
   <div class="row">
     <label class="field">
       <span>Format{formatLocked ? ' (preset)' : ''}</span>
-      <select bind:value={app.output.format} onchange={onFormatChange} disabled={formatLocked}>
+      <select value={out.format} onchange={onFormatChange} disabled={formatLocked}>
         {#each formats as f (f)}<option value={f}>{FORMAT_LABEL[f]}</option>{/each}
       </select>
     </label>
@@ -223,8 +268,8 @@
     {:else}
       <label class="field">
         <span>Discord target</span>
-        <select value={out.target} onchange={onTargetChange} aria-label="Discord target" title="Which Discord rules and byte cap the linter enforces — the preset only sets the default">
-          {#each TARGET_DEFS as t (t.id)}<option value={t.id}>{t.label}</option>{/each}
+        <select value={out.target} onchange={onTargetChange} aria-label="Discord target" title="Which Discord rules and byte cap the linter enforces — the preset only sets the default{video ? '; video can only be an attachment' : ''}">
+          {#each targetDefs as t (t.id)}<option value={t.id}>{t.label}</option>{/each}
         </select>
       </label>
       <span class="field">
@@ -296,7 +341,17 @@
   </div>
 
   <!-- Row 3: the quality knobs of the chosen format -->
-  {#if out.format === 'gif'}
+  {#if gifskiOn}
+    <div class="row">
+      <label class="field slider">
+        <span>gifski quality (1–100) — <b>{out.quality > 0 ? out.quality : DEFAULT_GIFSKI_QUALITY}</b>{out.quality > 0 ? '' : ' (default)'}</span>
+        <span class="row">
+          <input type="range" min="1" max="100" step="1" bind:value={app.output.quality} aria-label="gifski quality" />
+          <NumField bind:value={app.output.quality} min={0} max={100} small title="gifski --quality; 0 = the default {DEFAULT_GIFSKI_QUALITY}" />
+        </span>
+      </label>
+    </div>
+  {:else if out.format === 'gif'}
     <div class="row">
       <label class="field">
         <span>Colours</span>
@@ -309,6 +364,16 @@
         <span class="row">
           <input type="range" min="0" max="200" step="1" bind:value={app.output.lossy} aria-label="Lossy" />
           <NumField bind:value={app.output.lossy} min={0} max={200} small />
+        </span>
+      </label>
+    </div>
+  {:else if video && crf}
+    <div class="row">
+      <label class="field slider">
+        <span>{crf.label} (0 = default {crf.default}; lower = better / bigger) — <b>{out.quality > 0 ? out.quality : `${crf.default} (default)`}</b></span>
+        <span class="row">
+          <input type="range" min="0" max={crf.max} step="1" bind:value={app.output.quality} aria-label={crf.label} />
+          <NumField bind:value={app.output.quality} min={0} max={crf.max} small title="Constant rate factor: lower is better quality and a bigger file; 0 uses the default {crf.default}" />
         </span>
       </label>
     </div>
@@ -393,6 +458,10 @@
           off — the knobs above are used as-is.
         {:else if out.preset === 'optimize'}
           ladder, cheapest first: lossy → frame drop → colours (gifsicle only, never scaled); 2 runner-ups as alternatives.
+        {:else if video && crf}
+          secant search over the {crf.label} alone (size and fps stay); 2 runner-ups as alternatives.
+        {:else if gifskiOn}
+          search over the gifski quality; 2 runner-ups as alternatives.
         {:else}
           ladder, cheapest first: lossy → fps → colours → downscale{out.target === 'sticker' ? ' (stickers are never downscaled)' : ''}; 2
           runner-ups as alternatives.
@@ -409,12 +478,33 @@
         <span class="sum">Advanced</span>
         {#if !advOpen && advSummary}<span class="muted small">· {advSummary}</span>{/if}
       </summary>
+      {#if advEncoder}
+        <div class="row">
+          <label class="field">
+            <span>Encoder</span>
+            <select
+              value={out.encoder === 'gifski' ? 'gifski' : ''}
+              onchange={(e) => (app.output.encoder = e.currentTarget.value === 'gifski' ? 'gifski' : '')}
+              aria-label="GIF encoder"
+              title="gifski builds per-frame local palettes: noticeably better gradients, much slower — attachments / no target only (Discord emotes break with it)"
+            >
+              <option value="">ffmpeg palette (default)</option>
+              <option value="gifski">gifski (HQ, slow)</option>
+            </select>
+          </label>
+          {#if gifskiOn}
+            <span class="hint">gifski quantises and dithers itself — the colours / lossy / dither / matte knobs do not apply; quality is gifski’s own 1–100.</span>
+          {/if}
+        </div>
+      {/if}
       {#if advMatte}
         <div class="row">
           <span class="field wrap">
             <span>
               {#if out.format === 'gif'}
                 Matte — blended under semi-transparent edges before the 1-bit cut
+              {:else if video}
+                Matte — video has no alpha: transparency is flattened onto this colour
               {:else}
                 Matte — background the image is flattened onto
               {/if}

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ProbeInfo } from '../../lib/api';
-  import { heightForWidth, ratioLabel, widthForHeight } from '../../lib/croprect';
+  import { ratioLabel, sizeForHeight, sizeForWidth } from '../../lib/croprect';
   import { clamp } from '../../lib/format';
   import { app, backgroundOp, centerSquareCrop, setCropRatioLock } from '../../lib/state.svelte';
   import NumField from '../NumField.svelte';
@@ -72,19 +72,28 @@
     c.x = clamp(Math.round(c.x), 0, info.width - c.w);
     c.y = clamp(Math.round(c.y), 0, info.height - c.h);
   }
-  /** an edited W drags H along while the ratio is locked (H = round(W / ratio)). */
+  /**
+   * An edited W drags H along while the ratio is locked (H = round(W / ratio));
+   * when the derived H clamps at the frame edge the typed W shrinks with it
+   * (sizeForWidth), so the pair always keeps the locked ratio instead of the
+   * lock silently breaking (WEB-11).
+   */
   function onWidth() {
     fix();
     if (lockedRatio > 0) {
-      app.ops.crop.h = heightForWidth(app.ops.crop.w, lockedRatio, info.height);
+      const s = sizeForWidth(app.ops.crop.w, lockedRatio, info.width, info.height);
+      app.ops.crop.w = s.w;
+      app.ops.crop.h = s.h;
       fix();
     }
   }
-  /** an edited H drags W along while the ratio is locked (W = round(H × ratio)). */
+  /** an edited H drags W along while the ratio is locked (W = round(H × ratio)); clamps shrink the typed H (WEB-11). */
   function onHeight() {
     fix();
     if (lockedRatio > 0) {
-      app.ops.crop.w = widthForHeight(app.ops.crop.h, lockedRatio, info.width);
+      const s = sizeForHeight(app.ops.crop.h, lockedRatio, info.width, info.height);
+      app.ops.crop.w = s.w;
+      app.ops.crop.h = s.h;
       fix();
     }
   }

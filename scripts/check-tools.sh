@@ -86,12 +86,14 @@ done
 # tag (setparams), the keying-on-alpha wrapper (split, alphaextract, blend,
 # alphamerge), the feather op's alpha-plane blur (gblur), filter-level trim
 # for animated WebP (trim, setpts) and the flip/rotate ops (transpose, hflip,
-# vflip). A build lacking one of these fails the image build, not a render.
+# vflip) — plus Phase 4's concat (the bounce op joins the forward and the
+# reversed copy with it). A build lacking one of these fails the image build,
+# not a render.
 for flt in palettegen paletteuse chromakey colorkey despill drawtext premultiply unpremultiply \
            alphaextract alphamerge overlay scale pad fps crop tile mpdecimate cropdetect \
            format split lut geq testsrc2 color \
            tpad reverse lagfun bbox colorchannelmixer setparams blend trim setpts gblur \
-           transpose hflip vflip; do
+           transpose hflip vflip concat; do
   if have_line -filters "$flt"; then ok "filter" "$flt"; else bad "filter" "$flt missing"; fi
 done
 for dmx in webp_anim gif apng mov concat image2 rawvideo; do
@@ -125,10 +127,13 @@ echo "== functional smoke test"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # 4 RGBA frames with a hard alpha edge → GIF (palette path), WebP (libwebp_anim),
-# APNG, and drawtext through fontconfig (DejaVu, then Noto). Each must decode
-# again, and the text frames must differ from the same frame without text
-# (drawtext found a face and painted).
+# APNG, MP4 (libx264, matte-flattened opaque, +faststart) and WebM (libvpx-vp9)
+# for the Phase 4 video exports, and drawtext through fontconfig (DejaVu, then
+# Noto). Each must decode again, the mp4's moov must precede its mdat, and the
+# text frames must differ from the same frame without text (drawtext found a
+# face and painted).
 src="testsrc2=size=64x64:rate=10:duration=0.4,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(hypot(X-32,Y-32),24),255,0)'"
+flatten="color=c=0x313338:size=64x64:rate=10,format=rgba[bg];[bg][0:v]overlay=format=auto:shortest=1,format=yuv420p"
 if ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -filter_complex "[0:v]split[a][b];[a]palettegen=reserve_transparent=1[p];[b][p]paletteuse=alpha_threshold=128" \
      -loop 0 "$tmp/t.gif" \
@@ -137,14 +142,37 @@ if ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
    && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -c:v apng -plays 0 -f apng "$tmp/t.png" \
    && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
+     -filter_complex "$flatten" -c:v libx264 -preset veryfast -crf 30 -movflags +faststart -an -f mp4 "$tmp/t.mp4" \
+   && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
+     -filter_complex "$flatten" -c:v libvpx-vp9 -crf 40 -b:v 0 -row-mt 1 -an -f webm "$tmp/t.webm" \
+   && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -frames:v 1 -c:v png "$tmp/notext.png" \
    && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -vf "drawtext=font=DejaVu Sans:text=ezlg:fontsize=20:fontcolor=white:x=4:y=4" -frames:v 1 -c:v png "$tmp/text.png" \
    && ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" \
      -vf "drawtext=font=Noto Sans:text=ezlg:fontsize=20:fontcolor=white:x=4:y=4" -frames:v 1 -c:v png "$tmp/text-noto.png"; then
-  ok "encode" "gif / webp / apng / drawtext (DejaVu Sans, Noto Sans)"
+  ok "encode" "gif / webp / apng / mp4 / webm / drawtext (DejaVu Sans, Noto Sans)"
 else
   bad "encode" "one of the smoke encodes failed"
+fi
+# Phase 4: -movflags +faststart must have moved the moov box in front of mdat
+# (that is what discordlint's video.faststart rule checks on real renders).
+moov_off=$(grep -abo moov "$tmp/t.mp4" 2>/dev/null | head -n 1 | cut -d: -f1)
+mdat_off=$(grep -abo mdat "$tmp/t.mp4" 2>/dev/null | head -n 1 | cut -d: -f1)
+if [ -n "$moov_off" ] && [ -n "$mdat_off" ] && [ "$moov_off" -lt "$mdat_off" ]; then
+  ok "faststart" "moov ($moov_off) precedes mdat ($mdat_off) in t.mp4"
+else
+  bad "faststart" "moov/mdat order wrong or missing (moov=${moov_off:-?} mdat=${mdat_off:-?})"
+fi
+# Phase 4: gifski must actually encode (the HQ toggle feeds it PNG frames).
+mkdir -p "$tmp/gsk"
+if ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i "$src" -c:v png "$tmp/gsk/f%02d.png" \
+   && gifski --fps 10 --quality 60 --repeat 0 -o "$tmp/t-gifski.gif" "$tmp/gsk"/f*.png >/dev/null 2>&1 \
+   && [ -s "$tmp/t-gifski.gif" ] \
+   && ffmpeg -hide_banner -v error -nostdin -i "$tmp/t-gifski.gif" -f null - 2>/dev/null; then
+  ok "gifski" "encoded + decoded a GIF from PNG frames"
+else
+  bad "gifski" "could not encode a GIF from PNG frames (or it does not decode)"
 fi
 for f in text.png text-noto.png; do
   if [ -s "$tmp/$f" ] && ! cmp -s "$tmp/$f" "$tmp/notext.png"; then
@@ -153,7 +181,7 @@ for f in text.png text-noto.png; do
     bad "drawtext" "$f is identical to the frame without text (nothing drawn)"
   fi
 done
-for f in t.gif t.webp t.png text.png text-noto.png; do
+for f in t.gif t.webp t.png t.mp4 t.webm text.png text-noto.png; do
   if [ -s "$tmp/$f" ] && ffmpeg -hide_banner -v error -nostdin -i "$tmp/$f" -f null - 2>/dev/null; then
     ok "decode" "$f ($(stat -c %s "$tmp/$f") bytes)"
   else

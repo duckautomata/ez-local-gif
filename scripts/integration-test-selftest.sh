@@ -28,6 +28,13 @@
 #   6. alpha_mid_count (the Phase 3 feather case) counts only alpha values
 #      strictly between 32 and 224 — 32 and 224 themselves are out — checked
 #      against an ffmpeg stub that emits a known raw alpha plane.
+#   7. The Phase 4 manifest helpers: primary_desc must return the PRIMARY
+#      file's desc (kind "output", listed first) and not an alternative's,
+#      primary_check_ok must find a lint-report row by rule id only when its
+#      ok is true, and input_lists must match a /api/input entry by exact
+#      name — each with jq and with the grep fallback.
+#   8. moov_before_mdat (the Phase 4 mp4 case) orders the first moov/mdat
+#      byte offsets: moov-first passes, mdat-first and boxless files fail.
 #
 #   bash scripts/integration-test-selftest.sh
 set -uo pipefail
@@ -189,6 +196,78 @@ if command -v jq >/dev/null 2>&1; then
   check_frames_helpers 1 jq
 else
   printf '[selftest] note: jq not on PATH — the jq branch of the frames-manifest helpers was not tested\n'
+fi
+
+# ---- 7. Phase 4 manifest helpers on a real-shaped output manifest: the
+# primary (kind "output") is listed first with its lint report, an
+# alternative follows with a different desc.
+printf '%s' '{"id":"j5","state":"done","recipeHash":"cccccccccccc","result":{"cached":false,"renderMs":9,"files":['\
+'{"name":"out.gif","url":"/out/cccccccccccc/out.gif","bytes":2000,"format":"gif","kind":"output","desc":"lossless gifsicle (no re-encode)","report":{"rulesVersion":"v","format":"gif","checks":[{"rule":"gif.netscape-loop","level":"error","ok":true,"fixed":false,"detail":""},{"rule":"video.faststart","level":"error","ok":true,"fixed":false,"detail":"moov precedes mdat"}],"ok":true}},'\
+'{"name":"alt1.gif","url":"/out/cccccccccccc/alt1.gif","bytes":1500,"format":"gif","kind":"alternative","desc":"fit at 20 fps"}'\
+']}}' > "$stmp/primary.json"
+printf '%s' '{"id":"j6","state":"done","result":{"files":[{"name":"out.mp4","url":"/out/dddddddddddd/out.mp4","kind":"output","report":{"checks":[{"rule":"video.faststart","level":"error","ok":false,"fixed":false,"detail":"mdat first"}],"ok":false}}]}}' > "$stmp/checkfail.json"
+printf '%s' '{"files":[{"name":"clip.mov","size":123,"mtime":"2026-08-29T10:00:00Z"},{"name":"other.gif","size":5,"mtime":"2026-08-29T10:00:00Z"}]}' > "$stmp/input.json"
+
+check_phase4_helpers() { # check_phase4_helpers USE_JQ LABEL
+  local mode=$1 label=$2 got
+  got=$(frames_helper "$mode" primary_desc "$stmp/primary.json")
+  if [ "$got" = "lossless gifsicle (no re-encode)" ]; then
+    ok "primary_desc ($label) returns the primary's desc, not the alternative's"
+  else
+    fail "primary_desc ($label) got '$got', want 'lossless gifsicle (no re-encode)'"
+  fi
+  if frames_helper "$mode" primary_check_ok "$stmp/primary.json" video.faststart >/dev/null; then
+    ok "primary_check_ok ($label) finds a passing rule row"
+  else
+    fail "primary_check_ok ($label) misses the passing video.faststart row"
+  fi
+  if frames_helper "$mode" primary_check_ok "$stmp/checkfail.json" video.faststart >/dev/null; then
+    fail "primary_check_ok ($label) accepts a failing rule row (ok:false)"
+  else
+    ok "primary_check_ok ($label) rejects a failing rule row"
+  fi
+  if frames_helper "$mode" primary_check_ok "$stmp/frames.json" video.faststart >/dev/null; then
+    fail "primary_check_ok ($label) claims a row on a manifest without reports"
+  else
+    ok "primary_check_ok ($label) rejects a manifest without that rule"
+  fi
+  if frames_helper "$mode" input_lists "$stmp/input.json" clip.mov >/dev/null; then
+    ok "input_lists ($label) finds clip.mov"
+  else
+    fail "input_lists ($label) misses clip.mov"
+  fi
+  if frames_helper "$mode" input_lists "$stmp/input.json" missing.mov >/dev/null; then
+    fail "input_lists ($label) false positive on missing.mov"
+  else
+    ok "input_lists ($label) rejects an unlisted name"
+  fi
+}
+check_phase4_helpers 0 grep
+if command -v jq >/dev/null 2>&1; then
+  check_phase4_helpers 1 jq
+else
+  printf '[selftest] note: jq not on PATH — the jq branch of the Phase 4 helpers was not tested\n'
+fi
+
+# ---- 8. moov_before_mdat on synthetic byte streams (the helper reads raw
+# offsets — no real mp4 needed).
+printf 'xxxxftypisomAAmoovAAAAAAmdatBBBB' > "$stmp/good.mp4"
+printf 'xxxxftypisomAAmdatBBBBAAmoovAAAA' > "$stmp/bad.mp4"
+printf 'no boxes here at all............' > "$stmp/none.mp4"
+if frames_helper 0 moov_before_mdat "$stmp/good.mp4" >/dev/null; then
+  ok "moov_before_mdat passes a moov-first file"
+else
+  fail "moov_before_mdat fails a moov-first file"
+fi
+if frames_helper 0 moov_before_mdat "$stmp/bad.mp4" >/dev/null; then
+  fail "moov_before_mdat passes an mdat-first file"
+else
+  ok "moov_before_mdat rejects an mdat-first file"
+fi
+if frames_helper 0 moov_before_mdat "$stmp/none.mp4" >/dev/null; then
+  fail "moov_before_mdat passes a file without moov/mdat"
+else
+  ok "moov_before_mdat rejects a file without moov/mdat"
 fi
 
 # ---- 6. alpha_mid_count (the feather case) on a known alpha plane, via an

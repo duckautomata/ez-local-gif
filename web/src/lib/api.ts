@@ -24,6 +24,10 @@
 //   GET  /out/{hash}/{name}[?dl=1]                    result file
 //   GET  /api/capabilities                            -> Capabilities
 //   GET  /healthz                                     "ok"
+// Phase 4 (capability-gated — see lib/capabilities.svelte.ts):
+//   GET  /api/input                                   -> InputResponse ({files: [...]}, features.inputPick)
+//   POST /api/sources/from-input {name}               -> Source (ingests a /input file like an upload)
+//   POST /api/results/{recipeHash}/save {file, name?} -> {name} (writes a result file to /output, features.outputSave)
 // Errors are {"error": "message"} with a 4xx/5xx status.
 
 // ---------------------------------------------------------------------------
@@ -86,7 +90,9 @@ export type OpKind =
   | 'text'
   | 'overlay'
   // Phase 4 (review R4)
-  | 'feather';
+  | 'feather'
+  // Phase 4: forward then backward ("ping-pong"), no params — frames and duration double
+  | 'bounce';
 
 export type FitMode = 'contain' | 'cover' | 'exact';
 
@@ -221,9 +227,9 @@ export interface Op {
   params?: OpParams;
 }
 
-/** Go: recipe.Format* constants. */
-export type OutputFormat = 'gif' | 'webp' | 'apng' | 'avif' | 'png' | 'jpeg' | 'frames';
-export const OUTPUT_FORMATS: readonly OutputFormat[] = ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames'];
+/** Go: recipe.Format* constants ("mp4"/"webm" are the Phase 4 opaque video exports). */
+export type OutputFormat = 'gif' | 'webp' | 'apng' | 'avif' | 'png' | 'jpeg' | 'frames' | 'mp4' | 'webm';
+export const OUTPUT_FORMATS: readonly OutputFormat[] = ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames', 'mp4', 'webm'];
 /** Go: recipe.Output.FrameFormat values (FormatFrames only). */
 export type FrameFormat = 'png' | 'jpeg' | 'webp';
 /**
@@ -245,6 +251,14 @@ export function isAnimatedFormat(f: OutputFormat | string): boolean {
 export function isStaticFormat(f: OutputFormat | string): boolean {
   return f === 'png' || f === 'jpeg';
 }
+/**
+ * Mirrors discordlint.IsVideoFormat: the Phase 4 opaque video exports. Never
+ * an emote/sticker (the server refuses those recipes), no loop semantics,
+ * flattened onto the matte, dimensions made even, audio dropped.
+ */
+export function isVideoFormat(f: OutputFormat | string): boolean {
+  return f === 'mp4' || f === 'webm';
+}
 
 /** Go: recipe.Output. Zero values / omitted fields mean "default". */
 export interface Output {
@@ -253,6 +267,7 @@ export interface Output {
   height?: number;
   fit?: FitMode;
   fps?: number;
+  /** webp/avif/jpeg 1..100; gifski --quality 1..100 (0 = 90); mp4/webm: the CRF itself (0 = 20 mp4 / 30 webm) */
   quality?: number;
   lossless?: boolean;
   lossy?: number;
@@ -265,6 +280,12 @@ export interface Output {
   fitKeepSize?: boolean;
   fitKeepFps?: boolean;
   frameFormat?: FrameFormat;
+  /**
+   * Phase 4, format gif only: "" (omitted) = ffmpeg palette (default),
+   * "gifski" = the gifski HQ encoder (target none / attachment tiers only —
+   * the server refuses gifski emotes/stickers with a 400).
+   */
+  encoder?: '' | 'gifski';
   /** informational; manifests rendered by older builds may carry retired ids (chat-gif, …) */
   preset?: PresetId | (string & {});
   target?: Target;
@@ -434,6 +455,42 @@ export interface Capabilities {
 /** Body of POST /api/sources/from-result. */
 export interface FromResultRequest {
   recipeHash: string;
+  name: string;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: /input picker + /output save (capability-gated)
+
+/** One file of GET /api/input: a decodable file in the mounted /input directory. */
+export interface InputFile {
+  name: string;
+  size: number;
+  /** RFC 3339 modification time */
+  mtime: string;
+}
+
+/** Answer of GET /api/input ({"files": [...]}, name-sorted, capped by the server). */
+export interface InputResponse {
+  files: InputFile[] | null;
+}
+
+/** Body of POST /api/sources/from-input: the exact name of a listed /input file. */
+export interface FromInputRequest {
+  name: string;
+}
+
+/**
+ * Body of POST /api/results/{recipeHash}/save: `file` is the manifest name of
+ * the result file to write to /output; `name` an optional base for the saved
+ * file name (the server default is the download name; collisions get -2, -3…).
+ */
+export interface SaveRequest {
+  file: string;
+  name?: string;
+}
+
+/** Answer of the save endpoint: the final (collision-safe) name in /output. */
+export interface SaveResponse {
   name: string;
 }
 
@@ -651,6 +708,37 @@ export function getResult(recipeHash: string, signal?: AbortSignal): Promise<Res
 
 export function getCapabilities(signal?: AbortSignal): Promise<Capabilities> {
   return requestJSON<Capabilities>('/api/capabilities', { signal });
+}
+
+/**
+ * listInput lists the decodable files in the server's /input directory
+ * (features.inputPick). 503 when /input is not mounted.
+ */
+export async function listInput(signal?: AbortSignal): Promise<InputFile[]> {
+  const res = await requestJSON<InputResponse>('/api/input', { signal });
+  return Array.isArray(res.files) ? res.files : [];
+}
+
+/**
+ * sourceFromInput ingests a listed /input file like an upload (sha256
+ * dedupe + probe) and returns its Source. The name must exactly match a
+ * listed entry (the server refuses anything else, path traversal included).
+ */
+export function sourceFromInput(name: string, signal?: AbortSignal): Promise<Source> {
+  const body: FromInputRequest = { name };
+  return requestJSON<Source>('/api/sources/from-input', jsonInit('POST', body, signal));
+}
+
+/**
+ * saveResult writes one result file to the server's /output directory
+ * (features.outputSave) and resolves with the final, collision-safe name.
+ * `base` optionally overrides the file-name base (extension kept).
+ */
+export async function saveResult(recipeHash: string, file: string, base?: string, signal?: AbortSignal): Promise<string> {
+  const body: SaveRequest = { file };
+  if (base) body.name = base;
+  const res = await requestJSON<SaveResponse>(`/api/results/${encodeURIComponent(recipeHash)}/save`, jsonInit('POST', body, signal));
+  return res.name;
 }
 
 /** ping resolves true when /healthz answers. Never throws. */

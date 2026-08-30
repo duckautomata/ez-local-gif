@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { fetchProxy, fetchStill, type ProxyRequest, type StillRequest } from '../lib/api';
   import { caps } from '../lib/capabilities.svelte';
   import { displayToPixel, readPixel, rgbToHex } from '../lib/eyedropper';
@@ -9,6 +9,7 @@
     app,
     buildOutput,
     effectiveOps,
+    forwardFrame,
     hasOverlays,
     opsApply,
     planFPS,
@@ -18,6 +19,7 @@
     recipeOps,
     recipeSources,
   } from '../lib/state.svelte';
+  import { registerPlayToggle } from '../lib/shortcuts';
   import { StillScheduler, type StillView } from '../lib/still';
   import BackdropToggle from './BackdropToggle.svelte';
   import CropOverlay from './CropOverlay.svelte';
@@ -118,6 +120,13 @@
   // server renders (and memoises) the preview from — format, size, fit, fps
   // (previewOutput) — so a quality / lossy / colours / dither / matte / loop
   // / fit-budget / preset / target change never re-requests a still.
+  //
+  // Crop mode's truncated stack also drops reverse and bounce, so its time
+  // must be on the forward un-reversed timeline: the scrubber frame is folded
+  // back first (forwardFrame, WEB-5) — otherwise the mirrored half of a
+  // bounced clip clamps to the clip end and the crop rectangle is drawn on
+  // the wrong frame.
+  const stillT = $derived(cropMode && info ? stillTime(forwardFrame(info, app.ops, app.output, i), fps) : t);
   const req = $derived.by((): StillRequest | null => {
     const src = app.source;
     if (!src) return null;
@@ -126,7 +135,7 @@
       sources: cropMode ? [src.hash] : recipeSources(src.hash, app.ops, app.output),
       ops: recipeOps(app.ops, app.output, { cropPreview: cropMode, keyPreview: picking }),
       output: cropMode ? { format: app.output.format } : previewOutput(buildOutput(app.output)),
-      t,
+      t: stillT,
       maxW: overlayMode ? CANVAS_STILL_MAXW : maxW,
     };
   });
@@ -213,6 +222,17 @@
       ? `Animated preview: the first ${PROXY_SECONDS} s at ≤ ${PROXY_MAXW} px (rendered on demand)`
       : 'Animated preview is not available: this server has no /api/proxy (update ezlg)',
   );
+
+  // Space (the global shortcut in App.svelte) toggles Play/Stop while the
+  // preview is mounted; with no preview (batch mode, no source) Space is
+  // inert. The closure reads the current derived state at press time.
+  onMount(() => {
+    registerPlayToggle(() => {
+      if (proxy.playing || proxy.loading) player.stop();
+      else if (canPlay) void player.play();
+    });
+    return () => registerPlayToggle(null);
+  });
 
   onDestroy(() => {
     still.dispose();

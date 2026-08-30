@@ -23,20 +23,25 @@
 //  4. Render the master with enc.MasterArgs + ffrun.RunFFmpeg (progress →
 //     Percent, using plan.Frames or plan.Duration for the denominator);
 //     scan alpha; fill enc.Master.
-//  5. Encode per output.Format (encoders.go, frames.go):
+//  5. Encode per output.Format (encoders.go, frames.go, phase4.go):
 //     gif → enc.GIFArgs then enc.GifsicleArgs (output.Loop restated as
-//     --loopcount); webp → enc.WebPArgs; apng → enc.APNGArgs (RGBA) or,
+//     --loopcount) — or, with Output.Encoder "gifski", PNG frames → gifski;
+//     webp → enc.WebPArgs; apng → enc.APNGArgs (RGBA) or,
 //     with Colors > 0, the indexed tile → pngquant → untile pipeline, then
 //     oxipng; avif → PNG frames → avifenc (still: AVIFStillArgs); png/jpeg →
-//     first frame (+ pngquant/oxipng for png); frames → one image per frame
+//     first frame (+ pngquant/oxipng for png); mp4/webm → the opaque video
+//     tails (enc.MP4Args/WebMArgs; Phase 4); frames → one image per frame
 //     + delays.json + frames.zip (STORE). With Output.FitBytes > 0 the fit
 //     engine (fit.go)
-//     runs the §5.4 ladder for gif/webp/apng/avif/jpeg and delivers the
+//     runs the §5.4 ladder for gif/webp/apng/avif/jpeg (CRF for mp4/webm)
+//     and delivers the
 //     winner plus up to two alternatives. Output.Preset "optimize" skips the
-//     master: a GIF source goes straight through gifsicle (optimize.go).
+//     master: a GIF source goes straight through gifsicle (optimize.go) —
+//     and an eligible plain GIF → GIF edit takes the lossless gifsicle fast
+//     path automatically (phase4.go), skipping the decode entirely.
 //  6. Lint per format with output.Target: discordlint.LintGIF(fix=true)
 //     (+ the gifsicle fallback ladder when a structural error remains),
-//     LintWebP, LintAPNG, LintStatic; frames are not linted. Report.HasAlpha
+//     LintWebP, LintAPNG, LintStatic, LintVideo; frames are not linted. Report.HasAlpha
 //     is overridden with the master's pixel alpha scan (the linter's flag is
 //     structural and over-reports on frame-diff optimised opaque animations;
 //     the structural verdict stays in a render.alpha info check when they
@@ -204,6 +209,27 @@ type Options struct {
 	// bytes, next to MaxProxies (a proxy runs up to MaxProxyWidth px for
 	// MaxProxySeconds). 0 = DefaultMaxProxyBytes (512 MiB).
 	MaxProxyBytes int64
+
+	// OutputDir (Phase 4) is where SaveResult writes result files ("Save to
+	// /output"). Wire to EZLG_OUTPUT (default /output in the container).
+	// Checked once by NewManager: when it is "" / missing / not a writable
+	// directory, OutputSaveEnabled reports false (the /api/capabilities
+	// features.outputSave flag) and SaveResult returns ErrNoOutputDir.
+	OutputDir string
+
+	// InputDir (Phase 4) is the read-only pick-a-file directory behind
+	// ListInput/SourceFromInput. Wire to EZLG_INPUT (default /input).
+	// Checked once by NewManager: when it is "" / missing / not a readable
+	// directory, InputPickEnabled reports false (features.inputPick) and
+	// both methods return ErrNoInputDir. The listing itself is per-request.
+	InputDir string
+
+	// MaxUploadBytes caps SourceFromInput's ingest at the same size the HTTP
+	// upload path enforces (wire the value resolved for
+	// server.Config.MaxUploadBytes — the EZLG_MAX_UPLOAD_MB knob), so a pick
+	// never admits what an upload of the same bytes would refuse with 413.
+	// An over-limit pick fails with ErrInputTooLarge; 0 = no jobs-side cap.
+	MaxUploadBytes int64
 }
 
 // Memo bounds.
@@ -300,6 +326,11 @@ type Manager struct {
 	fonts     []enc.Font
 	fontsDone bool
 	autocrop  flight[recipe.CropParams]
+
+	// Phase 4: whether Options.OutputDir / InputDir were usable at
+	// NewManager time (see OutputSaveEnabled / InputPickEnabled).
+	outputSave bool
+	inputPick  bool
 }
 
 // NewManager wires the store, tools and options.
@@ -344,6 +375,8 @@ func NewManager(st *store.Store, tools ffrun.Tools, opts Options) *Manager {
 		scratch:    newByteBudget(budget),
 		jobs:       make(map[string]*job),
 		previewSem: make(chan struct{}, max(minPreviewConcurrency, opts.Concurrency)),
+		outputSave: dirWritable(opts.OutputDir),
+		inputPick:  dirReadable(opts.InputDir),
 	}
 	if budget > 0 && budget < opts.MaxMasterBytes {
 		log.Printf("jobs: scratch %s holds %s, less than the %s frame-master cap; larger renders will be refused up-front (raise shm_size or lower EZLG_MAX_MASTER_BYTES)",
@@ -403,10 +436,11 @@ func (m *Manager) ToolVersions() map[string]string {
 var supportedFormats = map[string]bool{
 	recipe.FormatGIF: true, recipe.FormatWebP: true, recipe.FormatAPNG: true, recipe.FormatAVIF: true,
 	recipe.FormatPNG: true, recipe.FormatJPEG: true, recipe.FormatFrames: true,
+	recipe.FormatMP4: true, recipe.FormatWebM: true,
 }
 
 // supportedFormatList is the human list for error messages.
-const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames"
+const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames, mp4, webm"
 
 // PipelineVersion salts the result key so that memoised outputs are only
 // reused while the code that produced them is unchanged. Bump it whenever
@@ -414,7 +448,20 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames"
 // flags, lint fixes); discordlint.RulesVersion is folded in automatically so
 // rule changes invalidate results too. Recipes themselves keep their
 // content hash (recipe.Recipe.Hash) — only the on-disk result key changes.
-const PipelineVersion = "2026-08-22.3"
+// 2026-08-23.1: Phase 4 — the lossless gifsicle fast path renders eligible
+// GIF→GIF recipes without a decode (different bytes for the same recipe),
+// and the bounce op / mp4 / webm / gifski paths are new.
+// 2026-08-23.2: Phase 4 integration — Output.Quality for mp4/webm is now the
+// encoder CRF itself (was a 1..100 slider mapping, since removed) and
+// the default vp9 CRF moved 31 → 30, so video recipes render differently.
+// 2026-08-23.3: fast-path eligibility tightened — variable-delay GIFs with a
+// trim/fps edit and near-miss fps requests (beyond fastPathFPSTolerance) now
+// take the decode pipeline, so previously-memoised wrong fast-path bytes
+// must not be reused.
+// 2026-08-23.4: mp4/webm tails convert to bt709/tv yuv420p inside the flatten
+// graph and tag the stream (enc videoColorConvert + -colorspace/-color_primaries/
+// -color_trc bt709), so every video recipe's bytes change.
+const PipelineVersion = "2026-08-23.4"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what
@@ -435,6 +482,9 @@ func (m *Manager) Submit(r recipe.Recipe) (Job, error) {
 	r.Ops = stripAutoCropResolved(r.Ops)
 	if !supportedFormats[strings.ToLower(r.Output.Format)] {
 		return Job{}, fmt.Errorf("%w: unsupported output format %q (supported: %s)", ErrInvalidRecipe, r.Output.Format, supportedFormatList)
+	}
+	if err := validatePhase4Output(r.Output); err != nil {
+		return Job{}, err
 	}
 	if _, err := r.Canonical(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)

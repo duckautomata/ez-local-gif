@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ping } from '../lib/api';
+  import { exitBatch } from '../lib/batch.svelte';
   import { resetRender } from '../lib/render.svelte';
   import { resetApp } from '../lib/state.svelte';
 
@@ -32,6 +33,7 @@
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
     e.preventDefault();
     resetRender();
+    exitBatch();
     resetApp();
   }
 </script>

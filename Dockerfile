@@ -162,9 +162,14 @@ RUN sed -i 's/\r$//' /usr/local/share/ezlg/*.sh \
 # ---------------------------------------------------------------------------
 FROM tools AS runtime
 COPY --from=gobuild /out/ezlg /usr/local/bin/ezlg
+# /input and /output are deliberately NOT created here: the server turns the
+# /input picker and "Save to /output" capabilities on only when the directory
+# exists (a compose bind mount creates the mount point), so an unbound install
+# honestly reports them off instead of showing an empty picker or saving into
+# a directory that vanishes with the container.
 RUN useradd --uid 1000 --user-group --create-home --shell /usr/sbin/nologin ezlg \
- && mkdir -p /data /input /output /fonts \
- && chown -R ezlg:ezlg /data /input /output
+ && mkdir -p /data /fonts \
+ && chown -R ezlg:ezlg /data
 VOLUME ["/data"]
 EXPOSE 8080
 ENV EZLG_DATA=/data \

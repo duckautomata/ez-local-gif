@@ -17,8 +17,14 @@ into the Go binary by `web/embed.go`.
                         #        fallback, presets, format (timecode, frame grid, drop rates),
                         #        rules labels, result grouping, drop planning, edit-as-source,
                         #        api helpers, render reset
-                        #   components: ResultCard / OutputCard / Preview / TrimCard / CropCard /
-                        #        BackgroundCard / OverlaysPanel rendered with svelte/server (SSR)
+                        #   Phase 4 lib: state.bounce (bounce op + doubled frame model),
+                        #        output.phase4 (mp4/webm CRF + gifski serialisation), batch
+                        #        (row/render/save orchestration with fakes), shortcuts (key
+                        #        mapping), capabilities (feature flags + formats gating),
+                        #        files (batch / mixed drop plans)
+                        #   components: ResultCard / OutputCard (+ .phase4) / Preview / TrimCard /
+                        #        CropCard / BackgroundCard / OverlaysPanel / BatchPanel rendered
+                        #        with svelte/server (SSR)
     npm run preview     # serve the built dist locally
 
 `npm run dev` proxies `/api`, `/out` and `/healthz` to the Go server at
@@ -49,15 +55,24 @@ into the Go binary by `web/embed.go`.
     src/lib/render.svelte.ts     job submission / progress / result state
     src/lib/format.ts            formatting helpers, snapFPS/gifDelays, fitSize, fmtTimecode, frame grid
     src/lib/result.ts            result-manifest grouping (primary / alternatives / frames / archive), chat sizes
-    src/lib/rules.ts             friendly labels for discordlint rule ids (gif.* webp.* apng.* static.*)
-    src/lib/files.ts             drop planning: one file vs image sequence, natural sort
+    src/lib/rules.ts             friendly labels for discordlint rule ids (gif.* webp.* apng.* static.* video.*)
+    src/lib/files.ts             drop planning: one file vs image sequence vs batch vs mixed (ask), natural sort
+    src/lib/batch.svelte.ts      Phase 4 batch mode: rows, global-ops-only recipes, per-row render/save
+                                 orchestration (injectable deps, unit-tested)
+    src/lib/shortcuts.ts         Phase 4 global shortcuts: key → action mapping, backdrop cycle,
+                                 Play-toggle registry, the "?" overlay's binding list
+    src/lib/capabilities.svelte.ts server feature flags + formats list (mp4/webm, gifski and
+                                 feather/bounce gating against an older ezlg)
     src/lib/editsource.ts        "edit as source": open tab → POST /api/sources/from-result → navigate
     src/lib/toast.svelte.ts      toasts
-    src/components/…             UploadZone, ProbeBadge, Preview (+ CropOverlay, OverlayLayer drag boxes,
-                                 eyedropper layer, Play/Stop), AnchorGrid, ops/* (Trim, Crop + auto-crop,
-                                 Resize, Fps, Speed + reverse, Background, FlipRotate, Delay,
-                                 OverlaysPanel → TextOverlayCard / ImageOverlayCard + TimeRangeFields),
-                                 OutputCard, RenderPanel, ResultCard (+ InChat), DiscordChecks, Header, Toasts
+    src/components/…             UploadZone (+ /input picker, mixed-drop choice), ProbeBadge, Preview
+                                 (+ CropOverlay, OverlayLayer drag boxes, eyedropper layer, Play/Stop),
+                                 AnchorGrid, ops/* (Trim, Crop + auto-crop, Resize, Fps, Speed + reverse
+                                 + bounce, Background, FlipRotate, Delay, OverlaysPanel →
+                                 TextOverlayCard / ImageOverlayCard + TimeRangeFields), OutputCard,
+                                 RenderPanel, ResultCard (+ InChat, Save to /output), DiscordChecks,
+                                 BatchPanel / BatchOpsPanel / BatchRenderPanel, ShortcutsOverlay,
+                                 Header, Toasts
 
 ## Behaviour notes
 
@@ -219,3 +234,45 @@ into the Go binary by `web/embed.go`.
   accepts either and checks they agree on the main source.
 - Jobs: `POST /api/jobs` → `EventSource /api/jobs/{id}/events`; if the stream
   cannot be opened or drops, the UI polls `GET /api/jobs/{id}` once a second.
+
+### Phase 4 (DESIGN.md §4.2–§4.4, §7)
+
+- **Batch**: dropping/picking several *video/animation* files enters batch mode
+  (several images stay an image **sequence** as in Phase 2; a mixed drop asks
+  which was meant). One row per file (name, probe badge, per-row unpremultiply
+  auto-default from `info.premultiplied`), the shared "Use for" chips + Output
+  card once at the top. Only geometry-independent global ops are offered:
+  unpremultiply (per-row), fps, speed, feather, background removal, reverse,
+  bounce — trim/crop/autocrop/resize/canvas/overlays/text are disabled ("Open
+  in editor" on a row seeds the single view with that source). "Render all" =
+  one ordinary `POST /api/jobs` per row (same ops + output, that row's source);
+  per-row progress via the existing SSE/polling, per-row result chip
+  (size / pass-fail vs target) + Download, "Save all to /output" when
+  `features.outputSave`.
+- **MP4 / WebM** in the Format select for the Chat and Custom presets, with
+  attachment targets or none only (never emote/sticker). Both are opaque: the
+  matte picker stays, the alpha-only knobs (alpha threshold / trim fringe,
+  dither) are hidden; the quality field is the CRF (0 = default 20 mp4 / 30
+  webm); a note says audio is dropped and dimensions are made even.
+- **gifski encoder**: Advanced GIF option "Encoder: ffmpeg palette (default) |
+  gifski (HQ, slow)" → `output.encoder: "gifski"`; shown only for format gif
+  with target none / an attachment tier (the server refuses emote/sticker with
+  400). Quality maps to gifski `--quality` (0 = 90).
+- **Bounce**: a "Bounce (forward then back, doubles the length)" checkbox in
+  the Speed card next to Reverse → the `bounce` op (no params); stacks with
+  reverse. The plan frames/duration double, which the scrubber and sticker
+  ≤ 5 s hint reflect.
+- **Save to /output / pick from /input**: the result card (and each batch row)
+  gets "Save to /output" when `features.outputSave` — `POST
+  /api/results/{recipeHash}/save {"file": name}` → toast with the returned
+  final name. The upload zone offers "… or pick from /input" when
+  `features.inputPick`: `GET /api/input` lists `{files: [{name, size,
+  mtime}]}`, a click does `POST /api/sources/from-input {"name": …}` and loads
+  the returned `Source` like an upload.
+- **Shortcuts**: Space toggles Play/Stop (ignored while an input/textarea/
+  contenteditable has focus), B cycles the preview backdrop (checkerboard →
+  dark → white), ? opens a shortcuts overlay (Esc closes). Existing:
+  Ctrl+Enter render, ←/→ frame step (Shift ×10, Home/End) on the scrubber.
+- The lossless gifsicle fast path is server-side and automatic — the UI only
+  shows the primary file's `desc` ("lossless gifsicle (no re-encode)") in the
+  result card, as it already does for fit descriptions.

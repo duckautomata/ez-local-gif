@@ -81,8 +81,14 @@ func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out
 		return nil, err
 	}
 	srcPath := s.main().Path
-	if plan.Reversed {
-		frames := proxyBufferFrames(plan, enc.ProxyArgs(srcPath, plan, maxW, maxSeconds, proxyName))
+	if plan.Reversed || plan.Bounced {
+		// A bounced plan is never seeked (enc.ProxyArgs passes its InputArgs
+		// through), so its bounce stage buffers the pre-bounce half of the
+		// doubled Plan.Frames — the doubled count is the conservative bound.
+		frames := plan.Frames
+		if !plan.Bounced {
+			frames = proxyBufferFrames(plan, enc.ProxyArgs(srcPath, plan, maxW, maxSeconds, proxyName))
+		}
 		if err := m.admitReversed(plan, frames, "this preview"); err != nil {
 			return nil, err
 		}

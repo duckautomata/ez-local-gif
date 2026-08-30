@@ -99,6 +99,40 @@ func FuzzLintStatic(f *testing.F) {
 	})
 }
 
+func FuzzLintVideo(f *testing.F) {
+	for _, name := range []string{"ff_2frame.mp4", "ff_2frame.webm"} {
+		f.Add(readFixture(f, name))
+	}
+	f.Add(buildMP4(mp4Opts{}))
+	f.Add(buildWebM(webmOpts{}))
+	f.Add(buildWebM(webmOpts{unknownSegSize: true}))
+	f.Add([]byte("\x00\x00\x00\x08ftyp"))
+	f.Add([]byte("\x1aE\xdf\xa3"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		for _, format := range []string{"mp4", "webm"} {
+			for _, target := range []Target{TargetNone, TargetEmote, TargetSticker, TargetAttachment} {
+				r, err := LintVideo(format, data, target)
+				if err != nil {
+					t.Fatalf("%s: unexpected error %v", format, err)
+				}
+				if r.Bytes != int64(len(data)) || r.Format != format || len(r.Checks) == 0 ||
+					r.Width < 0 || r.Height < 0 || r.Frames < 0 || r.DurationMS < 0 ||
+					!r.LoopForever || r.HasAlpha {
+					t.Fatalf("%s: report %+v", format, r)
+				}
+				for _, c := range r.Checks {
+					if c.Fixed {
+						t.Fatalf("no fixer, yet %s reports Fixed", c.Rule)
+					}
+				}
+				if r.OK != checkList(r.Checks).allOK() {
+					t.Fatalf("OK disagrees with the checks: %+v", r)
+				}
+			}
+		}
+	})
+}
+
 func FuzzLintWebP(f *testing.F) {
 	for _, name := range []string{"ff_lossy_alpha.webp", "ff_lossless_alpha.webp", "ff_still.webp", "ff_still_alpha.webp", "ff_loop1.webp"} {
 		f.Add(readFixture(f, name))

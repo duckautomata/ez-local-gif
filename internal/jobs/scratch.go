@@ -41,7 +41,10 @@ const (
 // (rawvideo rgba) and for the reverse stage's buffer too: the graph pins the
 // frames to rgba right in front of "reverse" ("format=rgba,reverse"), so a
 // reversed render never holds more than Frames x Width x Height x 4 in
-// memory whatever depth the chain carried before it.
+// memory whatever depth the chain carried before it. Bounce ops (Phase 4)
+// need no extra factor here: graph doubles Plan.Frames (and Duration) per
+// bounce, so the estimate already measures the doubled output — and each
+// bounce's in-graph reverse branch buffers only the pre-bounce half of it.
 func masterBytes(p *graph.Plan) int64 {
 	if p == nil {
 		return 0
@@ -68,18 +71,23 @@ func (m *Manager) masterCapError(what string, need int64, frames, width, height 
 		ErrInvalidRecipe, what, humanBytes(need), frames, width, height, humanBytes(m.opts.MaxMasterBytes))
 }
 
-// admitReversed refuses a still/proxy of a reversed plan whose reverse
-// stage would buffer more than Options.MaxMasterBytes: the filter holds
-// every output-sized RGBA frame it is handed in memory until EOF, which for
-// a preview is frames frames — the whole trimmed clip for a still, the tail
-// the proxy's seek leaves for a proxy (proxyBufferFrames). The preview
-// endpoints hand the plan to ffmpeg straight away, without the render
-// path's scratch admission, so without this check a reversed 1080p clip
-// that the render refuses up-front would still be decoded for its preview.
-// Forward plans buffer nothing and an unknown frame count (0) cannot be
-// checked; what names the preview for the message.
+// admitReversed refuses a still/proxy of a reversed OR bounced plan whose
+// reverse/bounce stage would buffer more than Options.MaxMasterBytes: the
+// reverse filter holds every output-sized RGBA frame it is handed in memory
+// until EOF, which for a preview is frames frames — the whole trimmed clip
+// for a still, the tail the proxy's seek leaves for a reversed proxy
+// (proxyBufferFrames). A bounced plan (Phase 4) is treated the same with
+// frames = Plan.Frames: its split/reverse branch buffers the pre-bounce
+// half of the (already doubled) frame count, so the doubled count is a
+// conservative bound, and bounced previews are never seeked (enc), so no
+// tail estimate applies. The preview endpoints hand the plan to ffmpeg
+// straight away, without the render path's scratch admission, so without
+// this check a reversed 1080p clip that the render refuses up-front would
+// still be decoded for its preview. Forward plans buffer nothing and an
+// unknown frame count (0) cannot be checked; what names the preview for the
+// message.
 func (m *Manager) admitReversed(plan *graph.Plan, frames int, what string) error {
-	if plan == nil || !plan.Reversed {
+	if plan == nil || (!plan.Reversed && !plan.Bounced) {
 		return nil
 	}
 	need := frameBytes(plan, frames)
@@ -116,6 +124,10 @@ func scratchFactor(out recipe.Output) int64 {
 	case recipe.FormatAPNG:
 		if out.Colors > 0 || out.FitBytes > 0 {
 			f = 2
+		}
+	case recipe.FormatGIF:
+		if isGifskiOutput(out) {
+			f = 2 // gifski reads PNG frames of the whole master
 		}
 	}
 	if out.FitBytes > 0 && fitFormats[format] {

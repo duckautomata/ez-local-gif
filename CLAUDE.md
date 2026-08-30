@@ -11,7 +11,7 @@ of truth for architecture, Discord rules, encoder commands and the phase plan.
 - `internal/enc` — argv builders for ffmpeg/gifsicle/… (pure, golden-tested)
 - `internal/fit` — fit-to-size search (ladder + secant over one knob; pure orchestration, fake-encoder tested)
 - `internal/ffrun` — the only package that spawns processes; ffmpeg progress parsing
-- `internal/discordlint` — GIF/WebP byte-level lint + fix (stdlib only)
+- `internal/discordlint` — GIF/WebP/APNG/static byte-level lint + fix, plus Phase 4 structural MP4/WebM lint (`LintVideo`, `video.*` rules, no fixer); stdlib only
 - `internal/probe` — ffprobe → ProbeInfo (+ alpha scan)
 - `internal/store` — /data layout: blobs by sha256, results by recipe hash, scratch, sweeper
 - `internal/jobs` — job table, SSE events, render pipeline

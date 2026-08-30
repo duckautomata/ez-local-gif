@@ -150,6 +150,26 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return m.deliver(ctx, j, started, r, hash, scratch, items)
 	}
 
+	// Phase 4: the lossless gifsicle fast path. An eligible GIF → GIF edit
+	// (a trim on the source frame grid, a crop, an fps of (n-1)/n of the
+	// source rate — every 2nd..4th frame dropped — and/or a
+	// loop count; format gif, default encoder, no fit budget, target
+	// none/attachment) is applied by gifsicle on the compressed frames —
+	// no decode, no master, pixels untouched (phase4.go). Recipes the check
+	// cannot prove eligible fall through to the decode pipeline below.
+	if fp, ok := m.fastPathFor(src, r); ok {
+		scratch, cleanup, err := m.st.ScratchDir(id)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		items, err := m.renderFastPath(ctx, j, scratch, src.Path, fp, r.Output, target)
+		if err != nil {
+			return nil, err
+		}
+		return m.deliver(ctx, j, started, r, hash, scratch, items)
+	}
+
 	// 2. Compile (autocrop resolved, overlay inputs bound to their blobs).
 	plan, err := m.compile(ctx, srcs, r.Ops, r.Output)
 	if err != nil {
@@ -215,7 +235,11 @@ func (m *Manager) encodeOutputs(ctx context.Context, j *job, scratch string, mas
 	)
 	switch format {
 	case recipe.FormatGIF:
-		item, err = m.produceGIF(ctx, j, scratch, master, out, target)
+		if isGifskiOutput(out) {
+			item, err = m.produceGifski(ctx, j, scratch, master, out, target)
+		} else {
+			item, err = m.produceGIF(ctx, j, scratch, master, out, target)
+		}
 	case recipe.FormatWebP:
 		item, err = m.produceWebP(ctx, j, scratch, master, out, target)
 	case recipe.FormatAPNG:
@@ -224,6 +248,8 @@ func (m *Manager) encodeOutputs(ctx context.Context, j *job, scratch string, mas
 		item, err = m.produceAVIF(ctx, j, scratch, master, out, target)
 	case recipe.FormatPNG, recipe.FormatJPEG:
 		item, err = m.produceStatic(ctx, j, scratch, master, out, target)
+	case recipe.FormatMP4, recipe.FormatWebM:
+		item, err = m.produceVideo(ctx, j, scratch, master, out, target)
 	case recipe.FormatFrames:
 		return m.produceFrames(ctx, j, scratch, master, out)
 	default:

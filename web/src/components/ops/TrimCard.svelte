@@ -63,7 +63,16 @@
   const total = $derived(planFrames(info, ops, app.output));
   const i = $derived(clamp(Math.round(app.ui.scrubFrame) || 0, 0, Math.max(0, total - 1)));
   const win = $derived(frameWindow(info, app.ops, app.output, i));
-  const atLast = $derived(total > 0 && i >= total - 1);
+  // A bounced plan doubles the frame count and frameWindow folds a mirrored-
+  // half index back to its EARLY forward source frame — right for Start (that
+  // IS the frame under the scrubber) but wrong for End: setting the trim end
+  // to a mirrored notch means the whole trimmed range plays, so End maps to
+  // "after the last forward frame" instead (same fwdTotal guard as
+  // frameWindow; without bounce fwdTotal === total and nothing changes).
+  const fwdTotal = $derived(ops.bounce && !info.isStill && total >= 2 && total % 2 === 0 ? total / 2 : total);
+  const endIdx = $derived(i >= fwdTotal ? fwdTotal - 1 : i);
+  const endWin = $derived(frameWindow(info, app.ops, app.output, endIdx));
+  const atLast = $derived(total > 0 && endIdx >= fwdTotal - 1);
 
   /** setStart: the start of the frame under the scrubber becomes the trim start. */
   function setStart() {
@@ -74,10 +83,10 @@
     app.ops.trim.enabled = true;
     app.ui.scrubFrame = 0;
   }
-  /** setEnd: the end of the frame under the scrubber becomes the trim end (the last frame = to the end). */
+  /** setEnd: the end of the frame under the scrubber becomes the trim end (the last forward frame, and any bounced mirror notch, = to the end). */
   function setEnd() {
     if (!(fps > 0)) return;
-    const e = win.end;
+    const e = endWin.end;
     if (e > 0 && e <= app.ops.trim.start) return;
     app.ops.trim.end = e;
     app.ops.trim.enabled = true;
@@ -111,7 +120,7 @@
       class="sm"
       onclick={setEnd}
       disabled={!(fps > 0)}
-      title={atLast ? 'End after the last frame (to the end)' : `End after the frame under the scrubber (frame ${i + 1}, ${fmtSeconds(win.end)} of the source)`}
+      title={atLast ? 'End after the last frame (to the end)' : `End after the frame under the scrubber (frame ${i + 1}, ${fmtSeconds(endWin.end)} of the source)`}
     >
       ◂ from scrubber
     </button>

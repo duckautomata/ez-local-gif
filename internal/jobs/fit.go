@@ -41,6 +41,7 @@ import (
 var fitFormats = map[string]bool{
 	recipe.FormatGIF: true, recipe.FormatWebP: true, recipe.FormatAPNG: true, recipe.FormatAVIF: true,
 	recipe.FormatPNG: true, recipe.FormatJPEG: true,
+	recipe.FormatMP4: true, recipe.FormatWebM: true, // Phase 4: CRF knob
 }
 
 const (
@@ -262,11 +263,17 @@ func knobsFor(rungs []fit.Rung, request string, out recipe.Output) map[string]fi
 // the user's own quality settings: the fit search must never degrade below
 // what the user asked for when that already fits (an emote-preset GIF at
 // lossy 0 used to come out at the knob's default mild, lossy 30). gif →
-// Output.Lossy; webp/avif/jpeg → 100 - the effective quality (the format's
-// default when Output.Quality is 0); apng/png → colour step 0. When the
-// user's setting is harsher than the knob's default harsh probe, the harsh
-// probe moves to Max so the bracket stays valid.
+// Output.Lossy (or the gifski quality knob when the recipe picked that
+// encoder); webp/avif/jpeg → 100 - the effective quality (the format's
+// default when Output.Quality is 0); apng/png → colour step 0; mp4/webm →
+// the user's Quality itself, which IS the encoder CRF for video (0 =
+// enc.DefaultX264CRF / DefaultVP9CRF; fit.KnobCRF). When the user's setting is
+// harsher than the knob's default harsh probe, the harsh probe moves to Max
+// so the bracket stays valid.
 func fitKnob(format string, out recipe.Output) fit.Knob {
+	if format == recipe.FormatGIF && isGifskiOutput(out) {
+		return gifskiFitKnob(out)
+	}
 	k := fit.KnobFor(format)
 	switch format {
 	case recipe.FormatGIF:
@@ -284,9 +291,35 @@ func fitKnob(format string, out recipe.Output) fit.Knob {
 			}
 		}
 		k.Mild = 100 - q
+	case recipe.FormatMP4:
+		if k.Mild = out.Quality; k.Mild <= 0 {
+			k.Mild = enc.DefaultX264CRF
+		}
+		// A user CRF milder than the default search window (12..40) is the
+		// user's explicit ask: extend Min down to it rather than raising it.
+		k.Min = min(k.Min, k.Mild)
+	case recipe.FormatWebM:
+		if k.Mild = out.Quality; k.Mild <= 0 {
+			k.Mild = enc.DefaultVP9CRF
+		}
+		// Same as mp4: never clamp an explicit mild CRF up to the window.
+		k.Min = min(k.Min, k.Mild)
 	default:
 		k.Mild = 0
 	}
+	k.Mild = min(max(k.Mild, k.Min), k.Max)
+	if k.Mild > k.Harsh {
+		k.Harsh = k.Max
+	}
+	return k
+}
+
+// gifskiFitKnob is the search knob of the gifski GIF path: fit.KnobQuality
+// semantics (candidate --quality = 100 - knob, qualityFromKnob), searched
+// over 0..99 with the mild probe at the user's own quality (default 90 →
+// knob 10) and the default harsh probe at quality 30.
+func gifskiFitKnob(out recipe.Output) fit.Knob {
+	k := fit.Knob{Min: 0, Max: 99, Mild: 100 - gifskiQuality(out.Quality), Harsh: 70, Name: fit.KnobQuality}
 	k.Mild = min(max(k.Mild, k.Min), k.Max)
 	if k.Mild > k.Harsh {
 		k.Harsh = k.Max
@@ -328,7 +361,12 @@ func knobDesc(format string, rung fit.Rung, out recipe.Output, knob int) string 
 	}
 	switch format {
 	case recipe.FormatGIF:
+		if isGifskiOutput(out) {
+			return fmt.Sprintf("gifski quality %d", qualityFromKnob(knob))
+		}
 		return fmt.Sprintf("lossy %d", knob)
+	case recipe.FormatMP4, recipe.FormatWebM:
+		return fmt.Sprintf("crf %d", knob)
 	case recipe.FormatAPNG:
 		if knob <= 0 {
 			return ""
@@ -498,7 +536,9 @@ func effectiveFormat(r fit.Rung, request string) string {
 
 // fitLadder picks the §5.4 ladder for the request: the emote ladders for
 // Target emote (GIF, or the WebP ladder for WebP/AVIF), indexed APNG then
-// GIF for Target sticker (GIF rungs only when the user forced GIF), the
+// GIF for Target sticker (GIF rungs only when the user forced GIF), a
+// single as-rendered rung for video (mp4/webm fit as-is, secant on CRF
+// alone per §5.4; FitKeepSize/FitKeepFPS are vacuously honoured), the
 // generic ladder otherwise. FitKeepSize/FitKeepFPS are honoured for every
 // ladder; rungs that cannot change anything against this master (fps drops
 // on a still) are neutralised and duplicates dropped. Generic colour rungs
@@ -528,6 +568,11 @@ func fitLadder(format string, out recipe.Output, master enc.Master) []fit.Rung {
 			}
 			rungs = gifOnly
 		}
+	case format == recipe.FormatMP4 || format == recipe.FormatWebM:
+		// DESIGN §5.4: video fits as rendered — no fps/size ladder, the
+		// secant search moves the CRF knob alone. FitKeepSize/FitKeepFPS
+		// are vacuously honoured (nothing here would change them).
+		rungs = []fit.Rung{{Format: format, Label: "as rendered"}}
 	default:
 		rungs = clampGenericColors(fit.Generic(format, fps, w, h, out.FitKeepSize, out.FitKeepFPS), out.Colors)
 	}
@@ -541,7 +586,31 @@ func fitLadder(format string, out recipe.Output, master enc.Master) []fit.Rung {
 		// the budget does the lossy quality search below it take over.
 		rungs = append([]fit.Rung{{Label: "lossless", Truecolor: true, Knob: &fit.Knob{Name: "probe"}}}, rungs...)
 	}
+	if format == recipe.FormatGIF && isGifskiOutput(out) {
+		// gifski builds its own per-frame palettes: the generic ladder's
+		// colour/dither dimension does not apply, so those rungs collapse
+		// onto their fps/size siblings (filterRungs dedupes them away).
+		rungs = dropColourRungs(rungs)
+	}
 	return filterRungs(rungs, master)
+}
+
+// dropColourRungs neutralises the palette dimension of a ladder (used for
+// the gifski encoder, which quantises itself): colours and dither are
+// cleared, the label loses its "<n> colours" part, and per-rung colour-step
+// knobs no longer apply.
+func dropColourRungs(rungs []fit.Rung) []fit.Rung {
+	out := make([]fit.Rung, 0, len(rungs))
+	for _, r := range rungs {
+		if r.Colors > 0 {
+			r.Label = stripColoursLabel(r.Label, r.Colors)
+			r.Colors = 0
+			r.Knob = nil
+		}
+		r.Dither = ""
+		out = append(out, r)
+	}
+	return out
 }
 
 // clampGenericColors post-filters the generic ladder against the user's own
@@ -638,7 +707,7 @@ func (r *fitRun) encode(ctx context.Context, rung fit.Rung, knob int, attempt in
 	cand := &fitCandidate{path: path, format: format, bytes: int64(len(data)), report: report, rung: rung, knob: knob, ok: !hasErrorCheck(report)}
 	r.cands.add(cand)
 	n := r.encodes.Add(1)
-	r.m.progress(r.j, fitProgressPct(n), fmt.Sprintf("fit: %d encodes (%s, %s %d → %s)", n, rung.Label, knobName(format), knob, humanBytes(cand.bytes)))
+	r.m.progress(r.j, fitProgressPct(n), fmt.Sprintf("fit: %d encodes (%s, %s %d → %s)", n, rung.Label, knobName(format, r.out), knob, humanBytes(cand.bytes)))
 	return path, reportedSize(cand), nil
 }
 
@@ -678,13 +747,18 @@ func fitProgressPct(n int64) float64 {
 	return pctEncodeStart + frac*(pctEncodeEnd-pctEncodeStart)
 }
 
-// knobName is the human name of a format's knob.
-func knobName(format string) string {
+// knobName is the human name of a format's knob (progress messages).
+func knobName(format string, out recipe.Output) string {
 	switch format {
 	case recipe.FormatGIF:
+		if isGifskiOutput(out) {
+			return "quality knob"
+		}
 		return "lossy"
 	case recipe.FormatAPNG, recipe.FormatPNG:
 		return "colour step"
+	case recipe.FormatMP4, recipe.FormatWebM:
+		return "crf"
 	}
 	return "quality knob"
 }
@@ -695,6 +769,20 @@ func (r *fitRun) encodeCandidate(ctx context.Context, format, id string, rung fi
 	tag := "-" + id
 	switch format {
 	case recipe.FormatGIF:
+		if isGifskiOutput(out) {
+			if m.tools.Gifski == "" {
+				return "", errors.New("the gifski encoder is not available on this server (use the default encoder)")
+			}
+			frames, err := r.pngFramesFor(ctx, v)
+			if err != nil {
+				return "", err
+			}
+			path := filepath.Join(r.dir, "c"+id+".gif")
+			if err := m.runGifski(ctx, r.dir, tag, frames, variantFPS(master, v), qualityFromKnob(knob), out.Loop, path); err != nil {
+				return "", err
+			}
+			return path, nil
+		}
 		gopts := gifOptionsFor(out, v, master)
 		if rung.Colors > 0 && (out.Colors <= 0 || rung.Colors < out.Colors) {
 			gopts.Colors = rung.Colors
@@ -753,6 +841,13 @@ func (r *fitRun) encodeCandidate(ctx context.Context, format, id string, rung fi
 	case recipe.FormatJPEG:
 		path := filepath.Join(r.dir, "c"+id+".jpg")
 		if err := m.encodeJPEGStill(ctx, master, v, qualityFromKnob(knob), out.Matte, path); err != nil {
+			return "", err
+		}
+		return path, nil
+	case recipe.FormatMP4, recipe.FormatWebM:
+		// Phase 4: the CRF knob goes verbatim into the tail's options.
+		path := filepath.Join(r.dir, "c"+id+"."+extFor(format))
+		if err := m.encodeVideoAt(ctx, r.j, tag, master, format, out, v, knob, path); err != nil {
 			return "", err
 		}
 		return path, nil
@@ -851,13 +946,15 @@ func (r *fitRun) lint(format string, data []byte, v *enc.Variant) (report discor
 		report, err = discordlint.LintStatic(recipe.FormatPNG, data, r.target)
 	case recipe.FormatJPEG:
 		report, err = discordlint.LintStatic(recipe.FormatJPEG, data, r.target)
+	case recipe.FormatMP4, recipe.FormatWebM:
+		report, err = discordlint.LintVideo(format, data, r.target)
 	default:
 		return report, data, false, fmt.Errorf("no linter for %q", format)
 	}
 	if err != nil {
 		return report, data, false, err
 	}
-	if format != recipe.FormatJPEG {
+	if !flattenedFormat(format) { // jpeg/mp4/webm are flattened: truly no alpha
 		applyMasterAlpha(&report, r.master)
 	}
 	return report, out, changed, nil

@@ -3,6 +3,7 @@
 
 import {
   isAnimatedFormat,
+  isVideoFormat,
   type AutoCropParams,
   type ChromaKeyParams,
   type ColorKeyParams,
@@ -36,7 +37,7 @@ import {
   type OverlayCfg,
   type TextOverlayCfg,
 } from './overlay';
-import { defaultOutput, fitsFormat, isSequence, limitKiB, presetAvailable, presetById, type OutputCfg } from './presets';
+import { defaultOutput, fitsFormat, gifskiAllowed, isSequence, limitKiB, presetAvailable, presetById, videoCRF, type OutputCfg } from './presets';
 
 // isSequence lives in presets.ts (isGifSource needs it there); re-exported so
 // components keep importing it from the state module.
@@ -146,6 +147,8 @@ export interface OpsCfg {
   speed: SpeedCfg;
   /** play backwards (op "reverse", after the geometry) */
   reverse: boolean;
+  /** forward then backward, "ping-pong" (op "bounce", after reverse): frames and duration double */
+  bounce: boolean;
   flipRotate: FlipRotateCfg;
   background: BackgroundCfg;
   /** soft transparency edge (op "feather", emitted right after the keying op) */
@@ -218,6 +221,7 @@ export function defaultOps(info?: ProbeInfo | null): OpsCfg {
     fps: { enabled: false, fps: Math.min(srcFps, GIF_MAX_FPS) },
     speed: { enabled: false, factor: 1 },
     reverse: false,
+    bounce: false,
     flipRotate: { enabled: false, horizontal: false, vertical: false, degrees: 0 },
     background: defaultBackground(),
     feather: { enabled: false, radius: FEATHER_DEFAULT },
@@ -467,7 +471,7 @@ export interface BuildOpsOptions {
 /**
  * buildOps serialises the op configuration in the documented order:
  * unpremultiply, delay, trim, speed, fps, chromakey/colorkey, feather,
- * crop/autocrop, resize, canvas, flip, rotate, reverse, then the
+ * crop/autocrop, resize, canvas, flip, rotate, reverse, bounce, then the
  * text/overlay ops in the user's order. With cropPreview the stack stops
  * before crop, so the still
  * shows the full frame in source pixel coordinates for the drag rectangle;
@@ -544,6 +548,10 @@ export function buildOps(c: OpsCfg, opts: BuildOpsOptions = {}): Op[] {
     }
   }
   if (c.reverse) ops.push({ kind: 'reverse' });
+  // Bounce follows reverse: [reverse, bounce] plays backwards then forwards,
+  // [bounce] forwards then backwards (the graph compiles the {reverse, bounce}
+  // group after the output fit in stack order).
+  if (c.bounce) ops.push({ kind: 'bounce' });
   ops.push(...overlayOps(c));
   return ops;
 }
@@ -599,9 +607,9 @@ export function fitBytesFor(c: Pick<OutputCfg, 'format' | 'fitEnabled' | 'fitKiB
   return Math.round(c.fitKiB * 1024);
 }
 
-/** usesMatte: formats flattened onto / thresholded against the matte colour. */
+/** usesMatte: formats flattened onto / thresholded against the matte colour (mp4/webm are fully flattened — Phase 4). */
 export function usesMatte(c: Pick<OutputCfg, 'format' | 'frameFormat'>): boolean {
-  return c.format === 'gif' || c.format === 'jpeg' || (c.format === 'frames' && c.frameFormat === 'jpeg');
+  return c.format === 'gif' || c.format === 'jpeg' || isVideoFormat(c.format) || (c.format === 'frames' && c.frameFormat === 'jpeg');
 }
 
 /**
@@ -620,12 +628,30 @@ export function buildOutput(c: OutputCfg): Output {
   if (c.fps > 0) o.fps = round(c.fps);
   switch (c.format) {
     case 'gif':
+      if (c.encoder === 'gifski' && gifskiAllowed(c)) {
+        // The gifski HQ path: gifski quantises and dithers itself, so the
+        // ffmpeg-palette knobs (colours / dither / lossy / alpha threshold /
+        // matte) do not apply and are left out of the recipe; quality is
+        // gifski --quality (0 = the server default 90).
+        o.encoder = 'gifski';
+        if (c.quality > 0) o.quality = clamp(Math.round(c.quality), 1, 100);
+        break;
+      }
       o.colors = c.colors;
       o.dither = c.dither;
       if (c.lossy > 0) o.lossy = Math.round(c.lossy);
       o.alphaThreshold = c.alphaThreshold;
       o.matte = c.matte;
       break;
+    case 'mp4':
+    case 'webm': {
+      // Opaque video (Phase 4): quality IS the CRF (0 = the server default
+      // 20 / 30); the master is flattened onto the matte.
+      const crf = videoCRF(c.format);
+      if (c.quality > 0 && crf) o.quality = clamp(Math.round(c.quality), 1, crf.max);
+      o.matte = c.matte;
+      break;
+    }
     case 'apng':
       if (c.colors > 0) o.colors = c.colors; // 0 = RGBA truecolour
       break;
@@ -870,15 +896,28 @@ function sequenceGrid(info: ProbeInfo, c: OpsCfg): { count: number; rate: number
 }
 
 /**
- * previewDuration is the output-time length of the clip after trim and speed
- * (graph.Plan.Duration): for an image sequence the selected grid frames at
- * their rate, else the trimmed source time; both divided by the speed.
+ * forwardDuration is the output-time length of the clip after trim and speed
+ * but BEFORE any bounce doubling: for an image sequence the selected grid
+ * frames at their rate, else the trimmed source time; both divided by the
+ * speed. This is the timeline "from scrubber" maps through (toSourceTime):
+ * a bounced clip's second half mirrors back onto it.
  */
-export function previewDuration(info: ProbeInfo, c: OpsCfg): number {
+export function forwardDuration(info: ProbeInfo, c: OpsCfg): number {
   const seq = sequenceGrid(info, c);
   if (seq) return seq.selected / seq.rate / speedFactor(c);
   const { start, end } = trimRange(info, c);
   return Math.max(0, (end - start) / speedFactor(c));
+}
+
+/**
+ * previewDuration is the output-time length of the clip (graph.Plan.Duration):
+ * forwardDuration, doubled by a bounce op (Phase 4 — the plan's Duration and
+ * Frames already carry the ×2, so the scrubber and the sticker ≤ 5 s check
+ * see the doubled length).
+ */
+export function previewDuration(info: ProbeInfo, c: OpsCfg): number {
+  const d = forwardDuration(info, c);
+  return c.bounce && !info.isStill ? d * 2 : d;
 }
 
 /**
@@ -900,8 +939,18 @@ export function sourceSpan(info: ProbeInfo, c: OpsCfg): { first: number; last: n
   return frameSpan(range.start, range.end, sourceFPS(info, c), sourceFrames(info, c));
 }
 
-/** toSourceTime maps a scrubber (output-time) position back to source seconds. */
+/**
+ * toSourceTime maps a scrubber (output-time) position back to source seconds.
+ * On a bounced clip the mirrored half (t ≥ forwardDuration) folds back onto
+ * the forward timeline — output D + x shows the same source frame as D − x —
+ * so trim-from-scrubber and the eyedropper keep working across the whole
+ * doubled range.
+ */
 export function toSourceTime(t: number, info: ProbeInfo, c: OpsCfg): number {
+  if (c.bounce && !info.isStill) {
+    const fwd = forwardDuration(info, c);
+    if (t > fwd) t = Math.max(0, 2 * fwd - t);
+  }
   const { start, end } = trimRange(info, c);
   return Math.min(end, start + t * speedFactor(c));
 }
@@ -934,21 +983,25 @@ export function planFPS(info: ProbeInfo | null | undefined, c: OpsCfg, out: Outp
  * A still source has one frame; 0 when the rate is unknown. Where the graph
  * would reject the recipe (a sequence trim or speed that leaves no frame)
  * the scrubber keeps one notch, like rule 4's floor; the preview shows the
- * graph's error. `c` should be effectiveOps (all-off for Optimize).
+ * graph's error. A bounce op doubles the count EXACTLY (graph.Plan.Frames is
+ * the forward count × 2, never a re-floor of the doubled duration); a still
+ * or single-frame source stays at 1 (the graph refuses bouncing those).
+ * `c` should be effectiveOps (all-off for Optimize).
  */
 export function planFrames(info: ProbeInfo | null | undefined, c: OpsCfg, out: OutputCfg): number {
   if (!info) return 0;
   const fps = planFPS(info, c, out);
   if (!(fps > 0)) return 0;
   if (info.isStill) return 1;
+  const bounce = c.bounce ? 2 : 1;
   const seq = sequenceGrid(info, c);
   if (seq) {
     if (seq.count === 1) return 1;
-    return Math.max(1, sequenceFrames(seq.selected, speedFactor(c), seq.rate, fps));
+    return Math.max(1, sequenceFrames(seq.selected, speedFactor(c), seq.rate, fps)) * bounce;
   }
-  const dur = previewDuration(info, c);
+  const dur = forwardDuration(info, c);
   if (!(dur > 0)) return 1;
-  return frameCount(dur, fps);
+  return frameCount(dur, fps) * bounce;
 }
 
 /**
@@ -978,11 +1031,44 @@ export function frameWindow(info: ProbeInfo, c: OpsCfg, out: OutputCfg, i: numbe
   const fps = planFPS(info, ops, out);
   const total = planFrames(info, ops, out);
   if (!(fps > 0) || total <= 0) return { start: 0, end: 0 };
-  const idx = clamp(Math.round(i), 0, total - 1);
+  let idx = clamp(Math.round(i), 0, total - 1);
+  // A bounced plan doubles the frame count; an index in the mirrored half
+  // shows the same source frame as its reflection in the forward half, so
+  // fold it back first (frame N+k mirrors frame N−1−k) and work on the
+  // forward grid — the trim the window feeds runs BEFORE the bounce.
+  let fwdTotal = total;
+  if (ops.bounce && !info.isStill && total >= 2 && total % 2 === 0) {
+    fwdTotal = total / 2;
+    if (idx >= fwdTotal) idx = 2 * fwdTotal - 1 - idx;
+  }
   const dur = sourceDuration(info, c);
   const range = trimRange(info, c);
   const start = Math.min(trimTime(toSourceTime(idx / fps, info, c)), trimStartMax(info, c));
-  let end = idx >= total - 1 ? range.end : Math.min(trimTime(toSourceTime((idx + 1) / fps, info, c)), dur);
+  let end = idx >= fwdTotal - 1 ? range.end : Math.min(trimTime(toSourceTime((idx + 1) / fps, info, c)), dur);
   if (end >= dur) end = 0;
   return { start, end };
+}
+
+/**
+ * forwardFrame folds 0-based plan frame i back onto the forward, un-reversed
+ * frame grid — the frame a still request whose op stack stops BEFORE reverse
+ * and bounce (crop mode: buildOps cropPreview) must ask for, or the server
+ * clamps a mirrored-half time to the clip end and renders the wrong frame
+ * (WEB-5). A bounced plan's mirrored half maps onto its forward twin (frame
+ * N+k → N−1−k, like frameWindow), and a reverse op flips the forward grid
+ * (with both the clip is [rev(F), F], so the two folds compose). Without
+ * reverse/bounce it is i unchanged (clamped to the plan).
+ */
+export function forwardFrame(info: ProbeInfo, c: OpsCfg, out: OutputCfg, i: number): number {
+  const ops = effectiveOps(c, out);
+  const total = planFrames(info, ops, out);
+  if (total <= 0) return 0;
+  let idx = clamp(Math.round(i), 0, total - 1);
+  let fwdTotal = total;
+  if (ops.bounce && !info.isStill && total >= 2 && total % 2 === 0) {
+    fwdTotal = total / 2;
+    if (idx >= fwdTotal) idx = 2 * fwdTotal - 1 - idx;
+  }
+  if (ops.reverse) idx = fwdTotal - 1 - idx;
+  return idx;
 }

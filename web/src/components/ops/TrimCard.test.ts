@@ -5,7 +5,7 @@
 import { render } from 'svelte/server';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ProbeInfo, Source } from '../../lib/api';
-import { app, setSource } from '../../lib/state.svelte';
+import { app, frameWindow, setSource } from '../../lib/state.svelte';
 import TrimCard from './TrimCard.svelte';
 
 const seqInfo: ProbeInfo = {
@@ -105,6 +105,37 @@ describe('TrimCard (SSR)', () => {
     out = html(gifInfo, true);
     expect(out).toContain('frame 50, 1.96 s of the source');
     expect(out).toContain('End after the last frame (to the end)');
+  });
+
+  // WEB-3: with Bounce on the plan doubles; frameWindow folds a mirrored-half
+  // notch to its EARLY forward twin — right for Start, but End "from scrubber"
+  // must mean "to the end" there (setting the end to a mirrored notch plays
+  // the whole trimmed range), never the folded early source time that used to
+  // collapse the trim to ~1 frame at the last notch.
+  it('bounce: End "from scrubber" on any mirrored-half notch means "to the end" (WEB-3)', () => {
+    setSource({ ...seqSrc, info: gifInfo, hash: 'f'.repeat(64) });
+    app.ops.bounce = true; // 2 s / 25 fps → 50 forward frames, 100 plan frames
+    // the very last notch (frame 100): the tooltip says "to the end", and the
+    // window End would store is 0 — frameWindow at the last FORWARD index
+    // reports the clip end as 0 ("to the end"), which is what setEnd now uses
+    // (endIdx folds every mirrored notch to fwdTotal − 1)
+    expect(frameWindow(gifInfo, app.ops, app.output, 49).end).toBe(0);
+    app.ui.scrubFrame = 99;
+    let out = html(gifInfo, true);
+    expect(out).toContain('End after the last frame (to the end)');
+    expect(out).not.toContain('0.04 s of the source'); // the folded frame-1 window that collapsed the trim
+    // a mid-mirrored-half notch (frame 76 of 100, folds to source frame 25):
+    // End no longer advertises "frame 76" with an early source time…
+    app.ui.scrubFrame = 75;
+    out = html(gifInfo, true);
+    expect(out).toContain('End after the last frame (to the end)');
+    expect(out).not.toContain('End after the frame under the scrubber (frame 76');
+    // …while Start keeps the folded frame under the scrubber (documented semantics)
+    expect(out).toContain('Start at the frame under the scrubber (frame 76, 0.96 s of the source)');
+    // the forward half is untouched: same End tooltip as without bounce
+    app.ui.scrubFrame = 12;
+    out = html(gifInfo, true);
+    expect(out).toContain('End after the frame under the scrubber (frame 13, 0.52 s of the source)');
   });
 
   it('labels End as exclusive (the frame at End is not included), as the overlay time range does', () => {

@@ -13,6 +13,8 @@ func TestKnobFor(t *testing.T) {
 		{"apng", Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}},
 		{"png", Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}},
 		{"jpeg", Knob{Min: 10, Max: 80, Mild: 20, Harsh: 60, Name: KnobQuality}},
+		{"mp4", Knob{Min: 12, Max: 40, Mild: 18, Harsh: 40, Name: KnobCRF}},
+		{"webm", Knob{Min: 15, Max: 55, Mild: 30, Harsh: 55, Name: KnobCRF}},
 		{"frames", Knob{Min: 0, Max: 100, Mild: 20, Harsh: 70, Name: KnobLevel}},
 		{"", Knob{Min: 0, Max: 100, Mild: 20, Harsh: 70, Name: KnobLevel}},
 	}
@@ -108,9 +110,10 @@ func TestDescribeKnob(t *testing.T) {
 		{KnobFor("webp"), 20, "quality 80"},
 		{KnobFor("jpeg"), 60, "quality 40"},
 		{KnobFor("apng"), 2, "colour step 2"},
-		{KnobFor("mp4"), 50, "level 50"},
+		{KnobFor("mp4"), 28, "crf 28"},
+		{KnobFor("webm"), 45, "crf 45"},
+		{KnobFor("mov"), 50, "level 50"},
 		{Knob{}, 3, "knob 3"},
-		{Knob{Name: "crf"}, 28, "crf 28"},
 	}
 	for _, c := range cases {
 		if got := describeKnob(c.k, c.v); got != c.want {

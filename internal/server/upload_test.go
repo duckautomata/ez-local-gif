@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -104,6 +105,51 @@ func sha256Hex(b []byte) string {
 func avifHead(t *testing.T) []byte {
 	t.Helper()
 	return append([]byte("\x00\x00\x00\x1cftypavif\x00\x00\x00\x00avifmif1miaf"), make([]byte, 64)...)
+}
+
+// webpHead builds a RIFF/WEBP head opening with one chunk of the given
+// fourcc and payload (enough for sniffing; not a decodable image).
+func webpHead(fourcc string, payload []byte) []byte {
+	b := []byte("RIFF\x00\x00\x00\x00WEBP")
+	b = append(b, fourcc...)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(payload)))
+	b = append(b, payload...)
+	if len(payload)%2 == 1 {
+		b = append(b, 0)
+	}
+	binary.LittleEndian.PutUint32(b[4:8], uint32(len(b)-8))
+	return b
+}
+
+// vp8xPayload is a 10-byte VP8X payload: flags byte + 3 reserved + 3-byte
+// canvas width-1 + 3-byte canvas height-1 (32x32).
+func vp8xPayload(flags byte) []byte {
+	return []byte{flags, 0, 0, 0, 31, 0, 0, 31, 0, 0}
+}
+
+// animWebPHead is an animated-WebP head: VP8X with the Animation bit (0x02)
+// set in the flags byte at file offset 20 (0x12 = Animation | Alpha).
+func animWebPHead(t *testing.T) []byte {
+	t.Helper()
+	return webpHead("VP8X", vp8xPayload(0x12))
+}
+
+// pngChunk appends one PNG chunk (big-endian length + type + data + a zero
+// CRC, which the sniffer never checks).
+func pngChunk(b []byte, typ string, data []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, uint32(len(data)))
+	b = append(b, typ...)
+	b = append(b, data...)
+	return append(b, 0, 0, 0, 0)
+}
+
+// apngHead is an APNG head: PNG signature, IHDR, then acTL before any IDAT
+// (enough for sniffing; not a decodable image).
+func apngHead(t *testing.T) []byte {
+	t.Helper()
+	b := []byte("\x89PNG\r\n\x1a\n")
+	b = pngChunk(b, "IHDR", make([]byte, 13))
+	return pngChunk(b, "acTL", make([]byte, 8))
 }
 
 // bigPNG renders a noisy (incompressible) PNG of a few MiB whose pixels
@@ -383,6 +429,12 @@ func TestUploadSequenceRejected(t *testing.T) {
 		{"two gif frames", []mpPart{filePart("a1.gif", tinyGIF(t)), filePart("a2.gif", tinyGIF(t))}, "file 1 (a1.gif) is not an image"},
 		{"two avif frames", []mpPart{filePart("a1.avif", avifHead(t)), filePart("a2.avif", avifHead(t))}, "file 1 (a1.avif) is not an image"},
 		{"extension-less gif content", []mpPart{filePart("frame-a", tinyGIF(t)), filePart("frame-b", tinyGIF(t))}, "file 1 (frame-a) is not an image"},
+		// Animated WebP and APNG carry sequence-eligible extensions but are
+		// animations: image2 would silently keep only their first frame, so
+		// the content sniff refuses them like gif/avif.
+		{"two animated webp frames", []mpPart{filePart("a1.webp", animWebPHead(t)), filePart("a2.webp", animWebPHead(t))}, "file 1 (a1.webp) is not an image"},
+		{"two apng frames", []mpPart{filePart("a1.png", apngHead(t)), filePart("a2.png", apngHead(t))}, "file 1 (a1.png) is not an image"},
+		{"still then animated webp", []mpPart{filePart("a.webp", webpHead("VP8X", vp8xPayload(0x10))), filePart("b.webp", animWebPHead(t))}, "file 2 (b.webp) is not an image"},
 		{"image then text", []mpPart{filePart("a.png", a), filePart("notes.txt", junk)}, "file 2 (notes.txt) is not an image"},
 		{"text then image", []mpPart{filePart("notes.txt", junk), filePart("a.png", a)}, "file 1 (notes.txt) is not an image"},
 		{"empty later frame", []mpPart{filePart("a.png", a), filePart("b.png", nil)}, "file 2 (b.png) is empty"},
@@ -626,6 +678,52 @@ func TestSniffImage(t *testing.T) {
 		if p.seqExt != tc.seqExt || p.storeName != tc.storeName {
 			t.Errorf("newUploadPart(%q) = seqExt %q storeName %q, want %q / %q", tc.name, p.seqExt, p.storeName, tc.seqExt, tc.storeName)
 		}
+	}
+}
+
+// TestSniffAnimated: the animated-content backstop mirrors the client sniff
+// (web/src/lib/files.ts sniffAnimated) — VP8X Animation bit or ANIM chunk
+// for WebP, acTL before IDAT for APNG; still content never trips it.
+func TestSniffAnimated(t *testing.T) {
+	animated := map[string][]byte{
+		"vp8x animation flag": animWebPHead(t),
+		"anim chunk":          webpHead("ANIM", make([]byte, 6)),
+		"apng acTL":           apngHead(t),
+	}
+	for name, head := range animated {
+		if !sniffAnimated(head) {
+			t.Errorf("sniffAnimated(%s) = false, want true", name)
+		}
+	}
+	// acTL bytes inside a chunk's data must not misfire: a PNG whose first
+	// IDAT payload contains the literal string.
+	inIDAT := []byte("\x89PNG\r\n\x1a\n")
+	inIDAT = pngChunk(inIDAT, "IHDR", make([]byte, 13))
+	inIDAT = pngChunk(inIDAT, "IDAT", []byte("xxacTLxx"))
+	still := map[string][]byte{
+		"vp8x without animation": webpHead("VP8X", vp8xPayload(0x10)),
+		"lossy webp":             append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 "), make([]byte, 16)...),
+		"plain png":              framePNG(t, 4),
+		"acTL inside IDAT data":  inIDAT,
+		"gif":                    tinyGIF(t),
+		"empty":                  nil,
+		"text":                   []byte("hello, world"),
+		"riff wave":              []byte("RIFF\x24\x00\x00\x00WAVEfmt "),
+	}
+	for name, head := range still {
+		if sniffAnimated(head) {
+			t.Errorf("sniffAnimated(%s) = true, want false", name)
+		}
+	}
+	// newUploadPart clears sequence eligibility for animated content, name
+	// or no name.
+	for _, name := range []string{"a.webp", "frame-a"} {
+		if p := newUploadPart(name, animWebPHead(t)); p.seqExt != "" || p.storeName != name {
+			t.Errorf("newUploadPart(%q, animated webp) = seqExt %q storeName %q, want none / %q", name, p.seqExt, p.storeName, name)
+		}
+	}
+	if p := newUploadPart("a.png", apngHead(t)); p.seqExt != "" {
+		t.Errorf("newUploadPart(a.png, apng) = seqExt %q, want none", p.seqExt)
 	}
 }
 

@@ -1,8 +1,9 @@
 // Server-side renders of the Feather card (review R4): the radius slider and
 // number field, the "soft edge ≈ 2–3×N" label and the format hint.
 import { render } from 'svelte/server';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ProbeInfo, Source } from '../../lib/api';
+import { resetFeatures, setFeatures } from '../../lib/capabilities.svelte';
 import { app, setSource } from '../../lib/state.svelte';
 import FeatherCard from './FeatherCard.svelte';
 
@@ -32,6 +33,7 @@ describe('FeatherCard (SSR)', () => {
   beforeEach(() => {
     setSource(gifSrc);
   });
+  afterEach(() => resetFeatures());
 
   it('collapsed: off by default, the summary shows the radius once enabled', () => {
     let out = html();
@@ -60,5 +62,17 @@ describe('FeatherCard (SSR)', () => {
     expect(out).toContain('GIF output still thresholds back to 1-bit alpha');
     expect(out).toContain('WebP, APNG and AVIF keep the soft edge');
     expect(out).toContain('scales down with the output');
+  });
+
+  // WEB-7: a pre-Phase-4 server 400s on the feather op — the card stays
+  // visible with a one-line notice, gated on the Phase 4 signal that already
+  // exists in /api/capabilities (a formats list carrying mp4).
+  it('stays visible with a notice on a server without the Phase 4 ops (formats list lacks mp4)', () => {
+    setFeatures({ features: { keying: true }, formats: ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'frames'] });
+    expect(html(true)).toContain('does not support feathering');
+    expect(html()).toContain('off — not supported by this server'); // the collapsed summary says so too
+    setFeatures({ features: { keying: true }, formats: ['gif', 'mp4', 'webm'] });
+    expect(html(true)).not.toContain('does not support feathering');
+    expect(html()).not.toContain('not supported by this server');
   });
 });

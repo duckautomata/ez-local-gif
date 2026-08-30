@@ -56,6 +56,31 @@
 #               it seeked, 20 = the trim was ignored)
 #   proxy       POST /api/proxy → image/webp, VP8X ANIM flag, canvas ≤ maxW,
 #               > 1 frame
+#
+# Phase 4 (video exports, bounce, gifski, fast path, /input //output):
+#   mp4         chat clip → attachment MP4 asked for 145×145 → job done, file
+#               downloads, ffprobe says h264 / yuv420p / even dims (144–146),
+#               moov precedes mdat both byte-level and via the lint report's
+#               "video.faststart" row, report.ok
+#   webm        attachment WebM → vp9 / yuv420p / even dims, report.ok
+#   bounce      frames export of the 0–0.5 s trim with and without the bounce
+#               op → exactly 2N frame files, bounce first == forward first,
+#               bounce first == bounce last and bounce frame N+1 == forward
+#               last (frames_match: sha256 or PSNR ≥ 50 dB)
+#   gifski      format gif, no target, encoder "gifski" → done, the GIF decodes
+#               and gifsicle parses > 1 frame, the primary desc names gifski;
+#               a gifski recipe with target emote is refused with 4xx
+#   fastpath    the Phase 2 GIF source + a crop op, target attachment → done,
+#               96×96, report.ok, and the primary desc says the lossless
+#               gifsicle path was taken (no re-encode)
+#   input/output (EZLG_START_SERVER=1 only — the script owns the dirs then;
+#               skipped with a note otherwise): capabilities inputPick /
+#               outputSave true; GET /api/input lists a clip copied into the
+#               temp /input dir; POST /api/sources/from-input ingests it and
+#               dedupes to the already-uploaded hash; a traversal name is
+#               refused; POST /api/results/{hash}/save writes the Phase 1 GIF
+#               into the temp /output dir byte-identically, twice → two
+#               distinct collision-safe names; an unknown file name is 404
 # Exit status is non-zero if anything fails; a summary is printed at the end.
 #
 #   EZLG_URL=http://localhost:8080 scripts/integration-test.sh
@@ -84,8 +109,9 @@
 #                       warning only, so EZLG_URL runs against a long-lived
 #                       stack still pass
 #   EZLG_TEST_TIMEOUT   seconds to wait for each job (default 120)
-#   EZLG_TEST_PHASE2    0 → run the Phase 1 checks only (default 1; also skips Phase 3)
-#   EZLG_TEST_PHASE3    0 → skip the Phase 3 checks (default 1)
+#   EZLG_TEST_PHASE2    0 → run the Phase 1 checks only (default 1; also skips Phases 3 and 4)
+#   EZLG_TEST_PHASE3    0 → skip the Phase 3 checks (default 1; also skips Phase 4)
+#   EZLG_TEST_PHASE4    0 → skip the Phase 4 checks (default 1)
 #   EZLG_TEST_KEEP      1 → keep the temp dir (printed at the end)
 #   EZLG_FFMPEG / EZLG_FFPROBE / EZLG_GIFSICLE / EZLG_WEBPINFO / EZLG_AVIFDEC
 #                       tool overrides (avifdec, unzip and jq are optional:
@@ -98,6 +124,7 @@ url=${url%/}
 timeout=${EZLG_TEST_TIMEOUT:-120}
 phase2=${EZLG_TEST_PHASE2:-1}
 phase3=${EZLG_TEST_PHASE3:-1}
+phase4=${EZLG_TEST_PHASE4:-1}
 ffmpeg=${EZLG_FFMPEG:-ffmpeg}
 ffprobe=${EZLG_FFPROBE:-ffprobe}
 gifsicle=${EZLG_GIFSICLE:-gifsicle}
@@ -127,6 +154,7 @@ trap cleanup EXIT
 log()   { printf '[itest] %s\n' "$*"; }
 ok()    { pass=$((pass+1));  results+=("PASS  $*"); printf '[itest]   pass: %s\n' "$*"; }
 fail()  { failn=$((failn+1)); results+=("FAIL  $*"); printf '[itest]   FAIL: %s\n' "$*" >&2; }
+skip()  { results+=("SKIP  $*"); printf '[itest]   skip: %s\n' "$*"; }
 abort() { summary; exit 1; }
 die()   { fail "$*"; abort; }
 summary() {
@@ -247,6 +275,41 @@ features_true() { # features_true FILE NAME → true if /api/capabilities says f
   else stripped "$1" | grep -qF "\"$2\":true"
   fi
 }
+# Phase 4 helpers.
+primary_desc() { # primary_desc FILE → the primary file's desc ("" when absent)
+  if [ "$use_jq" = 1 ]; then
+    jq -r 'first(.result.files[]? | select((.kind // "") == "" or .kind == "output")) | .desc // empty' "$1" 2>/dev/null
+  else
+    # The primary file is listed first and nothing before the files carries a
+    # "desc" key, so the first desc in the manifest is the primary's. Grep the
+    # raw file, not stripped(): the desc value itself holds spaces (Go's
+    # encoder writes no spaces around ':' — same reasoning as fonts_has).
+    grep -oE '"desc":"[^"]*"' "$1" | head -n 1 | sed -E 's/^"desc":"//; s/"$//'
+  fi
+}
+primary_check_ok() { # primary_check_ok FILE RULE → true if the primary file's lint report lists check RULE with ok true
+  if [ "$use_jq" = 1 ]; then
+    jq -e --arg r "$2" 'first(.result.files[]? | select((.kind // "") == "" or .kind == "output")) | any(.report.checks[]?; .rule == $r and .ok == true)' "$1" >/dev/null 2>&1
+  else
+    # discordlint.Check marshals in struct order: {"rule":…,"level":…,"ok":…,…}.
+    stripped "$1" | grep -qE "\"rule\":\"$2\",\"level\":\"[^\"]*\",\"ok\":true"
+  fi
+}
+input_lists() { # input_lists FILE NAME → true if GET /api/input lists the file name (exact)
+  if [ "$use_jq" = 1 ]; then jq -e --arg n "$2" 'any(.files[]?; .name == $n)' "$1" >/dev/null 2>&1
+  else grep -qF "\"name\":\"$2\"" "$1" # Go's encoder writes no spaces around ':'
+  fi
+}
+moov_before_mdat() { # moov_before_mdat FILE → 0 when the first moov box precedes the first mdat (both present)
+  # Captured first (house SIGPIPE rule); top-level boxes only ever contain
+  # these four-byte names once each in our own faststart outputs.
+  local offs moov mdat
+  offs=$(grep -abo -e moov -e mdat "$1" 2>/dev/null || true)
+  moov=$(sed -n 's/^\([0-9]*\):moov$/\1/p' <<<"$offs" | head -n 1)
+  mdat=$(sed -n 's/^\([0-9]*\):mdat$/\1/p' <<<"$offs" | head -n 1)
+  [ -n "$moov" ] && [ -n "$mdat" ] && [ "$moov" -lt "$mdat" ]
+}
+pixfmt_of() { "$ffprobe" -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nw=1:nk=1 "$1" 2>/dev/null | head -n 1; }
 
 # ---- zip helpers (Go's archive/zip output: no archive comment, no zip64)
 zip_entries() { # zip_entries FILE → total entry count from the end-of-central-directory record
@@ -441,6 +504,10 @@ if [ "${EZLG_START_SERVER:-0}" = 1 ]; then
   # EZLG_TEST_DATA is the explicit opt-in override.
   export EZLG_DATA=${EZLG_TEST_DATA:-$tmp/data}
   mkdir -p "$EZLG_DATA"
+  # Phase 4: own the picker/save dirs too (overriding anything inherited), so
+  # the /input //output cases below can see what the server sees.
+  export EZLG_INPUT="$tmp/inputdir" EZLG_OUTPUT="$tmp/outputdir"
+  mkdir -p "$EZLG_INPUT" "$EZLG_OUTPUT"
   log "building ezlg ..."
   (cd "$repo" && go build -o "$tmp/ezlg" ./cmd/ezlg) || die "go build failed"
   log "starting server (data=$EZLG_DATA, log=$tmp/server.log)"
@@ -999,6 +1066,209 @@ if [ "$code" = 200 ]; then
 else
   cat "$tmp/proxy.webp" >&2
   fail "POST /api/proxy → $code"
+fi
+
+if [ "$phase4" != 1 ]; then
+  summary
+  [ "$failn" -eq 0 ]
+  exit
+fi
+
+# =============================================================================
+# Phase 4: MP4/WebM export, bounce, gifski encoder, lossless gifsicle fast
+# path, /input picker + /output save
+# =============================================================================
+log "phase 4: video exports, bounce, gifski, fast path"
+
+# ---- submit every Phase 4 job up front
+recipe[mp4]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"'],"output":{"format":"mp4","width":145,"height":145,"fit":"contain","preset":"chat","target":"attachment"}}'
+recipe[webm]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"'],"output":{"format":"webm","preset":"chat","target":"attachment"}}'
+trim05='{"kind":"trim","params":{"start":0,"end":0.5}}'
+recipe[bounce-fwd]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"','"$trim05"'],"output":{"format":"frames","frameFormat":"png","preset":"frames"}}'
+recipe[bounce]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"','"$trim05"',{"kind":"bounce"}],"output":{"format":"frames","frameFormat":"png","preset":"frames"}}'
+recipe[gifski]='{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"'],"output":{"format":"gif","encoder":"gifski","quality":90,"preset":"custom"}}'
+phase4_jobs=(mp4 webm bounce-fwd bounce gifski)
+if [ -n "$gif_hash" ]; then
+  recipe[fastpath]='{"v":1,"sources":["'"$gif_hash"'"],"ops":[{"kind":"crop","params":{"x":16,"y":16,"w":96,"h":96}}],"output":{"format":"gif","preset":"custom","target":"attachment"}}'
+  phase4_jobs+=(fastpath)
+fi
+for name in "${phase4_jobs[@]}"; do
+  submit_job "$name" || true
+done
+
+# gifski is never allowed for emote/sticker targets (per-frame local palettes
+# break on Discord emotes — DESIGN.md §9a): the recipe must be refused.
+code=$(curl -sS -o "$tmp/gifski_emote.json" -w '%{http_code}' --max-time 30 -H 'Content-Type: application/json' \
+         --data '{"v":1,"sources":["'"$hash"'"],"ops":['"$unp"'],"output":{"format":"gif","encoder":"gifski","width":128,"height":128,"fit":"contain","preset":"emote","target":"emote"}}' "$url/api/jobs")
+case "$code" in
+  4*) ok "gifski + target emote refused ($code)" ;;
+  *)  cat "$tmp/gifski_emote.json" >&2; fail "gifski + target emote → $code, want 4xx" ;;
+esac
+
+# ---- attachment MP4: h264 / yuv420p / even dims / moov before mdat
+name=mp4
+if finish_job $name && fetch_primary $name mp4; then
+  f=${out_file[$name]}
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>"$tmp/$name.err"; then ok "$name: decodes (ffmpeg)"; else fail "$name: does not decode: $(head -c 300 "$tmp/$name.err")"; fi
+  if [ "$(codec_of "$f")" = h264 ]; then ok "$name: codec h264"; else fail "$name: codec '$(codec_of "$f")', want h264"; fi
+  if [ "$(pixfmt_of "$f")" = yuv420p ]; then ok "$name: pix_fmt yuv420p"; else fail "$name: pix_fmt '$(pixfmt_of "$f")', want yuv420p"; fi
+  d=$(dims_of "$f"); w=${d%x*}; h=${d#*x}
+  if [ "${w:-1}" -ge 144 ] && [ "$w" -le 146 ] && [ "${h:-1}" -ge 144 ] && [ "$h" -le 146 ] \
+     && [ $((w % 2)) -eq 0 ] && [ $((h % 2)) -eq 0 ]; then
+    ok "$name: $d — the odd 145x145 request was made even"
+  else
+    fail "$name: dims '$d', want both sides even and within 144..146 (requested 145x145)"
+  fi
+  if moov_before_mdat "$f"; then ok "$name: moov precedes mdat (+faststart, byte check)"; else fail "$name: moov does not precede mdat"; fi
+  if primary_check_ok "$tmp/poll_$name.json" video.faststart; then ok "$name: lint row video.faststart ok"; else fail "$name: lint report has no passing video.faststart row"; fi
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+fi
+
+# ---- attachment WebM: vp9 / yuv420p / even dims
+name=webm
+if finish_job $name && fetch_primary $name webm; then
+  f=${out_file[$name]}
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>"$tmp/$name.err"; then ok "$name: decodes (ffmpeg)"; else fail "$name: does not decode: $(head -c 300 "$tmp/$name.err")"; fi
+  if [ "$(codec_of "$f")" = vp9 ]; then ok "$name: codec vp9"; else fail "$name: codec '$(codec_of "$f")', want vp9"; fi
+  if [ "$(pixfmt_of "$f")" = yuv420p ]; then ok "$name: pix_fmt yuv420p"; else fail "$name: pix_fmt '$(pixfmt_of "$f")', want yuv420p"; fi
+  d=$(dims_of "$f"); w=${d%x*}; h=${d#*x}
+  if [ "${w:-1}" -gt 0 ] && [ $((w % 2)) -eq 0 ] && [ "${h:-1}" -gt 0 ] && [ $((h % 2)) -eq 0 ]; then
+    ok "$name: $d (even dims)"
+  else
+    fail "$name: dims '$d', want both sides even"
+  fi
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+fi
+
+# ---- bounce: 2N frames, forward then backward (full copy: first == last)
+name=bounce-fwd
+n_bf=0
+if finish_job $name; then
+  n_bf=$(files_of_kind "$tmp/poll_$name.json" frame)
+  if [ "${n_bf:-0}" -ge 2 ]; then ok "$name: forward trim exports $n_bf frames"; else fail "$name: only ${n_bf:-0} frame files, want ≥ 2"; n_bf=0; fi
+fi
+name=bounce
+if finish_job $name; then
+  n_bn=$(files_of_kind "$tmp/poll_$name.json" frame)
+  if [ "${n_bf:-0}" -ge 2 ] && [ "${n_bn:-0}" = "$((n_bf * 2))" ]; then
+    ok "$name: $n_bn frame files == 2 × the forward export's $n_bf"
+  else
+    fail "$name: ${n_bn:-0} frame files, want exactly 2 × ${n_bf:-?}"
+  fi
+  bf=$(frame_url_at "$tmp/poll_$name.json" first); bl=$(frame_url_at "$tmp/poll_$name.json" last)
+  bm=$(frame_urls "$tmp/poll_$name.json" | sed -n "$((n_bf + 1))p") # first frame of the reversed half
+  ff4=$(frame_url_at "$tmp/poll_bounce-fwd.json" first); fl4=$(frame_url_at "$tmp/poll_bounce-fwd.json" last)
+  if [ -n "$bf" ] && [ -n "$bl" ] && [ -n "$bm" ] && [ -n "$ff4" ] && [ -n "$fl4" ] \
+     && download "$bf" "$tmp/bnc_first.png" && download "$bl" "$tmp/bnc_last.png" \
+     && download "$bm" "$tmp/bnc_mid.png" \
+     && download "$ff4" "$tmp/bfwd_first.png" && download "$fl4" "$tmp/bfwd_last.png"; then
+    if ! frames_match "$tmp/bfwd_first.png" "$tmp/bfwd_last.png"; then ok "$name: forward first and last frames differ (a bounce is detectable)"; else fail "$name: forward first and last frames are identical — cannot tell a bounce"; fi
+    if frames_match "$tmp/bnc_first.png" "$tmp/bfwd_first.png"; then ok "$name: first frame == forward first frame"; else fail "$name: first frame != forward first frame (PSNR $(psnr_of "$tmp/bnc_first.png" "$tmp/bfwd_first.png") dB)"; fi
+    if frames_match "$tmp/bnc_first.png" "$tmp/bnc_last.png"; then ok "$name: first frame == last frame (ping-pong returns to the start)"; else fail "$name: first frame != last frame (PSNR $(psnr_of "$tmp/bnc_first.png" "$tmp/bnc_last.png") dB)"; fi
+    if frames_match "$tmp/bnc_mid.png" "$tmp/bfwd_last.png"; then ok "$name: frame N+1 == forward last frame (the reversed half starts at the end)"; else fail "$name: frame N+1 != forward last frame (PSNR $(psnr_of "$tmp/bnc_mid.png" "$tmp/bfwd_last.png") dB)"; fi
+  else
+    fail "$name: could not download the first/mid/last frames of both exports"
+  fi
+fi
+
+# ---- gifski encoder (HQ toggle, non-Discord target)
+name=gifski
+if finish_job $name && fetch_primary $name gif; then
+  f=${out_file[$name]}
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
+  n=$(gif_frames "$f")
+  if [ "${n:-0}" -gt 1 ]; then ok "$name: gifsicle-clean, $n frames"; else fail "$name: gifsicle/ffprobe report '${n:-?}' frame(s)"; fi
+  d4=$(primary_desc "$tmp/poll_$name.json")
+  case "$d4" in
+    *gifski*) ok "$name: primary desc names gifski ('$d4')" ;;
+    *)        fail "$name: primary desc '$d4' does not mention gifski" ;;
+  esac
+fi
+
+# ---- lossless gifsicle fast path (GIF source + crop only, attachment target)
+name=fastpath
+if [ -n "$gif_hash" ] && finish_job $name && fetch_primary $name gif; then
+  f=${out_file[$name]}
+  if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
+  if have "$gifsicle" && [ "$(gif_screen_size "$f")" = 96x96 ]; then ok "$name: cropped to 96x96"; else fail "$name: logical screen '$(gif_screen_size "$f")', want 96x96"; fi
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  d4=$(primary_desc "$tmp/poll_$name.json")
+  case "$d4" in
+    *"lossless gifsicle"*) ok "$name: primary desc says the lossless path was taken ('$d4')" ;;
+    *)                     fail "$name: primary desc '$d4' does not mention the lossless gifsicle path" ;;
+  esac
+fi
+
+# ---- /input picker + /output save (only meaningful when this script started
+# the server and therefore owns the dirs the server sees)
+log "phase 4: /input picker + /output save"
+if [ "${EZLG_START_SERVER:-0}" = 1 ]; then
+  code=$(curl -sS -o "$tmp/caps4.json" -w '%{http_code}' --max-time 30 "$url/api/capabilities")
+  if [ "$code" = 200 ]; then
+    for feat in inputPick outputSave; do
+      if features_true "$tmp/caps4.json" "$feat"; then ok "capabilities: features.$feat == true"; else fail "capabilities: features.$feat is not true"; fi
+    done
+  else
+    fail "GET /api/capabilities → $code"
+  fi
+  if cp "$tmp/src.mov" "$EZLG_INPUT/clip.mov"; then
+    code=$(curl -sS -o "$tmp/input.json" -w '%{http_code}' --max-time 30 "$url/api/input")
+    if [ "$code" = 200 ]; then
+      ok "GET /api/input → 200"
+      if input_lists "$tmp/input.json" clip.mov; then ok "input: lists clip.mov"; else fail "input: clip.mov not listed: $(head -c 300 "$tmp/input.json")"; fi
+    else
+      fail "GET /api/input → $code"
+    fi
+    code=$(curl -sS -o "$tmp/frominput.json" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' \
+             --data '{"name":"clip.mov"}' "$url/api/sources/from-input")
+    if [ "$code" = 200 ]; then
+      ok "POST /api/sources/from-input → 200"
+      ihash=$(json_str "$tmp/frominput.json" '.hash' hash)
+      if [ "$ihash" = "$hash" ]; then ok "from-input: deduped to the uploaded source hash"; else fail "from-input: hash '$ihash' != uploaded '$hash' (same bytes must dedupe)"; fi
+    else
+      cat "$tmp/frominput.json" >&2
+      fail "POST /api/sources/from-input → $code"
+    fi
+    code=$(curl -sS -o "$tmp/frominput_bad.json" -w '%{http_code}' --max-time 30 -H 'Content-Type: application/json' \
+             --data '{"name":"../clip.mov"}' "$url/api/sources/from-input")
+    case "$code" in
+      4*) ok "from-input: traversal name ../clip.mov refused ($code)" ;;
+      *)  fail "from-input: traversal name ../clip.mov → $code, want 4xx" ;;
+    esac
+  else
+    fail "could not copy the clip into $EZLG_INPUT"
+  fi
+  if [ -n "${rhash:-}" ] && [ -n "${rname:-}" ] && [ -s "${out_file[gif]:-}" ]; then
+    save1=""; save2=""
+    for i in 1 2; do
+      code=$(curl -sS -o "$tmp/save$i.json" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' \
+               --data '{"file":"'"$rname"'"}' "$url/api/results/$rhash/save")
+      if [ "$code" = 200 ]; then
+        sname=$(json_str "$tmp/save$i.json" '.name' name)
+        if [ -n "$sname" ] && [ -s "$EZLG_OUTPUT/$sname" ] && cmp -s "$EZLG_OUTPUT/$sname" "${out_file[gif]}"; then
+          ok "save #$i: wrote '$sname' to /output byte-identically"
+        else
+          fail "save #$i: '$sname' is missing from $EZLG_OUTPUT or differs from the downloaded gif"
+        fi
+        [ "$i" = 1 ] && save1=$sname || save2=$sname
+      else
+        cat "$tmp/save$i.json" >&2
+        fail "POST /api/results/{recipeHash}/save #$i → $code"
+      fi
+    done
+    if [ -n "$save1" ] && [ -n "$save2" ] && [ "$save1" != "$save2" ]; then
+      ok "save: second save got a distinct collision-safe name ($save1 / $save2)"
+    elif [ -n "$save1" ] && [ -n "$save2" ]; then
+      fail "save: both saves returned '$save1' — not collision-safe"
+    fi
+    code=$(curl -sS -o "$tmp/save_bad.json" -w '%{http_code}' --max-time 30 -H 'Content-Type: application/json' \
+             --data '{"file":"no-such-file.gif"}' "$url/api/results/$rhash/save")
+    if [ "$code" = 404 ]; then ok "save: unknown file name → 404"; else fail "save: unknown file name → $code, want 404"; fi
+  else
+    fail "save: no recipeHash / file / downloaded gif from the Phase 1 gif job"
+  fi
+else
+  skip "input/output cases: EZLG_START_SERVER != 1 — a remote server's /input //output dirs are not visible from here (run with EZLG_START_SERVER=1 to cover GET /api/input, POST /api/sources/from-input and POST /api/results/{recipeHash}/save)"
 fi
 
 summary

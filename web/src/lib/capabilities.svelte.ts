@@ -1,8 +1,11 @@
 // Server feature flags: the "features" map of GET /api/capabilities, loaded
 // once per page into a $state the components gate their UI on — the Play
-// button (proxy), the Text card's font picker (fonts) and the notices on the
-// Background / Overlays cards (keying / overlays) when an older ezlg serves
-// a newer SPA.
+// button (proxy), the Text card's font picker (fonts), the notices on the
+// Background / Overlays cards (keying / overlays), and Phase 4's /input
+// picker (inputPick), "Save to /output" (outputSave), gifski encoder
+// toggle (gifski) and the Phase 4 op cards (feather / bounce,
+// phase4OpsOffered) when an older ezlg serves a newer SPA. The "formats"
+// list gates the MP4 / WebM Format options the same way (formatOffered).
 //
 // Until the server has answered every flag is assumed on (the SPA ships with
 // the server that has them all), so nothing flickers off and back on at page
@@ -13,7 +16,7 @@
 
 import { getCapabilities, type Capabilities } from './api';
 
-export const FEATURE_NAMES = ['fit', 'sequence', 'optimize', 'keying', 'overlays', 'proxy', 'fonts'] as const;
+export const FEATURE_NAMES = ['fit', 'sequence', 'optimize', 'keying', 'overlays', 'proxy', 'fonts', 'feather', 'bounce', 'inputPick', 'outputSave', 'gifski'] as const;
 export type FeatureName = (typeof FEATURE_NAMES)[number];
 export type Features = Record<FeatureName, boolean>;
 
@@ -38,12 +41,42 @@ export const caps = $state({
   /** the server has answered (the flags are its, not the optimistic defaults) */
   loaded: false,
   features: featuresFrom(null),
+  /** the server's "formats" list; null = no answer yet (every format assumed offered) */
+  formats: null as string[] | null,
 });
 
 /** setFeatures installs a capabilities answer (null = back to "unknown": everything on). */
-export function setFeatures(c: Pick<Capabilities, 'features'> | null): void {
+export function setFeatures(c: Pick<Capabilities, 'features' | 'formats'> | null): void {
   caps.features = featuresFrom(c);
   caps.loaded = c !== null;
+  caps.formats = c ? (Array.isArray(c.formats) ? [...c.formats] : []) : null;
+}
+
+/**
+ * formatOffered reports whether the server encodes this output format
+ * (capabilities "formats"). Until the server has answered every format is
+ * assumed offered; a server that answered without the name (pre-Phase-4:
+ * no mp4/webm) has it off. An answer without a formats list at all (Phase 1)
+ * turns nothing off — only an explicit list that lacks the name does.
+ */
+export function formatOffered(format: string): boolean {
+  const list = caps.formats;
+  if (list === null || list.length === 0) return true;
+  return list.includes(format);
+}
+
+/**
+ * phase4OpsOffered reports whether the server understands the Phase 4 op
+ * kinds — feather and bounce (an older ezlg 400s on the unknown kind at the
+ * first still / proxy / render, with no hint why). The primary signal is the
+ * explicit "feather" / "bounce" names in the features map; a Phase 4 server
+ * from before those names existed still answers with mp4 in its "formats"
+ * list (ffmpeg-only, never toolchain-gated — no earlier server offers it),
+ * so that list is kept as a fallback. Like formatOffered, no answer yet —
+ * or an answer without a formats list at all — leaves the ops on.
+ */
+export function phase4OpsOffered(): boolean {
+  return (caps.features.feather && caps.features.bounce) || formatOffered('mp4');
 }
 
 let pending: Promise<Features> | null = null;

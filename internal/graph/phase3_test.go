@@ -873,6 +873,9 @@ func checkPlan3(t *testing.T, got, want *Plan) {
 	if got.Reversed != want.Reversed {
 		t.Errorf("Reversed got %v want %v", got.Reversed, want.Reversed)
 	}
+	if got.Bounced != want.Bounced {
+		t.Errorf("Bounced got %v want %v", got.Bounced, want.Bounced)
+	}
 	if got.SourceVFR != want.SourceVFR {
 		t.Errorf("SourceVFR got %v want %v", got.SourceVFR, want.SourceVFR)
 	}
@@ -1292,11 +1295,11 @@ func TestCompileDetect(t *testing.T) {
 			},
 		},
 		{
-			name: "every other kind is ignored: geometry, autocrop, reverse, text, overlay",
+			name: "every other kind is ignored: geometry, autocrop, reverse, bounce, text, overlay",
 			srcs: []recipe.ProbeInfo{h264, ovPNG},
 			ops: []recipe.Op{
 				crop(0, 0, 640, 360), resize(320, 0, ""), canvas(400, 400, ""), flip(true, false), rotate(90),
-				resolved(0, 0, 100, 100), autocrop(recipe.AutoCropParams{}), reverse(),
+				resolved(0, 0, 100, 100), autocrop(recipe.AutoCropParams{}), reverse(), bounce(),
 				text(recipe.TextParams{Text: "x"}), overlay(recipe.OverlayParams{Source: 1}),
 				colorkey(recipe.ColorKeyParams{Color: "ffffff"}),
 			},
@@ -1424,8 +1427,8 @@ func TestCompileDetect(t *testing.T) {
 			want.SourceVFR = tc.srcs[0].Kind == recipe.KindAnimation
 			want.SeekUnsafe = seekUnsafeDemuxer(tc.srcs[0].Format)
 			checkPlan3(t, got, &want)
-			if len(got.ExtraInputs) != 0 || len(got.TextFiles) != 0 || got.Reversed {
-				t.Errorf("detection plan must have no extra inputs, text files or reverse: %+v", got)
+			if len(got.ExtraInputs) != 0 || len(got.TextFiles) != 0 || got.Reversed || got.Bounced {
+				t.Errorf("detection plan must have no extra inputs, text files, reverse or bounce: %+v", got)
 			}
 			for _, stage := range []string{"scale=", "crop=", "pad=", "transpose", "hflip", "vflip", "reverse", "drawtext", "overlay"} {
 				if tc.srcs[0].Sequence != nil && (stage == "scale=" || stage == "pad=") {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ProbeInfo } from '../../lib/api';
+  import { phase4OpsOffered } from '../../lib/capabilities.svelte';
   import { fmtNum, fmtSeconds } from '../../lib/format';
   import { app, trimRange } from '../../lib/state.svelte';
   import NumField from '../NumField.svelte';
@@ -13,26 +14,33 @@
   let open = $state(false);
   const cfg = $derived(app.ops.speed);
   const reverse = $derived(app.ops.reverse);
+  const bounce = $derived(app.ops.bounce);
   const range = $derived(trimRange(info, app.ops));
   const inDur = $derived(range.end - range.start);
   const factor = $derived(cfg.enabled && cfg.factor > 0 ? cfg.factor : 1);
+  const outDur = $derived((inDur / factor) * (bounce ? 2 : 1));
   const summary = $derived.by(() => {
     const parts: string[] = [];
-    if (cfg.enabled && cfg.factor !== 1) parts.push(`${fmtNum(cfg.factor)}× → ${fmtSeconds(inDur / factor)}`);
+    if (cfg.enabled && cfg.factor !== 1) parts.push(`${fmtNum(cfg.factor)}× → ${fmtSeconds(outDur)}`);
     if (reverse) parts.push('reversed');
+    if (bounce) parts.push(`bounce (${fmtSeconds(outDur)})`);
     return parts.length ? parts.join(' · ') : '1×';
   });
   const quick = [0.5, 0.75, 1, 1.5, 2, 3, 4];
+  // An older server (pre-Phase-4) rejects the bounce op with a 400: the
+  // checkbox stays, with a notice — like the Background / Overlays gates (WEB-7).
+  const bounceSupported = $derived(phase4OpsOffered());
 
-  // The header toggle covers the factor and the reverse switch.
+  // The header toggle covers the factor, the reverse and the bounce switch.
   function getEnabled(): boolean {
-    return cfg.enabled || reverse;
+    return cfg.enabled || reverse || bounce;
   }
   function setEnabled(v: boolean) {
     if (v) app.ops.speed.enabled = true;
     else {
       app.ops.speed.enabled = false;
       app.ops.reverse = false;
+      app.ops.bounce = false;
     }
   }
 
@@ -56,6 +64,15 @@
     <label class="inline" title="Play the clip backwards (after trim, speed and the geometry ops)">
       <input type="checkbox" bind:checked={app.ops.reverse} /><span>Reverse</span>
     </label>
+    <label class="inline" title="Play forward, then backward (ping-pong): the clip's frames and duration double">
+      <input type="checkbox" bind:checked={app.ops.bounce} /><span>Bounce — forward then back, doubles the length</span>
+    </label>
   </div>
-  <p class="hint">Applied after trim. Stickers must be ≤ 5 s — speeding up is one way to fit. Reverse plays the trimmed range backwards.</p>
+  {#if !bounceSupported}
+    <p class="note">This server does not support Bounce (an older ezlg) — the bounce op will be rejected at render; update the server.</p>
+  {/if}
+  <p class="hint">
+    Applied after trim. Stickers must be ≤ 5 s — speeding up is one way to fit. Reverse plays the trimmed range backwards; Bounce
+    appends the reversed copy (with Reverse on: backwards first, then forwards).
+  </p>
 </OpCard>

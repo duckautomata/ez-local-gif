@@ -45,6 +45,14 @@ const LABELS: Record<string, string> = {
   // Reads correctly for both outcomes: ✓ when the output is indexed, and a
   // neutral info dot when an RGBA-truecolour output fails the check.
   'apng.indexed': 'Indexed 8-bit-alpha APNG (sticker default rung)',
+  // video (Phase 4: mp4 / webm attachments — structural lint, never rewritten)
+  'video.container': 'Valid MP4 / WebM container',
+  'video.faststart': 'moov before mdat (faststart)',
+  'video.codec': 'H.264 (mp4) / VP9 (webm) codec',
+  'video.dims': 'Even dimensions, ≤ 4096 px',
+  'video.duration': 'Duration / frame rate summary',
+  'video.size-limit': 'Within the byte limit',
+  'video.attachment-only': 'Video can only be an attachment',
   // static images
   'static.size-limit': 'Within the byte limit',
   'static.emote-dims': 'Emote size 128×128',
