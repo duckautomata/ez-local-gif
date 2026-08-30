@@ -46,7 +46,7 @@ ARG NODE_SHA256=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
 # ---------------------------------------------------------------------------
 # web: build the Svelte SPA
 # ---------------------------------------------------------------------------
-FROM node:22-alpine AS web
+FROM node:26-alpine AS web
 WORKDIR /app/web
 COPY web/package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci
@@ -56,7 +56,7 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # gobuild: static Go binary with the SPA embedded
 # ---------------------------------------------------------------------------
-FROM golang:1.26-trixie AS gobuild
+FROM golang:1.27-trixie AS gobuild
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum* ./
