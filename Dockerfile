@@ -21,10 +21,10 @@
 # ---------------------------------------------------------------------------
 # FFmpeg 9.0.1 — BtbN static gpl build. Dated autobuild tag (never the rolling
 # "latest" asset). BtbN keeps daily tags for ~2 weeks and month-end tags
-# permanently; refresh with scripts/pin-ffmpeg.sh when the tag disappears.
-ARG FFMPEG_TAG=autobuild-2026-08-18-15-03
-ARG FFMPEG_ASSET=ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz
-ARG FFMPEG_SHA256=c99d981946abf7f733590d0c2e8ee39316f2cf97927ef7aa2ea4edd456ac2d39
+# permanently, so pin a month-end tag (scripts/pin-ffmpeg.sh picks one).
+ARG FFMPEG_TAG=autobuild-2026-08-31-13-27
+ARG FFMPEG_ASSET=ffmpeg-n9.0.1-11-ge47273f4d9-linux64-gpl-9.0.tar.xz
+ARG FFMPEG_SHA256=182c1b509720e939bb47bfb47dc29cc0c298640401128e3dce8627d10707eb5a
 # libwebp 1.5.0 command-line tools, Google's official static Linux build
 # (cwebp/dwebp/img2webp/gif2webp/webpmux/webpinfo/anim_dump/anim_diff).
 # Debian's "webp" package would work too but drags in Mesa + LLVM (~200 MB)

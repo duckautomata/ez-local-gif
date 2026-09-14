@@ -90,8 +90,10 @@ DejaVu + Noto core fonts with fontconfig and the `/fonts` scan path, self-checke
 `scripts/check-tools.sh` — tool versions, ffmpeg capabilities, font families, encode/decode
 smoke) → `runtime` (non-root `ezlg`, tini, healthcheck) and `dev` (tools + Go + Node, root).
 Third-party downloads are pinned by URL and
-sha256 in the `ARG`s at the top of the Dockerfile; `scripts/pin-ffmpeg.sh` prints fresh values
-when the BtbN autobuild tag is pruned (daily tags live ~2 weeks, month-end tags are permanent).
+sha256 in the `ARG`s at the top of the Dockerfile. FFmpeg is pinned to a BtbN month-end
+autobuild tag: daily tags live only ~2 weeks (a pruned tag fails the build with curl exit 22),
+month-end tags are permanent. `scripts/pin-ffmpeg.sh` prints fresh values for the newest
+month-end tag (`FFMPEG_DAILY=1` for the newest daily).
 
 ## CI
 

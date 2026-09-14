@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # pin-ffmpeg.sh — print Dockerfile ARG lines for a BtbN FFmpeg-Builds tag.
 #
-#   scripts/pin-ffmpeg.sh                         # newest dated autobuild with a 9.0 linux64 gpl asset
-#   scripts/pin-ffmpeg.sh autobuild-2026-08-31-13-00
+#   scripts/pin-ffmpeg.sh                         # newest month-end autobuild with a 9.0 linux64 gpl asset
+#   FFMPEG_DAILY=1 scripts/pin-ffmpeg.sh          # newest dated autobuild, even a daily one
+#   scripts/pin-ffmpeg.sh autobuild-2026-08-31-13-27
 #
 # BtbN keeps daily "autobuild-YYYY-MM-DD-hh-mm" releases for about two weeks
-# and the last build of each month permanently, so the pinned tag in the
-# Dockerfile eventually disappears. Run this, paste the three ARG lines into
-# the Dockerfile, rebuild. The sha256 comes from the GitHub release asset
+# and the last build of each month permanently, so a pinned daily tag
+# eventually disappears (curl exits 22 in the Docker build). By default this
+# picks the newest tag from an already-finished month, i.e. a permanent
+# month-end build. Run this, paste the three ARG lines into the Dockerfile,
+# rebuild. The sha256 comes from the GitHub release asset
 # digest and is re-verified by downloading the tarball (set NO_DOWNLOAD=1 to
 # skip the ~125 MB download).
 #
@@ -18,15 +21,20 @@ api=https://api.github.com/repos/BtbN/FFmpeg-Builds/releases
 tag=${1:-}
 series=${FFMPEG_SERIES:-9.0}
 pattern="linux64-gpl-${series}.tar.xz"
+# Tags dated before this month ("YYYY-MM" at [10:17] of autobuild-YYYY-MM-…)
+# are month-end builds; an explicit tag or FFMPEG_DAILY=1 skips the filter.
+before=""
+[ -n "$tag" ] || [ "${FFMPEG_DAILY:-0}" = 1 ] || before=$(date -u +%Y-%m)
 
 fetch() { curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' "$@"; }
 
 # pick_asset JSON → "tag name url digest" for the first matching linux64 gpl asset
 pick_asset() {
   if command -v jq >/dev/null 2>&1; then
-    jq -r --arg p "$pattern" '
+    jq -r --arg p "$pattern" --arg before "$before" '
       (if type == "array" then . else [.] end)
       | map(select(.tag_name != "latest"))
+      | map(select($before == "" or .tag_name[10:17] < $before))
       | map({tag: .tag_name, a: (.assets[] | select(.name | endswith($p)))})
       | .[0] | select(. != null)
       | "\(.tag) \(.a.name) \(.a.browser_download_url) \(.a.digest // "")"'
@@ -34,10 +42,12 @@ pick_asset() {
     node -e '
       let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
         let rs = JSON.parse(s); if (!Array.isArray(rs)) rs = [rs];
+        const before = process.argv[2];
         for (const r of rs) { if (r.tag_name === "latest") continue;
+          if (before && !(r.tag_name.slice(10, 17) < before)) continue;
           const a = r.assets.find(a => a.name.endsWith(process.argv[1]));
           if (a) { console.log(r.tag_name, a.name, a.browser_download_url, a.digest || ""); return; } }
-      });' "$pattern"
+      });' "$pattern" "$before"
   else
     echo "pin-ffmpeg: need jq or node" >&2; exit 1
   fi
