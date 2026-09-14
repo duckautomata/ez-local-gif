@@ -62,8 +62,9 @@ services:
       EZLG_MAX_UPLOAD_MB: "2048"       # max upload size
       # EZLG_CONCURRENCY: "8"          # concurrent renders (default NumCPU/2)
       # EZLG_MAX_MASTER_BYTES: "2147483648"   # cap on one render's RGBA frame master in bytes
-      #                                 # (default 2 GiB; also bounds the reverse buffer and
-      #                                 # reversed previews; keep it below shm_size)
+      #                                 # (default 2 GiB; the ONLY bound on the reverse/bounce RAM
+      #                                 # buffer too — keep it below shm_size AND host RAM, past RAM
+      #                                 # you get OOM kills, not refusals; huge values are clamped)
       # EZLG_ADDR: ":8080"             # listen address (also change ports: and the healthcheck)
       # EZLG_INPUT: "/input"           # folder the /input picker lists (bind it read-only above)
       # EZLG_OUTPUT: "/output"         # folder "Save to /output" writes to

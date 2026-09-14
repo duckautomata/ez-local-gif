@@ -19,7 +19,34 @@ const defaultFPS = 10
 const minFPS = 0.001
 
 // Upper bounds. They keep a typo (or a hostile recipe) from asking ffmpeg
-// for a frame it cannot allocate or a master that fills tmpfs.
+// for a frame it cannot allocate.
+//
+// Note what is NOT here: a cap on the frame count or on the RGBA master's
+// byte size. The graph only reports Plan.Width/Height/Frames; whether a
+// render's master (Width*Height*4*Frames at the output size) or a
+// reversed/bounced stage's buffer fits is jobs' decision — Options.
+// MaxMasterBytes, checked by admitScratch (renders) and admitReversed
+// (reversed/bounced previews and static reversed renders) against the
+// operator's configured limit. Forward stills and proxies are never gated
+// on the frame count at all: they seek one frame or stream a
+// constant-bounded head and build no master. An earlier 8 GiB compile-time
+// cap here refused every still and proxy of an untrimmed 4K clip before a
+// trim/crop/resize could be applied — exactly the editing the app exists
+// for (2026-09-13); trim/crop/resize/fit are compiled into the one render
+// pass and the master is measured at output size, so the untrimmed source's
+// size is irrelevant to what the render actually allocates.
+//
+// The removal relies on one invariant: nothing allocates from Plan.Frames
+// before jobs' admission. Every consumer is a comparison or a float — the
+// frames-export cap in jobs/render.go, clampStillTime in jobs/still.go,
+// proxyBufferFrames in jobs/proxy.go, enc's seek maths. Forward stills seek
+// one frame (-frames:v 1); proxies are bounded by MaxProxySeconds /
+// MaxProxyWidth / 15 fps (the libwebp_anim encoder holds at most 450 frames
+// at <= 720 px — bounded by constants, not by the source); the autocrop
+// detection pass by autocropTimeout. A future make([]T, plan.Frames) would
+// break it: a crafted container probes to billions of frames, and Frames
+// saturates at math.MaxInt after bounces (see assemble). Reviewers must
+// catch that.
 const (
 	// MaxDim is the largest width or height a resize/canvas/Output may
 	// request and the largest side any resulting frame may have.
@@ -31,15 +58,14 @@ const (
 	// all speed ops.
 	MinSpeed = 0.05
 	MaxSpeed = 100
-	// MaxMasterBytes caps the expected RGBA master (Width*Height*4*Frames)
-	// when the frame count is known.
-	MaxMasterBytes = 8 << 30
 	// MaxBounces caps the bounce ops in one recipe. Each bounce nests
 	// another split/reverse/concat stage whose reverse branch buffers a
 	// full copy of the clip, so the structure itself grows exponentially —
-	// and for sources whose frame count is unknown (Frames 0) the byte
-	// caps cannot see that. The UI offers a single bounce; 8 is already
-	// far past anything useful.
+	// and for sources whose frame count is unknown (Frames 0: a probe with
+	// no Duration and no Frames/FPS) no byte cap can see that: jobs'
+	// admission passes need == 0, and only the ENOSPC mapping and the
+	// preview timeouts bound such a source. The UI offers a single bounce;
+	// 8 is already far past anything useful.
 	MaxBounces = 8
 )
 
@@ -959,30 +985,28 @@ func (c *compiler) outputFit() error {
 	return nil
 }
 
-// finish is assemble plus the render limits: the final frame must be within
-// checkFrame (which catches an oversized source that no op shrinks) and the
-// expected master within MaxMasterBytes.
+// finish is assemble plus the render's frame limit: the final frame must be
+// within checkFrame (which catches an oversized source that no op shrinks).
+// It applies no cap on the frame count or on the master's byte size: the
+// plan reports Width/Height/Frames and jobs decides whether the render's
+// master or a reversed/bounced stage's buffer fits (Options.MaxMasterBytes,
+// admitScratch / admitReversed) — forward stills and proxies never build a
+// master and are not gated at all. See the "Upper bounds" comment for the
+// invariant (nothing allocates from Plan.Frames before admission) that
+// makes an unbounded Frames safe to report.
 func (c *compiler) finish() (*Plan, error) {
 	if err := checkFrame(c.w, c.h); err != nil {
 		return nil, errorf("output %v; add a resize", err)
 	}
-	p, err := c.assemble()
-	if err != nil {
-		return nil, err
-	}
-	if bytes := float64(p.Width) * float64(p.Height) * 4 * float64(p.Frames); bytes > MaxMasterBytes {
-		return nil, errorf("expected master (%dx%d x %d frames = %.1f GiB) exceeds the %d GiB limit; trim, lower the fps or resize",
-			p.Width, p.Height, p.Frames, bytes/(1<<30), MaxMasterBytes>>30)
-	}
-	return p, nil
+	return c.assemble()
 }
 
 // assemble appends the terminal format=rgba (unless the chain already ends
 // in one, e.g. a yuva still whose alpha head is its only stage), assembles
 // the filter text (the completed chains, then the current one ending in
 // [out], joined with ";") and derives the output facts: size, alpha, source
-// rate, duration and frame count. It applies no size limit (finish does;
-// CompileDetect deliberately skips them).
+// rate, duration and frame count. It applies no frame-size limit (finish
+// does; CompileDetect deliberately skips it).
 func (c *compiler) assemble() (*Plan, error) {
 	c.ensureRGBA()
 	p := &c.plan
@@ -1025,17 +1049,32 @@ func (c *compiler) assemble() (*Plan, error) {
 		p.Duration = math.Max(end-p.TrimStart, 0) / p.Speed
 		// floor, matching the fps stage's round=down; FrameTolerance absorbs
 		// the microsecond rounding of the seek args (see its doc); >= 1 so a
-		// sub-frame clip still plans a frame.
-		p.Frames = max(1, int(math.Floor(p.Duration*p.FPS+FrameTolerance)))
+		// sub-frame clip still plans a frame. The float -> int conversion
+		// saturates at MaxInt like the bounce doubling below: Go leaves an
+		// out-of-range conversion implementation-defined, and on amd64 (the
+		// runtime image) it yields MinInt64, which max(1, ...) would read as
+		// ONE frame — the opposite of what the saturation is for. No probe
+		// reaches it today (ffprobe's duration is int64 microseconds, FPS is
+		// capped at MaxFPS), so this only hardens the invariant; +Inf lands
+		// in the same branch.
+		if f := math.Floor(p.Duration*p.FPS + FrameTolerance); f >= math.MaxInt {
+			p.Frames = math.MaxInt
+		} else {
+			p.Frames = max(1, int(f))
+		}
 	}
 	// Each bounce (Phase 4) doubles the output: applied after the
-	// trim/speed/fps math above — so a trim doubles the trimmed length — and
-	// before finish's MaxMasterBytes check, which therefore measures the
-	// doubled frame count. An unknown Duration/Frames (0) stays unknown.
-	// The doubling saturates at MaxInt instead of wrapping: a crafted
-	// container can probe to enough frames that even MaxBounces doublings
-	// overflow int, and a wrapped (negative or zero) count would slip past
-	// finish's byte check; saturated, the check rejects the plan.
+	// trim/speed/fps math above — so a trim doubles the trimmed length —
+	// so jobs' admission (admitScratch for the master, admitReversed for
+	// the buffered reverse branch) sees the doubled frame count. An unknown
+	// Duration/Frames (0) stays unknown.
+	// The doubling saturates at MaxInt instead of wrapping, as the
+	// conversion above does: a crafted container can probe to enough frames
+	// that even MaxBounces doublings overflow int, and a wrapped count would
+	// reach jobs as 0 ("unknown", which admission passes) or as a negative no
+	// byte estimate refuses — or, through the conversion, as 1. Saturated,
+	// jobs' overflow-safe byte estimate (frameBytes, itself saturating at
+	// MaxInt64) refuses the plan instead.
 	for range c.bounces {
 		p.Duration *= 2
 		if p.Frames > math.MaxInt/2 {

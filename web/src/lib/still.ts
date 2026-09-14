@@ -25,6 +25,40 @@ export interface StillDeps {
 
 export const DECODE_ERROR = 'The preview image could not be decoded';
 
+/** Fit-mode still width: at most this wide (the server scales the output canvas down to it). */
+export const FIT_STILL_MAXW = 480;
+/** Fit-mode still width on wide screens (≥ 1500 px). */
+export const FIT_STILL_MAXW_WIDE = 720;
+/**
+ * The "unscaled" request width: graph.MaxDim, the largest frame the server
+ * can produce, so its scale=min(iw, maxW) never shrinks the still and the
+ * PNG is exactly the output canvas (Plan.Width × Plan.Height).
+ */
+export const CANVAS_STILL_MAXW = 8192;
+
+/**
+ * stillMaxW is the width cap a preview still is requested at:
+ *
+ * - Fit (the default): FIT_STILL_MAXW, or FIT_STILL_MAXW_WIDE on a wide
+ *   screen — a scrub step then moves a small PNG (~100 ms server-side, and
+ *   memoised), whatever the output size;
+ * - with overlays on the stage: unscaled (CANVAS_STILL_MAXW), so the still's
+ *   natural size IS the output canvas the overlay coordinates live on and the
+ *   drag boxes map 1:1;
+ * - at a fixed zoom (1× / 2× / 4×): unscaled too. The zoom multiplies the
+ *   still's natural width, so 1× must be one OUTPUT pixel per CSS pixel and
+ *   2× / 4× must magnify real output pixels (the img is rendered
+ *   `pixelated` there): a 2560-wide output at 4× used to be a 480-px still
+ *   stretched to 1920 px — a blur of preview pixels, not the frame the
+ *   render produces. The larger PNG per scrub step is the price of a real
+ *   zoom, paid only while zoomed; Fit goes back to the small still (its own
+ *   memo entry, so switching back is instant).
+ */
+export function stillMaxW(opts: { overlay: boolean; zoomed: boolean; wide: boolean }): number {
+  if (opts.overlay || opts.zoomed) return CANVAS_STILL_MAXW;
+  return opts.wide ? FIT_STILL_MAXW_WIDE : FIT_STILL_MAXW;
+}
+
 /**
  * StillScheduler turns a stream of StillRequests (one per state change) into
  * at most one in-flight fetch whose result matches the latest state:

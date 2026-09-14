@@ -34,6 +34,61 @@ export function fmtBytes(bytes: number): string {
   return `${v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : Math.round(v).toLocaleString('en-US')} ${units[i]}`;
 }
 
+/**
+ * fixedHalfEven renders bytes / div with d decimals the way Go's %.Nf
+ * renders the float64 quotient: correctly rounded from its exact value,
+ * exact decimal ties to the even neighbour (fmt.Sprintf("%.0f", 10.5) is
+ * "10", "%.1f" of 1.25 is "1.2"), where JS toFixed rounds every tie up.
+ * div is a power of two, so the double Go formats is exactly the rational
+ * bytes / div, and integer (BigInt) arithmetic on it reproduces Go's digits
+ * for every integer byte count. Float arithmetic did not: v × 10 needs up
+ * to four more mantissa bits than v, so above 2^49 B (512 TiB) the product
+ * could round onto or off a .5 and disagree with Go in the last digit —
+ * 2758454771764429 B is 2.4500000000000002 PiB, "2.5 PiB" in Go, and "2.4"
+ * for a float port that saw an exact tie. Cosmetic (no estimate reaches
+ * PiB), but the whole point of this function is agreeing with the server.
+ */
+function fixedHalfEven(bytes: number, div: number, d: number): string {
+  const num = BigInt(bytes) * 10n ** BigInt(d);
+  const den = BigInt(div);
+  let q = num / den;
+  const twice = (num % den) * 2n;
+  if (twice > den || (twice === den && q % 2n === 1n)) q += 1n; // nearest; an exact tie to even
+  const digits = q.toString().padStart(d + 1, '0');
+  return d === 0 ? digits : `${digits.slice(0, -d)}.${digits.slice(-d)}`;
+}
+
+/**
+ * fmtBytesShort renders a byte count exactly like jobs.humanBytes
+ * (internal/jobs/scratch.go) — "2 GiB", "9.7 GiB", "1.5 GiB", "348 MiB": a
+ * whole value or one ≥ 10 prints no decimals, a fractional value below 10
+ * one decimal, units up to PiB (math.MaxInt64 is "8192 PiB"). The Render
+ * panel's master estimate sits in the same panel as the server's verbatim
+ * refusal message, so the figures must agree digit for digit — fmtBytes
+ * (two decimals below 10) would put "9.67 GiB" next to the server's
+ * "9.7 GiB" — and they do for every integer count (fixedHalfEven works in
+ * integers; a fractional count, which humanBytes' int64 never sees, is
+ * floored first). The unit and the whole-value test are decided on the
+ * double bytes / div like humanBytes decides them on its float64. Negative
+ * / non-finite values render as "—".
+ */
+export function fmtBytesShort(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  bytes = Math.floor(bytes);
+  const unit = 1024;
+  if (bytes < unit) return `${bytes} B`;
+  let div = unit;
+  let exp = 0;
+  for (let m = Math.floor(bytes / unit); m >= unit && exp < 4; m = Math.floor(m / unit)) {
+    div *= unit;
+    exp++;
+  }
+  const v = bytes / div;
+  const suffix = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'][exp];
+  if (v >= 10 || Number.isInteger(v)) return `${fixedHalfEven(bytes, div, 0)} ${suffix}`;
+  return `${fixedHalfEven(bytes, div, 1)} ${suffix}`;
+}
+
 /** fmtSeconds: "1.50 s", "0.033 s" for tiny values, "1:02.5" above a minute. */
 export function fmtSeconds(s: number): string {
   if (!Number.isFinite(s)) return '—';

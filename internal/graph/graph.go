@@ -77,9 +77,11 @@
 //     preserving their stack order: reverse is ffmpeg's reverse filter,
 //     emitted as "format=rgba,reverse" after the output fit, so the filter —
 //     which holds every frame until EOF — buffers frames at the output size
-//     and at 4 B/px, which MaxMasterBytes (and jobs' master estimate)
-//     bounds; each bounce op (Phase 4) closes the chain into a split and
-//     concatenates the frames with their own reversal — "format=rgba,
+//     and at 4 B/px, which jobs' reverse-buffer admission (Options.
+//     MaxMasterBytes, admitReversed) bounds — the graph itself never
+//     refuses a plan for its frame count; each bounce op (Phase 4) closes
+//     the chain into a split and concatenates the frames with their own
+//     reversal — "format=rgba,
 //     split[fN][rN];[rN]reverse[rrN];[fN][rrN]concat=n=2:v=1:a=0," and the
 //     chain continues — doubling Frames and Duration (Plan.Bounced is set;
 //     the reverse branch buffers at the output size and 4 B/px exactly like
@@ -147,11 +149,23 @@
 //     (the static formats and frame exports take what they need from it);
 //     Output.FrameFormat must be "", png, jpeg or webp and Output.FitBytes
 //     >= 0.
-//   - Sizes are bounded: resize/canvas/Output dimensions and every resulting
-//     frame must be <= 8192 px per side and <= 32 megapixels, the speed factor
-//     must lie in [0.05, 100] and the expected RGBA master (W*H*4*Frames, when
-//     the frame count is known) must fit in 8 GiB; Compile rejects anything
-//     larger with a descriptive error.
+//   - Sizes are bounded, frame counts are not: resize/canvas/Output
+//     dimensions and every resulting frame must be <= 8192 px per side and
+//     <= 32 megapixels and the speed factor must lie in [0.05, 100]; Compile
+//     rejects anything larger with a descriptive error. The graph puts no
+//     cap on Plan.Frames or on the RGBA master's byte size (W*H*4*Frames):
+//     it reports Plan.Width/Height/Frames and jobs decides whether a
+//     render's master or a reversed/bounced stage's buffer fits
+//     (Options.MaxMasterBytes, admitScratch / admitReversed) — forward
+//     stills and proxies build no master and are never gated on the frame
+//     count, so an untrimmed 4K clip previews and is trimmed/cropped in the
+//     app (the earlier 8 GiB compile-time cap refused exactly that). Nothing
+//     allocates from Plan.Frames before that admission (see the "Upper
+//     bounds" comment in compile.go). Caveat, pre-existing and shared with
+//     every byte cap: a source whose frame count is unknown (Frames 0 — a
+//     probe with no Duration and no Frames/FPS) is a blind spot; jobs'
+//     admission passes need == 0 and only the ENOSPC mapping and the
+//     preview timeouts bound such a source.
 //   - Detection plans (Phase 3, CompileDetect): the autocrop op's content
 //     box must be found on the frames the crop will apply to — the source
 //     frame after keying, before any geometry. CompileDetect compiles only
@@ -318,8 +332,11 @@ type TextFile struct {
 //
 // It validates op params (unknown kinds, out-of-range crops, non-positive
 // sizes, colours, fonts, time ranges) and the upper bounds (MaxDim,
-// MaxPixels, MinSpeed/MaxSpeed, MaxMasterBytes) and returns descriptive
-// errors suitable for showing in the UI.
+// MaxPixels, MinSpeed/MaxSpeed, MaxBounces) and returns descriptive errors
+// suitable for showing in the UI. It never refuses a plan for its frame
+// count or master size: the plan reports Width/Height/Frames and jobs
+// admits or refuses the render (Options.MaxMasterBytes, admitScratch /
+// admitReversed); forward stills and proxies are not gated at all.
 func CompileWithSources(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Output) (*Plan, error) {
 	if len(srcs) == 0 {
 		return nil, errorf("no sources")
@@ -401,10 +418,13 @@ var detectOps = map[string]bool{
 // the source frame (the normalised canvas for a mixed-size sequence),
 // Plan.HasAlpha reporting whether those frames carry alpha (source alpha or
 // keying: that decides whether the box is read off the alpha plane), and
-// empty ExtraInputs/TextFiles, Reversed false. The size limits of Compile
-// (MaxDim, MaxPixels, MaxMasterBytes) are not applied: the detection streams
-// the frames through -f null and never materialises a master, and a source
+// empty ExtraInputs/TextFiles, Reversed false. The frame-size limits of
+// Compile (MaxDim, MaxPixels) are not applied: the detection streams the
+// frames through -f null and never materialises a master, and a source
 // that only a later resize shrinks must still be croppable to its content.
+// (Frame counts are not capped by either entry point — that is jobs'
+// admission, which detection plans never reach; the pass is bounded by
+// jobs' autocropTimeout instead.)
 func CompileDetect(srcs []recipe.ProbeInfo, ops []recipe.Op) (*Plan, error) {
 	if len(srcs) == 0 {
 		return nil, errorf("no sources")

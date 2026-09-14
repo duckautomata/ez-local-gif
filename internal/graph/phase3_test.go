@@ -352,8 +352,9 @@ func TestCompilePhase3(t *testing.T) {
 		{
 			// The reverse filter holds every frame until EOF, so it runs after
 			// the output fit (the frames it buffers are the output-sized ones
-			// MaxMasterBytes bounds), still in front of the final-canvas ops,
-			// and always behind a format=rgba that pins its buffer to 4 B/px.
+			// jobs' admitReversed / Options.MaxMasterBytes bounds), still in
+			// front of the final-canvas ops, and always behind a format=rgba
+			// that pins its buffer to 4 B/px.
 			name: "reverse after the geometry and the output fit, on rgba; frames and duration unchanged",
 			srcs: []recipe.ProbeInfo{prores}, ops: []recipe.Op{crop(0, 0, 1080, 1080), reverse()}, out: recipe.Output{Format: "webp", Width: 128, Height: 128},
 			want: Plan{
@@ -1032,19 +1033,25 @@ func TestCompilePhase3Errors(t *testing.T) {
 // TestReverseAfterOutputFit: ffmpeg's reverse filter holds every frame it
 // receives until EOF, so it must run after the output fit — the only shrink
 // on the UI's Emote/Sticker preset path, which sets Output.Width/Height and
-// no resize op. MaxMasterBytes measures the post-fit Plan.Width x Height, so
-// a reverse in front of the fit buffered source-sized frames the cap never
-// saw (a 1080p 60 s ProRes clip fit to 128 px: ~28 GiB for a 0.11 GiB
-// master). After the fit the buffered frame is exactly Plan.Width x Height
-// and the cap bounds the reverse buffer too.
+// no resize op. jobs' reverse-buffer admission (admitReversed, Options.
+// MaxMasterBytes) measures the post-fit Plan.Width x Height, so a reverse in
+// front of the fit buffered source-sized frames the estimate never saw (a
+// 1080p 60 s ProRes clip fit to 128 px: ~28 GiB for a 0.11 GiB master).
+// After the fit the buffered frame is exactly Plan.Width x Height and the
+// estimate bounds the reverse buffer too. The graph itself caps nothing by
+// frame count: the untrimmed clip compiles and reports its size.
 func TestReverseAfterOutputFit(t *testing.T) {
 	long := with(prores, func(p *recipe.ProbeInfo) { p.Duration, p.Frames = 60, 1800 })
 	emote := recipe.Output{Format: "gif", Width: 128, Height: 128, FPS: 30}
 
-	// Sanity: the same clip without the output fit is over the cap, so the
-	// cap is what protects the fit case.
-	if _, err := Compile(long, []recipe.Op{reverse()}, recipe.Output{Format: "gif", FPS: 30}); err == nil || !strings.Contains(err.Error(), "exceeds the 8 GiB limit") {
-		t.Fatalf("1080p x 1800 frames without a fit: %v, want the master cap", err)
+	// Sanity: the same clip without the output fit compiles too (7.4 GiB of
+	// reverse buffer at 1080p) — the graph reports Width/Height/Frames and
+	// leaves the refusal to jobs, so what the fit case relies on is the
+	// post-fit size those fields report.
+	if p, err := Compile(long, []recipe.Op{reverse()}, recipe.Output{Format: "gif", FPS: 30}); err != nil {
+		t.Fatalf("1080p x 1800 frames without a fit: %v, want a plan (the cap is jobs')", err)
+	} else if p.Width != 1920 || p.Height != 1080 || p.Frames != 1800 || !p.Reversed {
+		t.Fatalf("1080p x 1800 frames without a fit: %dx%d x %d frames reversed %v, want 1920x1080 x 1800 true", p.Width, p.Height, p.Frames, p.Reversed)
 	}
 
 	cases := []struct {
@@ -1480,13 +1487,17 @@ func TestCompileDetectErrors(t *testing.T) {
 }
 
 // TestCompileDetectSkipsRenderLimits: the detection never materialises a
-// master and cannot shrink the source, so the render's frame and master
-// limits do not apply to it (a source that only a later resize brings under
-// them must still be croppable to its content).
+// master and cannot shrink the source, so the render's frame-size limits
+// (MaxDim, MaxPixels — the only limits Compile applies; frame counts are
+// jobs' admission, which detection plans never reach) do not apply to it: a
+// source that only a later resize brings under them must still be croppable
+// to its content. A merely long clip compiles through both entry points.
 func TestCompileDetectSkipsRenderLimits(t *testing.T) {
 	long := with(h264, func(p *recipe.ProbeInfo) { p.Duration, p.Frames = 3600, 108000 }) // 1280x720x4 x 107892 frames = 370 GiB
-	if _, err := Compile(long, nil, webp()); err == nil || !strings.Contains(err.Error(), "exceeds the 8 GiB limit") {
-		t.Fatalf("Compile of the long clip: %v", err)
+	if p, err := Compile(long, nil, webp()); err != nil {
+		t.Fatalf("Compile of the long clip: %v, want a plan (the graph caps no frame count)", err)
+	} else if p.Frames != 107892 || p.Width != 1280 || p.Height != 720 {
+		t.Fatalf("Compile of the long clip: %d frames %dx%d, want 107892 1280x720", p.Frames, p.Width, p.Height)
 	}
 	p, err := CompileDetect([]recipe.ProbeInfo{long}, []recipe.Op{chromakey(recipe.ChromaKeyParams{})})
 	if err != nil {
@@ -1573,7 +1584,7 @@ func TestEscapeFilterPath(t *testing.T) {
 	tests := []struct{ in, want string }{
 		{"/tmp/ezlg/job/t1.txt", "/tmp/ezlg/job/t1.txt"},
 		{`C:\a\t.txt`, `C\\:\\\\a\\\\t.txt`},
-		{`C:\Users\chris\x y.txt`, `C\\:\\\\Users\\\\chris\\\\x y.txt`},
+		{`C:\Users\user\x y.txt`, `C\\:\\\\Users\\\\user\\\\x y.txt`},
 		{"dir with space/t 'q'.txt", `dir with space/t \\\'q\\\'.txt`},
 		{"a,b;c[d]", `a\,b\;c\[d\]`},
 		{"k=v", "k=v"},

@@ -834,6 +834,72 @@ func TestByteBudget(t *testing.T) {
 	}
 }
 
+// TestFrameBytesSaturate: the master / reverse-buffer estimate is
+// overflow-safe on every factor and saturates at MaxInt64, so an absurd
+// plan is refused by the cap rather than wrapping into a number admission
+// waves through. Two shapes: graph's bounce doubling pins Frames at MaxInt
+// (where multiplying by Width alone overflows), and a crafted container
+// probes to a count far below MaxInt whose product with 8192x4096x4 still
+// leaves int64 (pre-fix that one wrapped). Both are refused by admitScratch
+// (naming the knob; the limit prints as "8192 PiB" only in the message, so
+// the assertion is on the variable name) and, bounced, by admitReversed.
+func TestFrameBytesSaturate(t *testing.T) {
+	st := newTestStore(t)
+	m := NewManager(st, fakeTools, Options{Concurrency: 1})
+	for _, p := range []*graph.Plan{
+		{Width: 1280, Height: 720, Frames: math.MaxInt},
+		{Width: 8192, Height: 4096, Frames: 1 << 40},
+	} {
+		if got := frameBytes(p, p.Frames); got != math.MaxInt64 {
+			t.Errorf("frameBytes(%dx%d x %d) = %d, want MaxInt64", p.Width, p.Height, p.Frames, got)
+		}
+		if got := masterBytes(p); got != math.MaxInt64 {
+			t.Errorf("masterBytes(%dx%d x %d) = %d, want MaxInt64", p.Width, p.Height, p.Frames, got)
+		}
+		_, err := m.admitScratch(context.Background(), nil, p, 1)
+		if err == nil || !errors.Is(err, ErrInvalidRecipe) || !strings.Contains(err.Error(), "EZLG_MAX_MASTER_BYTES") {
+			t.Errorf("admitScratch(%dx%d x %d) = %v, want ErrInvalidRecipe naming EZLG_MAX_MASTER_BYTES", p.Width, p.Height, p.Frames, err)
+		}
+		if m.scratch.Used() != 0 {
+			t.Errorf("budget leaked after the refusal: %d", m.scratch.Used())
+		}
+		bounced := *p
+		bounced.Bounced = true
+		err = m.admitReversed(&bounced, bounced.Frames, "this still")
+		if err == nil || !errors.Is(err, ErrInvalidRecipe) || !strings.Contains(err.Error(), "EZLG_MAX_MASTER_BYTES") || !strings.Contains(err.Error(), "reverse buffer") {
+			t.Errorf("admitReversed(bounced %dx%d x %d) = %v, want the reverse-buffer refusal", p.Width, p.Height, p.Frames, err)
+		}
+	}
+	// The exact products below the saturation point are untouched.
+	if got := frameBytes(&graph.Plan{Width: 8192, Height: 4096, Frames: 1 << 20}, 1<<20); got != int64(8192)*4096*4<<20 {
+		t.Errorf("frameBytes(8192x4096 x 2^20) = %d", got)
+	}
+}
+
+// TestMaxMasterBytesClamp: NewManager clamps Options.MaxMasterBytes at
+// MaxMasterBytesCeiling, so the scratch reserve (up to 3.125x the cap) can
+// never overflow int64 into a non-positive value that skips the budget;
+// values at or under the ceiling pass through unchanged.
+func TestMaxMasterBytesClamp(t *testing.T) {
+	st := newTestStore(t)
+	if got := NewManager(st, fakeTools, Options{MaxMasterBytes: math.MaxInt64}).MaxMasterBytes(); got != MaxMasterBytesCeiling {
+		t.Errorf("MaxMasterBytes(MaxInt64) = %d, want the ceiling %d", got, int64(MaxMasterBytesCeiling))
+	}
+	if got := NewManager(st, fakeTools, Options{MaxMasterBytes: MaxMasterBytesCeiling + 1}).MaxMasterBytes(); got != MaxMasterBytesCeiling {
+		t.Errorf("MaxMasterBytes(ceiling+1) = %d, want the ceiling", got)
+	}
+	if got := NewManager(st, fakeTools, Options{MaxMasterBytes: MaxMasterBytesCeiling}).MaxMasterBytes(); got != MaxMasterBytesCeiling {
+		t.Errorf("MaxMasterBytes(ceiling) = %d, want unchanged", got)
+	}
+	if got := NewManager(st, fakeTools, Options{MaxMasterBytes: 3 << 30}).MaxMasterBytes(); got != 3<<30 {
+		t.Errorf("MaxMasterBytes(3 GiB) = %d, want unchanged", got)
+	}
+	// The reserve formula's worst case at the ceiling stays positive.
+	if r := scratchReserve(MaxMasterBytesCeiling) + 2*MaxMasterBytesCeiling; r <= 0 {
+		t.Errorf("reserve at the ceiling with factor 3 overflowed: %d", r)
+	}
+}
+
 func TestMasterCapRejectsBeforeFFmpeg(t *testing.T) {
 	st := newTestStore(t)
 	hash := putSource(t, st, true)

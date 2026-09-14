@@ -50,10 +50,17 @@ Everything is optional; set it under `environment:` in `compose.yaml` (or with `
 | `EZLG_MAX_BYTES` | `21474836480` (20 GiB) | Cap on total `/data` size (`0` = none) |
 | `EZLG_MAX_UPLOAD_MB` | `2048` | Maximum upload size |
 | `EZLG_CONCURRENCY` | `max(1, NumCPU/2)` | Concurrent renders |
-| `EZLG_MAX_MASTER_BYTES` | `2147483648` (2 GiB) | Cap on one render's RGBA frame master (frames × W × H × 4 at output size): a larger render is refused up-front with a hint (trim / lower fps / resize). Also bounds the `reverse` buffer and refuses reversed previews over it. `0`, negative or unparsable → default; keep it below `shm_size` |
+| `EZLG_MAX_MASTER_BYTES` | `2147483648` (2 GiB) | Cap on one render's RGBA frame master (frames × W × H × 4 at the **output** size, so trim / crop / resize / fit all shrink it) and — the only bound there is — on the RAM buffer of `reverse` / `bounce`. Previews (still, Play) of any source work whatever its length: the cap binds renders, plus reversed/bounced previews and static (png/jpeg) *reversed* renders through their reverse buffer (a bounce alone costs a static render one decoded frame — nothing is buffered before its first frame). The UI shows the estimate under Render (size · frames · bytes · scratch multiple; a reversed png/jpeg also shows the RAM its reverse buffers) and, when over, how many frames / seconds fit at that size (seconds floored to a tenth, so a trim to them fits); a render over the cap is refused before ffmpeg runs (`… the limit is 2 GiB — trim the clip, lower the fps or resize the output`). For fit / AVIF / frames / gifski renders the scratch byte budget (`scratchBudgetBytes` in capabilities: the scratch filesystem — `shm_size` — minus what the still/proxy memos may hold, 768 MiB by default) can bind first, at 2–3× the master — the UI shows that too, naming the budget. `0`, negative or unparsable → default; clamped at `math.MaxInt64/16`; keep it below `shm_size` **and** host RAM (past RAM you get OOMs, not refusals) |
 | `EZLG_INPUT` | `/input` | Folder the in-app `/input` picker lists (mount it read-only). Checked once at startup (exists + readable) → `features.inputPick`; the listing itself is per-request, so new files appear without a restart |
 | `EZLG_OUTPUT` | `/output` | Folder "Save to /output" writes to (must be writable by uid 1000 — see [Quick start](#quick-start-from-a-source-checkout)). Checked once at startup (exists + writable) → `features.outputSave` |
 | `EZLG_FFMPEG`, `EZLG_FFPROBE`, `EZLG_GIFSICLE`, `EZLG_GIFSKI`, `EZLG_IMG2WEBP`, `EZLG_WEBPINFO`, `EZLG_AVIFENC`, `EZLG_AVIFDEC`, `EZLG_PNGQUANT`, `EZLG_OXIPNG`, `EZLG_FC_LIST` | found on `PATH` | Override a tool path (`fc-list` feeds `GET /api/fonts`; without it the font list is empty and text overlays still resolve bundled families by name) |
+
+Practical limits at the default 2 GiB cap, measured at the *output* size (max frames =
+⌊2 GiB / (W × H × 4)⌋; seconds at 30 fps): 128 × 128 (emote) ≈ 32768 frames ≈ 18 min; 480 × 270
+≈ 4142 frames ≈ 2 min 18 s; 1920 × 1080 → 258 frames ≈ 8.6 s; 2560 × 1440 → 145 frames ≈ 4.8 s.
+An emote or sticker from a long 4K clip is small because the master is measured after the fit —
+trim and crop in the app first (previews work on any source); what the cap refuses is a
+full-resolution export of a long clip (a streaming encode without a master is a later item).
 
 Volumes / mounts: `/data` (required, keep it on a Linux filesystem), `/output` (optional, rw,
 must be writable by uid 1000 — see [Quick start](#quick-start-from-a-source-checkout)), `/input`
@@ -81,7 +88,7 @@ recipe schema is `internal/recipe`). `curl` works as-is; browsers are held to sa
 | `GET /api/results/{recipeHash}` | the result manifest (`files[]` with `name`, `url`, `bytes`, W×H, frames, fps, `report` = Discord lint, `kind` = `output` / `alternative` / `frame` / `archive`, `desc` = binding fit knob / encoder path taken) |
 | `POST /api/results/{recipeHash}/save` | `{"file": "<name from the manifest>", "name": "<optional base>"}` → writes that result file to `/output` under a collision-safe name (`base.ext`, `base-2.ext`, …) and returns `{"name": "<final name>"}`. 404 unknown result/file; 503 without `/output` (`features.outputSave` false) |
 | `GET /out/{recipeHash}/{name}` | a result file (immutable; `?dl=1` adds `Content-Disposition: attachment` named after the source) |
-| `GET /api/capabilities` | tool versions, Discord byte limits, lint rules version, concurrency, max upload, formats, `features` (`fit`, `sequence`, `optimize`, `keying`, `overlays`, `proxy`, `fonts` = whether `/api/fonts` lists anything, and from Phase 4 `inputPick` / `outputSave` = whether `/input` / `/output` are mounted and usable) |
+| `GET /api/capabilities` | tool versions, Discord byte limits, lint rules version, concurrency, max upload, formats, `features` (`fit`, `sequence`, `optimize`, `keying`, `overlays`, `proxy`, `fonts` = whether `/api/fonts` lists anything, and from Phase 4 `inputPick` / `outputSave` = whether `/input` / `/output` are mounted and usable), and from 2026-09-13 `maxMasterBytes` (the frame-master cap in bytes — `EZLG_MAX_MASTER_BYTES` after clamping) and `scratchBudgetBytes` (the scratch byte budget renders reserve from — the scratch filesystem minus the still/proxy memo allowance, not `shm_size` itself; `0` = unlimited / unknown) — the UI's estimate line under Render is computed against both |
 | `GET /healthz` | `ok` |
 
 `Output` fields that matter most: `format` (`gif` · `webp` · `apng` · `avif` · `png` · `jpeg` ·

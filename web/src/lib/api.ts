@@ -440,6 +440,30 @@ export interface Capabilities {
   version?: string;
   concurrency?: number;
   maxUploadBytes?: number;
+  /**
+   * jobs.Options.MaxMasterBytes (server: jm.MaxMasterBytes()): the
+   * per-render cap on the RGBA frame master — frames × width × height × 4
+   * of the compiled plan, measured at OUTPUT size — and, since the graph
+   * stopped capping compiles on frame count (2026-09-13), the only bound on
+   * the reverse / bounce buffer too. A render over it is refused up-front
+   * by jobs.admitScratch; forward stills and proxies are never gated on it.
+   * Absent / 0 (an older server, or a server without a job manager) =
+   * unknown: the SPA shows its estimate without a verdict
+   * (lib/state.svelte.ts masterVerdict).
+   */
+  maxMasterBytes?: number;
+  /**
+   * jobs.Manager.ScratchBudgetBytes(): the scratch byte budget a render's
+   * reservation must fit under — the master plus headroom plus the
+   * PNG-intermediate / fit-candidate multiples (jobs.scratchReserve /
+   * scratchFactor). It is NOT shm_size itself: jobs.NewManager derives it
+   * as the scratch filesystem's size minus what the still / proxy memo
+   * dirs may hold (MaxStillsBytes + MaxProxyBytes, 768 MiB by default),
+   * since those share the tmpfs — the Render panel words it as "shm_size
+   * minus the preview cache". It can bind below maxMasterBytes for fit,
+   * AVIF, indexed-APNG and frames renders. 0 = unlimited or unknown.
+   */
+  scratchBudgetBytes?: number;
   formats?: string[] | null;
   /** every Discord target, in display order (Phase 2) */
   targets?: string[] | null;

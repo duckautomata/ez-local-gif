@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/bits"
 	"os"
 	"strings"
 	"sync"
@@ -13,7 +15,7 @@ import (
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
 )
 
-// Scratch admission (DESIGN.md §4.1 frame cap, §9.9 tmpfs sizing).
+// Scratch admission (DESIGN.md §4.1 frame-master cap, §9.9 tmpfs sizing).
 //
 // The RGBA master of a render is frames x width x height x 4 bytes on the
 // scratch tmpfs. Its size is known from the compiled plan before ffmpeg
@@ -22,12 +24,39 @@ import (
 // taking every concurrent render on the same tmpfs down with it. Renders
 // that do fit reserve their estimate from a byte budget (the size of the
 // scratch filesystem) so concurrent jobs cannot collectively overflow it.
+//
+// This is the ONLY frame-master cap (2026-09-13): the graph reports
+// Plan.Width/Height/Frames and never refuses a plan for its frame count —
+// an earlier 8 GiB compile-time cap there refused the still and proxy of an
+// untrimmed 4K clip before it could be trimmed/cropped/resized in-app,
+// although neither builds a master. Here the cap is applied to what is
+// actually allocated: the master of a render (admitScratch, at the output
+// size, so a trimmed and fitted render of a huge source is small) and the
+// in-RAM buffer of ffmpeg's reverse filter for reversed/bounced previews
+// and static reversed renders (admitReversed). Forward stills and proxies
+// are never gated on the frame count: a still seeks one frame, a proxy
+// streams a head bounded by MaxProxySeconds / MaxProxyWidth / 15 fps. The
+// blind spot every byte cap shares: a source whose frame count is unknown
+// (Frames 0) passes with need == 0 and is bounded only by the ENOSPC
+// mapping and the preview timeouts.
 
 const (
 	// DefaultMaxMasterBytes is Options.MaxMasterBytes when unset: 2 GiB, the
 	// DESIGN.md §4.1 frame-master cap (the streaming bypass for larger
-	// sources is Phase 2).
+	// outputs — frames straight into the encoder, no master — is a later
+	// item).
 	DefaultMaxMasterBytes = 2 << 30
+
+	// MaxMasterBytesCeiling is the largest Options.MaxMasterBytes NewManager
+	// accepts (MaxInt64/16 = 512 PiB; larger values are logged and clamped).
+	// The scratch reservation of an admitted render is need + max(need/8,
+	// 8 MiB) + (factor-1)*need with factor <= 3 (scratchFactor), i.e. at
+	// most 3.125*need, and need <= MaxMasterBytes — so with the cap at or
+	// under MaxInt64/16 the reserve can never overflow into a non-positive
+	// value that reserveScratch would treat as "nothing to reserve" and
+	// skip the budget. No real host has 512 PiB of RAM or tmpfs, so the
+	// clamp costs an operator nothing.
+	MaxMasterBytesCeiling = math.MaxInt64 / 16
 
 	// scratchHeadroomMin/Div size the extra scratch reserved next to the
 	// master for the encoder outputs (base.gif, opt.gif, enc.webp, the
@@ -41,10 +70,19 @@ const (
 // (rawvideo rgba) and for the reverse stage's buffer too: the graph pins the
 // frames to rgba right in front of "reverse" ("format=rgba,reverse"), so a
 // reversed render never holds more than Frames x Width x Height x 4 in
-// memory whatever depth the chain carried before it. Bounce ops (Phase 4)
-// need no extra factor here: graph doubles Plan.Frames (and Duration) per
-// bounce, so the estimate already measures the doubled output — and each
-// bounce's in-graph reverse branch buffers only the pre-bounce half of it.
+// memory whatever depth the chain carried before it — for an animated
+// render the master estimate therefore covers the reverse buffer and
+// admitScratch alone suffices. That equality breaks for the static formats
+// (png/jpeg): render.go cuts their plan to one frame (oneFramePlan) before
+// admitScratch, but "-frames:v 1" shortens the encode, not the decode, so
+// a reverse filter still buffers the whole clip — reversed static renders
+// are admitted by admitReversed on the pre-cut plan first (a bounce alone
+// is not: its first output frame is the forward branch's, and the run ends
+// before its reverse branch has buffered anything — see render.go). Bounce
+// ops (Phase 4) need no extra factor here: graph doubles Plan.Frames (and
+// Duration) per bounce, so the estimate already measures the doubled
+// output — and each bounce's in-graph reverse branch buffers only the
+// pre-bounce half of it.
 func masterBytes(p *graph.Plan) int64 {
 	if p == nil {
 		return 0
@@ -53,12 +91,30 @@ func masterBytes(p *graph.Plan) int64 {
 }
 
 // frameBytes is masterBytes for frames output-sized RGBA frames of plan; 0
-// when the count or the frame size is unknown.
+// when the count or the frame size is unknown. The product is overflow-safe
+// on every factor and saturates at math.MaxInt64, so an absurd plan is
+// refused by the cap instead of wrapping into a small or negative number
+// that admission would wave through. A saturated count is not the only
+// way there: a crafted MP4 (mvhd timescale 1, duration 2^32-1) probes to a
+// Duration of 4.29e9 s and at 60 fps plans 2.6e11 frames — well below
+// MaxInt, but 8192 x 4096 x 4 x 2.6e11 is past int64 — and graph's bounce
+// doubling pins Frames at math.MaxInt, where even Width alone overflows.
+// bits.Mul64 on the running product keeps every step exact: a non-zero
+// high word or a low word past MaxInt64 means the true product does not
+// fit an int64.
 func frameBytes(p *graph.Plan, frames int) int64 {
 	if p == nil || frames <= 0 || p.Width <= 0 || p.Height <= 0 {
 		return 0
 	}
-	return int64(frames) * int64(p.Width) * int64(p.Height) * 4
+	n := uint64(frames)
+	for _, f := range [...]uint64{uint64(p.Width), uint64(p.Height), 4} {
+		hi, lo := bits.Mul64(n, f)
+		if hi != 0 || lo > math.MaxInt64 {
+			return math.MaxInt64
+		}
+		n = lo
+	}
+	return int64(n)
 }
 
 // masterCapError is the ErrInvalidRecipe a render or preview gets when what
@@ -71,21 +127,29 @@ func (m *Manager) masterCapError(what string, need int64, frames, width, height 
 		ErrInvalidRecipe, what, humanBytes(need), frames, width, height, humanBytes(m.opts.MaxMasterBytes))
 }
 
-// admitReversed refuses a still/proxy of a reversed OR bounced plan whose
-// reverse/bounce stage would buffer more than Options.MaxMasterBytes: the
-// reverse filter holds every output-sized RGBA frame it is handed in memory
-// until EOF, which for a preview is frames frames — the whole trimmed clip
-// for a still, the tail the proxy's seek leaves for a reversed proxy
-// (proxyBufferFrames). A bounced plan (Phase 4) is treated the same with
-// frames = Plan.Frames: its split/reverse branch buffers the pre-bounce
-// half of the (already doubled) frame count, so the doubled count is a
-// conservative bound, and bounced previews are never seeked (enc), so no
-// tail estimate applies. The preview endpoints hand the plan to ffmpeg
-// straight away, without the render path's scratch admission, so without
-// this check a reversed 1080p clip that the render refuses up-front would
-// still be decoded for its preview. Forward plans buffer nothing and an
-// unknown frame count (0) cannot be checked; what names the preview for the
-// message.
+// admitReversed refuses a still/proxy of a reversed OR bounced plan — or a
+// static (png/jpeg) render of a reversed one — whose reverse/bounce stage
+// would buffer more than Options.MaxMasterBytes: the reverse filter holds
+// every output-sized RGBA frame it is handed in memory until EOF, which is
+// frames frames — the whole trimmed clip for a still and for a static
+// render (whose "-frames:v 1" cuts the encode, not the decode), the tail
+// the proxy's seek leaves for a reversed proxy (proxyBufferFrames). A
+// bounced plan (Phase 4) is treated the same with frames = Plan.Frames for
+// a still or proxy: its split/reverse branch buffers the pre-bounce half of
+// the (already doubled) frame count, so the doubled count is a conservative
+// bound — a still at t >= D really is served by that branch, after it has
+// buffered the whole forward pass — and bounced previews are never seeked
+// (enc), so no tail estimate applies. A bounce-only static render is not
+// gated here (render.go: its first frame is the forward branch's, and the
+// run ends before the reverse branch fills). The preview endpoints hand the
+// plan to ffmpeg straight away, without the render path's scratch
+// admission, and the static render's scratch admission sees a one-frame
+// plan, so without this check a reversed 1080p clip that an animated
+// render refuses up-front would still be decoded for its preview or PNG
+// export — and, the graph applying no frame-count cap of its own, that
+// buffer would be bounded by nothing but host RAM. Forward plans buffer
+// nothing and are never gated on the frame count; an unknown frame count
+// (0) cannot be checked; what names the preview/render for the message.
 func (m *Manager) admitReversed(plan *graph.Plan, frames int, what string) error {
 	if plan == nil || (!plan.Reversed && !plan.Bounced) {
 		return nil

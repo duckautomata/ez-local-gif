@@ -40,20 +40,32 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		versions = map[string]string{}
 	}
 	conc := 0
+	// The render admission caps (jobs/scratch.go), published so the SPA can
+	// show the master estimate against them before Render: maxMasterBytes
+	// is the frame-master / reverse-buffer cap (jobs.Options.MaxMasterBytes
+	// after its default and ceiling clamp), scratchBudgetBytes the scratch
+	// byte budget a render's reserve (scratchFactor x master + headroom)
+	// must fit — 0 there means unlimited or unknown, and both are 0 without
+	// a manager, which the SPA reads as "no estimate verdict".
+	var maxMaster, scratchBudget int64
 	if s.jm != nil {
 		conc = s.jm.Concurrency()
+		maxMaster = s.jm.MaxMasterBytes()
+		scratchBudget = s.jm.ScratchBudgetBytes()
 	}
 	w.Header().Set("Cache-Control", "no-cache")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"tools":          versions,
-		"targets":        targetNames(),
-		"limits":         targetLimits(),
-		"rulesVersion":   discordlint.RulesVersion,
-		"version":        s.cfg.Version,
-		"concurrency":    conc,
-		"maxUploadBytes": s.cfg.MaxUploadBytes,
-		"formats":        outputFormats(),
-		"features":       s.features(len(s.fonts(ctx)) > 0, versions),
+		"tools":              versions,
+		"targets":            targetNames(),
+		"limits":             targetLimits(),
+		"rulesVersion":       discordlint.RulesVersion,
+		"version":            s.cfg.Version,
+		"concurrency":        conc,
+		"maxUploadBytes":     s.cfg.MaxUploadBytes,
+		"maxMasterBytes":     maxMaster,
+		"scratchBudgetBytes": scratchBudget,
+		"formats":            outputFormats(),
+		"features":           s.features(len(s.fonts(ctx)) > 0, versions),
 	})
 }
 

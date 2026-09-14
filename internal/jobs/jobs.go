@@ -12,12 +12,17 @@
 //     existing manifest.
 //  2. Resolve every autocrop op (autocrop.go), then plan :=
 //     graph.CompileWithSources(infos, ops, output) with the overlay input
-//     paths filled in. Estimate the RGBA master (plan.Frames*W*H*4; one
-//     frame for the static formats, whose master is cut to the first
-//     frame): refuse renders over Options.MaxMasterBytes or larger than the
-//     scratch filesystem up-front, otherwise reserve the estimate (plus
-//     room for PNG intermediates where the format needs them) from the
-//     scratch budget — see scratch.go.
+//     paths filled in. Estimate the RGBA master (plan.Frames*W*H*4 at the
+//     output size; one frame for the static formats, whose master is cut
+//     to the first frame — a reversed static plan is first admitted by its
+//     reverse buffer on the uncut count, since "-frames:v 1" does not
+//     shorten the reverse filter's decode; a bounce alone buffers nothing
+//     before its first frame, see render.go): refuse renders over
+//     Options.MaxMasterBytes or larger than the scratch filesystem
+//     up-front, otherwise reserve the estimate (plus room for PNG
+//     intermediates where the format needs them) from the scratch budget —
+//     see scratch.go. This is the only frame-master cap; the graph never
+//     refuses a plan for its frame count.
 //  3. scratch := store.ScratchDir(jobID); write the drawtext bodies
 //     (plan.TextFiles) into it and bind them (graph.BindTextFiles).
 //  4. Render the master with enc.MasterArgs + ffrun.RunFFmpeg (progress →
@@ -181,11 +186,21 @@ type Options struct {
 	PublicBase  string // prefix for File.URL (default "/out")
 
 	// MaxMasterBytes caps the RGBA frame master of one render (frames x
-	// width x height x 4, estimated from the compiled plan before ffmpeg
-	// starts). A render that would exceed it fails up-front with an
-	// ErrInvalidRecipe error asking to trim / lower the fps / resize.
-	// 0 = DefaultMaxMasterBytes (2 GiB, DESIGN.md §4.1). Wire to
+	// width x height x 4 at the output size, estimated from the compiled
+	// plan before ffmpeg starts). A render that would exceed it fails
+	// up-front with an ErrInvalidRecipe error asking to trim / lower the
+	// fps / resize. 0 = DefaultMaxMasterBytes (2 GiB, DESIGN.md §4.1);
+	// values above MaxMasterBytesCeiling are logged and clamped to it (see
+	// the constant for the overflow it prevents). Wire to
 	// EZLG_MAX_MASTER_BYTES.
+	//
+	// It is the only frame-master cap: the graph never refuses a plan for
+	// its frame count (2026-09-13), so this option is also the sole bound
+	// on the RAM that ffmpeg's reverse filter buffers for reversed/bounced
+	// previews and static reversed renders (admitReversed) — the scratch
+	// budget below sees only disk. Forward stills and proxies build no
+	// master and are not gated by it at all. An operator who raises it past
+	// the host's RAM trades refusals for OOM kills.
 	MaxMasterBytes int64
 
 	// ScratchBudgetBytes bounds the sum of the master estimates (plus
@@ -345,6 +360,13 @@ func NewManager(st *store.Store, tools ffrun.Tools, opts Options) *Manager {
 	if opts.MaxMasterBytes <= 0 {
 		opts.MaxMasterBytes = DefaultMaxMasterBytes
 	}
+	if opts.MaxMasterBytes > MaxMasterBytesCeiling {
+		// Past the ceiling the scratch reserve (up to 3.125x the cap, see
+		// MaxMasterBytesCeiling) could overflow int64 into a non-positive
+		// value that skips the budget; no host has this much anyway.
+		log.Printf("jobs: EZLG_MAX_MASTER_BYTES %d exceeds the %s ceiling; clamped", opts.MaxMasterBytes, humanBytes(MaxMasterBytesCeiling))
+		opts.MaxMasterBytes = MaxMasterBytesCeiling
+	}
 	if opts.MaxStillsBytes <= 0 {
 		opts.MaxStillsBytes = DefaultMaxStillsBytes
 	}
@@ -388,11 +410,16 @@ func NewManager(st *store.Store, tools ffrun.Tools, opts Options) *Manager {
 // Concurrency returns the render semaphore size.
 func (m *Manager) Concurrency() int { return cap(m.sem) }
 
-// MaxMasterBytes returns the effective per-render frame-master cap.
+// MaxMasterBytes returns the effective per-render frame-master cap
+// (Options.MaxMasterBytes after the default and the ceiling clamp) — what
+// GET /api/capabilities publishes as maxMasterBytes so the SPA can show the
+// estimate against it before Render.
 func (m *Manager) MaxMasterBytes() int64 { return m.opts.MaxMasterBytes }
 
 // ScratchBudgetBytes returns the effective scratch admission budget (0 =
-// unlimited).
+// unlimited) — published as scratchBudgetBytes next to MaxMasterBytes: for
+// fit / AVIF / frames renders the reserve (scratchFactor x the master plus
+// headroom) can exceed the budget while the master is still under the cap.
 func (m *Manager) ScratchBudgetBytes() int64 { return m.scratch.Limit() }
 
 // PreviewConcurrency returns the preview semaphore size: how many still /

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   dropRates,
+  fmtBytesShort,
   fmtLimit,
   fmtTimecode,
   floorTime,
@@ -31,6 +32,84 @@ describe('fmtTimecode', () => {
     expect(fmtTimecode(-3)).toBe('00:00.00');
     expect(fmtTimecode(NaN)).toBe('00:00.00');
     expect(fmtTimecode(Infinity)).toBe('00:00.00');
+  });
+});
+
+// Every expectation below was printed by a verbatim copy of jobs.humanBytes
+// (internal/jobs/scratch.go) run with Go: the Render panel's estimate sits
+// next to the server's refusal message and must agree digit for digit.
+describe('fmtBytesShort (jobs.humanBytes)', () => {
+  it('renders whole values and values ≥ 10 without decimals, smaller fractions with one, up to PiB', () => {
+    for (const [n, want] of [
+      [0, '0 B'],
+      [1, '1 B'],
+      [1023, '1023 B'],
+      [1024, '1 KiB'],
+      [1536, '1.5 KiB'],
+      [2560, '2.5 KiB'],
+      [1024000, '1000 KiB'],
+      [1048575, '1024 KiB'], // 1023.999 KiB: still the KiB unit, rounded to 1024
+      [1234567, '1.2 MiB'],
+      [8 << 20, '8 MiB'],
+      [9 << 20, '9 MiB'],
+      [348 << 20, '348 MiB'],
+      [512 << 20, '512 MiB'],
+      [3 * 2 ** 29, '1.5 GiB'],
+      [2 ** 31, '2 GiB'],
+      [2621440000, '2.4 GiB'],
+      [5 * 2 ** 29, '2.5 GiB'],
+      [3 * 2 ** 30, '3 GiB'],
+      [3435973836, '3.2 GiB'],
+      [10380902400, '9.7 GiB'], // the user's 2560×1440 × 704 frames
+      [10 * 2 ** 30, '10 GiB'],
+      [100 * 2 ** 30, '100 GiB'],
+      [2 ** 40, '1 TiB'],
+      [2 ** 50, '1 PiB'],
+      [2 ** 50 + 2 ** 49, '1.5 PiB'],
+      [2 ** 63, '8192 PiB'], // humanBytes(math.MaxInt64): the unit ladder stops at PiB
+    ] as const) {
+      expect(fmtBytesShort(n), String(n)).toBe(want);
+    }
+  });
+
+  it('rounds exact ties to the even neighbour like Go’s %.0f / %.1f, not up like toFixed', () => {
+    expect(fmtBytesShort(21 * 2 ** 29)).toBe('10 GiB'); // 10.5 GiB → 10
+    expect(fmtBytesShort(23 * 2 ** 29)).toBe('12 GiB'); // 11.5 GiB → 12
+    expect(fmtBytesShort(5 * 2 ** 28)).toBe('1.2 GiB'); // 1.25 GiB → 1.2
+    expect(fmtBytesShort(7 * 2 ** 28)).toBe('1.8 GiB'); // 1.75 GiB → 1.8
+  });
+
+  it('agrees with Go at PiB scale too, where v × 10 is no longer exact in a double (integer arithmetic decides the digits)', () => {
+    // every expectation printed by the verbatim humanBytes copy run with Go 1.26
+    for (const [n, want] of [
+      [2758454771764429, '2.5 PiB'], // 2.4500000000000002 PiB: a float port saw an exact tie and printed 2.4
+      [2871044762448691, '2.5 PiB'], // 2.5499999999999998 PiB: … or rounded the product onto .5 and printed 2.6
+      [2251799813685249, '2.0 PiB'], // 2^51 + 1: not a whole double, so Go prints one decimal — "2.0"
+      [1688849860263937, '1.5 PiB'],
+      [1407374883553279, '1.2 PiB'],
+      [2814749767106561, '2.5 PiB'],
+      [2814749767106559, '2.5 PiB'],
+      [5 * 2 ** 48, '1.2 PiB'], // exact ties, to even
+      [7 * 2 ** 48, '1.8 PiB'],
+      [9 * 2 ** 48, '2.2 PiB'],
+      [11821949021847552, '10 PiB'], // 10.5 → 10
+      [12947848928690176, '12 PiB'], // 11.5 → 12
+      [3940649673949184, '3.5 PiB'],
+      [3096224743817216, '2.8 PiB'],
+      [3377699720527872, '3 PiB'],
+      [2 ** 59 - 1, '512 PiB'], // jobs.MaxMasterBytesCeiling (MaxInt64/16 = 2^59 − 1 rounds to 2^59 as a double on both sides)
+    ] as const) {
+      expect(fmtBytesShort(n), String(n)).toBe(want);
+    }
+    // a fractional count (humanBytes' int64 never sees one) is floored first
+    expect(fmtBytesShort(1536.9)).toBe('1.5 KiB');
+    expect(fmtBytesShort(1023.5)).toBe('1023 B');
+  });
+
+  it('never throws on garbage', () => {
+    expect(fmtBytesShort(-1)).toBe('—');
+    expect(fmtBytesShort(NaN)).toBe('—');
+    expect(fmtBytesShort(Infinity)).toBe('—');
   });
 });
 

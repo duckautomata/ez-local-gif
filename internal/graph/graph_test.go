@@ -823,7 +823,7 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "limits: a master of exactly 8 GiB is accepted",
+			name: "limits: an 8 GiB master compiles — the cap is jobs' Options.MaxMasterBytes, not the graph's",
 			src:  with(h264, func(p *recipe.ProbeInfo) { p.Width, p.Height, p.FPS, p.Duration, p.Frames = 2048, 1024, 1, 1024, 1024 }),
 			out:  webp(),
 			want: Plan{
@@ -1588,7 +1588,8 @@ func TestCompileErrors(t *testing.T) {
 		{"output fit exact above 32 megapixels", h264, nil, recipe.Output{Format: "webp", Width: 8192, Height: 4097, Fit: "exact"}, "output: frame 8192x4097 exceeds the limits (8192 px per side, 32 megapixels)"},
 		{"oversized source without a resize", with(still, func(p *recipe.ProbeInfo) { p.Width, p.Height = 12000, 8000 }), nil, webp(), "output frame 12000x8000 exceeds the limits (8192 px per side, 32 megapixels); add a resize"},
 		{"source wider than 8192 without a resize", with(h264, func(p *recipe.ProbeInfo) { p.Width, p.Height = 9000, 100 }), []recipe.Op{flip(true, false)}, gif(), "output frame 9000x100 exceeds the limits"},
-		{"master above 8 GiB", with(h264, func(p *recipe.ProbeInfo) { p.Width, p.Height, p.Duration, p.Frames = 3840, 2160, 300, 9000 }), nil, webp(), "expected master (3840x2160 x 8991 frames = 277.8 GiB) exceeds the 8 GiB limit; trim, lower the fps or resize"},
+		// No "master above N GiB" row: the graph caps no frame count or
+		// master size (TestCompileNoMasterCap); that is jobs' admission.
 
 		// Phase 2: sequences, delay op, alpha stream, output options.
 		{"delay zero", pngSeq, []recipe.Op{delay(0)}, webp(), "op 0 (delay): ms must be between 1 and 60000 (got 0)"},
@@ -1618,7 +1619,6 @@ func TestCompileErrors(t *testing.T) {
 		{"frame format is case-sensitive", h264, nil, recipe.Output{Format: recipe.FormatFrames, FrameFormat: "PNG"}, `output: frame format "PNG" must be one of png, jpeg, webp`},
 		{"frame format jpg is not an alias", h264, nil, recipe.Output{Format: recipe.FormatFrames, FrameFormat: "jpg"}, `output: frame format "jpg" must be one of png, jpeg, webp`},
 		{"negative fit bytes", h264, nil, recipe.Output{Format: "gif", FitBytes: -1}, "output: fitBytes must be >= 0 (got -1)"},
-		{"sequence master above 8 GiB", with(withSeq(pngSeq, func(s *recipe.SequenceInfo) { s.Count = 5000 }), func(p *recipe.ProbeInfo) { p.Width, p.Height, p.Frames = 8192, 4096, 5000 }), nil, webp(), "exceeds the 8 GiB limit"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1637,6 +1637,38 @@ func TestCompileErrors(t *testing.T) {
 }
 
 // --- SnapFPS ----------------------------------------------------------------
+
+// TestCompileNoMasterCap: the graph caps no frame count and no master byte
+// size — the cap is jobs' (Options.MaxMasterBytes, admitScratch /
+// admitReversed), applied once per render at the output size. An untrimmed
+// 4K clip and a 32-megapixel sequence therefore compile and report their
+// Width/Height/Frames at the source size, so their stills and proxies
+// (which build no master) work and the user can trim/crop/resize in-app;
+// an earlier 8 GiB compile-time cap refused exactly these plans
+// ("expected master … exceeds the 8 GiB limit") before any editing.
+func TestCompileNoMasterCap(t *testing.T) {
+	cases := []struct {
+		name       string
+		src        recipe.ProbeInfo
+		w, h, want int
+	}{
+		// 3840x2160 x 8991 frames = 277.8 GiB of RGBA.
+		{"untrimmed 4K clip", with(h264, func(p *recipe.ProbeInfo) { p.Width, p.Height, p.Duration, p.Frames = 3840, 2160, 300, 9000 }), 3840, 2160, 8991},
+		// 8192x4096 x 5000 frames = 625 GiB of RGBA (MaxPixels exactly).
+		{"32-megapixel sequence", with(withSeq(pngSeq, func(s *recipe.SequenceInfo) { s.Count = 5000 }), func(p *recipe.ProbeInfo) { p.Width, p.Height, p.Frames = 8192, 4096, 5000 }), 8192, 4096, 5000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := Compile(tc.src, nil, webp())
+			if err != nil {
+				t.Fatalf("Compile: %v, want a plan (the cap is jobs' Options.MaxMasterBytes)", err)
+			}
+			if p.Width != tc.w || p.Height != tc.h || p.Frames != tc.want {
+				t.Errorf("plan reports %dx%d x %d frames, want %dx%d x %d", p.Width, p.Height, p.Frames, tc.w, tc.h, tc.want)
+			}
+		})
+	}
+}
 
 func TestSnapFPS(t *testing.T) {
 	tests := []struct {

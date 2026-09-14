@@ -385,11 +385,13 @@ func (c *compiler) autocrop(d decodedOp, p *recipe.AutoCropParams) error {
 // the geometry stages AND the output fit. The filter holds every input
 // frame in memory until EOF, so it must see the frames at their final size:
 // after the output fit the frame is exactly Plan.Width x Plan.Height (no
-// later stage changes the size), which MaxMasterBytes bounds — Output.
-// Width/Height is where the UI's Emote/Sticker presets shrink the frame,
-// and a reverse in front of that fit buffered the source-sized frames (a
-// 1080p 60 s ProRes clip fit to 128 px: 28 GiB for a 0.1 GiB master) while
-// the cap measured the post-fit size. Reverse commutes bit-exactly with the
+// later stage changes the size), which is what jobs' reverse-buffer
+// admission (Options.MaxMasterBytes, admitReversed — the graph itself caps
+// no frame count) measures — Output.Width/Height is where the UI's
+// Emote/Sticker presets shrink the frame, and a reverse in front of that
+// fit buffered the source-sized frames (a 1080p 60 s ProRes clip fit to
+// 128 px: 28 GiB for a 0.1 GiB master) while the estimate measured the
+// post-fit size. Reverse commutes bit-exactly with the
 // spatial stages (scale/crop/pad), and text/overlay timing stays in output
 // (reversed) time because finalCanvas still follows it. The filter reuses
 // the forward timestamps for the reversed frames, so Frames and Duration
@@ -449,10 +451,11 @@ func (c *compiler) reverse(ops []decodedOp) error {
 // The chain continues from the concat — the final-canvas ops and the
 // terminal format=rgba follow as usual, so the last chain still ends in
 // [out]. Frames and Duration double per bounce (assemble applies the
-// doubling after the trim/speed/fps math, so finish's MaxMasterBytes check
-// measures the doubled count); the split/reverse branch buffers the
-// pre-bounce frames at the output size, which that cap bounds exactly like
-// a plain reverse's buffer.
+// doubling after the trim/speed/fps math, so jobs' admission — the graph
+// caps no frame count — measures the doubled count); the split/reverse
+// branch buffers the pre-bounce frames at the output size, which jobs'
+// admitReversed (Options.MaxMasterBytes) bounds exactly like a plain
+// reverse's buffer, and jobs' master estimate counts the doubled clip.
 func (c *compiler) bounce() {
 	c.bounces++
 	n := c.bounces

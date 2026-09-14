@@ -25,6 +25,7 @@ import (
 	"github.com/duckautomata/ez-local-gif/internal/ffrun"
 	"github.com/duckautomata/ez-local-gif/internal/graph"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
+	"github.com/duckautomata/ez-local-gif/internal/store"
 )
 
 const (
@@ -258,9 +259,9 @@ func TestPreviewAdmissionReversed(t *testing.T) {
 	out := recipe.Output{Format: "gif"}
 	ctx := context.Background()
 
-	// The plan passes graph's 8 GiB compile cap (4.6 GiB) and fails the
-	// jobs 2 GiB default; the proxy's tail (about 10 s + the seek-back at
-	// 30 fps) is 2.4 GiB, over the default too.
+	// The plan compiles (the graph caps no frame count) at 4.6 GiB of
+	// reverse buffer, over the jobs 2 GiB default; the proxy's tail (about
+	// 10 s + the seek-back at 30 fps) is 2.4 GiB, over the default too.
 	plan, err := graph.Compile(info, reverse, stillOutput(out))
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -348,6 +349,211 @@ func TestPreviewAdmissionReversed(t *testing.T) {
 	check(t, "trimmed reversed still", err, false)
 	_, err = m.Proxy(ctx, []string{src}, trimmed, out, 0, 0)
 	check(t, "trimmed reversed proxy", err, false)
+}
+
+// bigSource stores a blob probed as the 2026-09-13 report's source — a
+// 2560x1440 30 fps 23.47 s H.264 clip, 704 frames = 9.7 GiB of RGBA — and
+// returns its hash. Nothing decodes it: the tests below only need a plan
+// whose untrimmed master is far over the 2 GiB default.
+func bigSource(t *testing.T, st *store.Store) string {
+	t.Helper()
+	b, err := st.PutBlob(bytes.NewReader([]byte("a 1440p clip, allegedly")), "big1440.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := recipe.ProbeInfo{Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "h264", PixFmt: "yuv420p", Bits: 8,
+		Width: 2560, Height: 1440, FPS: 30, Duration: 23.4667, Frames: 704, Kind: recipe.KindVideo}
+	if err := st.SetBlobInfo(b.Hash, info); err != nil {
+		t.Fatal(err)
+	}
+	return b.Hash
+}
+
+// checkAdmission asserts on the error of a still/proxy call: refused means
+// ErrInvalidRecipe naming EZLG_MAX_MASTER_BYTES (and each extra want) with
+// no ffmpeg spawned; otherwise the fake ffmpeg must have been reached (the
+// error mentions ffmpeg and is not an ErrInvalidRecipe).
+func checkAdmission(t *testing.T, what string, err error, refused bool, wants ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: no error", what)
+	}
+	if refused {
+		if !errors.Is(err, ErrInvalidRecipe) {
+			t.Errorf("%s: %v (want ErrInvalidRecipe)", what, err)
+		}
+		for _, want := range append([]string{"EZLG_MAX_MASTER_BYTES"}, wants...) {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: error %q lacks %q", what, err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "ffmpeg") {
+			t.Errorf("%s: ffmpeg was spawned: %v", what, err)
+		}
+		return
+	}
+	if errors.Is(err, ErrInvalidRecipe) || !strings.Contains(err.Error(), "ffmpeg") {
+		t.Errorf("%s: %v (want the fake ffmpeg to be reached)", what, err)
+	}
+}
+
+// TestPreviewAdmissionForwardLargeMaster (2026-09-13 report): a source
+// whose untrimmed master is far over the cap — 2560x1440 x 704 frames =
+// 9.7 GiB — must still preview so it can be trimmed/cropped/fitted in-app.
+// The graph no longer refuses such a plan at compile time, and forward
+// stills/proxies build no master, so Still and Proxy of the untouched clip
+// reach ffmpeg; only Submit — the render, which would build the master —
+// is refused, naming the knob. With the editing the report wanted (trim to
+// 3 s, crop, gif at 128x128) the render's master is 90 x 128 x 128 x 4 =
+// 5.6 MiB and its admission passes too; the only failure left is the fake
+// ffmpeg. No refusal or failure leaves anything on scratch.
+func TestPreviewAdmissionForwardLargeMaster(t *testing.T) {
+	st := newTestStore(t)
+	src := bigSource(t, st)
+	out := recipe.Output{Format: "gif"}
+	ctx := context.Background()
+	m := NewManager(st, fakeTools, Options{Concurrency: 1})
+
+	// Sanity on the plan the manager compiles: 9.7 GiB, over the default.
+	plan, err := graph.Compile(mustInfo(t, st, src), nil, stillOutput(out))
+	if err != nil {
+		t.Fatalf("compile: %v (the graph must not cap the frame count)", err)
+	}
+	if plan.Frames != 704 || plan.Width != 2560 || plan.Height != 1440 {
+		t.Fatalf("plan = %dx%d x %d frames", plan.Width, plan.Height, plan.Frames)
+	}
+	if got := masterBytes(plan); got != 10380902400 || got <= DefaultMaxMasterBytes || humanBytes(got) != "9.7 GiB" {
+		t.Fatalf("masterBytes = %d (%s), want 10380902400 (9.7 GiB), over the default cap", got, humanBytes(got))
+	}
+
+	_, err = m.Still(ctx, src, nil, out, 0.5, 0)
+	checkAdmission(t, "forward still of the untrimmed clip", err, false)
+	_, err = m.Proxy(ctx, []string{src}, nil, out, 0, 0)
+	checkAdmission(t, "forward proxy of the untrimmed clip", err, false)
+
+	j, err := m.Submit(recipe.Recipe{Sources: []string{src}, Output: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fin := waitFinished(t, m, j.ID)
+	if fin.State != StateError {
+		t.Fatalf("render of the untrimmed clip: %+v, want the cap refusal", fin)
+	}
+	for _, want := range []string{"frame master would need", "9.7 GiB", "704 frames of 2560x1440", "EZLG_MAX_MASTER_BYTES", ErrInvalidRecipe.Error()} {
+		if !strings.Contains(fin.Error, want) {
+			t.Errorf("render error %q lacks %q", fin.Error, want)
+		}
+	}
+	if strings.Contains(fin.Error, "ffmpeg") {
+		t.Errorf("render of the untrimmed clip spawned ffmpeg: %q", fin.Error)
+	}
+
+	// The report's intended edit: trim + crop, fitted to an emote.
+	edited := []recipe.Op{
+		{Kind: recipe.OpTrim, Params: json.RawMessage(`{"start":0,"end":3}`)},
+		{Kind: recipe.OpCrop, Params: json.RawMessage(`{"x":0,"y":0,"w":800,"h":600}`)},
+	}
+	emote := recipe.Output{Format: "gif", Width: 128, Height: 128}
+	if p, err := graph.Compile(mustInfo(t, st, src), edited, emote); err != nil {
+		t.Fatalf("compile edited: %v", err)
+	} else if p.Frames != 90 || p.Width != 128 || p.Height != 128 || masterBytes(p) > DefaultMaxMasterBytes {
+		t.Fatalf("edited plan = %dx%d x %d frames (%s)", p.Width, p.Height, p.Frames, humanBytes(masterBytes(p)))
+	}
+	_, err = m.Still(ctx, src, edited, emote, 0.5, 0)
+	checkAdmission(t, "edited still", err, false)
+	_, err = m.Proxy(ctx, []string{src}, edited, emote, 0, 0)
+	checkAdmission(t, "edited proxy", err, false)
+	j, err = m.Submit(recipe.Recipe{Sources: []string{src}, Ops: edited, Output: emote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fin := waitFinished(t, m, j.ID); fin.State != StateError || !strings.Contains(fin.Error, "ffmpeg") || strings.Contains(fin.Error, "EZLG_MAX_MASTER_BYTES") {
+		t.Errorf("edited render should pass admission and reach the fake ffmpeg: %+v", fin)
+	}
+	if m.scratch.Used() != 0 {
+		t.Errorf("budget not released: %d", m.scratch.Used())
+	}
+	if entries, _ := os.ReadDir(st.Scratch); len(entries) != 0 {
+		t.Errorf("scratch has %d entries after refused/failed previews and renders", len(entries))
+	}
+}
+
+// TestStaticReversedRenderAdmission: a png/jpeg render is cut to one frame
+// (oneFramePlan) before its scratch admission, but "-frames:v 1" shortens
+// the encode, not the decode — a reversed static export still buffers the
+// whole trimmed clip in ffmpeg's reverse filter. With the graph's
+// compile-time cap gone that buffer must be admitted here: the untrimmed
+// 1440p clip's reversed PNG (704 frames = 9.7 GiB) and its reversed-then-
+// bounced PNG ([reverse, bounce]: the reverse consumes the clip before the
+// split sees a frame; the doubled 1408 frames are the conservative bound —
+// 19 GiB) are refused naming the knob and the reverse buffer without an
+// ffmpeg run; the reverse trimmed to 3 s (90 frames = 1.3 GiB) is admitted
+// and reaches the fake ffmpeg. A bounce ALONE buffers nothing for a static
+// render — the first output frame is the forward branch's and -frames:v 1
+// ends the run before the reverse branch fills (render.go) — so the
+// untrimmed bounced PNG (1408 doubled frames, 19 GiB were it checked) and
+// the bounce trimmed to 3 s reach ffmpeg like a forward static export of
+// the untrimmed clip (one frame of master, no buffer).
+func TestStaticReversedRenderAdmission(t *testing.T) {
+	st := newTestStore(t)
+	src := bigSource(t, st)
+	m := NewManager(st, fakeTools, Options{Concurrency: 1})
+	png := recipe.Output{Format: "png"}
+	trim3 := recipe.Op{Kind: recipe.OpTrim, Params: json.RawMessage(`{"start":0,"end":3}`)}
+
+	// render submits ops as a png recipe; frames "" means admitted (the
+	// fake ffmpeg is reached), otherwise the refusal must name that count.
+	render := func(t *testing.T, what string, ops []recipe.Op, frames string) {
+		t.Helper()
+		j, err := m.Submit(recipe.Recipe{Sources: []string{src}, Ops: ops, Output: png})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fin := waitFinished(t, m, j.ID)
+		if fin.State != StateError {
+			t.Fatalf("%s: %+v", what, fin)
+		}
+		if frames != "" {
+			for _, want := range []string{"EZLG_MAX_MASTER_BYTES", "reverse buffer", "this render", frames + " frames of 2560x1440", "trim the clip", ErrInvalidRecipe.Error()} {
+				if !strings.Contains(fin.Error, want) {
+					t.Errorf("%s: error %q lacks %q", what, fin.Error, want)
+				}
+			}
+			if strings.Contains(fin.Error, "ffmpeg") {
+				t.Errorf("%s: ffmpeg was spawned: %q", what, fin.Error)
+			}
+			if _, err := os.Stat(filepath.Join(st.Scratch, j.ID)); !os.IsNotExist(err) {
+				t.Errorf("%s: scratch dir created for a refused render: %v", what, err)
+			}
+		} else if !strings.Contains(fin.Error, "ffmpeg") || strings.Contains(fin.Error, "EZLG_MAX_MASTER_BYTES") {
+			t.Errorf("%s: should pass admission and reach the fake ffmpeg: %+v", what, fin)
+		}
+		if m.scratch.Used() != 0 {
+			t.Errorf("%s: budget leaked: %d", what, m.scratch.Used())
+		}
+	}
+	render(t, "reversed png of the untrimmed clip", []recipe.Op{{Kind: recipe.OpReverse}}, "704")
+	render(t, "reversed then bounced png of the untrimmed clip", []recipe.Op{{Kind: recipe.OpReverse}, {Kind: recipe.OpBounce}}, "1408")
+	render(t, "reversed png trimmed to 3 s", []recipe.Op{trim3, {Kind: recipe.OpReverse}}, "")
+	render(t, "bounced png of the untrimmed clip", []recipe.Op{{Kind: recipe.OpBounce}}, "")
+	render(t, "bounced png trimmed to 3 s", []recipe.Op{trim3, {Kind: recipe.OpBounce}}, "")
+	render(t, "forward png of the untrimmed clip", nil, "")
+	if entries, _ := os.ReadDir(st.Scratch); len(entries) != 0 {
+		t.Errorf("scratch has %d entries after the renders", len(entries))
+	}
+}
+
+// mustInfo returns the probe info stored for src.
+func mustInfo(t *testing.T, st *store.Store, src string) recipe.ProbeInfo {
+	t.Helper()
+	b, err := st.GetBlob(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Info == nil {
+		t.Fatalf("source %s has no probe info", src)
+	}
+	return *b.Info
 }
 
 // TestPreviewSemaphoreAndFlight: at most PreviewConcurrency still/proxy

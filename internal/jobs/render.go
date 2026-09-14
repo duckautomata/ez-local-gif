@@ -177,6 +177,33 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 	}
 	static := recipe.IsStaticFormat(format)
 	if static {
+		// A reversed static render is admitted by its reverse buffer
+		// BEFORE the plan is cut to one frame: "-frames:v 1" shortens the
+		// encode, not the decode — a reverse filter ahead of the output
+		// holds the whole trimmed clip in RAM at the output size before it
+		// can emit its first (= the last source) frame, exactly as a
+		// reversed still does (admitReversed). The one-frame plan below
+		// would pass admitScratch with one frame's worth, and with no
+		// frame-count cap in the graph a reversed PNG export of an
+		// untrimmed 4K clip would otherwise buffer 9.7 GiB bounded by
+		// nothing but host RAM. A bounce ALONE is not checked here: its
+		// graph is split[f][r];[r]reverse[rr];[f][rr]concat, so the first
+		// output frame is the forward branch's first frame and "-frames:v
+		// 1" ends the run before the reverse branch has buffered anything
+		// (measured on FFmpeg 9: a 600-frame 1080p bounce with -frames:v 1
+		// peaks at 4 MiB like a forward graph; a reverse graph at 4.8 GiB)
+		// — a bounced PNG of an untrimmed clip costs one decoded frame. A
+		// [reverse, bounce] stack sets Reversed and is covered: that
+		// reverse must consume the whole clip before the split sees a
+		// frame. Plan.Frames — doubled per bounce — is the count the
+		// [bounce, reverse] case really buffers (the reverse consumes the
+		// concat's 2N frames) and a conservative bound for [reverse,
+		// bounce] (N buffered).
+		if plan.Reversed {
+			if err := m.admitReversed(plan, plan.Frames, "this render"); err != nil {
+				return nil, err
+			}
+		}
 		// Static formats encode the first frame only: cut the master there
 		// (admission, progress and the encoders all see a one-frame plan).
 		plan = oneFramePlan(plan)

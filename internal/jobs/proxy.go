@@ -65,9 +65,14 @@ const (
 // EZLG_MAX_MASTER_BYTES) when the frames its reverse stage buffers — the
 // tail from enc.ProxyArgs's seek to the trim end, or the whole clip when
 // it does not seek (proxyBufferFrames) — would exceed Options.MaxMasterBytes
-// in output-sized RGBA (admitReversed). The ffmpeg run takes a preview slot
-// (PreviewConcurrency) and concurrent requests for the same memo key share
-// one run; a memo hit waits for neither.
+// in output-sized RGBA (admitReversed). A forward plan is never gated on
+// its frame count: the proxy streams the first maxSeconds at <= maxW px and
+// 15 fps into libwebp_anim, a buffer bounded by MaxProxySeconds /
+// MaxProxyWidth (<= 450 frames at <= 720 px — constants, not the source),
+// so an untrimmed 4K clip of any length plays (the graph caps no frame
+// count either; the render's cap applies at Submit). The ffmpeg run takes
+// a preview slot (PreviewConcurrency) and concurrent requests for the same
+// memo key share one run; a memo hit waits for neither.
 func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64) ([]byte, error) {
 	maxW, maxSeconds = proxyBounds(maxW, maxSeconds)
 	ops = stripAutoCropResolved(ops)

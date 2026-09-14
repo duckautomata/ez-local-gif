@@ -114,6 +114,49 @@ describe('formatOffered (Phase 4: mp4/webm gating)', () => {
   });
 });
 
+// The frame-master cap and scratch budget the server publishes next to the
+// flags (2026-09-13): 0 = unknown, so an older server or a garbled answer can
+// never produce a false "Render will be refused" in the Render panel.
+describe('caps.maxMasterBytes / scratchBudgetBytes', () => {
+  afterEach(() => resetFeatures());
+
+  it('are 0 (unknown) before the server answers and after resetFeatures', () => {
+    expect(caps.maxMasterBytes).toBe(0);
+    expect(caps.scratchBudgetBytes).toBe(0);
+    setFeatures({ ...answer(phase3), maxMasterBytes: 2 ** 31, scratchBudgetBytes: 3 * 2 ** 30 });
+    expect(caps.maxMasterBytes).toBe(2 ** 31);
+    expect(caps.scratchBudgetBytes).toBe(3 * 2 ** 30);
+    resetFeatures();
+    expect(caps.maxMasterBytes).toBe(0);
+    expect(caps.scratchBudgetBytes).toBe(0);
+    setFeatures({ ...answer(phase3), maxMasterBytes: 2 ** 30 });
+    setFeatures(null);
+    expect(caps.maxMasterBytes).toBe(0);
+  });
+
+  it('an answer without the fields (an older server), or with non-finite / non-positive ones, leaves them unknown', () => {
+    setFeatures(answer(phase3)); // no fields at all
+    expect(caps.maxMasterBytes).toBe(0);
+    expect(caps.scratchBudgetBytes).toBe(0);
+    for (const bad of [0, -1, NaN, Infinity, -Infinity, null, '2147483648', undefined]) {
+      setFeatures({ ...answer(phase3), maxMasterBytes: bad as unknown as number, scratchBudgetBytes: bad as unknown as number });
+      expect(caps.maxMasterBytes, String(bad)).toBe(0);
+      expect(caps.scratchBudgetBytes, String(bad)).toBe(0);
+    }
+    // a scratch budget of 0 (unlimited) next to a real cap: the cap alone is known
+    setFeatures({ ...answer(phase3), maxMasterBytes: 2 ** 31, scratchBudgetBytes: 0 });
+    expect(caps.maxMasterBytes).toBe(2 ** 31);
+    expect(caps.scratchBudgetBytes).toBe(0);
+  });
+
+  it('callers may pass a partial object: features / formats alone still type-check and install', () => {
+    setFeatures({ features: { ...phase3, proxy: false }, formats: ['gif'] });
+    expect(caps.loaded).toBe(true);
+    expect(caps.features.proxy).toBe(false);
+    expect(caps.maxMasterBytes).toBe(0);
+  });
+});
+
 // WEB-7: feather and bounce gate on their explicit feature names; a Phase 4
 // server from before the names existed is caught by the formats-list
 // fallback (mp4 is offered by every Phase 4 server and by no earlier one).

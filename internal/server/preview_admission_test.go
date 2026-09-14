@@ -15,11 +15,13 @@ import (
 
 // TestPreviewAdmission: POST /api/proxy and /api/still hand the plan to
 // jobs with the render path's frame-master admission for reversed plans. A
-// probed 1920x1080 30 fps 20 s source with ops [{kind: reverse}] passes
-// graph's 8 GiB compile cap but its reverse buffer exceeds the 2 GiB jobs
-// cap (the whole clip for the still, the 10 s tail for the proxy), so both
-// endpoints answer 400 naming EZLG_MAX_MASTER_BYTES without starting
-// ffmpeg; the same plan without the reverse reaches ffmpeg.
+// probed 1920x1080 30 fps 20 s source with ops [{kind: reverse}] compiles
+// (the graph caps no frame count — the only cap is jobs') but its reverse
+// buffer exceeds the 2 GiB jobs cap (the whole clip for the still, the
+// 10 s tail for the proxy), so both endpoints answer 400 naming
+// EZLG_MAX_MASTER_BYTES without starting ffmpeg; the same plan without the
+// reverse — a forward plan, never gated on its frame count — reaches
+// ffmpeg.
 func TestPreviewAdmission(t *testing.T) {
 	tools, marker := fakeFFmpeg(t)
 	e := newEnvWithTools(t, Config{}, nil, tools)

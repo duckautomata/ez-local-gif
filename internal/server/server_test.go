@@ -228,6 +228,50 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+// TestCapabilitiesCaps: maxMasterBytes / scratchBudgetBytes mirror the
+// manager's configured admission caps (2026-09-13: the SPA shows the master
+// estimate against them before Render, so they must be the effective values
+// jobs admits against) and are 0 — "no verdict" — on a server without a
+// manager.
+func TestCapabilitiesCaps(t *testing.T) {
+	e := newEnvWithOptions(t, Config{}, nil, hostTools(), jobs.Options{Concurrency: 1, MaxMasterBytes: 3 << 30, ScratchBudgetBytes: 5 << 30})
+	_, body := e.get(t, "/api/capabilities")
+	var caps struct {
+		MaxMasterBytes     int64 `json:"maxMasterBytes"`
+		ScratchBudgetBytes int64 `json:"scratchBudgetBytes"`
+	}
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatalf("decode: %v: %s", err, body)
+	}
+	if caps.MaxMasterBytes != 3<<30 || caps.MaxMasterBytes != e.jm.MaxMasterBytes() {
+		t.Errorf("maxMasterBytes = %d, want 3 GiB (the manager's %d)", caps.MaxMasterBytes, e.jm.MaxMasterBytes())
+	}
+	if caps.ScratchBudgetBytes != 5<<30 || caps.ScratchBudgetBytes != e.jm.ScratchBudgetBytes() {
+		t.Errorf("scratchBudgetBytes = %d, want 5 GiB (the manager's %d)", caps.ScratchBudgetBytes, e.jm.ScratchBudgetBytes())
+	}
+
+	// No manager: both 0, and the endpoint still answers.
+	root := t.TempDir()
+	st, err := store.New(filepath.Join(root, "data"), filepath.Join(root, "scratch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{Version: "nojm"}, st, nil, hostTools(), nil)
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/capabilities", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no manager: status %d: %s", rec.Code, rec.Body)
+	}
+	caps.MaxMasterBytes, caps.ScratchBudgetBytes = -1, -1
+	if err := json.Unmarshal(rec.Body.Bytes(), &caps); err != nil {
+		t.Fatalf("no manager: decode: %v: %s", err, rec.Body)
+	}
+	if caps.MaxMasterBytes != 0 || caps.ScratchBudgetBytes != 0 {
+		t.Errorf("no manager: maxMasterBytes %d scratchBudgetBytes %d, want 0 0", caps.MaxMasterBytes, caps.ScratchBudgetBytes)
+	}
+}
+
 func TestCapabilities(t *testing.T) {
 	e := newEnv(t, Config{MaxUploadBytes: 12345, Version: "v9"}, nil)
 	resp, body := e.get(t, "/api/capabilities")
@@ -242,14 +286,30 @@ func TestCapabilities(t *testing.T) {
 		Version        string            `json:"version"`
 		Concurrency    int               `json:"concurrency"`
 		MaxUploadBytes int64             `json:"maxUploadBytes"`
-		Formats        []string          `json:"formats"`
-		Features       map[string]bool   `json:"features"`
+		// The render admission caps (2026-09-13): the SPA shows the master
+		// estimate against them before Render.
+		MaxMasterBytes     int64           `json:"maxMasterBytes"`
+		ScratchBudgetBytes int64           `json:"scratchBudgetBytes"`
+		Formats            []string        `json:"formats"`
+		Features           map[string]bool `json:"features"`
 	}
 	if err := json.Unmarshal(body, &caps); err != nil {
 		t.Fatalf("decode: %v: %s", err, body)
 	}
 	if caps.Tools == nil {
 		t.Error("tools must be an object")
+	}
+	// maxMasterBytes is the manager's effective cap (its default here, so
+	// non-zero); scratchBudgetBytes is whatever budget the manager derived
+	// (0 = unlimited/unknown is a legal value, so only equality is checked).
+	if caps.MaxMasterBytes <= 0 || caps.MaxMasterBytes != e.jm.MaxMasterBytes() {
+		t.Errorf("maxMasterBytes = %d, want the manager's cap %d", caps.MaxMasterBytes, e.jm.MaxMasterBytes())
+	}
+	if caps.ScratchBudgetBytes != e.jm.ScratchBudgetBytes() {
+		t.Errorf("scratchBudgetBytes = %d, want the manager's budget %d", caps.ScratchBudgetBytes, e.jm.ScratchBudgetBytes())
+	}
+	if !bytes.Contains(body, []byte(`"maxMasterBytes":`)) || !bytes.Contains(body, []byte(`"scratchBudgetBytes":`)) {
+		t.Errorf("capabilities body lacks the cap fields: %s", body)
 	}
 	// Every Discord target with its cap — the attachment tiers included —
 	// and nothing else; targets carries the display order.

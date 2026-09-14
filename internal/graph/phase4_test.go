@@ -11,6 +11,7 @@ package graph
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -202,8 +203,8 @@ func bounceN(n int) []recipe.Op {
 // Exactly MaxBounces still compile on a small source; one more is refused,
 // naming the offending op.
 func TestBounceCap(t *testing.T) {
-	// pngSeq: 60 frames of 200x100 → 60<<MaxBounces doubled frames, well
-	// under the master cap.
+	// pngSeq: 60 frames of 200x100 → 60<<MaxBounces doubled frames (1.1 GiB,
+	// were jobs ever to render it — the graph itself caps no frame count).
 	p, err := Compile(pngSeq, bounceN(MaxBounces), webp())
 	if err != nil {
 		t.Fatalf("%d bounces: %v", MaxBounces, err)
@@ -222,25 +223,46 @@ func TestBounceCap(t *testing.T) {
 // TestBounceFramesSaturate: assemble's per-bounce Frames doubling saturates
 // at MaxInt instead of wrapping. A crafted container can probe to enough
 // frames that even MaxBounces doublings overflow int — pre-fix, ~3e18
-// frames doubled 8 times wrapped negative, finish's MaxMasterBytes byte
-// check saw a negative product and admitted the plan (and Frames 0 reads as
-// "unknown" everywhere downstream). Saturated, the master cap rejects it.
+// frames doubled 8 times wrapped negative, and a wrapped count reaches
+// jobs as a negative no byte estimate refuses or as 0, which reads as
+// "unknown" everywhere downstream and passes admission. The graph itself
+// caps no frame count (that is jobs' Options.MaxMasterBytes), so the plan
+// compiles — with Frames pinned at MaxInt, which jobs' overflow-safe
+// estimate then refuses. The float -> int conversion of the count itself
+// saturates the same way: past 2^63 frames Go's conversion is
+// implementation-defined (MinInt64 on amd64, which max(1, ...) turned into
+// a ONE-frame plan), so a clip of 3e19 frames without any bounce must also
+// report MaxInt.
 func TestBounceFramesSaturate(t *testing.T) {
 	// ~3e18 frames at 29.97 fps; 8 doublings would be ~7.7e20, past MaxInt.
 	src := with(h264, func(p *recipe.ProbeInfo) { p.Duration = 1e17 })
-	_, err := Compile(src, bounceN(MaxBounces), webp())
-	if err == nil || !strings.Contains(err.Error(), "exceeds the 8 GiB limit") {
-		t.Fatalf("saturated bounce: %v, want the master cap, not a wrapped frame count", err)
+	p, err := Compile(src, bounceN(MaxBounces), webp())
+	if err != nil {
+		t.Fatalf("saturated bounce: %v, want a plan (the cap is jobs')", err)
+	}
+	if p.Frames != math.MaxInt || !p.Bounced {
+		t.Fatalf("saturated bounce: Frames %d Bounced %v, want math.MaxInt true (saturated, not wrapped)", p.Frames, p.Bounced)
+	}
+
+	// ~3e19 frames at 29.97 fps with no bounce: the conversion saturates.
+	huge := with(h264, func(p *recipe.ProbeInfo) { p.Duration = 1e18 })
+	p, err = Compile(huge, nil, webp())
+	if err != nil {
+		t.Fatalf("saturated conversion: %v, want a plan (the cap is jobs')", err)
+	}
+	if p.Frames != math.MaxInt || p.Bounced {
+		t.Fatalf("saturated conversion: Frames %d Bounced %v, want math.MaxInt false (saturated, not MinInt64 read as 1)", p.Frames, p.Bounced)
 	}
 }
 
-// TestBounceMasterCap: the MaxMasterBytes check runs on the doubled frame
-// count (assemble doubles Frames per bounce before finish measures the
-// master), so a large source that fits plain — and with one bounce — fails
-// with two, and the emote fit brings even the quadrupled clip back under.
-func TestBounceMasterCap(t *testing.T) {
-	// 1920x1080 x 300 frames = 2.3 GiB plain, 4.6 GiB after one bounce,
-	// 9.3 GiB after two — past the 8 GiB cap.
+// TestBounceFramesDouble: assemble doubles Frames per bounce after the
+// trim/speed/fps math, so the plan reports the quadrupled count for two
+// bounces — the count jobs' admission (admitScratch / admitReversed,
+// Options.MaxMasterBytes) measures — and the graph never refuses on it:
+// 1920x1080 x 300 frames is 2.3 GiB plain, 4.6 GiB after one bounce and
+// 9.3 GiB after two, and all three compile. The emote fit keeps the
+// quadrupled count at the 128 px output size.
+func TestBounceFramesDouble(t *testing.T) {
 	src := with(prores, func(p *recipe.ProbeInfo) { p.Duration, p.Frames = 10, 300 })
 
 	p, err := Compile(src, []recipe.Op{bounce()}, webp())
@@ -251,9 +273,12 @@ func TestBounceMasterCap(t *testing.T) {
 		t.Fatalf("one bounce: Frames %d Bounced %v, want 600 true", p.Frames, p.Bounced)
 	}
 
-	_, err = Compile(src, []recipe.Op{bounce(), bounce()}, webp())
-	if err == nil || !strings.Contains(err.Error(), "exceeds the 8 GiB limit") || !strings.Contains(err.Error(), "1200 frames") {
-		t.Fatalf("two bounces: %v, want the master cap on the quadrupled 1200 frames", err)
+	p, err = Compile(src, []recipe.Op{bounce(), bounce()}, webp())
+	if err != nil {
+		t.Fatalf("two bounces: %v, want a plan (the graph caps no frame count)", err)
+	}
+	if p.Frames != 1200 || p.Width != 1920 || p.Height != 1080 || !p.Bounced {
+		t.Fatalf("two bounces: Frames %d %dx%d Bounced %v, want 1200 1920x1080 true", p.Frames, p.Width, p.Height, p.Bounced)
 	}
 
 	p, err = Compile(src, []recipe.Op{bounce(), bounce()}, recipe.Output{Format: "webp", Width: 128, Height: 128})
@@ -268,16 +293,21 @@ func TestBounceMasterCap(t *testing.T) {
 // TestBounceAfterOutputFit mirrors TestReverseAfterOutputFit: the bounce's
 // split/reverse branch buffers every frame it sees until EOF, so it must
 // run after the output fit — then the buffered frame is exactly Plan.Width x
-// Plan.Height at 4 B/px (the leading format=rgba pins it) and the
-// MaxMasterBytes check, which sees the doubled Frames, bounds the buffer
-// too. The final-canvas ops still follow it.
+// Plan.Height at 4 B/px (the leading format=rgba pins it) and jobs'
+// admission (admitReversed / Options.MaxMasterBytes), which sees the
+// doubled Frames, bounds the buffer too. The graph caps nothing itself: the
+// untrimmed clip compiles and reports the doubled count at the source size.
+// The final-canvas ops still follow the bounce.
 func TestBounceAfterOutputFit(t *testing.T) {
 	long := with(prores, func(p *recipe.ProbeInfo) { p.Duration, p.Frames = 60, 1800 })
 	emote := recipe.Output{Format: "gif", Width: 128, Height: 128, FPS: 30}
 
-	// Sanity: without a fit the doubled master is over the cap.
-	if _, err := Compile(long, []recipe.Op{bounce()}, recipe.Output{Format: "gif", FPS: 30}); err == nil || !strings.Contains(err.Error(), "exceeds the 8 GiB limit") {
-		t.Fatalf("1080p x 3600 frames without a fit: %v, want the master cap", err)
+	// Sanity: without a fit the doubled master (14.8 GiB) compiles as well
+	// — the refusal is jobs', on the Width/Height/Frames reported here.
+	if p, err := Compile(long, []recipe.Op{bounce()}, recipe.Output{Format: "gif", FPS: 30}); err != nil {
+		t.Fatalf("1080p x 3600 frames without a fit: %v, want a plan (the cap is jobs')", err)
+	} else if p.Frames != 3600 || p.Width != 1920 || p.Height != 1080 || !p.Bounced {
+		t.Fatalf("1080p x 3600 frames without a fit: %d frames %dx%d bounced %v, want 3600 1920x1080 true", p.Frames, p.Width, p.Height, p.Bounced)
 	}
 
 	cases := []struct {

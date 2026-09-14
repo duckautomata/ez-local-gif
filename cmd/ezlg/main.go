@@ -17,9 +17,17 @@
 //	                     like an upload of the same bytes
 //	EZLG_CONCURRENCY     concurrent renders         (default max(1, NumCPU/2))
 //	EZLG_MAX_MASTER_BYTES cap on one render's RGBA frame master in bytes (default 2 GiB =
-//	                     2147483648; <= 0 keeps the default). A recipe whose master would
-//	                     exceed it is refused up-front (jobs.Options.MaxMasterBytes) — the
-//	                     error names this variable, so it must be a real knob.
+//	                     2147483648; <= 0 keeps the default; above jobs.MaxMasterBytesCeiling,
+//	                     512 PiB, it is logged and clamped). A recipe whose master (at the
+//	                     output size) would exceed it is refused up-front
+//	                     (jobs.Options.MaxMasterBytes) — the error names this variable, so it
+//	                     must be a real knob. It is the only frame-master cap (the graph never
+//	                     refuses a plan for its frame count) and so also the sole bound on the
+//	                     RAM ffmpeg's reverse filter buffers for reversed/bounced previews and
+//	                     static (png/jpeg) reversed renders: raised past host RAM, those become
+//	                     OOM kills instead of refusals. Forward stills and proxies are never
+//	                     gated by it; GET /api/capabilities publishes it as maxMasterBytes so
+//	                     the SPA shows the estimate before Render.
 //	EZLG_OUTPUT          "Save to /output" directory (default "/output"); checked once at
 //	                     startup — when it is missing or not writable the save feature is
 //	                     off (capabilities features.outputSave false, the endpoint answers 503)

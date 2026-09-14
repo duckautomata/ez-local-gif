@@ -117,3 +117,32 @@ Polish + extras, DESIGN.md §10 item 4 — built 2026-08-29:
   next to Reverse.
 - **Keyboard shortcuts** — Space plays/stops the preview, B cycles the backdrop, ? shows the
   shortcut overlay (plus the existing Ctrl+Enter render and ←/→ frame stepping).
+
+## Post-Phase-4 fixes
+
+- **Large sources are editable in-app (2026-09-13)** — the frame-master cap
+  (`EZLG_MAX_MASTER_BYTES`, 2 GiB by default) now lives in the job admission alone. The still
+  preview and the Play proxy of any source work whatever its length (an untrimmed 2560×1440,
+  704-frame clip used to fail its very first preview with "exceeds the 8 GiB limit" — a cap in
+  the filter compiler on a master that previews never build), so trim / crop / resize / fit are
+  applied in the app and the render's master is measured at the *output* size: an emote from a
+  long 4K clip is small. Reversed / bounced previews and static (PNG/JPEG) reversed renders are
+  admitted by their `reverse` buffer instead (a bounce alone buffers nothing before a static
+  render's first frame, so a bounced PNG costs one decoded frame), the estimate is overflow-safe,
+  and the cap is clamped at a documented ceiling. No result-cache version was bumped (cached
+  outputs are unaffected); DESIGN.md §4.1 has the practical-limits table.
+- **Live size estimate under Render** — `W×H · N frames · ~X of decoded frames` (`· about k×
+  that on scratch` for fit / AVIF / frames / gifski renders; `· ~Y buffered by the reverse` for a
+  reversed PNG/JPEG export, the RAM the server admits it on; "up to … before crop-to-content"
+  while auto-crop is on), computed from the probe and the op stack against the server's
+  `maxMasterBytes` / `scratchBudgetBytes` (both new in `GET /api/capabilities`). Over any bound
+  it becomes a note with the frames and seconds that fit at that size (seconds floored to a
+  tenth, so a trim to them always fits; the scratch note names the published budget — `shm_size`
+  minus the preview cache; with auto-crop on it says the render *may* be refused, since the
+  server measures after detection); a Frames export over 2000 frames says so. Render stays
+  enabled — the server has the last word. Batch rows get no estimate.
+- **Preview zoom shows real output pixels (2026-09-13)** — 1× / 2× / 4× used to stretch the
+  Fit-mode still (≤ 480 px wide, 720 on wide screens), so 4× of a 2560-wide output was a blurry
+  480-px frame. A fixed zoom now requests the still unscaled (the output canvas, as overlay mode
+  already did): 1× is one output pixel per CSS pixel and 2× / 4× magnify the frame the render
+  produces. Fit keeps the small still; the larger PNG per scrub step is paid only while zoomed.

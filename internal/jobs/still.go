@@ -66,7 +66,10 @@ func (m *Manager) Still(ctx context.Context, srcHash string, ops []recipe.Op, ou
 // naming EZLG_MAX_MASTER_BYTES) when its reverse/bounce stage would buffer
 // more than Options.MaxMasterBytes — the whole (for bounce: doubled)
 // trimmed clip in output-sized RGBA frames, as the render's master would
-// (admitReversed). The ffmpeg run
+// (admitReversed). A forward plan is never gated on its frame count: the
+// still seeks one frame ("-frames:v 1") and builds no master, so an
+// untrimmed 4K clip of any length previews (the graph caps no frame count
+// either; the render's cap applies at Submit). The ffmpeg run
 // takes a preview slot (PreviewConcurrency) and concurrent requests for the
 // same memo key share one run; a memo hit waits for neither.
 func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int) ([]byte, error) {

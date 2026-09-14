@@ -1,6 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StillRequest } from './api';
-import { DECODE_ERROR, StillScheduler, type StillView } from './still';
+import { CANVAS_STILL_MAXW, DECODE_ERROR, FIT_STILL_MAXW, FIT_STILL_MAXW_WIDE, StillScheduler, stillMaxW, type StillView } from './still';
+
+describe('stillMaxW', () => {
+  it('Fit requests a small still: 480 px, 720 on a wide screen', () => {
+    expect(stillMaxW({ overlay: false, zoomed: false, wide: false })).toBe(FIT_STILL_MAXW);
+    expect(stillMaxW({ overlay: false, zoomed: false, wide: true })).toBe(FIT_STILL_MAXW_WIDE);
+    expect(FIT_STILL_MAXW).toBe(480);
+    expect(FIT_STILL_MAXW_WIDE).toBe(720);
+  });
+
+  it('a fixed zoom requests the output canvas unscaled, so 1× / 2× / 4× multiply real output pixels (bug: 4× of a 2560-wide output was a stretched 480-px still)', () => {
+    expect(stillMaxW({ overlay: false, zoomed: true, wide: false })).toBe(CANVAS_STILL_MAXW);
+    expect(stillMaxW({ overlay: false, zoomed: true, wide: true })).toBe(CANVAS_STILL_MAXW);
+    // graph.MaxDim: the server's scale=min(iw, maxW) never shrinks the still
+    expect(CANVAS_STILL_MAXW).toBe(8192);
+  });
+
+  it('overlays on the stage request the canvas unscaled whatever the zoom or screen', () => {
+    expect(stillMaxW({ overlay: true, zoomed: false, wide: false })).toBe(CANVAS_STILL_MAXW);
+    expect(stillMaxW({ overlay: true, zoomed: false, wide: true })).toBe(CANVAS_STILL_MAXW);
+    expect(stillMaxW({ overlay: true, zoomed: true, wide: true })).toBe(CANVAS_STILL_MAXW);
+  });
+});
 
 // A controllable fetch: every call is recorded with its signal and settled by
 // the test. It deliberately does NOT reject on abort by itself, so a test can

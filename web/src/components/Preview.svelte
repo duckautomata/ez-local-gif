@@ -20,23 +20,17 @@
     recipeSources,
   } from '../lib/state.svelte';
   import { registerPlayToggle } from '../lib/shortcuts';
-  import { StillScheduler, type StillView } from '../lib/still';
+  import { StillScheduler, stillMaxW, type StillView } from '../lib/still';
   import BackdropToggle from './BackdropToggle.svelte';
   import CropOverlay from './CropOverlay.svelte';
   import OverlayLayer from './OverlayLayer.svelte';
 
-  /**
-   * With overlays on the stage the still is requested unscaled (graph's
-   * MaxDim as the width cap, so the server's min(iw, maxW) never shrinks it):
-   * its natural size is then exactly the output canvas the overlay
-   * coordinates live on, and the drag boxes map 1:1.
-   */
-  const CANVAS_STILL_MAXW = 8192;
   /** Proxy (Play) limits: DESIGN §7 — first 10 s, ≤ 360 px wide. */
   const PROXY_MAXW = 360;
   const PROXY_SECONDS = 10;
 
-  // Preview stills are at most 480 px wide, 720 on wide screens.
+  // In Fit the still is at most 480 px wide, 720 on wide screens; overlays
+  // and a fixed zoom request the output canvas unscaled (lib/still.stillMaxW).
   const wideQuery = window.matchMedia('(min-width: 1500px)');
   let wide = $state(wideQuery.matches);
   $effect(() => {
@@ -44,7 +38,14 @@
     wideQuery.addEventListener('change', onChange);
     return () => wideQuery.removeEventListener('change', onChange);
   });
-  const maxW = $derived(wide ? 720 : 480);
+
+  // Zoom: Fit scales the still into the stage; 1× / 2× / 4× show the OUTPUT
+  // canvas at that many CSS pixels per output pixel (zoomStyle), which is
+  // only true when the still is requested unscaled — see stillMaxW.
+  type Zoom = 'fit' | 1 | 2 | 4;
+  const zooms: readonly Zoom[] = ['fit', 1, 2, 4];
+  let zoom = $state<Zoom>('fit');
+  const zoomed = $derived(zoom !== 'fit');
 
   const info = $derived(app.source?.info ?? null);
   // The ops the recipe carries (none for Optimize — the preview then shows the source as-is).
@@ -115,8 +116,10 @@
   // The still request. In crop mode the op stack stops before crop and no
   // output fitting is applied, so the frame is the full source in source
   // pixel coordinates (the overlay maps display px → source px). While the
-  // eyedropper is armed the keying op is left out. With overlays the still
-  // is unscaled (see CANVAS_STILL_MAXW). The output carries only what the
+  // eyedropper is armed the keying op is left out. With overlays on the
+  // stage, or at a fixed zoom, the still is unscaled (lib/still.stillMaxW:
+  // the zoom multiplies the still's natural size, so 4× must magnify real
+  // output pixels, not a 480-px preview). The output carries only what the
   // server renders (and memoises) the preview from — format, size, fit, fps
   // (previewOutput) — so a quality / lossy / colours / dither / matte / loop
   // / fit-budget / preset / target change never re-requests a still.
@@ -136,7 +139,7 @@
       ops: recipeOps(app.ops, app.output, { cropPreview: cropMode, keyPreview: picking }),
       output: cropMode ? { format: app.output.format } : previewOutput(buildOutput(app.output)),
       t: stillT,
-      maxW: overlayMode ? CANVAS_STILL_MAXW : maxW,
+      maxW: stillMaxW({ overlay: overlayMode, zoomed, wide }),
     };
   });
 
@@ -151,9 +154,6 @@
   });
   let natural = $state({ w: 0, h: 0 });
   let imgEl = $state<HTMLImageElement | null>(null);
-  type Zoom = 'fit' | 1 | 2 | 4;
-  const zooms: readonly Zoom[] = ['fit', 1, 2, 4];
-  let zoom = $state<Zoom>('fit');
 
   $effect(() => {
     const r = req;
@@ -273,7 +273,10 @@
   // height of a tall still and squash it (an explicit width plus max-height
   // does not keep the aspect the way max-width + max-height alone do); the
   // stage scrolls instead. The overlay drag boxes map each axis by its own
-  // ratio anyway (overlay.displayScale).
+  // ratio anyway (overlay.displayScale). natural.w is the output canvas
+  // width while zoomed (the still is requested unscaled), so the factor is
+  // CSS pixels per output pixel; the proxy (≤ PROXY_MAXW wide, a deliberately
+  // low-res animation) is simply enlarged by the same factor.
   const zoomStyle = $derived(zoom === 'fit' || natural.w === 0 ? '' : `width:${natural.w * zoom}px;max-width:none;max-height:none;`);
   const position = $derived(canStep ? `${fmtTimecode(shown)} · f ${i + 1} / ${total}` : fmtSeconds(shown));
   const positionText = $derived(canStep ? `frame ${i + 1} of ${total}, ${fmtTimecode(shown)}` : `${fmtSeconds(shown)} of ${fmtSeconds(duration)}`);

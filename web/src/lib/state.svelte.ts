@@ -3,6 +3,7 @@
 
 import {
   isAnimatedFormat,
+  isStaticFormat,
   isVideoFormat,
   type AutoCropParams,
   type ChromaKeyParams,
@@ -720,14 +721,26 @@ export function previewOutput(o: Output): Output {
  * cannot be known client-side: no source size, or auto-crop on (the server
  * resolves the content box) without both output dimensions. `c` should be
  * effectiveOps.
+ *
+ * With `ignoreAutocrop` the auto-crop stage is left out and the canvas is
+ * the UNCROPPED frame's: the content box is at most the whole frame, and
+ * the manual rectangle is skipped too because auto-crop replaces it in the
+ * stack (buildOps emits one or the other), so the rectangle says nothing
+ * about the box. planMaster uses it for the "up to … before
+ * crop-to-content" estimate; nothing else should.
  */
-export function planCanvas(info: ProbeInfo | null | undefined, c: OpsCfg, out: Pick<OutputCfg, 'width' | 'height' | 'fit'>): { w: number; h: number } | null {
+export interface PlanCanvasOptions {
+  /** treat auto-crop as absent: the pre-crop canvas (planMaster's upper bound) */
+  ignoreAutocrop?: boolean;
+}
+
+export function planCanvas(info: ProbeInfo | null | undefined, c: OpsCfg, out: Pick<OutputCfg, 'width' | 'height' | 'fit'>, opts: PlanCanvasOptions = {}): { w: number; h: number } | null {
   if (!info || !(info.width > 0) || !(info.height > 0)) return null;
   if (out.width > 0 && out.height > 0) return { w: Math.round(out.width), h: Math.round(out.height) };
-  if (c.autocrop.enabled) return null;
+  if (c.autocrop.enabled && !opts.ignoreAutocrop) return null;
   let w = info.width;
   let h = info.height;
-  if (c.crop.enabled && c.crop.w > 0 && c.crop.h > 0) {
+  if (!c.autocrop.enabled && c.crop.enabled && c.crop.w > 0 && c.crop.h > 0) {
     w = Math.round(c.crop.w);
     h = Math.round(c.crop.h);
   }
@@ -956,13 +969,28 @@ export function toSourceTime(t: number, info: ProbeInfo, c: OpsCfg): number {
 }
 
 /**
+ * DEFAULT_FPS mirrors graph's defaultFPS (internal/graph/compile.go): the
+ * rate the compiler plans at when neither an fps op, Output.fps nor the
+ * probe names one.
+ */
+export const DEFAULT_FPS = 10;
+
+/**
  * planFPS is the plan's frame grid: the effective output fps (fps op →
- * Output.fps → source rate, snapped for the format). 0 when unknown. `c`
- * should be effectiveOps (all-off for Optimize).
+ * Output.fps → source rate, snapped for the format). When none of those is
+ * known but the clip's length is, it is graph's default: compiler.fps falls
+ * through to defaultFPS (10) and assemble then plans floor(Duration × 10)
+ * frames — a probe that reports a duration but neither r_frame_rate nor
+ * avg_frame_rate (rare) — so the scrubber and the master estimate count
+ * the frames the server will render instead of showing nothing. 0 when
+ * nothing is known, and for a still (no length: its one frame needs no
+ * grid). `c` should be effectiveOps (all-off for Optimize).
  */
 export function planFPS(info: ProbeInfo | null | undefined, c: OpsCfg, out: OutputCfg): number {
   if (!info) return 0;
-  return effectiveFPS(c, out, sourceFPS(info, c));
+  const fps = effectiveFPS(c, out, sourceFPS(info, c));
+  if (fps > 0) return fps;
+  return !info.isStill && sourceDuration(info, c) > 0 ? snapFPS(out.format, DEFAULT_FPS) : 0;
 }
 
 /**
@@ -1071,4 +1099,284 @@ export function forwardFrame(info: ProbeInfo, c: OpsCfg, out: OutputCfg, i: numb
   }
   if (ops.reverse) idx = fwdTotal - 1 - idx;
   return idx;
+}
+
+// ---------------------------------------------------------------------------
+// Frame-master estimate — mirrors the render admission of internal/jobs
+// (scratch.go: masterBytes / scratchFactor / scratchReserve / admitScratch;
+// render.go: oneFramePlan, the frames-export cap). The graph never refuses a
+// plan for its frame count (2026-09-13: forward stills and proxies of any
+// source work), so the only thing standing between an untrimmed 4K clip and
+// a refused Render is jobs' cap — and the user must see it BEFORE pressing
+// Render, next to the trim / crop / resize / fit controls that shrink it.
+// The Render button stays enabled: the server's admission has the last word
+// (auto-crop recipes are admitted after detection, unknown lengths pass).
+// ---------------------------------------------------------------------------
+
+/**
+ * MAX_EXTRACT_FRAMES mirrors jobs.MaxExtractFrames (internal/jobs/frames.go):
+ * a frames export above it is refused before any decode ("too many frames
+ * … trim or lower fps"), checked on the plan's full frame count — the
+ * static-format one-frame cut does not apply to "frames".
+ */
+export const MAX_EXTRACT_FRAMES = 2000;
+
+/**
+ * SCRATCH_HEADROOM_MIN / SCRATCH_HEADROOM_DIV mirror jobs.scratchHeadroomMin
+ * / scratchHeadroomDiv: the extra scratch reserved next to the master for
+ * the encoder outputs is the larger of master/8 and 8 MiB.
+ */
+export const SCRATCH_HEADROOM_MIN = 8 << 20;
+const SCRATCH_HEADROOM_DIV = 8;
+
+/**
+ * SCRATCH_FIT_FORMATS mirrors jobs.fitFormats (internal/jobs/fit.go) — the
+ * formats whose fit search keeps candidates on scratch and so cost one
+ * master more (scratchFactor). It deliberately differs from
+ * presets.FIT_FORMATS, which lacks png because the Output card offers no fit
+ * for a static PNG and buildOutput never emits fitBytes for it; jobs' list
+ * has png (a static-PNG fit ladder exists server-side), and the mirror keeps
+ * jobs' list so its unit test can check jobs' own factor table verbatim.
+ */
+const SCRATCH_FIT_FORMATS: ReadonlySet<string> = new Set(['gif', 'webp', 'apng', 'avif', 'png', 'jpeg', 'mp4', 'webm']);
+
+/**
+ * scratchFactor mirrors jobs.scratchFactor on the WIRE output (buildOutput's
+ * result, so the same knobs the server sees): how many master-sized chunks
+ * of scratch a render may need on top of the headroom — 1 for outputs
+ * encoded straight from the master (gif, webp, RGBA apng, static, video); 2
+ * when PNG intermediates of every frame are written next to it (avif,
+ * frames, indexed apng — colors > 0 or a fit budget, gifski gif); +1 more
+ * for a fit search on a fit format, whose ladder keeps candidates plus the
+ * per-variant intermediates alive until the search returns.
+ */
+export function scratchFactor(o: Output): number {
+  const format = String(o.format).toLowerCase();
+  let f = 1;
+  switch (format) {
+    case 'avif':
+    case 'frames':
+      f = 2;
+      break;
+    case 'apng':
+      if ((o.colors ?? 0) > 0 || (o.fitBytes ?? 0) > 0) f = 2;
+      break;
+    case 'gif':
+      if ((o.encoder ?? '').trim().toLowerCase() === 'gifski') f = 2; // gifski reads PNG frames of the whole master
+      break;
+  }
+  if ((o.fitBytes ?? 0) > 0 && SCRATCH_FIT_FORMATS.has(format)) f++;
+  return f;
+}
+
+/**
+ * scratchReserve mirrors jobs.scratchReserve: what a render reserves from
+ * the scratch budget for a master of `need` bytes — the master plus
+ * max(need/8, 8 MiB) headroom for the encoded outputs (integer division
+ * like Go's). 0 stays 0 (unknown).
+ */
+export function scratchReserve(need: number): number {
+  if (!(need > 0)) return 0;
+  return need + Math.max(Math.floor(need / SCRATCH_HEADROOM_DIV), SCRATCH_HEADROOM_MIN);
+}
+
+/** MasterEstimate is what planMaster predicts jobs' admission will measure. */
+export interface MasterEstimate {
+  /** graph.Plan.Width × Height: the master's frame size (planCanvas) */
+  w: number;
+  h: number;
+  /** master frames: 1 for a still / single-frame source and for a static format, else planFrames (a bounce already doubled it) */
+  frames: number;
+  /** jobs.masterBytes: w × h × 4 × frames */
+  bytes: number;
+  /** jobs.scratchFactor of the wire output */
+  factor: number;
+  /** what admitScratch reserves: scratchReserve(bytes) + (factor − 1) × bytes */
+  reserve: number;
+  /**
+   * frames ffmpeg's reverse filter buffers for a static (png / jpeg) render
+   * with the reverse op on — planFrames, the pre-cut count (doubled per
+   * bounce, the bound render.go hands admitReversed); 0 for every other
+   * render (an animated render's buffer is at most its master, which
+   * `bytes` already measures; a bounce alone buffers nothing before its
+   * first frame) and when the count is unknown (the server cannot check it either)
+   */
+  bufferFrames: number;
+  /** w × h × 4 × bufferFrames: the reverse buffer admitReversed judges against the cap alone (RAM, not scratch); 0 when there is none */
+  bufferBytes: number;
+  /** planFPS (0 = unknown) — turns a frame budget into seconds */
+  fps: number;
+  /**
+   * the canvas is the pre-crop one: auto-crop is on without both output
+   * dimensions, so the content box the server resolves is unknown here and
+   * the figure is "up to … before crop-to-content"
+   */
+  upperBound: boolean;
+}
+
+/**
+ * planMaster is the SPA's copy of the frame-master estimate jobs admits a
+ * render on (jobs.masterBytes / admitScratch): null when there is nothing to
+ * estimate — no source, the gifsicle-only Optimize preset (no ops, no
+ * master; !opsApply), or an unknown frame count (no rate: jobs then admits
+ * need 0 and only the ENOSPC mapping bounds the render — the same blind
+ * spot the server has, so no verdict is shown). `c` should be effectiveOps.
+ *
+ *   - frames: 1 for a still source or a one-frame sequence
+ *     (graph.singleFrame → Frames 1) and for a static format
+ *     (recipe.IsStaticFormat: png / jpeg — render.go cuts the plan to
+ *     oneFramePlan before admitScratch); otherwise planFrames, which
+ *     already doubles per bounce like graph's assemble.
+ *   - bufferFrames / bufferBytes: the reverse buffer of a static render
+ *     with the reverse op on — render.go admits it by admitReversed on the
+ *     PRE-cut plan, before the one-frame cut, because "-frames:v 1"
+ *     shortens the encode, not the decode: a reverse filter must consume
+ *     the whole clip before it can emit its first frame, so a reversed PNG
+ *     of an untrimmed 4K clip costs 9.7 GiB of RAM for one frame of
+ *     master. The count is planFrames (doubled by a bounce on top of the
+ *     reverse — [reverse, bounce] — exactly the doubled Plan.Frames the
+ *     server judges, a conservative bound there too). 0 for a bounce
+ *     alone: the bounce's first output frame is the forward branch's and
+ *     the run ends before its reverse branch fills (render.go measured
+ *     it), so the server does not check it either; 0 for animated
+ *     renders, whose buffer is at most the master `bytes` measures. An
+ *     unknown count leaves it 0 with the one-frame master still shown:
+ *     admitReversed passes need 0 the same way.
+ *   - canvas: planCanvas — the dimensions are NOT rounded to even for
+ *     mp4 / webm: the even-pad lives in the encoder tail (enc), after the
+ *     master, so a 127×127 master is 127×127 (jobs measures the plan).
+ *     When planCanvas is null only because auto-crop is on without both
+ *     output dimensions, the uncropped canvas stands in (ignoreAutocrop)
+ *     and upperBound is set: the content box is at most the whole frame —
+ *     though with a resize or one output dimension keeping the aspect, a
+ *     box of another aspect can come out taller or wider than the frame
+ *     scaled the same way, so it is the pre-crop figure, not a strict bound.
+ *   - factor / reserve: scratchFactor of the wire output (buildOutput) and
+ *     scratchReserve(bytes) + (factor − 1) × bytes, what admitScratch
+ *     reserves from the scratch budget (jobs.admitScratch → reserveScratch).
+ *
+ * The lossless gifsicle fast path (jobs.fastPathFor: a GIF → GIF trim /
+ * crop / fps-drop / loop edit with the default encoder, no fit budget,
+ * target none / attachment — no decode, no master) is unreachable from the
+ * SPA today: buildOutput always emits colors / dither / alphaThreshold /
+ * matte for gif, which the eligibility check refuses. If a "keep palette"
+ * option ever appears, fast-path-shaped recipes must return null here.
+ */
+export function planMaster(info: ProbeInfo | null | undefined, c: OpsCfg, out: OutputCfg): MasterEstimate | null {
+  if (!info || !opsApply(out)) return null;
+  let canvas = planCanvas(info, c, out);
+  let upperBound = false;
+  if (!canvas && c.autocrop.enabled) {
+    canvas = planCanvas(info, c, out, { ignoreAutocrop: true });
+    upperBound = canvas !== null;
+  }
+  if (!canvas) return null;
+  const single = info.isStill || (isSequence(info) && (info.sequence?.count ?? info.frames) === 1);
+  const staticOut = isStaticFormat(out.format);
+  const frames = single || staticOut ? 1 : planFrames(info, c, out);
+  if (!(frames > 0)) return null;
+  const frameBytes = canvas.w * canvas.h * 4;
+  const bytes = frameBytes * frames;
+  const factor = scratchFactor(buildOutput(out));
+  const bufferFrames = staticOut && !single && c.reverse ? Math.max(0, planFrames(info, c, out)) : 0;
+  return {
+    w: canvas.w,
+    h: canvas.h,
+    frames,
+    bytes,
+    factor,
+    reserve: scratchReserve(bytes) + (factor - 1) * bytes,
+    bufferFrames,
+    bufferBytes: frameBytes * bufferFrames,
+    fps: planFPS(info, c, out),
+    upperBound,
+  };
+}
+
+/** MasterCaps is the part of capabilities.caps masterVerdict reads (0 = unknown). */
+export interface MasterCaps {
+  maxMasterBytes: number;
+  scratchBudgetBytes: number;
+}
+
+/** MasterVerdict is masterVerdict's answer: whether jobs would refuse the estimate, and what fits instead. */
+export interface MasterVerdict {
+  /** the server would refuse the render up-front */
+  over: boolean;
+  /**
+   * what binds, in the server's order: the reverse buffer of a static
+   * render (admitReversed, before the one-frame cut), the per-render cap
+   * or the scratch budget ('' when nothing is over)
+   */
+  by: '' | 'buffer' | 'cap' | 'scratch';
+  /** the binding bound in master bytes — when nothing is over, the tighter known bound (0 = none known) */
+  limit: number;
+  /** master frames of est's size that fit under limit (0 = unknown, or not even one) */
+  maxFrames: number;
+  /**
+   * maxFrames / fps FLOORED to a tenth of a second (0 when the rate is
+   * unknown) — never above what fits, so a trim to exactly this value
+   * plans at most maxFrames frames: 2330 frames at 30 fps are 77.667 s,
+   * and a trim to a nearest-rounded "77.7 s" would plan floor(77.7 × 30 +
+   * 1e-4) = 2331 frames, one over the cap the note said it fits.
+   */
+  maxSeconds: number;
+}
+
+/**
+ * scratchMasterLimit inverts the reservation admitScratch makes — bytes +
+ * max(bytes/8, 8 MiB) + (factor − 1) × bytes — for the largest master whose
+ * reservation fits under `budget`: bytes × (factor + 1/8) once the master
+ * is ≥ 64 MiB (its eighth then exceeds the 8 MiB floor), else factor × bytes
+ * + 8 MiB. The reservation is continuous and increasing in bytes, so
+ * whichever branch the first answer lands in is the right one. 0 for no
+ * budget.
+ */
+function scratchMasterLimit(budget: number, factor: number): number {
+  if (!(budget > 0)) return 0;
+  let b = budget / (factor + 1 / SCRATCH_HEADROOM_DIV);
+  if (b < SCRATCH_HEADROOM_MIN * SCRATCH_HEADROOM_DIV) b = (budget - SCRATCH_HEADROOM_MIN) / factor;
+  return Math.max(0, Math.floor(b));
+}
+
+/**
+ * masterVerdict judges a planMaster estimate the way jobs will, in the
+ * render's order: the reverse buffer of a static render first
+ * (`caps.maxMasterBytes > 0 && bufferBytes > maxMasterBytes` — "buffer";
+ * render.go's admitReversed runs before the one-frame cut and judges the
+ * buffer against the cap alone, RAM being no scratch), then the master
+ * over the per-render cap (`bytes > maxMasterBytes` — "cap"), else over
+ * the scratch budget (`caps.scratchBudgetBytes > 0 && reserve >
+ * scratchBudgetBytes` — "scratch"; a fit / AVIF / frames render's multiple
+ * can bind below the cap). `limit` is the binding bound in master bytes —
+ * for the scratch case the largest master whose reservation fits
+ * (scratchMasterLimit) — and maxFrames / maxSeconds turn it into what fits
+ * at the estimate's frame size and rate, so the note can say "trim to
+ * about N frames (S s)"; for the buffer case that is the clip length whose
+ * reverse fits. An unknown cap (0: no answer yet, or an older server)
+ * never binds, so the UI shows the estimate alone — the server's admission
+ * has the last word.
+ */
+export function masterVerdict(est: MasterEstimate, caps: MasterCaps): MasterVerdict {
+  const cap = caps.maxMasterBytes > 0 ? caps.maxMasterBytes : 0;
+  const scratch = caps.scratchBudgetBytes > 0 ? scratchMasterLimit(caps.scratchBudgetBytes, est.factor) : 0;
+  let by: MasterVerdict['by'] = '';
+  let limit = 0;
+  if (cap > 0 && est.bufferBytes > cap) {
+    by = 'buffer';
+    limit = cap;
+  } else if (cap > 0 && est.bytes > cap) {
+    by = 'cap';
+    limit = cap;
+  } else if (caps.scratchBudgetBytes > 0 && est.reserve > caps.scratchBudgetBytes) {
+    by = 'scratch';
+    limit = scratch;
+  } else {
+    limit = cap > 0 && scratch > 0 ? Math.min(cap, scratch) : Math.max(cap, scratch);
+  }
+  const frameBytes = est.w * est.h * 4;
+  const maxFrames = limit > 0 && frameBytes > 0 ? Math.floor(limit / frameBytes) : 0;
+  // floor to the tenth (see MasterVerdict.maxSeconds); one division so an on-grid value (29 frames at 10 fps = 2.9 s) is not pushed under by float error
+  const maxSeconds = est.fps > 0 ? Math.floor((maxFrames * 10) / est.fps) / 10 : 0;
+  return { over: by !== '', by, limit, maxFrames, maxSeconds };
 }

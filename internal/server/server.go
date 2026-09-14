@@ -78,6 +78,12 @@
 //	                                a Level-3 boosted server, Nitro),
 //	                                "rulesVersion": "...", "version": "...", "concurrency": N,
 //	                                "maxUploadBytes": N,
+//	                                "maxMasterBytes": N (jobs.Options.MaxMasterBytes: the frame-master cap
+//	                                a render is admitted against — also the reverse/bounce buffer cap —
+//	                                after its default and ceiling clamp; 0 without a manager),
+//	                                "scratchBudgetBytes": N (the scratch byte budget a render's reserve
+//	                                must fit; 0 = unlimited or unknown) — both so the SPA can show the
+//	                                live master estimate and its verdict before Render,
 //	                                "formats": ["gif","webp","apng","avif","png","jpeg","frames","mp4","webm"],
 //	                                "features": {"fit": true, "sequence": true, "optimize": true,
 //	                                "keying": true, "overlays": true, "proxy": true,

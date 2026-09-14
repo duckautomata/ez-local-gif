@@ -6,13 +6,21 @@
 // toggle (gifski) and the Phase 4 op cards (feather / bounce,
 // phase4OpsOffered) when an older ezlg serves a newer SPA. The "formats"
 // list gates the MP4 / WebM Format options the same way (formatOffered).
+// The same answer carries the server's frame-master cap ("maxMasterBytes",
+// jobs.Options.MaxMasterBytes) and scratch budget ("scratchBudgetBytes"),
+// which the Render panel judges its live master estimate against
+// (state.planMaster / masterVerdict) so an untrimmed 4K clip is trimmed,
+// cropped or resized in-app instead of being refused at Render.
 //
 // Until the server has answered every flag is assumed on (the SPA ships with
 // the server that has them all), so nothing flickers off and back on at page
 // load; a server that answers without a "features" map at all (Phase 1) or
 // without a given name (a Phase 2 build: fit / sequence / optimize only) has
-// that feature off. A failed fetch keeps the optimistic defaults and is
-// retried on the next loadFeatures() call.
+// that feature off. The byte caps have no optimistic default: 0 = unknown
+// (no answer yet, or a server from before they were published) and the
+// estimate is then shown without a verdict — never a false refusal. A failed
+// fetch keeps the optimistic defaults and is retried on the next
+// loadFeatures() call.
 
 import { getCapabilities, type Capabilities } from './api';
 
@@ -43,13 +51,42 @@ export const caps = $state({
   features: featuresFrom(null),
   /** the server's "formats" list; null = no answer yet (every format assumed offered) */
   formats: null as string[] | null,
+  /**
+   * The server's per-render frame-master cap in bytes
+   * (jobs.Options.MaxMasterBytes, "maxMasterBytes"); 0 = unknown — no answer
+   * yet, or a server from before the field existed — so the Render panel
+   * never claims a refusal it cannot know about.
+   */
+  maxMasterBytes: 0,
+  /**
+   * The server's scratch admission budget in bytes
+   * (jobs.Manager.ScratchBudgetBytes(), "scratchBudgetBytes"); 0 = unlimited
+   * or unknown.
+   */
+  scratchBudgetBytes: 0,
 });
 
-/** setFeatures installs a capabilities answer (null = back to "unknown": everything on). */
-export function setFeatures(c: Pick<Capabilities, 'features' | 'formats'> | null): void {
+/**
+ * capBytes reads one of the byte caps of a capabilities answer: a finite,
+ * positive number, else 0 (absent on an older server, null, a string from a
+ * misbehaving proxy, NaN / Infinity — none of which may become a verdict).
+ */
+function capBytes(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/**
+ * setFeatures installs a capabilities answer (null = back to "unknown":
+ * everything on, both byte caps 0). Callers pass partial objects (tests, an
+ * older server's answer), so the byte caps are optional and 0 when absent,
+ * non-finite or ≤ 0.
+ */
+export function setFeatures(c: Pick<Capabilities, 'features' | 'formats' | 'maxMasterBytes' | 'scratchBudgetBytes'> | null): void {
   caps.features = featuresFrom(c);
   caps.loaded = c !== null;
   caps.formats = c ? (Array.isArray(c.formats) ? [...c.formats] : []) : null;
+  caps.maxMasterBytes = c ? capBytes(c.maxMasterBytes) : 0;
+  caps.scratchBudgetBytes = c ? capBytes(c.scratchBudgetBytes) : 0;
 }
 
 /**
