@@ -2,6 +2,8 @@ package discordlint
 
 import (
 	"bytes"
+	"image/gif"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -40,6 +42,74 @@ func FuzzLintGIF(f *testing.F) {
 				}
 			}
 			LintGIF(data, target, false)
+		}
+	})
+}
+
+// FuzzMergeGIFHolds: never panics, the output parses with exactly `merged`
+// fewer frames, a second pass finds nothing, and — for small files image/gif
+// accepts — the composited timeline is unchanged, whether the decoder reads
+// the reserved disposal 4 as "leave" (ffmpeg, gifsicle) or as "restore
+// previous" (Chromium, Firefox).
+func FuzzMergeGIFHolds(f *testing.F) {
+	for _, name := range []string{"ff_alpha.gif", "ff_opaque.gif", "ff_transdiff.gif"} {
+		f.Add(readFixture(f, name))
+	}
+	f.Add(encodeCv(f, holdThenClear()))
+	f.Add(encodeCv(f, harmlessHolds()))
+	f.Add(encodeCv(f, smallerClearThenRepeat()))
+	f.Add(encodeCv(f, reservedDisposal4()))
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 8 {
+		f.Add(encodeCv(f, randomCvAnim(rng)))
+	}
+	f.Add([]byte("GIF89a"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		out, merged, err := MergeGIFHolds(data)
+		if err != nil {
+			return
+		}
+		before, err := parseGIF(data)
+		if err != nil {
+			t.Fatalf("MergeGIFHolds accepted what parseGIF rejects: %v", err)
+		}
+		after, err := parseGIF(out)
+		if err != nil {
+			t.Fatalf("merged bytes do not parse: %v", err)
+		}
+		framesBefore, _ := before.frames()
+		framesAfter, _ := after.frames()
+		if merged < 0 || len(framesAfter) != len(framesBefore)-merged || (len(framesBefore) > 0 && len(framesAfter) == 0) {
+			t.Fatalf("%d frames -> %d with merged = %d", len(framesBefore), len(framesAfter), merged)
+		}
+		if merged == 0 {
+			if !bytes.Equal(out, data) {
+				t.Fatal("merged == 0 but the bytes changed")
+			}
+			return
+		}
+		if _, again, err := MergeGIFHolds(out); err != nil || again != 0 {
+			t.Fatalf("second pass: merged %d, err %v", again, err)
+		}
+		if int(before.width)*int(before.height) > 1<<12 || len(framesBefore) > 64 {
+			return
+		}
+		// image/gif keeps the transparency of an earlier GCE when a frame
+		// has several, so such files have no reference.
+		for _, fr := range framesBefore {
+			if len(fr.dupGCE) > 0 {
+				return
+			}
+		}
+		ga, errA := gif.DecodeAll(bytes.NewReader(data))
+		gb, errB := gif.DecodeAll(bytes.NewReader(out))
+		if errA != nil || errB != nil {
+			return
+		}
+		for _, browserModel := range []bool{false, true} {
+			if !sameTimeline(refTimeline(refCompositeGIF(ga, framesBefore, browserModel)), refTimeline(refCompositeGIF(gb, framesAfter, browserModel))) {
+				t.Fatalf("merging %d frames changed the composited timeline (browser model %v)", merged, browserModel)
+			}
 		}
 	})
 }

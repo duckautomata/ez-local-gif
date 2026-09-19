@@ -121,6 +121,25 @@ attachments show frame 0 only (sticker-only, as designed); the **indexed 8-bit-a
 soft alpha** as an attachment; all GIFs show a dark 1-bit outline in light mode (inherent —
 WebP/AVIF/APNG when soft edges matter).
 
+**The kit's clip never holds a pose, and that hid a bug.** On 2026-09-19 a transparent GIF with
+long holds "stacked" on Discord (new poses drawn over old ones): Discord drops a frame that does
+not change the picture — and its disposal with it — and gifsicle's optimiser makes exactly such
+clear-only frames at the end of a hold. A one-off six-variant upload test pinned it down
+([`reviews/discord-stack-test-2026-09-19.md`](reviews/discord-stack-test-2026-09-19.md),
+[`DESIGN.md`](DESIGN.md) §5.2 item 9 / §9b); the fix is `discordlint.MergeGIFHolds` on ffmpeg's
+output before gifsicle, the `gif.noop-frame-disposal` lint rule, and a hold repair (coalesce with
+`gifsicle -U --disposal=background` → merge → `-O2 --careful`) that runs whenever that rule fails,
+for every target — the lossless fast path and the optimize preset depend on it, because they
+cannot merge before their single gifsicle call. **Public lilliput does not reproduce it**, so no
+local test can stand in for an upload: after any change to the GIF path, the ladder or gifsicle's
+flags, also upload a transparent GIF whose subject holds still for a run of frames between poses
+and then moves somewhere that needs the old pixels cleared (the kit has no such variant yet). What
+an upload has verified so far is the six-variant matrix, plus the fact that the rebuilt pipeline's
+output for the reported recipe is byte-identical to its variant 2 (58,640 B, ok on Discord); the
+repair's outputs (in particular the coalesced last rung: full canvas *and* a per-frame transparent
+index) and other inputs have not been uploaded. The rule's exact definition is in
+[`DESIGN.md`](DESIGN.md) §5.3.
+
 Re-run the kit after any encoder or linter change and upload the variants to a **private**
 Discord server again:
 
@@ -155,7 +174,8 @@ alpha 1 the old `gbrap12le` detour left; the self-test checks a corner pixel of 
 and RGBA APNG). The RGBA masters live on `/dev/shm/ezl-testkit`, or under `$TMPDIR` with a warning
 when `/dev/shm` is Docker's default 64 MiB. It emits every encoder path from
 [`DESIGN.md`](DESIGN.md) §4.2 / §9:
-ffmpeg palette GIF + `gifsicle -O2` (default), the same coalesced with `gifsicle -U`, gifski
+ffmpeg palette GIF + `gifsicle -O2` (default), the same coalesced with plain `gifsicle -U` (b — a
+historical comparison that writes a disposal 0/2 mix, not the app's fallback any more), gifski
 (local palettes), ffmpeg-only GIF, animated WebP lossy (`yuva420p` and `bgra` input, e / e2) and
 lossless, RGBA APNG, 128×128 emote GIF/WebP fitted under 256 KiB, 320×320 sticker indexed
 8-bit-alpha APNG (i3, the default rung, listed first) / GIF / RGBA APNG fitted under 512 KiB, and

@@ -11,7 +11,9 @@
 // frame actually uses (to pick an unused transparent index for frame 0), it
 // decodes the frame's pixel indices with compress/lzw (the decoder image/gif
 // is built on), one frame at a time so a damaged frame does not block the
-// analysis of the others.
+// analysis of the others. gif.noop-frame-disposal and MergeGIFHolds go one
+// step further and composite the animation on a canvas (gifcanvas.go) to
+// find frames that do not change the picture.
 //
 // WebP is parsed as RIFF: VP8X flags/canvas, ANIM (bg colour, loop count),
 // ANMF frames (offset, size, duration, blend/dispose, ALPH/VP8/VP8L payload
@@ -211,15 +213,38 @@ type Report struct {
 //	              as errors) key on IsDiscord: an unrecognised target string
 //	              now behaves like TargetNone instead of a cap-less Discord
 //	              target.
+//	2026-09-19.1  gif.noop-frame-disposal (new, after gif.disposal): a frame
+//	              that leaves the composited picture unchanged must not
+//	              clear a different area than its predecessor. Discord's
+//	              production pipeline drops frames that do not change the
+//	              picture, folding their delay into the previous frame, and
+//	              the dropped frame's disposal is lost with it
+//	              (user-verified 2026-09-19 with six pixel-identical
+//	              structural variants; public lilliput keeps every frame and
+//	              does not reproduce it). gifsicle -O1/-O2/-O3 writes such a
+//	              frame after every hold that is followed by a clear — a
+//	              short disposal-2 frame whose only job is to erase — so the
+//	              next pose stacked on the old one. An error for Discord
+//	              targets, a warning for TargetNone; not fixable at block
+//	              level. MergeGIFHolds (gifcanvas.go) removes harmless holds
+//	              before the optimiser runs so the pattern is not produced.
+//	              The analysis ends at the first frame decoders disagree on
+//	              (outside the logical screen, or a reserved disposal 4-7:
+//	              browsers read 4 as restore previous, ffmpeg/gifsicle as
+//	              leave), at undecodable LZW data or at an analysis cap:
+//	              unsafe frames found before that point still fail, otherwise
+//	              the check passes with a "not analysed from frame N on"
+//	              detail, and MergeGIFHolds merges only before that frame.
 //
 // LintVideo (the video.* rules, Phase 4) is additive — it covers formats
 // no earlier build could lint — so it did not bump the version.
-const RulesVersion = "2026-08-19.4"
+const RulesVersion = "2026-09-19.1"
 
 // ErrNotImplemented was returned by the pre-implementation stubs. It is
 // kept for API compatibility; no linter returns it any more.
 var ErrNotImplemented = errors.New("discordlint: not implemented")
 
-// LintGIF is implemented in gif.go, LintWebP in webp.go, LintAPNG in apng.go
+// LintGIF is implemented in gif.go (canvas simulation, gif.noop-frame-disposal
+// and MergeGIFHolds in gifcanvas.go), LintWebP in webp.go, LintAPNG in apng.go
 // (PNG chunk parser in png.go), LintStatic in static.go and LintVideo in
 // video.go (MP4 probe in mp4.go, WebM probe in webm.go).

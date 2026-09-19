@@ -176,7 +176,7 @@ func frameGCEs(t *testing.T, data []byte) []*gifGCE {
 
 // decodeGIF decodes with image/gif (an independent decoder) and fails the
 // test when it cannot.
-func decodeGIF(t *testing.T, data []byte) *gif.GIF {
+func decodeGIF(t testing.TB, data []byte) *gif.GIF {
 	t.Helper()
 	g, err := gif.DecodeAll(bytes.NewReader(data))
 	if err != nil {

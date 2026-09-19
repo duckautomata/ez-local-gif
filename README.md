@@ -10,7 +10,8 @@ images — sized for Discord's emote (256 KiB, 128×128) and sticker (512 KiB, 3
 - **Presets + fit-to-size** — emote / sticker / chat presets, and a search that lands the file
   under any byte target while giving up as little quality as possible.
 - **Discord byte-level linter** — checks and fixes the rules that make files render black,
-  opaque, flickering or play-once after Discord's server-side transcode.
+  opaque, flickering, stacked (old frames never cleared) or play-once after Discord's server-side
+  transcode.
 - **Editing ops** — trim, crop, resize, fps/speed, background removal (chroma/color key),
   feather (soft edges), image/text/animated overlays, reverse and bounce.
 - **Batch** — apply one preset to a folder's worth of clips at once.
@@ -61,7 +62,7 @@ kit, production image builds) is in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 | `internal/enc` | argv builders for ffmpeg/gifsicle/… (pure, golden-tested) |
 | `internal/fit` | Fit-to-size search (ladder + secant over one knob; pure orchestration, fake-encoder tested) |
 | `internal/ffrun` | The only package that spawns processes; ffmpeg progress parsing |
-| `internal/discordlint` | GIF/WebP byte-level lint + fix (stdlib only) |
+| `internal/discordlint` | GIF/WebP byte-level lint + fix, `MergeGIFHolds` (folds held GIF frames into the previous frame's delay; run on ffmpeg's GIF output before the gifsicle post-pass) (stdlib only) |
 | `internal/probe` | ffprobe → ProbeInfo (+ alpha scan) |
 | `internal/store` | `/data` layout: blobs by sha256, results by recipe hash, scratch, sweeper |
 | `internal/jobs` | Job table, SSE events, render pipeline |

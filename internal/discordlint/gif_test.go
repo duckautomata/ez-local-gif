@@ -88,7 +88,7 @@ func TestLintGIFCompliantFixtures(t *testing.T) {
 			// Every rule is reported for a generic file (plus emote dims).
 			want := []string{
 				RuleGIFGCEEveryFrame, RuleGIFFrame0Transparent, RuleGIFLSDBackground, RuleGIFDisposal,
-				RuleGIFNetscapeLoop, RuleGIFMinDelay, RuleGIFGlobalPalette, RuleGIFNoInterlace,
+				RuleGIFNoopFrameDisposal, RuleGIFNetscapeLoop, RuleGIFMinDelay, RuleGIFGlobalPalette, RuleGIFNoInterlace,
 				RuleGIFNoExtraExtensions, RuleGIFFirstFrameVisible, RuleGIFTrailer, RuleGIFSizeLimit, RuleGIFEmoteDims,
 			}
 			if got := ruleIDs(r); strings.Join(got, ",") != strings.Join(want, ",") {

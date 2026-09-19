@@ -10,6 +10,7 @@ const LABELS: Record<string, string> = {
   'gif.frame0-transparency': 'First frame declares transparency',
   'gif.lsd-background-index': 'Screen background index matches transparency',
   'gif.disposal': 'Explicit frame disposal (1 or 2)',
+  'gif.noop-frame-disposal': 'No frame that only changes disposal (Discord drops those)',
   'gif.netscape-loop': 'NETSCAPE loop block',
   'gif.min-delay': 'Frame delays ≥ 2 cs',
   'gif.global-palette': 'Single global palette',

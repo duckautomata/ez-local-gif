@@ -70,7 +70,7 @@ func TestExtForAndHelpers(t *testing.T) {
 	if !strings.Contains(tooManyFramesMsg(2500), "2500") || !strings.Contains(tooManyFramesMsg(2500), "trim or lower fps") {
 		t.Errorf("tooManyFramesMsg = %q", tooManyFramesMsg(2500))
 	}
-	if !isLimitRule("apng.sticker") || !isLimitRule("static.emote-dims") || !isLimitRule(RuleFitTarget) || isLimitRule("apng.plays-forever") || isLimitRule("gif.disposal") {
+	if !isLimitRule("apng.sticker") || !isLimitRule("static.emote-dims") || !isLimitRule(RuleFitTarget) || isLimitRule("apng.plays-forever") || isLimitRule("gif.disposal") || isLimitRule(discordlint.RuleGIFNoopFrameDisposal) {
 		t.Error("isLimitRule classification")
 	}
 }

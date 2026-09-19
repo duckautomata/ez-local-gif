@@ -626,6 +626,14 @@ func gifOptionsFor(out recipe.Output, v *enc.Variant, master enc.Master) enc.GIF
 // so gopts.Loop restates Output.Loop (0 = forever, N = --loopcount=N) or a
 // "play N+1 times" GIF would come out looping forever. --colors is only
 // passed when the user asked for a palette size (with ordered dither).
+//
+// Between the two passes the held frames of base.gif are merged
+// (mergeHoldsInFile): ffmpeg writes one frame per master frame, and every -O
+// level of gifsicle turns a run of identical frames into one long frame plus
+// a short clear-only frame that Discord drops together with its disposal
+// (discordlint gif.noop-frame-disposal) — the optimiser must never see a
+// hold run. Without gifsicle the merge still runs: it is pixel-exact and the
+// file only gets smaller.
 func (m *Manager) encodeGIFAt(ctx context.Context, j *job, scratch, tag string, master enc.Master, gopts enc.GIFOptions, sopts enc.GifsicleOptions) (string, error) {
 	base := filepath.Join(scratch, "base"+tag+".gif")
 	args := enc.GIFArgs(master, gopts, base)
@@ -639,6 +647,10 @@ func (m *Manager) encodeGIFAt(ctx context.Context, j *job, scratch, tag string, 
 	if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, args, onProgress); err != nil {
 		return "", fmt.Errorf("gif encode: %w", err)
 	}
+	if tag == "" {
+		m.progress(j, pctEncodeStart+(pctEncodeEnd-pctEncodeStart)*0.8, "merging held frames")
+	}
+	mergeHoldsInFile(base)
 	if m.tools.Gifsicle == "" {
 		return base, nil
 	}
@@ -679,9 +691,41 @@ func (m *Manager) encodeWebPAt(ctx context.Context, j *job, scratch, tag string,
 	return path, nil
 }
 
-// lintGIF lints+fixes data and, when structural errors remain and gifsicle
-// is available, walks the re-encode ladder (--colors N → -U -O2 --careful →
-// -U), re-linting after each rung. It returns the best bytes and report.
+// mergeHoldsInFile rewrites the GIF at path with its held frames merged
+// (discordlint.MergeGIFHolds) and returns how many frames went. It is best
+// effort: a read/parse/write failure is logged and the file stays as it was —
+// the encode continues with the unmerged frames and the lint (plus the hold
+// repair) still has the last word.
+func mergeHoldsInFile(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("jobs: merge held frames: %v", err)
+		return 0
+	}
+	out, merged, err := discordlint.MergeGIFHolds(data)
+	if err != nil {
+		log.Printf("jobs: merge held frames of %s: %v", filepath.Base(path), err)
+		return 0
+	}
+	if merged == 0 {
+		return 0
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		log.Printf("jobs: merge held frames: %v", err)
+		return 0
+	}
+	return merged
+}
+
+// lintGIF lints+fixes data and, when structural failures remain
+// (hasStructuralError: error-level checks, or gif.noop-frame-disposal at any
+// level — so held frames are repaired for target none too) and gifsicle is
+// available, walks the re-encode ladder, re-linting after each rung:
+// "gifsicle --colors N" (skipped when gif.noop-frame-disposal is the only
+// structural failure — a palette pass keeps the frame structure), then the
+// hold repair (repairGIFHolds: coalesce → merge held frames → -O2 --careful,
+// falling back to the coalesced all-disposal-2 file). It returns the best
+// bytes and report.
 func (m *Manager) lintGIF(ctx context.Context, j *job, scratch string, data []byte, target discordlint.Target, out recipe.Output) ([]byte, discordlint.Report, error) {
 	report, fixed, err := discordlint.LintGIF(data, target, true)
 	if err != nil {
@@ -700,52 +744,152 @@ func (m *Manager) lintGIF(ctx context.Context, j *job, scratch string, data []by
 	}
 	// Every rung restates Output.Loop (gifsicle would otherwise reset the
 	// NETSCAPE count to forever).
-	rungs := []struct {
-		name  string
-		opts  enc.GifsicleOptions
-		strip bool // drop the -O flag → plain -U (coalesced full frames)
-	}{
-		{"gifsicle --colors", enc.GifsicleOptions{Colors: colors, Lossy: out.Lossy, Loop: out.Loop}, false},
-		{"gifsicle -U -O2 --careful", enc.GifsicleOptions{Unoptimize: true, OptimizeLevel: 2, Lossy: out.Lossy, Loop: out.Loop}, false},
-		{"gifsicle -U", enc.GifsicleOptions{Unoptimize: true, Loop: out.Loop}, true},
-	}
-	in := filepath.Join(scratch, "ladder-in.gif")
-	for i, rung := range rungs {
+	if ladderTriesColors(report) {
+		const name = "gifsicle --colors"
 		if err := ctx.Err(); err != nil {
 			return nil, report, err
 		}
-		m.progress(j, pctLint, fmt.Sprintf("re-encoding for Discord (%s)", rung.name))
-		if err := os.WriteFile(in, data, 0o644); err != nil {
-			return nil, report, err
-		}
-		outPath := filepath.Join(scratch, fmt.Sprintf("ladder-%d.gif", i))
-		args := enc.GifsicleArgs(in, outPath, rung.opts)
-		if rung.strip {
-			args = stripOptimizeFlag(args)
-		}
-		if err := ffrun.Run(ctx, m.tools.Gifsicle, args); err != nil {
-			log.Printf("jobs: %s failed: %v", rung.name, err)
-			continue
-		}
-		cand, err := os.ReadFile(outPath)
+		m.progress(j, pctLint, fmt.Sprintf("re-encoding for Discord (%s)", name))
+		cand, rep, err := m.ladderColors(ctx, scratch, data, target, enc.GifsicleOptions{Colors: colors, Lossy: out.Lossy, Loop: out.Loop})
 		if err != nil {
-			log.Printf("jobs: read %s output: %v", rung.name, err)
-			continue
+			log.Printf("jobs: %s failed: %v", name, err)
+		} else {
+			data, report = cand, rep
 		}
-		rep, fixed, err := discordlint.LintGIF(cand, target, true)
-		if err != nil {
-			log.Printf("jobs: lint after %s: %v", rung.name, err)
-			continue
-		}
-		if len(fixed) > 0 {
-			cand = fixed
-		}
-		data, report = cand, rep
-		if !hasStructuralError(rep) {
-			break
+		if !hasStructuralError(report) {
+			return data, report, nil
 		}
 	}
-	return data, report, nil
+	if err := ctx.Err(); err != nil {
+		return nil, report, err
+	}
+	note := func(step string) { m.progress(j, pctLint, fmt.Sprintf("re-encoding for Discord (%s)", step)) }
+	cand, rep, err := m.repairGIFHolds(ctx, scratch, "", data, target, enc.GifsicleOptions{Lossy: out.Lossy, Loop: out.Loop}, note)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, report, ctx.Err()
+		}
+		log.Printf("jobs: hold repair failed: %v", err)
+		return data, report, nil
+	}
+	return cand, rep, nil
+}
+
+// ladderTriesColors reports whether the ladder's "gifsicle --colors" rung is
+// worth running for rep: it is when any structural error other than
+// gif.noop-frame-disposal failed (a palette pass keeps the frame structure,
+// so it can never fix that one).
+func ladderTriesColors(rep discordlint.Report) bool {
+	return hasStructuralError(rep) && !onlyHoldsFailed(rep)
+}
+
+// ladderColors is the ladder's first rung: one "gifsicle -O2 --colors N"
+// pass over data, linted and fixed.
+func (m *Manager) ladderColors(ctx context.Context, scratch string, data []byte, target discordlint.Target, opts enc.GifsicleOptions) ([]byte, discordlint.Report, error) {
+	in := filepath.Join(scratch, "ladder-in.gif")
+	outPath := filepath.Join(scratch, "ladder-colors.gif")
+	defer os.Remove(in)
+	defer os.Remove(outPath)
+	if err := os.WriteFile(in, data, 0o644); err != nil {
+		return nil, discordlint.Report{}, err
+	}
+	if err := ffrun.Run(ctx, m.tools.Gifsicle, enc.GifsicleArgs(in, outPath, opts)); err != nil {
+		return nil, discordlint.Report{}, err
+	}
+	return lintGIFFile(outPath, target)
+}
+
+// lintGIFFile reads a GIF and lints it with the byte fixer applied.
+func lintGIFFile(path string, target discordlint.Target) ([]byte, discordlint.Report, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, discordlint.Report{}, err
+	}
+	rep, fixed, err := discordlint.LintGIF(data, target, true)
+	if err != nil {
+		return nil, rep, err
+	}
+	if len(fixed) > 0 {
+		data = fixed
+	}
+	return data, rep, nil
+}
+
+// holdRepairNote is appended to a deliverable's description when the hold
+// repair replaced its bytes.
+const holdRepairNote = "held frames re-encoded for Discord"
+
+// holdRepairOptions are the two gifsicle passes of repairGIFHolds for the
+// caller's post-pass options: coalesce is step A (-U --disposal=background,
+// no optimiser, nothing lossy), reopt step B (-O2 --careful plus the
+// caller's Lossy/Colors/Dither). Both restate the caller's Loop.
+func holdRepairOptions(sopts enc.GifsicleOptions) (coalesce, reopt enc.GifsicleOptions) {
+	coalesce = enc.GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true, Loop: sopts.Loop}
+	reopt = enc.GifsicleOptions{Lossy: sopts.Lossy, Colors: sopts.Colors, Dither: sopts.Dither, Threads: sopts.Threads, OptimizeLevel: 2, Loop: sopts.Loop}
+	if reopt.Colors > 0 && reopt.Dither == "" {
+		reopt.Dither = "o8"
+	}
+	return coalesce, reopt
+}
+
+// repairGIFHolds re-encodes a GIF whose frame structure Discord would play
+// wrong (gif.noop-frame-disposal: a frame that leaves the picture unchanged
+// but carries the disposal that clears it — Discord drops such frames) and
+// doubles as the generic structural re-encode of the fallback ladder:
+//
+//	A. gifsicle -U --disposal=background, no optimiser: every frame becomes a
+//	   full-canvas disposal-2 frame (pixel-exact), in which every held frame
+//	   is a harmless no-op — discordlint.MergeGIFHolds then folds the holds
+//	   into their first frame.
+//	B. gifsicle -O2 --careful (+ the caller's Lossy/Colors/Dither) over A:
+//	   with no run of identical frames left the optimiser has nothing to
+//	   turn into a clear-only frame.
+//
+// B's bytes are returned unless its report still has a structural failure
+// (hasStructuralError, which counts the hold rule at any level) or the pass
+// failed, in which case A's are — larger, but structurally the
+// plainest file gifsicle can write. With Lossy 0 and Colors 0 both are
+// pixel-exact against data. tag keeps the scratch file names unique (fit
+// candidates run concurrently); note, when not nil, is told which step
+// runs. An error means step A failed and the caller keeps what it had.
+func (m *Manager) repairGIFHolds(ctx context.Context, scratch, tag string, data []byte, target discordlint.Target, sopts enc.GifsicleOptions, note func(step string)) ([]byte, discordlint.Report, error) {
+	if m.tools.Gifsicle == "" {
+		return nil, discordlint.Report{}, errors.New("gifsicle is not available")
+	}
+	if note == nil {
+		note = func(string) {}
+	}
+	in := filepath.Join(scratch, "holds"+tag+"-in.gif")
+	flat := filepath.Join(scratch, "holds"+tag+"-flat.gif")
+	opt := filepath.Join(scratch, "holds"+tag+"-opt.gif")
+	defer func() {
+		for _, p := range []string{in, flat, opt} {
+			os.Remove(p)
+		}
+	}()
+	coalesce, reopt := holdRepairOptions(sopts)
+
+	note("gifsicle -U --disposal=background")
+	if err := os.WriteFile(in, data, 0o644); err != nil {
+		return nil, discordlint.Report{}, err
+	}
+	if err := ffrun.Run(ctx, m.tools.Gifsicle, enc.GifsicleArgs(in, flat, coalesce)); err != nil {
+		return nil, discordlint.Report{}, fmt.Errorf("gifsicle coalesce: %w", err)
+	}
+	mergeHoldsInFile(flat)
+
+	note("gifsicle -O2 --careful")
+	if err := ffrun.Run(ctx, m.tools.Gifsicle, enc.GifsicleArgs(flat, opt, reopt)); err != nil {
+		if ctx.Err() != nil {
+			return nil, discordlint.Report{}, ctx.Err()
+		}
+		log.Printf("jobs: hold repair: gifsicle -O2: %v", err)
+	} else if cand, rep, err := lintGIFFile(opt, target); err != nil {
+		log.Printf("jobs: hold repair: lint after gifsicle -O2: %v", err)
+	} else if !hasStructuralError(rep) {
+		return cand, rep, nil
+	}
+	return lintGIFFile(flat, target)
 }
 
 // RuleRenderAlpha is the info-level check jobs appends to a report when the
@@ -779,20 +923,87 @@ func applyMasterAlpha(report *discordlint.Report, master enc.Master) {
 	})
 }
 
-// hasStructuralError reports whether a LevelError check failed that a
-// re-encode through gifsicle could plausibly fix (i.e. anything but byte /
-// dimension / duration limits, which need the fit engine).
+// hasStructuralError reports whether a check failed that a re-encode through
+// gifsicle could plausibly fix: any failed LevelError check but the byte /
+// dimension / duration limits (those need the fit engine), plus a failed
+// gif.noop-frame-disposal at ANY level (isStructuralFailure). The latter is
+// what makes lintGIF repair the held frames of a "target none" output too.
+//
+// It is about repairing, not about delivering: whether a report is OK for its
+// target stays hasErrorCheck's business (a warn-level hold failure that could
+// not be repaired never makes a fit candidate not-ok; fitCandidates.smallest
+// merely prefers files without one when nothing fit).
 func hasStructuralError(rep discordlint.Report) bool {
 	for _, c := range rep.Checks {
-		if c.OK || c.Level != discordlint.LevelError {
-			continue
+		if isStructuralFailure(c) {
+			return true
 		}
-		if isLimitRule(c.Rule) {
-			continue
-		}
-		return true
 	}
 	return false
+}
+
+// isStructuralFailure is hasStructuralError / onlyHoldsFailed for one check.
+// The hold rule is structural whatever its level: discordlint reports it as
+// an error for Discord targets and as a warning for target none, but the file
+// is the same one — this tool's own gifsicle -O pass makes the clear-only
+// frames out of a clean source, target none is the SPA's default for the
+// Optimize preset, and the output usually ends up on Discord anyway. The
+// repair is pixel-exact and size-neutral, so there is no reason to withhold
+// it. Every other rule keeps the LevelError requirement.
+func isStructuralFailure(c discordlint.Check) bool {
+	if c.OK || isLimitRule(c.Rule) {
+		return false
+	}
+	return c.Level == discordlint.LevelError || c.Rule == discordlint.RuleGIFNoopFrameDisposal
+}
+
+// repairIfOnlyHolds is the lint step of the paths that do not walk the full
+// ladder (the optimize preset and the fit candidates): when the only
+// structural failure of report is gif.noop-frame-disposal — at any level, so
+// for every target including none (isStructuralFailure) — and gifsicle is
+// available, the hold repair replaces data and report (repaired = true).
+// Without it every candidate of a source with held frames would fail the
+// lint for a Discord target and no fit could ever be found, and a target-none
+// optimize would deliver the clear-only frames gifsicle just made. A failed
+// repair is logged and the inputs come back unchanged (for target none that
+// is still a deliverable file: the rule is a warning there).
+//
+// Known limitation (DESIGN.md §5.3): data already carries the caller's
+// --lossy pass and step B of the repair applies sopts.Lossy again, so a
+// repaired candidate is second-generation lossy (about 0.5 dB at equal size)
+// and costs about 2.3x the gifsicle work of an unrepaired one.
+func (m *Manager) repairIfOnlyHolds(ctx context.Context, scratch, tag string, data []byte, report discordlint.Report, target discordlint.Target, sopts enc.GifsicleOptions) ([]byte, discordlint.Report, bool) {
+	if !onlyHoldsFailed(report) || m.tools.Gifsicle == "" {
+		return data, report, false
+	}
+	cand, rep, err := m.repairGIFHolds(ctx, scratch, tag, data, target, sopts, nil)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("jobs: hold repair failed: %v", err)
+		}
+		return data, report, false
+	}
+	return cand, rep, true
+}
+
+// onlyHoldsFailed reports whether gif.noop-frame-disposal failed — at any
+// level: error for a Discord target, warn for target none — and is the only
+// structural failure (hasStructuralError's notion: byte/dimension/duration
+// limits and the other rules' warnings do not count). That is the one
+// structural failure a palette pass cannot touch and the hold repair
+// (repairGIFHolds) always can.
+func onlyHoldsFailed(rep discordlint.Report) bool {
+	holds := false
+	for _, c := range rep.Checks {
+		if !isStructuralFailure(c) {
+			continue
+		}
+		if c.Rule != discordlint.RuleGIFNoopFrameDisposal {
+			return false
+		}
+		holds = true
+	}
+	return holds
 }
 
 // hasErrorCheck reports whether any LevelError check failed (the report is
@@ -817,20 +1028,6 @@ func isLimitRule(rule string) bool {
 		}
 	}
 	return false
-}
-
-// stripOptimizeFlag removes gifsicle's -O<n>/--optimize flags so that a
-// GifsicleOptions{Unoptimize: true} argv becomes the plain "-U" rung of the
-// fallback ladder (enc always emits an -O level).
-func stripOptimizeFlag(args []string) []string {
-	out := make([]string, 0, len(args))
-	for _, a := range args {
-		if (strings.HasPrefix(a, "-O") && len(a) <= 3) || strings.HasPrefix(a, "--optimize") {
-			continue
-		}
-		out = append(out, a)
-	}
-	return out
 }
 
 // writeStaging lays out the result dir: every produced file under its

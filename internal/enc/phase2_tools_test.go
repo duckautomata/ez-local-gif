@@ -1,8 +1,8 @@
 package enc_test
 
 // Real-tool checks of the Phase 2 argv: the indexed APNG pipeline (tile →
-// pngquant → untile), avifenc/avifdec, gifsicle frame dropping, pngquant,
-// oxipng, the JPEG flatten graphs, the frame writers and the variant frame
+// pngquant → untile), avifenc/avifdec, gifsicle frame dropping and the
+// coalesce rung (-U --disposal=background without -O), pngquant, oxipng, the JPEG flatten graphs, the frame writers and the variant frame
 // count. Every test skips when its tools are not on PATH, so the suite
 // passes on the host (ffmpeg only) and runs fully in the ezlg-dev image.
 
@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -651,6 +652,124 @@ func TestGifsicleOptimizeArgsOnDisk(t *testing.T) {
 			}
 		}
 	})
+}
+
+// poseHoldGIF writes a 40x30 transparent GIF (full-canvas frames, disposal
+// 2) whose sprite holds each pose for a run of identical frames and then
+// jumps somewhere that needs the old pose cleared — the shape every
+// gifsicle -O level turns into one long disposal-1 frame plus a short frame
+// that repeats the picture only to carry disposal 2.
+func poseHoldGIF(t *testing.T, dir string) string {
+	t.Helper()
+	pal := color.Palette{color.RGBA{}, color.RGBA{220, 30, 30, 255}, color.RGBA{30, 30, 220, 255}}
+	g := &gif.GIF{LoopCount: 0}
+	for i, pose := range []int{0, 0, 0, 0, 1, 1, 1, 2, 0, 0, 0} {
+		fr := image.NewPaletted(image.Rect(0, 0, 40, 30), pal)
+		for y := 8; y < 20; y++ {
+			for x := 2 + pose*13; x < 12+pose*13; x++ {
+				fr.SetColorIndex(x, y, uint8(1+(x+y)%2))
+			}
+		}
+		g.Image = append(g.Image, fr)
+		g.Delay = append(g.Delay, 5+i)
+		g.Disposal = append(g.Disposal, gif.DisposalBackground)
+	}
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, g); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "hold.gif")
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// compositeGIF renders g per the GIF spec and returns the canvas shown
+// during each frame (row-major; a cleared pixel is the zero colour).
+func compositeGIF(g *gif.GIF) [][]color.RGBA {
+	w, h := g.Config.Width, g.Config.Height
+	canvas := make([]color.RGBA, w*h)
+	shown := make([][]color.RGBA, 0, len(g.Image))
+	for i, fr := range g.Image {
+		var before []color.RGBA
+		if g.Disposal[i] == gif.DisposalPrevious {
+			before = slices.Clone(canvas)
+		}
+		r := fr.Rect.Intersect(image.Rect(0, 0, w, h))
+		for y := r.Min.Y; y < r.Max.Y; y++ {
+			for x := r.Min.X; x < r.Max.X; x++ {
+				// image/gif gives the frame's transparent index alpha 0.
+				if c := color.RGBAModel.Convert(fr.At(x, y)).(color.RGBA); c.A != 0 {
+					canvas[y*w+x] = c
+				}
+			}
+		}
+		shown = append(shown, slices.Clone(canvas))
+		switch g.Disposal[i] {
+		case gif.DisposalBackground:
+			for y := r.Min.Y; y < r.Max.Y; y++ {
+				clear(canvas[y*w+r.Min.X : y*w+r.Max.X])
+			}
+		case gif.DisposalPrevious:
+			canvas = before
+		}
+	}
+	return shown
+}
+
+// TestGifsicleCoalesceRungOnDisk: -U --disposal=background without -O turns
+// its input — the encoder's full frames or gifsicle's own optimised deltas —
+// into full-canvas disposal-2 frames that render pixel for pixel like the
+// input, with its delays and loop count. No frame of such a file depends on
+// another frame's disposal, which is what Discord needs (it drops frames that
+// do not change the picture, and their disposal with them).
+func TestGifsicleCoalesceRungOnDisk(t *testing.T) {
+	gs := toolOrSkip(t, "gifsicle")
+	dir := t.TempDir()
+	src := poseHoldGIF(t, dir)
+	opt := filepath.Join(dir, "opt.gif")
+	runTool(t, gs, enc.GifsicleArgs(src, opt, enc.GifsicleOptions{}))
+	canvas := image.Rect(0, 0, 40, 30)
+	deltas := false
+	og := readGIF(t, opt)
+	for i, fr := range og.Image {
+		if fr.Rect != canvas || og.Disposal[i] != gif.DisposalBackground {
+			deltas = true
+		}
+	}
+	if !deltas {
+		t.Fatalf("gifsicle -O2 left every frame full-canvas with disposal 2; the optimised case proves nothing")
+	}
+
+	for _, tc := range []struct{ name, in string }{{"full-frame input", src}, {"optimised input", opt}} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(dir, "coalesced-"+filepath.Base(tc.in))
+			runTool(t, gs, enc.GifsicleArgs(tc.in, out, enc.GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true}))
+			in, g := readGIF(t, tc.in), readGIF(t, out)
+			if len(g.Image) != len(in.Image) {
+				t.Fatalf("%d frames, want %d (a plain rewrite keeps every frame)", len(g.Image), len(in.Image))
+			}
+			if g.LoopCount != 0 {
+				t.Errorf("loop count %d, want 0 (forever)", g.LoopCount)
+			}
+			want, got := compositeGIF(in), compositeGIF(g)
+			for i, fr := range g.Image {
+				if fr.Rect != canvas {
+					t.Errorf("frame %d covers %v, want the full canvas %v", i, fr.Rect, canvas)
+				}
+				if g.Disposal[i] != gif.DisposalBackground {
+					t.Errorf("frame %d disposal %d, want 2 (background)", i, g.Disposal[i])
+				}
+				if g.Delay[i] != in.Delay[i] {
+					t.Errorf("frame %d delay %d cs, want %d", i, g.Delay[i], in.Delay[i])
+				}
+				if !slices.Equal(got[i], want[i]) {
+					t.Errorf("frame %d renders differently from the input's frame %d", i, i)
+				}
+			}
+		})
+	}
 }
 
 // --- pngquant / oxipng on stills ----------------------------------------------------

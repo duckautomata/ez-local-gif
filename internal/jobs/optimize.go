@@ -92,11 +92,18 @@ func (m *Manager) renderOptimize(ctx context.Context, j *job, scratch string, sr
 	if len(fixed) > 0 {
 		data = fixed
 	}
+	if onlyHoldsFailed(report) {
+		m.progress(j, pctLint, "re-encoding held frames for Discord")
+	}
+	data, report, repaired := m.repairIfOnlyHolds(ctx, scratch, "", data, report, target, optimizeRepairOptions(opts))
 	item, err := m.finalFile(scratch, recipe.FormatGIF, data, &report)
 	if err != nil {
 		return nil, err
 	}
 	item.desc = optimizeDesc(opts, facts.frames)
+	if repaired {
+		item.desc += " · " + holdRepairNote
+	}
 	return []produced{item}, nil
 }
 
@@ -120,6 +127,17 @@ func gifsicleOptimizeOptions(out recipe.Output, lossy, colors, drop int) enc.Gif
 		o.Dither = gifsicleDither(out.Dither)
 	}
 	return o
+}
+
+// optimizeRepairOptions maps the optimiser's options onto the post-pass
+// options of the hold repair (repairGIFHolds), which re-optimises with the
+// same lossy / colours / dither / loop. Frame dropping is not repeated: the
+// repair works on the already-dropped frames. Known limitation: the repair's
+// input already carries this lossy pass, so the repaired file is
+// second-generation lossy while its description names a single "lossy N"
+// (--colors is a no-op on the already reduced palette).
+func optimizeRepairOptions(o enc.GifsicleOptimizeOptions) enc.GifsicleOptions {
+	return enc.GifsicleOptions{Lossy: o.Lossy, Colors: o.Colors, Dither: o.Dither, Loop: o.Loop}
 }
 
 // gifsicleDither maps the recipe's paletteuse dither names onto gifsicle's
@@ -338,13 +356,22 @@ func (m *Manager) optimizeFit(ctx context.Context, j *job, scratch, src string, 
 		if err != nil {
 			return "", 0, fmt.Errorf("lint: %w", err)
 		}
-		if len(fixed) > 0 {
+		changed := len(fixed) > 0
+		if changed {
 			data = fixed
+		}
+		// A source with held frames fails gif.noop-frame-disposal at every
+		// knob (for every target: error for Discord, warn for none — both
+		// are repaired); the candidate (and the size the search sees) is the
+		// repaired file. Known limitation (DESIGN.md §5.3): that is ~2.3x the
+		// gifsicle work per candidate and a second --lossy=knob generation.
+		data, report, repaired := m.repairIfOnlyHolds(ctx, dir, "-"+strings.TrimSuffix(filepath.Base(path), ".gif"), data, report, target, optimizeRepairOptions(opts))
+		if changed || repaired {
 			if err := os.WriteFile(path, data, 0o644); err != nil {
 				return "", 0, err
 			}
 		}
-		cand := &fitCandidate{path: path, format: recipe.FormatGIF, bytes: int64(len(data)), report: report, rung: rung, knob: knob, ok: !hasErrorCheck(report)}
+		cand := &fitCandidate{path: path, format: recipe.FormatGIF, bytes: int64(len(data)), report: report, rung: rung, knob: knob, ok: !hasErrorCheck(report), holdsRepaired: repaired}
 		cands.add(cand)
 		n := encodes.Add(1)
 		m.progress(j, fitProgressPct(n), fmt.Sprintf("fit: %d encodes (%s, lossy %d → %s)", n, rung.Label, knob, humanBytes(cand.bytes)))
@@ -360,7 +387,13 @@ func (m *Manager) optimizeFit(ctx context.Context, j *job, scratch, src string, 
 		return nil, fmt.Errorf("fit search: %w", err)
 	}
 	log.Printf("jobs: job %s optimize fit: %d encodes, %d rungs skipped, %d errors, fit=%v", j.snap.ID, res.Tried, len(res.Skipped), len(res.Errors), res.Best != nil)
-	describe := func(c *fitCandidate) string { return "fit at " + c.rung.Label + fmt.Sprintf(" · lossy %d", c.knob) }
+	describe := func(c *fitCandidate) string {
+		desc := "fit at " + c.rung.Label + fmt.Sprintf(" · lossy %d", c.knob)
+		if c.holdsRepaired {
+			desc += " · " + holdRepairNote
+		}
+		return desc
+	}
 	items, err := m.fitDeliverables(ctx, cands, res.Best, res.Alternatives, budget, res.Skipped, res.Errors, scratch, enc.Master{}, describe)
 	if err != nil {
 		return nil, err

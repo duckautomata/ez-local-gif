@@ -43,6 +43,11 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	// Fake gifsicle mode (holds_test.go). When both fakes are configured the
+	// argv decides which tool this process stands in for.
+	if dir := os.Getenv(fakeGifsicleEnv); dir != "" && (os.Getenv(fakeToolEnv) == "" || isGifsicleArgv(os.Args[1:])) {
+		os.Exit(runFakeGifsicle(dir))
+	}
 	if os.Getenv(fakeToolEnv) != "" {
 		os.Exit(runFakeFFmpeg())
 	}
@@ -87,7 +92,16 @@ func runFakeFFmpeg() int {
 	case hasArg(args, "null"):
 		os.Stderr.WriteString(fakeBBoxLine)
 	default:
-		if err := os.WriteFile(args[len(args)-1], []byte(fakeWebP), 0o644); err != nil {
+		// fakeOutEnv names a file whose bytes are the encode's output (the
+		// fake proxy otherwise).
+		payload := []byte(fakeWebP)
+		if src := os.Getenv(fakeOutEnv); src != "" {
+			if payload, err = os.ReadFile(src); err != nil {
+				fmt.Fprintln(os.Stderr, "fake ffmpeg: payload:", err)
+				return 1
+			}
+		}
+		if err := os.WriteFile(args[len(args)-1], payload, 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, "fake ffmpeg: output:", err)
 			return 1
 		}

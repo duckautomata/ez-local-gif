@@ -79,6 +79,10 @@ type fitCandidate struct {
 	rung   fit.Rung
 	knob   int
 	ok     bool // no LevelError check failed
+	// holdsRepaired: the GIF failed gif.noop-frame-disposal only (at any
+	// level, i.e. for every target) and the hold repair (repairGIFHolds)
+	// replaced its bytes; descriptions say so.
+	holdsRepaired bool
 }
 
 // fitCandidates is the thread-safe record of every attempt of a search.
@@ -102,7 +106,11 @@ func (c *fitCandidates) get(path string) *fitCandidate {
 }
 
 // smallest returns the best attempt when nothing fit: structurally sound
-// files first (only limit rules failed), then by size.
+// files first (only limit rules failed), then by size. hasStructuralError
+// counts an unrepaired gif.noop-frame-disposal failure at any level, so for
+// target none a candidate without clear-only frames is preferred too; one
+// with them stays deliverable (ok is hasErrorCheck's, and the rule is only a
+// warning there).
 func (c *fitCandidates) smallest() *fitCandidate {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -347,6 +355,9 @@ func (r *fitRun) describe(c *fitCandidate) string {
 	desc := "fit at " + c.rung.Label
 	if k := knobDesc(c.format, c.rung, r.out, c.knob); k != "" {
 		desc += " · " + k
+	}
+	if c.holdsRepaired {
+		desc += " · " + holdRepairNote
 	}
 	return desc
 }
@@ -699,12 +710,30 @@ func (r *fitRun) encode(ctx context.Context, rung fit.Rung, knob int, attempt in
 	if err != nil {
 		return "", 0, fmt.Errorf("lint %s candidate: %w", format, err)
 	}
-	if changed {
+	// encodeGIFAt merges the held frames before gifsicle sees them, so this
+	// is the safety net (a lossy pass can still flatten two near-identical
+	// frames into a hold — reproduced with gifsicle 1.96 at lossy >= 1 on
+	// frames that differ by a few near-colour pixels, see
+	// TestRenderFitRepairsLossyHolds; gifski's loop pass optimises too): the
+	// candidate on disk and the size the search sees are the repaired file's.
+	// Known limitation: the repair's -O2 pass applies --lossy=knob to bytes
+	// that already carry it (second-generation lossy, DESIGN.md §5.3).
+	repaired := false
+	if format == recipe.FormatGIF {
+		sopts := enc.GifsicleOptions{Loop: r.out.Loop}
+		if !isGifskiOutput(r.out) {
+			sopts.Lossy = knob // gifski's knob is its quality, not gifsicle's lossy
+		}
+		if data, report, repaired = r.m.repairIfOnlyHolds(ctx, r.dir, "-"+id, data, report, r.target, sopts); repaired {
+			applyMasterAlpha(&report, r.master)
+		}
+	}
+	if changed || repaired {
 		if err := os.WriteFile(path, data, 0o644); err != nil {
 			return "", 0, fmt.Errorf("write candidate: %w", err)
 		}
 	}
-	cand := &fitCandidate{path: path, format: format, bytes: int64(len(data)), report: report, rung: rung, knob: knob, ok: !hasErrorCheck(report)}
+	cand := &fitCandidate{path: path, format: format, bytes: int64(len(data)), report: report, rung: rung, knob: knob, ok: !hasErrorCheck(report), holdsRepaired: repaired}
 	r.cands.add(cand)
 	n := r.encodes.Add(1)
 	r.m.progress(r.j, fitProgressPct(n), fmt.Sprintf("fit: %d encodes (%s, %s %d → %s)", n, rung.Label, knobName(format, r.out), knob, humanBytes(cand.bytes)))

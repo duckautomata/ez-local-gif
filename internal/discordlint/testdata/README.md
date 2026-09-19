@@ -32,7 +32,18 @@ synthetic alpha channel:
 Edge-case GIFs (missing GCE, disposal 0/3, missing NETSCAPE, delay 0, comment
 extension, local colour table, wrong LSD background index, …) are built in Go
 by the tests with image/gif.EncodeAll plus byte surgery (see
-`fixtures_test.go`). Edge-case APNGs (zero / short delays, oversized canvas,
+`fixtures_test.go`). The canvas-simulation fixtures for `gif.noop-frame-disposal`
+and `MergeGIFHolds` (gifsicle's hold → clear-only frame in its -O2 and -O1
+shapes, harmless holds, per-frame transparent indices, local tables, real
+interlacing, frames without a GCE, disposal 3, reserved disposals and frames
+outside the logical screen (both end the analysis), random animations checked
+against an image/gif-based reference compositor) are built the same way by
+`encodeCv` in `gifcanvas_test.go`; the Discord-verified GIFs of the 2026-09-19
+investigation are not in the repository — `TestNoopFrameDisposalLocalFiles`
+checks an explicit list of them (`tmp/discord-stack-test/1-…6-*.gif`,
+`tmp/Dragoon.gif`, `tmp/repro/out/base.gif`) with their expected verdicts,
+skips each one that is absent, and looks at no other file in those folders.
+Edge-case APNGs (zero / short delays, oversized canvas,
 frames outside the canvas, acTL after IDAT, missing IEND, hidden default
 image, bad sequence numbers, truncation, …) are byte surgery on
 `ff_rgba.apng` or synthetic chunk lists with dummy pixel data (see

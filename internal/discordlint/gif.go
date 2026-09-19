@@ -12,6 +12,7 @@ const (
 	RuleGIFFrame0Transparent = "gif.frame0-transparency"
 	RuleGIFLSDBackground     = "gif.lsd-background-index"
 	RuleGIFDisposal          = "gif.disposal"
+	RuleGIFNoopFrameDisposal = "gif.noop-frame-disposal" // implemented in gifcanvas.go
 	RuleGIFNetscapeLoop      = "gif.netscape-loop"
 	RuleGIFMinDelay          = "gif.min-delay"
 	RuleGIFGlobalPalette     = "gif.global-palette"
@@ -52,7 +53,9 @@ type gifLinter struct {
 // missing and, for Discord targets, its count forced to 0 = loop forever
 // — TargetNone keeps the file's own count; comment / plain-text /
 // non-NETSCAPE application extensions stripped). Unfixable violations
-// (disposal 3, interlaced frames, local colour tables, no free palette
+// (disposal 3, a frame that leaves the picture unchanged but clears a
+// different area than its predecessor — gif.noop-frame-disposal, see
+// gifcanvas.go —, interlaced frames, local colour tables, no free palette
 // slot, over byte limit, sticker duration/frame/fps limits, and — as a
 // warning — a sticker side over 320 px) are reported as failed checks so
 // the caller can fall back to a re-encode. The returned bytes equal data
@@ -69,6 +72,7 @@ func LintGIF(data []byte, target Target, fix bool) (Report, []byte, error) {
 	l.ruleFrame0Transparency()
 	l.ruleLSDBackground()
 	l.ruleDisposal()
+	l.ruleNoopFrameDisposal()
 	l.ruleNetscapeLoop()
 	l.ruleMinDelay()
 	l.ruleGlobalPalette()

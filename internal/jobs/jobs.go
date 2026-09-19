@@ -29,8 +29,10 @@
 //     Percent, using plan.Frames or plan.Duration for the denominator);
 //     scan alpha; fill enc.Master.
 //  5. Encode per output.Format (encoders.go, frames.go, phase4.go):
-//     gif → enc.GIFArgs then enc.GifsicleArgs (output.Loop restated as
-//     --loopcount) — or, with Output.Encoder "gifski", PNG frames → gifski;
+//     gif → enc.GIFArgs, discordlint.MergeGIFHolds (held frames become one
+//     long frame before the optimiser can see the run), then
+//     enc.GifsicleArgs (output.Loop restated as --loopcount) — or, with
+//     Output.Encoder "gifski", PNG frames → gifski;
 //     webp → enc.WebPArgs; apng → enc.APNGArgs (RGBA) or,
 //     with Colors > 0, the indexed tile → pngquant → untile pipeline, then
 //     oxipng; avif → PNG frames → avifenc (still: AVIFStillArgs); png/jpeg →
@@ -45,7 +47,11 @@
 //     and an eligible plain GIF → GIF edit takes the lossless gifsicle fast
 //     path automatically (phase4.go), skipping the decode entirely.
 //  6. Lint per format with output.Target: discordlint.LintGIF(fix=true)
-//     (+ the gifsicle fallback ladder when a structural error remains),
+//     (+ the gifsicle fallback ladder when a structural error remains:
+//     --colors N, then the hold repair — coalesce to all-disposal-2 frames,
+//     merge held frames, re-optimise; the optimize preset and the fit
+//     candidates run the hold repair alone when gif.noop-frame-disposal is
+//     their only structural failure),
 //     LintWebP, LintAPNG, LintStatic, LintVideo; frames are not linted. Report.HasAlpha
 //     is overridden with the master's pixel alpha scan (the linter's flag is
 //     structural and over-reports on frame-diff optimised opaque animations;
@@ -488,7 +494,18 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames, mp4, webm
 // 2026-08-23.4: mp4/webm tails convert to bt709/tv yuv420p inside the flatten
 // graph and tag the stream (enc videoColorConvert + -colorspace/-color_primaries/
 // -color_trc bt709), so every video recipe's bytes change.
-const PipelineVersion = "2026-08-23.4"
+// 2026-09-19.2: held frames — the GIF path merges identical frames
+// (discordlint.MergeGIFHolds) between ffmpeg and gifsicle, the fallback
+// ladder's "-U -O2" / "-U" rungs became the hold repair (coalesce with
+// --disposal=background → merge → -O2 --careful), and the optimize preset and
+// the fit candidates run that repair when gif.noop-frame-disposal is their
+// only structural failure. The rule counts as structural at any level, so
+// the repair also runs for target none (where discordlint reports it as a
+// warning): the lossless fast path, the optimize preset and its fit
+// candidates no longer deliver the clear-only frames gifsicle -O makes out of
+// a source's holds. Every GIF with a hold renders to different bytes, and
+// the memoised ones stack their poses on Discord. (.1 was never committed.)
+const PipelineVersion = "2026-09-19.2"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what

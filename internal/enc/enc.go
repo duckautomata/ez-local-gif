@@ -465,14 +465,32 @@ func gifFilter(m Master, o GIFOptions) string {
 
 // GifsicleOptions controls the post-pass. Zero values: OptimizeLevel 2,
 // Careful true (set NoCareful to disable), Lossy 0 = off, Colors 0 = keep,
-// Loop 0 = forever.
+// Loop 0 = forever, NoOptimize / DisposeBackground off (the optimiser runs
+// and picks each frame's disposal).
 type GifsicleOptions struct {
 	Lossy         int
 	Colors        int
-	OptimizeLevel int  // 1..3 (0 = 2). Never 3 for Discord targets.
+	OptimizeLevel int  // 1..3 (0 = 2). Never 3 for Discord targets. Ignored with NoOptimize.
 	NoCareful     bool // default is --careful
 	Unoptimize    bool // -U first (coalesce) — used by the re-encode fallback ladder
 	Threads       int  // -j N (0 = omit)
+	// NoOptimize omits the -O<level> flag entirely: gifsicle rewrites the
+	// frames it was given (coalesced ones with Unoptimize) without running
+	// its optimiser. Every -O level merges a hold into one long disposal-1
+	// frame plus a short frame that repeats the picture only to carry
+	// disposal 2, and Discord drops frames that do not change the picture —
+	// and their disposal with them (discordlint gif.noop-frame-disposal). The
+	// hold repair's coalesce step (jobs.repairGIFHolds: Unoptimize +
+	// DisposeBackground + NoOptimize) is the only user: in its coalesced
+	// all-disposal-2 frames every held frame is a harmless no-op that
+	// discordlint.MergeGIFHolds can fold. NoOptimize alone does not remove
+	// such frames from an input that already has them (plain -U keeps them).
+	NoOptimize bool
+	// DisposeBackground emits --disposal=background (right after -U when
+	// Unoptimize, else first). With Unoptimize and NoOptimize every output
+	// frame is a full-canvas frame with disposal 2, pixel-exact against the
+	// input. Under -O the optimiser chooses disposals itself and overrides it.
+	DisposeBackground bool
 	// Dither selects gifsicle's --dither method when Colors > 0 ("" = no
 	// dithering; "o8" = ordered 8x8 as in DESIGN.md §4.2; other gifsicle
 	// methods such as "ro64", "o3", "o4", "ordered", "halftone",
@@ -488,21 +506,31 @@ type GifsicleOptions struct {
 // GifsicleArgs returns e.g. ["-O2","--careful","--lossy=40","--colors","128",
 // "--loopcount=forever","in.gif","-o","out.gif"].
 //
+// With Unoptimize, DisposeBackground and NoOptimize it is the coalesce rung:
+// ["-U","--disposal=background","--careful","--loopcount=forever","in.gif",
+// "-o","out.gif"].
+//
 // gifsicle applies options positionally, so the order is fixed: -U first
-// (coalesce before anything else), then -O<level>, --careful, --lossy=N,
-// --colors N [--dither=M], -jN, and finally --loopcount=forever|N in -o out.
+// (coalesce before anything else), then --disposal=background, -O<level>
+// (unless NoOptimize), --careful, --lossy=N, --colors N [--dither=M], -jN,
+// and finally --loopcount=forever|N in -o out.
 func GifsicleArgs(in, out string, o GifsicleOptions) []string {
 	args := make([]string, 0, 12)
 	if o.Unoptimize {
 		args = append(args, "-U")
 	}
-	level := o.OptimizeLevel
-	if level < 1 {
-		level = DefaultGifsicleOptimize
-	} else if level > 3 {
-		level = 3
+	if o.DisposeBackground {
+		args = append(args, "--disposal=background")
 	}
-	args = append(args, "-O"+strconv.Itoa(level))
+	if !o.NoOptimize {
+		level := o.OptimizeLevel
+		if level < 1 {
+			level = DefaultGifsicleOptimize
+		} else if level > 3 {
+			level = 3
+		}
+		args = append(args, "-O"+strconv.Itoa(level))
+	}
 	if !o.NoCareful {
 		args = append(args, "--careful")
 	}

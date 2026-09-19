@@ -8,7 +8,7 @@
 #
 #   a  GIF   ffmpeg palettegen/paletteuse (matte #313338, alpha_threshold 128,
 #            bayer scale 3, one global palette) → gifsicle -O2 --careful
-#   b  GIF   same base → gifsicle -U (coalesced full frames, explicit disposal)
+#   b  GIF   same base → plain gifsicle -U (coalesced full frames; gifsicle writes a disposal 0/2 mix)
 #   c  GIF   gifski from RGBA PNG frames (per-frame local palettes)
 #   d  GIF   ffmpeg palette output only (no gifsicle)
 #   e  WebP  libwebp_anim lossy  yuva420p q80  -loop 0 -map_metadata -1
@@ -624,7 +624,7 @@ attachment. Re-run this checklist after an encoder or linter change and update t
 | File | What it tests | Upload as | Expect |
 |---|---|---|---|
 | \`a_gif_ffmpeg-palette_gifsicle-O2.gif\` | Default GIF path: palettegen/paletteuse, matte #313338, alpha_threshold 128, bayer 3, single global palette, then \`gifsicle -O2 --careful\` (frame-diff optimised) | chat attachment | transparent, dark fringe on light theme only, no flicker |
-| \`b_gif_ffmpeg-palette_gifsicle-U.gif\` | Same frames coalesced by \`gifsicle -U\` (full frames, explicit disposal) — the fallback if (a) glitches through Discord's proxy | chat attachment | identical look to (a), bigger file |
+| \`b_gif_ffmpeg-palette_gifsicle-U.gif\` | Same frames coalesced by plain \`gifsicle -U\` (full frames; gifsicle writes a disposal 0/2 mix). Kept as a historical comparison (the 2026-08-19 results refer to it) — not the app's fallback any more: since 2026-09-19 that is \`gifsicle -U --disposal=background\` + MergeGIFHolds (DESIGN.md §5.3) | chat attachment | identical look to (a), bigger file |
 | \`c_gif_gifski_local-palettes.gif\` | gifski quality 90 from RGBA PNGs, matte #313338 (per-frame local palettes — historically glitchy on Discord) | chat attachment | best gradients; watch for random per-frame colour changes |
 | \`d_gif_ffmpeg-only.gif\` | ffmpeg palette GIF with no gifsicle pass (ffmpeg's own GCE/disposal choices) | chat attachment | same as (a); black background here means the linter fixer is required |
 | \`e_webp_lossy_yuva420p_q80.webp\` | Animated WebP, libwebp_anim lossy q80 yuva420p (ffmpeg converts RGB→YUV, the app's default), \`-loop 0\`, no metadata | chat attachment | soft alpha survives, loops forever, no ghost trails |

@@ -485,23 +485,11 @@ func TestScanMasterAlpha(t *testing.T) {
 	}
 }
 
-func TestStripOptimizeFlag(t *testing.T) {
-	in := []string{"-U", "-O2", "--careful", "--loopcount=forever", "in.gif", "-o", "out.gif"}
-	got := stripOptimizeFlag(in)
-	want := []string{"-U", "--careful", "--loopcount=forever", "in.gif", "-o", "out.gif"}
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Errorf("got %q", got)
-	}
-	// -o and file names must survive.
-	if strings.Join(stripOptimizeFlag([]string{"--optimize=3", "-o", "x-O2.gif"}), " ") != "-o x-O2.gif" {
-		t.Error("stripped too much")
-	}
-}
-
 // TestGifsicleLoopWiring pins the contract jobs relies on: Output.Loop goes
 // into enc.GifsicleOptions.Loop, which enc renders as --loopcount=forever
-// (0) or --loopcount=N — and the ladder's -U rung, which strips -O, keeps
-// it. (The end-to-end count check is TestRenderGIFLoopCount.)
+// (0) or --loopcount=N — and both passes of the ladder's hold repair
+// (holdRepairOptions) keep it. (The end-to-end count check is
+// TestRenderGIFLoopCount.)
 func TestGifsicleLoopWiring(t *testing.T) {
 	forever := enc.GifsicleArgs("in.gif", "out.gif", enc.GifsicleOptions{Lossy: 40, Colors: 128, Loop: 0})
 	if !slices.Contains(forever, "--loopcount=forever") {
@@ -514,9 +502,34 @@ func TestGifsicleLoopWiring(t *testing.T) {
 	if idx := slices.Index(three, "--loopcount=3"); idx < 0 || three[idx+1] != "in.gif" {
 		t.Errorf("loop flag not before the input: %q", three)
 	}
-	un := stripOptimizeFlag(enc.GifsicleArgs("i", "o", enc.GifsicleOptions{Unoptimize: true, Loop: 5}))
-	if !slices.Contains(un, "--loopcount=5") || slices.Contains(un, "-O2") {
-		t.Errorf("-U rung: %q", un)
+	coalesce, reopt := holdRepairOptions(enc.GifsicleOptions{Lossy: 40, Loop: 5})
+	if un := enc.GifsicleArgs("i", "o", coalesce); !slices.Contains(un, "--loopcount=5") || slices.Contains(un, "-O2") {
+		t.Errorf("coalesce pass: %q", un)
+	}
+	if re := enc.GifsicleArgs("i", "o", reopt); !slices.Contains(re, "--loopcount=5") || !slices.Contains(re, "-O2") {
+		t.Errorf("re-optimise pass: %q", re)
+	}
+}
+
+// TestHoldRepairOptions pins the two gifsicle passes of repairGIFHolds: step
+// A coalesces to full-canvas disposal-2 frames without the optimiser and
+// without anything lossy (it must stay pixel-exact — it is also the
+// fallback), step B re-optimises with the caller's lossy / colours / dither.
+func TestHoldRepairOptions(t *testing.T) {
+	coalesce, reopt := holdRepairOptions(enc.GifsicleOptions{Lossy: 60, Colors: 64, Loop: 2, Unoptimize: true, NoOptimize: true, OptimizeLevel: 3, NoCareful: true})
+	if got, want := strings.Join(enc.GifsicleArgs("in.gif", "out.gif", coalesce), " "), "-U --disposal=background --careful --loopcount=2 in.gif -o out.gif"; got != want {
+		t.Errorf("coalesce argv = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(enc.GifsicleArgs("in.gif", "out.gif", reopt), " "), "-O2 --careful --lossy=60 --colors 64 --dither=o8 --loopcount=2 in.gif -o out.gif"; got != want {
+		t.Errorf("re-optimise argv = %q, want %q", got, want)
+	}
+	_, reopt = holdRepairOptions(enc.GifsicleOptions{Colors: 64, Dither: "floyd-steinberg"})
+	if got := enc.GifsicleArgs("i", "o", reopt); !slices.Contains(got, "--dither=floyd-steinberg") {
+		t.Errorf("caller's dither lost: %q", got)
+	}
+	_, reopt = holdRepairOptions(enc.GifsicleOptions{})
+	if got, want := strings.Join(enc.GifsicleArgs("i", "o", reopt), " "), "-O2 --careful --loopcount=forever i -o o"; got != want {
+		t.Errorf("lossless re-optimise argv = %q, want %q", got, want)
 	}
 }
 
@@ -732,6 +745,103 @@ func TestStructuralErrorClassification(t *testing.T) {
 	rep.Checks = append(rep.Checks, discordlint.Check{Rule: "gif.global-palette", Level: discordlint.LevelError, OK: false})
 	if !hasStructuralError(rep) {
 		t.Error("local palette failure not structural")
+	}
+}
+
+// TestHoldsRuleClassification: gif.noop-frame-disposal is a structural
+// failure (a re-encode fixes it, the fit engine cannot) at ANY level — error
+// for a Discord target, warn for target none — and the ladder / the
+// ladder-less paths key on it being the ONLY structural failure: then the
+// --colors rung is skipped (it keeps the frame structure) and the optimize
+// preset and the fit candidates run the hold repair. Every other rule is only
+// structural at error level, and warn never makes a candidate not-ok.
+func TestHoldsRuleClassification(t *testing.T) {
+	if isLimitRule(discordlint.RuleGIFNoopFrameDisposal) {
+		t.Fatalf("%s classified as a limit rule", discordlint.RuleGIFNoopFrameDisposal)
+	}
+	fail := func(rule string, level discordlint.Level) discordlint.Check {
+		return discordlint.Check{Rule: rule, Level: level, OK: false}
+	}
+	holds := fail(discordlint.RuleGIFNoopFrameDisposal, discordlint.LevelError)
+	size := fail("gif.size-limit", discordlint.LevelError)
+	dims := fail("gif.emote-dims", discordlint.LevelError)
+	palette := fail("gif.global-palette", discordlint.LevelError)
+	warn := fail("gif.first-frame-visible", discordlint.LevelWarn)
+	holdsWarn := fail(discordlint.RuleGIFNoopFrameDisposal, discordlint.LevelWarn)
+	paletteWarn := fail("gif.global-palette", discordlint.LevelWarn)
+	pass := discordlint.Check{Rule: "gif.disposal", Level: discordlint.LevelError, OK: true}
+	for _, c := range []struct {
+		name                       string
+		checks                     []discordlint.Check
+		structural, only, tryColor bool
+	}{
+		{"clean", []discordlint.Check{pass, warn}, false, false, false},
+		{"holds alone", []discordlint.Check{pass, holds}, true, true, false},
+		{"holds + limits + warnings", []discordlint.Check{size, dims, warn, holds}, true, true, false},
+		{"holds + palette", []discordlint.Check{holds, palette}, true, false, true},
+		{"palette alone", []discordlint.Check{palette}, true, false, true},
+		{"limits alone", []discordlint.Check{size, dims}, false, false, false},
+		// TargetNone reports the rule as a warning: repaired all the same.
+		{"holds as a warning", []discordlint.Check{pass, holdsWarn}, true, true, false},
+		{"holds as a warning + other warnings", []discordlint.Check{holdsWarn, paletteWarn, warn}, true, true, false},
+		{"holds as a warning + palette error", []discordlint.Check{holdsWarn, palette}, true, false, true},
+		{"other warnings alone", []discordlint.Check{paletteWarn, warn}, false, false, false},
+		{"holds as a warning, passing", []discordlint.Check{{Rule: discordlint.RuleGIFNoopFrameDisposal, Level: discordlint.LevelWarn, OK: true}}, false, false, false},
+		{"holds passing", []discordlint.Check{{Rule: discordlint.RuleGIFNoopFrameDisposal, Level: discordlint.LevelError, OK: true}}, false, false, false},
+	} {
+		rep := discordlint.Report{Checks: c.checks}
+		if got := hasStructuralError(rep); got != c.structural {
+			t.Errorf("%s: hasStructuralError = %v, want %v", c.name, got, c.structural)
+		}
+		if got := onlyHoldsFailed(rep); got != c.only {
+			t.Errorf("%s: onlyHoldsFailed = %v, want %v", c.name, got, c.only)
+		}
+		if got := ladderTriesColors(rep); got != c.tryColor {
+			t.Errorf("%s: ladderTriesColors = %v, want %v", c.name, got, c.tryColor)
+		}
+	}
+	// A holds-only candidate is never reported at its real size to the fit
+	// search unless it was repaired (reportedSize): it cannot be chosen.
+	cand := &fitCandidate{bytes: 1000, report: discordlint.Report{Checks: []discordlint.Check{holds}}}
+	if got := reportedSize(cand); got != fitOverTarget {
+		t.Errorf("unrepaired holds candidate reports %d, want fitOverTarget", got)
+	}
+	// For target none the rule is a warning: a candidate whose repair failed
+	// stays ok and deliverable at its real size, exactly as before the rule
+	// counted as structural; smallest() merely prefers a file without it.
+	warnRep := discordlint.Report{OK: true, Checks: []discordlint.Check{holdsWarn}}
+	if hasErrorCheck(warnRep) {
+		t.Error("a warn-level hold failure counts as an error check")
+	}
+	unrepaired := &fitCandidate{path: "a", bytes: 1000, report: warnRep, ok: !hasErrorCheck(warnRep)}
+	if got := reportedSize(unrepaired); !unrepaired.ok || got != 1000 {
+		t.Errorf("unrepaired warn-level candidate: ok=%v reports %d, want ok at 1000", unrepaired.ok, got)
+	}
+	cands := newFitCandidates()
+	cands.add(unrepaired)
+	if got := cands.smallest(); got != unrepaired {
+		t.Errorf("smallest() = %+v, want the only candidate", got)
+	}
+	clean := &fitCandidate{path: "b", bytes: 2000, report: discordlint.Report{OK: true, Checks: []discordlint.Check{pass}}, ok: true}
+	cands.add(clean)
+	if got := cands.smallest(); got != clean {
+		t.Errorf("smallest() = %s, want the candidate without clear-only frames", got.path)
+	}
+}
+
+// TestRepairWithoutGifsicle: with no gifsicle the hold repair is a no-op
+// that hands the inputs back (lintGIF and the fit paths then deliver the
+// linter's verdict as it is).
+func TestRepairWithoutGifsicle(t *testing.T) {
+	m := &Manager{}
+	rep := discordlint.Report{Checks: []discordlint.Check{{Rule: discordlint.RuleGIFNoopFrameDisposal, Level: discordlint.LevelError}}}
+	in := []byte("GIF89a")
+	data, got, repaired := m.repairIfOnlyHolds(context.Background(), t.TempDir(), "", in, rep, discordlint.TargetEmote, enc.GifsicleOptions{})
+	if repaired || !bytes.Equal(data, in) || len(got.Checks) != 1 {
+		t.Errorf("repairIfOnlyHolds without gifsicle: repaired=%v data=%q report=%+v", repaired, data, got)
+	}
+	if _, _, err := m.repairGIFHolds(context.Background(), t.TempDir(), "", in, discordlint.TargetEmote, enc.GifsicleOptions{}, nil); err == nil {
+		t.Error("repairGIFHolds without gifsicle must fail")
 	}
 }
 

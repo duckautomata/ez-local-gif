@@ -12,12 +12,14 @@ Accepted — renders verified on a private Discord server, see
 
 - **ProRes 4444 / any video / GIF / animated WebP → Discord-safe GIF and animated WebP** with
   transparency: premultiplied-alpha toggle (on by default for ProRes), matte + 1-bit threshold
-  for GIF, 8-bit straight alpha for WebP, one global palette, `gifsicle -O2 --careful`,
+  for GIF, 8-bit straight alpha for WebP, one global palette, held frames merged and then
+  `gifsicle -O2 --careful` (the merge is a 2026-09-19 fix, see the end of this page),
   `libwebp_anim` with `-loop 0`.
 - **Discord linter** (`internal/discordlint`): checks and fixes the byte-level rules that make
   files render black / opaque / flickering / play-once after Discord's server-side transcode
-  (GCE on every frame, frame-0 transparency flag, explicit disposal, NETSCAPE loop, VP8X
-  ALPHA/ANIM flags, loop 0, no metadata); the result card shows the report.
+  (GCE on every frame, frame-0 transparency flag, explicit disposal, no frame that leaves the
+  picture unchanged but changes the disposal, NETSCAPE loop, VP8X ALPHA/ANIM flags, loop 0, no
+  metadata); the result card shows the report.
 - Trim, crop, resize/canvas, fps, speed, flip/rotate ops; still preview with scrubber over
   checkerboard / Discord dark / white.
 
@@ -146,3 +148,30 @@ Polish + extras, DESIGN.md §10 item 4 — built 2026-08-29:
   480-px frame. A fixed zoom now requests the still unscaled (the output canvas, as overlay mode
   already did): 1× is one output pixel per CSS pixel and 2× / 4× magnify the frame the render
   produces. Fit keeps the small still; the larger PNG per scrub step is paid only while zoomed.
+- **GIFs with held poses no longer "stack" on Discord (2026-09-19)** — a transparent GIF whose
+  subject holds still for a while rendered correctly everywhere except Discord, where each new
+  pose was drawn on top of the old one. Discord drops a frame that does not change the picture,
+  and that frame's disposal with it; gifsicle's optimiser (`-O1` / `-O2` / `-O3` alike) turns the
+  end of a hold into exactly such a frame — a short disposal-2 frame whose only job is to clear
+  the area — so the clear was lost. Confirmed by the user with a six-variant upload test
+  ([`reviews/discord-stack-test-2026-09-19.md`](reviews/discord-stack-test-2026-09-19.md));
+  public lilliput does not reproduce it. Three changes: the GIF path merges held frames into the
+  previous frame's delay **before** gifsicle (`discordlint.MergeGIFHolds` — also several times
+  smaller without gifsicle: 486 KB → 73 KB on the reported clip, and 58.6 KB vs 59.3 KB with
+  it); the linter's new `gif.noop-frame-disposal` check fails such frames (error for Discord
+  targets, warning otherwise); and the re-encode ladder became `--colors N` → coalesce
+  (`gifsicle -U --disposal=background`) → merge holds → `-O2 --careful` → the coalesced
+  all-disposal-2 file. That repair runs whenever the check fails, for **every** target (also as
+  the warning it is for target none): plain renders, the lossless fast path and gifski get it
+  through the ladder; the optimize preset (which, like the fast path, cannot merge first:
+  frame selection and crop happen inside the same gifsicle call) and the fit candidates run it
+  when the check is their only structural failure (their description then says "held frames
+  re-encoded for Discord"). The old `-U -O2` / plain `-U` rungs are gone (plain `-U` kept the bad frames).
+  Cached results are re-rendered (`PipelineVersion` 2026-09-19.2, `RulesVersion` 2026-09-19.1);
+  DESIGN.md §5.2 item 9 and §5.3. **Verified on Discord:** the six-variant matrix, and the
+  pipeline's output for the reported recipe is byte-identical to its variant 2 (58,640 B, ok).
+  The repaired / coalesced forms and other inputs have not been uploaded. Known limits
+  (DESIGN.md §11): in the optimize preset and fit candidates the repair applies `--lossy` a
+  second time; a GIF too large to analyse (16 M canvas pixels / 2³¹ decoded pixels), a frame
+  outside the logical screen or a reserved disposal value ends the analysis and the check passes
+  with a "not analysed" note.

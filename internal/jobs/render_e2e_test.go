@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/duckautomata/ez-local-gif/internal/discordlint"
+	"github.com/duckautomata/ez-local-gif/internal/enc"
 	"github.com/duckautomata/ez-local-gif/internal/ffrun"
 	"github.com/duckautomata/ez-local-gif/internal/probe"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
@@ -738,5 +739,466 @@ func TestRenderEndToEnd(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(st.ResultDir(ResultKey(recipe.Recipe{Sources: []string{blob.Hash}, Output: recipe.Output{Format: "gif", Width: 32, Height: 32, Target: "emote", Lossy: 30}, Ops: []recipe.Op{{Kind: recipe.OpFPS, Params: json.RawMessage(`{"fps":10}`)}}})), store.ManifestName)); err != nil {
 		t.Errorf("gif manifest missing on disk: %v", err)
+	}
+}
+
+// ---- held frames (gif.noop-frame-disposal) -----------------------------------
+
+// holdPoses are the three sprite positions of the hold fixtures (64x48
+// canvas): disjoint rects, so a pose that is never cleared stays visible
+// next to the following one.
+var holdPoses = []image.Rectangle{image.Rect(4, 6, 20, 22), image.Rect(24, 20, 40, 36), image.Rect(44, 28, 60, 44)}
+
+// holdsPalette: index 0 is transparent.
+var holdsPalette = color.Palette{color.RGBA{0, 0, 0, 0}, color.RGBA{220, 30, 30, 255}, color.RGBA{30, 30, 220, 255}}
+
+// holdsGIF builds a transparent 64x48 GIF at 25 fps whose red sprite changes
+// pose every 25 frames (3 poses, 75 frames, every frame a full-canvas
+// disposal-2 frame — what ffmpeg writes for an alpha source): the shape that
+// made gifsicle emit a clear-only frame after each hold.
+func holdsGIF(t *testing.T) []byte {
+	t.Helper()
+	g := &gif.GIF{LoopCount: 0, Config: image.Config{Width: 64, Height: 48, ColorModel: holdsPalette}} // one global palette
+	for i := 0; i < 75; i++ {
+		fr := image.NewPaletted(image.Rect(0, 0, 64, 48), holdsPalette)
+		fillRect(fr, holdPoses[i/25], 1)
+		g.Image = append(g.Image, fr)
+		g.Delay = append(g.Delay, 4)
+		g.Disposal = append(g.Disposal, gif.DisposalBackground)
+	}
+	return encodeTestGIF(t, g)
+}
+
+// unsafeHoldsGIF synthesises the frame structure gifsicle -O2 writes for a
+// transparent animation with holds: each pose is a disposal-1 frame with a
+// long delay followed by a short all-transparent disposal-2 frame over the
+// pose's rect whose only job is to clear it. Frames 1 and 3 are unsafe
+// no-ops (frame 5 is the last one: harmless).
+func unsafeHoldsGIF(t *testing.T) []byte {
+	t.Helper()
+	g := &gif.GIF{LoopCount: 0, Config: image.Config{Width: 64, Height: 48, ColorModel: holdsPalette}}
+	for _, pose := range holdPoses {
+		fr := image.NewPaletted(image.Rect(0, 0, 64, 48), holdsPalette)
+		fillRect(fr, pose, 1)
+		g.Image = append(g.Image, fr, image.NewPaletted(pose, holdsPalette))
+		g.Delay = append(g.Delay, 96, 4)
+		g.Disposal = append(g.Disposal, gif.DisposalNone, gif.DisposalBackground)
+	}
+	return encodeTestGIF(t, g)
+}
+
+func fillRect(fr *image.Paletted, r image.Rectangle, idx uint8) {
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			fr.SetColorIndex(x, y, idx)
+		}
+	}
+}
+
+func encodeTestGIF(t *testing.T, g *gif.GIF) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, g); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// holdsCheck returns the gif.noop-frame-disposal check of a report.
+func holdsCheck(t *testing.T, rep *discordlint.Report) discordlint.Check {
+	t.Helper()
+	if rep == nil {
+		t.Fatal("no report")
+	}
+	for _, c := range rep.Checks {
+		if c.Rule == discordlint.RuleGIFNoopFrameDisposal {
+			return c
+		}
+	}
+	t.Fatalf("report has no %s check: %+v", discordlint.RuleGIFNoopFrameDisposal, rep.Checks)
+	return discordlint.Check{}
+}
+
+// assertOnePosePerFrame composites data per the GIF spec (disposal 0/1/2)
+// and checks that every displayed frame shows exactly one of holdPoses — a
+// pose that was never cleared shows up as a second one — and that all three
+// are shown in order. It returns the frame count.
+func assertOnePosePerFrame(t *testing.T, data []byte) int {
+	t.Helper()
+	g, err := gif.DecodeAll(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	canvas := image.NewRGBA(image.Rect(0, 0, g.Config.Width, g.Config.Height))
+	var order []int
+	for k, fr := range g.Image {
+		b := fr.Bounds()
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				if c := fr.At(x, y); !isTransparent(c) {
+					canvas.Set(x, y, c)
+				}
+			}
+		}
+		var shown []int
+		for p, pose := range holdPoses {
+			cx, cy := (pose.Min.X+pose.Max.X)/2, (pose.Min.Y+pose.Max.Y)/2
+			if !isTransparent(canvas.At(cx, cy)) {
+				shown = append(shown, p)
+			}
+		}
+		if len(shown) != 1 {
+			t.Errorf("frame %d shows poses %v, want exactly one", k, shown)
+		} else if len(order) == 0 || order[len(order)-1] != shown[0] {
+			order = append(order, shown[0])
+		}
+		switch g.Disposal[k] {
+		case gif.DisposalBackground:
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					canvas.Set(x, y, color.RGBA{})
+				}
+			}
+		case gif.DisposalPrevious:
+			t.Fatalf("frame %d uses disposal 3", k)
+		}
+	}
+	if fmt.Sprint(order) != "[0 1 2]" {
+		t.Errorf("pose order = %v, want [0 1 2]", order)
+	}
+	return len(g.Image)
+}
+
+func isTransparent(c color.Color) bool {
+	_, _, _, a := c.RGBA()
+	return a == 0
+}
+
+// TestRenderGIFWithHolds: a transparent source whose sprite holds each pose
+// renders to a GIF Discord plays right. Discord drops frames that do not
+// change the picture — and their disposal with them — and gifsicle's
+// optimiser turns a run of identical frames into one long frame plus a short
+// clear-only frame of exactly that kind, so the next pose stacked on the old
+// one. The pipeline merges the held frames before gifsicle sees them: the
+// final file passes gif.noop-frame-disposal, has nothing left to merge, shows
+// one pose per frame in a spec decoder and has far fewer frames than the
+// master (with and without gifsicle: the merge does not depend on it).
+func TestRenderGIFWithHolds(t *testing.T) {
+	tools := realTools(t)
+	st := newTestStore(t)
+	blob, err := st.PutBlob(bytes.NewReader(holdsGIF(t)), "holds.gif")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	info, err := probe.Probe(ctx, tools, blob.Path, 0)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if err := st.SetBlobInfo(blob.Hash, info); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("gifsicle: %q", tools.Gifsicle)
+	// fps 10 is no drop-every-N of 25 fps: the decode pipeline renders it
+	// (30 master frames, holds of 10), never the gifsicle fast path.
+	ops := []recipe.Op{{Kind: recipe.OpFPS, Params: json.RawMessage(`{"fps":10}`)}}
+	const masterFrames = 30
+	noGifsicle := tools
+	noGifsicle.Gifsicle = ""
+	for _, c := range []struct {
+		name  string
+		tools ffrun.Tools
+		out   recipe.Output
+	}{
+		{"attachment", tools, recipe.Output{Format: "gif", Target: "attachment"}},
+		{"attachment-lossy", tools, recipe.Output{Format: "gif", Target: "attachment", Lossy: 40, Colors: 32}},
+		{"attachment-fit", tools, recipe.Output{Format: "gif", Target: "attachment", FitBytes: 200000}},
+		{"no-target", tools, recipe.Output{Format: "gif"}},
+		{"no-gifsicle", noGifsicle, recipe.Output{Format: "gif", Target: "attachment", Dither: "none"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := NewManager(st, c.tools, Options{Concurrency: 1})
+			r := recipe.Recipe{Sources: []string{blob.Hash}, Ops: ops, Output: c.out}
+			fin := runJob(t, m, r)
+			if fin.State != StateDone {
+				t.Fatalf("job failed: %s (stage %s)", fin.Error, fin.Stage)
+			}
+			f := fin.Result.Files[0]
+			if chk := holdsCheck(t, f.Report); !chk.OK {
+				t.Errorf("%s failed: %s", chk.Rule, chk.Detail)
+			} else {
+				t.Logf("%s: %s", chk.Rule, chk.Detail)
+			}
+			if c.out.Target != "" && !f.Report.OK {
+				t.Errorf("report not OK: %+v", f.Report.Checks)
+			}
+			data, err := os.ReadFile(filepath.Join(st.ResultDir(ResultKey(r)), f.Name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, merged, err := discordlint.MergeGIFHolds(data); err != nil || merged != 0 {
+				t.Errorf("MergeGIFHolds(final) merged %d frames (%v), want 0", merged, err)
+			}
+			frames := assertOnePosePerFrame(t, data)
+			t.Logf("%s: %d frames (master %d), %d bytes, desc %q", f.Name, frames, masterFrames, len(data), f.Desc)
+			if frames > masterFrames/3 {
+				t.Errorf("%d frames: the holds of the %d-frame master were not merged", frames, masterFrames)
+			}
+		})
+	}
+}
+
+// TestLintGIFRepairsUnsafeHolds feeds the lint ladder a GIF with the unsafe
+// clear-only frames (real gifsicle needed for the repair): the first lint
+// fails gif.noop-frame-disposal only and the hold repair's output passes, is
+// pixel-correct and keeps the loop count (that the --colors rung is skipped
+// is pinned by the fake-gifsicle TestLintGIFLadderRungs). The same source
+// through the paths that run gifsicle on a GIF directly — the lossless fast
+// path and the optimize preset, single-shot and with a fit budget — comes out
+// repaired too, with truthful descriptions, for a Discord target (the rule is
+// an error) and for target none (a warning; the SPA's Optimize preset
+// default) alike.
+func TestLintGIFRepairsUnsafeHolds(t *testing.T) {
+	tools := realTools(t)
+	if tools.Gifsicle == "" {
+		t.Skip("gifsicle not on PATH")
+	}
+	src := unsafeHoldsGIF(t)
+	rep, _, err := discordlint.LintGIF(src, discordlint.TargetAttachment, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chk := holdsCheck(t, &rep); chk.OK || chk.Level != discordlint.LevelError || !onlyHoldsFailed(rep) {
+		t.Fatalf("fixture must fail %s only: %+v", discordlint.RuleGIFNoopFrameDisposal, rep.Checks)
+	}
+	st := newTestStore(t)
+	m := NewManager(st, tools, Options{Concurrency: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	t.Run("ladder", func(t *testing.T) {
+		j := &job{snap: Job{ID: "holds", State: StateRunning, Stage: StageLint}, cancel: func() {}, subs: map[int]*subscriber{}}
+		scratch := t.TempDir()
+		var steps []string
+		data, rep, err := m.lintGIF(ctx, j, scratch, src, discordlint.TargetAttachment, recipe.Output{Format: "gif", Loop: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chk := holdsCheck(t, &rep); !chk.OK {
+			t.Errorf("after the ladder: %s", chk.Detail)
+		}
+		if !rep.OK {
+			t.Errorf("report not OK: %+v", rep.Checks)
+		}
+		if n := assertOnePosePerFrame(t, data); n != 3 {
+			t.Errorf("%d frames, want the 3 poses", n)
+		}
+		if left, _ := filepath.Glob(filepath.Join(scratch, "*.gif")); len(left) != 0 {
+			t.Errorf("repair left scratch files: %v", left)
+		}
+		// The helper on its own: the steps it announces, a harsh lossy knob,
+		// and a finite loop count restated by both passes.
+		out, orep, err := m.repairGIFHolds(ctx, scratch, "-x", src, discordlint.TargetNone, enc.GifsicleOptions{Lossy: 200, Loop: 2}, func(s string) { steps = append(steps, s) })
+		if err != nil || hasStructuralError(orep) {
+			t.Fatalf("repairGIFHolds: %v %+v", err, orep.Checks)
+		}
+		if chk := holdsCheck(t, &orep); !chk.OK {
+			t.Errorf("repairGIFHolds: %s", chk.Detail)
+		}
+		assertOnePosePerFrame(t, out)
+		if g, err := gif.DecodeAll(bytes.NewReader(out)); err != nil || g.LoopCount != 2 {
+			t.Errorf("loop count after the repair: %v (%v), want 2", g.LoopCount, err)
+		}
+		if len(steps) != 2 || !strings.Contains(steps[0], "-U") || !strings.Contains(steps[1], "-O2") {
+			t.Errorf("announced steps = %q", steps)
+		}
+	})
+
+	blob, err := st.PutBlob(bytes.NewReader(src), "unsafe-holds.gif")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := probe.Probe(ctx, tools, blob.Path, 0)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if err := st.SetBlobInfo(blob.Hash, info); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		out  recipe.Output
+	}{
+		{"fast-path", recipe.Output{Format: "gif", Target: "attachment"}},
+		{"optimize", recipe.Output{Format: "gif", Target: "attachment", Preset: "optimize"}},
+		{"optimize-lossy", recipe.Output{Format: "gif", Target: "attachment", Preset: "optimize", Lossy: 30}},
+		{"optimize-fit", recipe.Output{Format: "gif", Target: "attachment", Preset: "optimize", FitBytes: 100000}},
+		{"fast-path-none", recipe.Output{Format: "gif", Loop: 3}},
+		{"optimize-none", recipe.Output{Format: "gif", Preset: "optimize", Colors: 256, Dither: "bayer", Lossy: 30}}, // the SPA's defaults
+		{"optimize-fit-none", recipe.Output{Format: "gif", Preset: "optimize", FitBytes: 100000}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := recipe.Recipe{Sources: []string{blob.Hash}, Output: c.out}
+			fin := runJob(t, m, r)
+			if fin.State != StateDone {
+				t.Fatalf("job failed: %s (stage %s)", fin.Error, fin.Stage)
+			}
+			f := fin.Result.Files[0]
+			if chk := holdsCheck(t, f.Report); !chk.OK {
+				t.Errorf("%s failed: %s", chk.Rule, chk.Detail)
+			}
+			if !f.Report.OK {
+				t.Errorf("report not OK (desc %q): %+v", f.Desc, f.Report.Checks)
+			}
+			// The fit alternatives are deliverables too.
+			for _, alt := range fin.Result.Files[1:] {
+				if alt.Report == nil || alt.Format != recipe.FormatGIF {
+					continue
+				}
+				if chk := holdsCheck(t, alt.Report); !chk.OK {
+					t.Errorf("%s (%q): %s failed: %s", alt.Name, alt.Desc, chk.Rule, chk.Detail)
+				}
+			}
+			data, err := os.ReadFile(filepath.Join(st.ResultDir(ResultKey(r)), f.Name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOnePosePerFrame(t, data)
+			t.Logf("%s: %d bytes, desc %q", f.Name, len(data), f.Desc)
+			if _, merged, err := discordlint.MergeGIFHolds(data); err != nil || merged != 0 {
+				t.Errorf("MergeGIFHolds(final) merged %d frames (%v), want 0", merged, err)
+			}
+			if strings.HasPrefix(c.name, "fast-path") {
+				if f.Desc != FastPathDesc {
+					t.Errorf("desc = %q, want %q", f.Desc, FastPathDesc)
+				}
+			} else if !strings.Contains(f.Desc, holdRepairNote) {
+				t.Errorf("desc %q does not mention the hold repair", f.Desc)
+			}
+		})
+	}
+}
+
+// nearHoldsPalette: index 0 is transparent; every pose colour is followed by
+// a neighbour one RGB unit away.
+var nearHoldsPalette = color.Palette{
+	color.RGBA{0, 0, 0, 0},
+	color.RGBA{200, 50, 50, 255}, color.RGBA{201, 50, 50, 255},
+	color.RGBA{50, 200, 50, 255}, color.RGBA{51, 200, 50, 255},
+	color.RGBA{50, 50, 200, 255}, color.RGBA{50, 51, 201, 255},
+}
+
+// nearHoldsGIF builds a transparent 64x48 GIF of 72 full-canvas disposal-2
+// frames with NO identical neighbours — nothing for MergeGIFHolds to fold —
+// but with near-holds: per pose one base frame plus three frames in which
+// five pose pixels take the neighbour colour. Any gifsicle --lossy pass
+// flattens those into true holds and its optimiser then writes the clear-only
+// frames gif.noop-frame-disposal is about. Pixel positions come from a fixed
+// LCG: the fixture is the same on every run.
+func nearHoldsGIF(t *testing.T) []byte {
+	t.Helper()
+	poses := []image.Rectangle{image.Rect(4, 4, 24, 24), image.Rect(30, 10, 60, 40), image.Rect(10, 26, 40, 46)}
+	lcg := uint32(1)
+	next := func(n int) int {
+		lcg = lcg*1664525 + 1013904223
+		return int(lcg>>16) % n
+	}
+	g := &gif.GIF{LoopCount: 0, Config: image.Config{Width: 64, Height: 48, ColorModel: nearHoldsPalette}}
+	add := func(fr *image.Paletted) {
+		g.Image = append(g.Image, fr)
+		g.Delay = append(g.Delay, 4)
+		g.Disposal = append(g.Disposal, gif.DisposalBackground)
+	}
+	for cycle := 0; cycle < 6; cycle++ {
+		for p, pose := range poses {
+			base := uint8(1 + 2*p)
+			fr := image.NewPaletted(image.Rect(0, 0, 64, 48), nearHoldsPalette)
+			fillRect(fr, pose, base)
+			add(fr)
+			for k := 0; k < 3; k++ {
+				nf := image.NewPaletted(fr.Rect, nearHoldsPalette)
+				copy(nf.Pix, fr.Pix)
+				for i := 0; i < 5; i++ {
+					nf.SetColorIndex(pose.Min.X+next(pose.Dx()), pose.Min.Y+next(pose.Dy()), base+1)
+				}
+				add(nf)
+			}
+		}
+	}
+	return encodeTestGIF(t, g)
+}
+
+// TestRenderFitRepairsLossyHolds exercises the render-fit safety net
+// (fitRun.encode → repairIfOnlyHolds), which the pre-gifsicle merge cannot
+// replace: the source has no identical frames, the lossy knob of the fit
+// search makes them. Every candidate below the lossless size comes out of
+// gifsicle --lossy with clear-only frames; the delivered file must be the
+// REPAIRED one — bytes on disk, reported size, report and description.
+func TestRenderFitRepairsLossyHolds(t *testing.T) {
+	tools := realTools(t)
+	if tools.Gifsicle == "" {
+		t.Skip("gifsicle not on PATH")
+	}
+	src := nearHoldsGIF(t)
+	if _, merged, err := discordlint.MergeGIFHolds(src); err != nil || merged != 0 {
+		t.Fatalf("fixture: MergeGIFHolds merged %d frames (%v), want 0 — the pre-merge must not be what fixes this source", merged, err)
+	}
+	st := newTestStore(t)
+	blob, err := st.PutBlob(bytes.NewReader(src), "near-holds.gif")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	info, err := probe.Probe(ctx, tools, blob.Path, 0)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if err := st.SetBlobInfo(blob.Hash, info); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(st, tools, Options{Concurrency: 1})
+	render := func(target string, fitBytes int64) (recipe.Recipe, File) {
+		t.Helper()
+		r := recipe.Recipe{Sources: []string{blob.Hash}, Output: recipe.Output{Format: "gif", Target: target, FitBytes: fitBytes, FitKeepFPS: true, FitKeepSize: true}}
+		fin := runJob(t, m, r)
+		if fin.State != StateDone {
+			t.Fatalf("job failed: %s (stage %s)", fin.Error, fin.Stage)
+		}
+		return r, fin.Result.Files[0]
+	}
+	_, lossless := render("attachment", 1<<20)
+	if strings.Contains(lossless.Desc, holdRepairNote) {
+		t.Fatalf("the lossless render was repaired (desc %q): the fixture has true holds", lossless.Desc)
+	}
+	t.Logf("lossless: %d bytes, desc %q", lossless.Bytes, lossless.Desc)
+	// Target none: the rule is a warning there and is repaired all the same.
+	for _, target := range []string{"attachment", ""} {
+		t.Run("target="+target, func(t *testing.T) {
+			r, f := render(target, lossless.Bytes*95/100)
+			t.Logf("%s: %d bytes, desc %q", f.Name, f.Bytes, f.Desc)
+			if f.Report == nil || !f.Report.OK {
+				t.Fatalf("report not OK: %+v", f.Report)
+			}
+			if !strings.Contains(f.Desc, holdRepairNote) {
+				t.Errorf("desc %q does not mention the hold repair: the safety net did not run", f.Desc)
+			}
+			data, err := os.ReadFile(filepath.Join(st.ResultDir(ResultKey(r)), f.Name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if int64(len(data)) != f.Bytes {
+				t.Errorf("delivered %d bytes, reported %d", len(data), f.Bytes)
+			}
+			// The delivered bytes, not the report the search kept.
+			rep, _, err := discordlint.LintGIF(data, discordlint.Target(target), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if chk := holdsCheck(t, &rep); !chk.OK {
+				t.Errorf("delivered file fails %s: %s", chk.Rule, chk.Detail)
+			}
+		})
 	}
 }

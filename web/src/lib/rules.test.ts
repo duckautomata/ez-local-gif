@@ -8,6 +8,7 @@ const GIF = [
   'gif.frame0-transparency',
   'gif.lsd-background-index',
   'gif.disposal',
+  'gif.noop-frame-disposal',
   'gif.netscape-loop',
   'gif.min-delay',
   'gif.global-palette',
@@ -65,6 +66,11 @@ describe('ruleLabel', () => {
   });
   it('lists exactly the rules it knows', () => {
     expect(new Set(knownRules())).toEqual(new Set([...GIF, ...WEBP, ...APNG, ...STATIC, ...VIDEO, ...JOBS]));
+  });
+  it('labels the no-op frame rule next to gif.disposal and says why it matters', () => {
+    const ids = knownRules();
+    expect(ids.indexOf('gif.noop-frame-disposal')).toBe(ids.indexOf('gif.disposal') + 1);
+    expect(ruleLabel('gif.noop-frame-disposal')).toMatch(/disposal.*Discord drops/);
   });
   it('labels the jobs-level fit rule and the apng.indexed check for both outcomes', () => {
     expect(ruleLabel('fit.target')).toBe('Fit-to-size budget reached');

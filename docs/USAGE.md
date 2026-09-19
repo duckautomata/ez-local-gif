@@ -150,8 +150,9 @@ the same. Notes:
 
 ## Troubleshooting
 
-All three are ownership / sizing problems between the container (uid 1000, `/dev/shm` scratch)
-and what the Docker daemon hands it. `docker compose logs app` shows the exact line.
+The first three are ownership / sizing problems between the container (uid 1000, `/dev/shm`
+scratch) and what the Docker daemon hands it — `docker compose logs app` shows the exact line;
+the last one is about a rendered file.
 
 **`store: /data/blobs is not writable by uid 1000 (...)` and the container exits at startup.**
 The `ezlg-data` volume (or whatever you bound to `/data`) was created or populated by another
@@ -191,3 +192,15 @@ sets `shm_size: "4gb"`; you see this when the image is run with a plain `docker 
 ignores it (Swarm/Kubernetes: mount an `emptyDir` with `medium: Memory` at `/dev/shm` instead).
 Anything ≥ 256 MiB stops the warning; 4 GiB is sized for 1080p sources (8.3 MB per frame). On WSL2
 also raise `memory=` in `%UserProfile%\.wslconfig` (see above) so the tmpfs has RAM to back it.
+
+**A transparent GIF "stacks" on Discord — each new pose is drawn on top of the old one — although
+it plays correctly in a browser.** GIFs rendered before the 2026-09-19 fix could do this when the
+subject holds still between poses: Discord drops a frame that does not change the picture, and
+with it the "clear this area" disposal gifsicle's optimiser had parked on that frame
+([`DESIGN.md`](DESIGN.md) §5.2 item 9). Render the recipe again — the fix bumped the result-cache
+versions, so it is re-rendered rather than served from cache — and upload the new file. The
+result card's Discord check `gif.noop-frame-disposal` names such frames when a GIF has them (an
+error for Discord targets, a warning for target none). When a render, an Optimize run or a fit
+candidate comes out with such frames the app re-encodes it by itself, for every target (Optimize
+and fit results then say "held frames re-encoded for Discord" in their description); you only
+see the check fail when that repair was not possible — for example no gifsicle on the server.

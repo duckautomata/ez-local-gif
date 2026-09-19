@@ -1177,6 +1177,31 @@ func TestGifsicleArgs(t *testing.T) {
 			o:    GifsicleOptions{Loop: 100000},
 			want: []string{"-O2", "--careful", "--loopcount=65535", "in.gif", "-o", "out.gif"},
 		},
+		{
+			name: "coalesce rung: -U, --disposal=background, no -O (full-canvas disposal-2 frames)",
+			o:    GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true},
+			want: []string{"-U", "--disposal=background", "--careful", "--loopcount=forever", "in.gif", "-o", "out.gif"},
+		},
+		{
+			name: "coalesce rung with lossy and a loop count",
+			o:    GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true, Lossy: 40, Loop: 3},
+			want: []string{"-U", "--disposal=background", "--careful", "--lossy=40", "--loopcount=3", "in.gif", "-o", "out.gif"},
+		},
+		{
+			name: "NoOptimize alone is a plain rewrite; OptimizeLevel is ignored",
+			o:    GifsicleOptions{NoOptimize: true, OptimizeLevel: 3},
+			want: []string{"--careful", "--loopcount=forever", "in.gif", "-o", "out.gif"},
+		},
+		{
+			name: "DisposeBackground without Unoptimize comes first, before -O",
+			o:    GifsicleOptions{DisposeBackground: true},
+			want: []string{"--disposal=background", "-O2", "--careful", "--loopcount=forever", "in.gif", "-o", "out.gif"},
+		},
+		{
+			name: "everything on with the new flags, order fixed",
+			o:    GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true, NoCareful: true, Lossy: 80, Colors: 64, Dither: "o8", Threads: 4, Loop: 1},
+			want: []string{"-U", "--disposal=background", "--lossy=80", "--colors", "64", "--dither=o8", "-j4", "--loopcount=1", "in.gif", "-o", "out.gif"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

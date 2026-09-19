@@ -857,7 +857,10 @@ if [ -n "$green_hash" ]; then
   recipe[chromakey]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"chromakey","params":{"color":"00ff00"}}],"output":{"format":"gif","width":128,"height":128,"fit":"contain","fps":20,"preset":"emote","target":"emote"}}'
   recipe[colorkey]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"colorkey","params":{"color":"00ff00","similarity":0.1}}],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
   recipe[feather]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"chromakey","params":{"color":"00ff00"}},{"kind":"feather","params":{"radius":3}}],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
-  phase3_jobs+=(chromakey colorkey feather)
+  # 50 fps out of the 30 fps clip: the fps filter repeats two frames in three,
+  # i.e. a transparent GIF made of short holds (see the holds check below).
+  recipe[holds]='{"v":1,"sources":["'"$green_hash"'"],"ops":[{"kind":"chromakey","params":{"color":"00ff00"}},{"kind":"fps","params":{"fps":50}}],"output":{"format":"gif","preset":"custom","target":"attachment"}}'
+  phase3_jobs+=(chromakey colorkey feather holds)
 fi
 if [ -n "$png_hash" ]; then
   recipe[overlay-png]='{"v":1,"sources":["'"$hash"'","'"$png_hash"'"],"ops":['"$unp"','"$ov_png_op"'],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
@@ -890,6 +893,35 @@ if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name gif; then
   fi
   if have "$gifsicle" && [ "$(gif_screen_size "$f")" = 128x128 ]; then ok "$name: gif is 128x128"; else fail "$name: gif is not 128x128"; fi
   if [ "$(fsize "$f")" -le 262144 ]; then ok "$name: ≤ 262144 bytes (emote budget)"; else fail "$name: $(fsize "$f") bytes > 262144"; fi
+fi
+
+# ---- holds: a transparent GIF with held frames. Discord drops frames that
+# do not change the picture — and their disposal with them — and gifsicle's
+# optimiser turns a run of identical frames into one long frame plus a short
+# clear-only frame of exactly that kind (the next pose then stacks on the old
+# one). The server merges held frames before gifsicle sees them: the lint row
+# passes and the repeated frames are gone (2 s × 50 fps = 100 master frames,
+# ~60 distinct ones). This case checks the outcome only: were the merge lost,
+# the lint ladder's hold repair (which runs for every target, none included)
+# would deliver the same structure at the cost of two more gifsicle passes.
+# That the merge itself runs before gifsicle is pinned by the Go tests
+# TestEncodeGIFAtMergesBeforeGifsicle (tool-free) and
+# TestRenderGIFWithHolds/no-gifsicle in internal/jobs.
+name=holds
+if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name gif; then
+  f=${out_file[$name]}
+  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; else fail "$name: primary report.ok != true"; fi
+  if primary_check_ok "$tmp/poll_$name.json" gif.noop-frame-disposal; then
+    ok "$name: lint row gif.noop-frame-disposal is ok (no clear-only frame Discord would drop)"
+  else
+    fail "$name: lint row gif.noop-frame-disposal missing or not ok"
+  fi
+  n=$(gif_frames "$f")
+  if [ "${n:-0}" -ge 2 ] && [ "${n:-0}" -le 70 ]; then
+    ok "$name: $n frames (held frames of the 100-frame master merged)"
+  else
+    fail "$name: ${n:-0} frames, want 2..70 — the held frames of the 100-frame master were not merged"
+  fi
 fi
 
 # ---- colorkey: pick-a-colour key → chat WebP with alpha
