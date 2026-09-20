@@ -129,9 +129,12 @@ func TestGIFArgs_Variant(t *testing.T) {
 	gifTail := func(filter string) []string {
 		return []string{"-filter_complex", filter, "-map", "[out]", "-loop", "0", "-f", "gif", "out.gif"}
 	}
+	gifAlphaTail := func(filter string) []string { // alpha: full-canvas frames, see GIFArgs
+		return []string{"-filter_complex", filter, "-map", "[out]", "-gifflags", "-offsetting", "-loop", "0", "-f", "gif", "out.gif"}
+	}
 	t.Run("alpha: colour source takes the variant size and rate", func(t *testing.T) {
 		got := GIFArgs(m, GIFOptions{HasAlpha: true, Variant: &Variant{FPS: 20, Width: 160}}, "out.gif")
-		want := withRaw(gifTail(
+		want := withRaw(gifAlphaTail(
 			"[0:v]" + vfFPS20Scale + "[v];" +
 				"[v]split[c][a];" +
 				"[a]alphaextract,lut=c0='gte(val,128)*255'[m];" +
@@ -157,7 +160,7 @@ func TestGIFArgs_Variant(t *testing.T) {
 		plain := GIFArgs(m, GIFOptions{HasAlpha: true}, "out.gif")
 		assertArgs(t, GIFArgs(m, GIFOptions{HasAlpha: true, Variant: &Variant{}}, "out.gif"), plain)
 		assertArgs(t, GIFArgs(m, GIFOptions{HasAlpha: true, Variant: &Variant{FPS: 25, Width: 320}}, "out.gif"), plain)
-		assertArgs(t, plain, withRaw(gifTail(gifAlphaFilter)...))
+		assertArgs(t, plain, withRaw(gifAlphaTail(gifAlphaFilter)...))
 	})
 }
 

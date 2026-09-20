@@ -985,6 +985,11 @@ func TestGIFArgs(t *testing.T) {
 	gifTail := func(filter, loop string) []string {
 		return []string{"-filter_complex", filter, "-map", "[out]", "-loop", loop, "-f", "gif", "out.gif"}
 	}
+	// Alpha masters: full-canvas frames (ffmpeg's bounding-box crop of
+	// transparent frames cuts off bottom-row pixels, see GIFArgs).
+	gifAlphaTail := func(filter, loop string) []string {
+		return []string{"-filter_complex", filter, "-map", "[out]", "-gifflags", "-offsetting", "-loop", loop, "-f", "gif", "out.gif"}
+	}
 
 	tests := []struct {
 		name string
@@ -996,7 +1001,25 @@ func TestGIFArgs(t *testing.T) {
 			name: "defaults with alpha (Discord-safe)",
 			m:    testMaster(),
 			o:    GIFOptions{HasAlpha: true},
-			want: append(append([]string{}, raw...), gifTail(gifAlphaFilter, "0")...),
+			want: append(append([]string{}, raw...), gifAlphaTail(gifAlphaFilter, "0")...),
+		},
+		{
+			// A clip that mixes fully opaque and transparent frames: no
+			// inter-frame transparency either (second encode, see GIFArgs).
+			name: "alpha, complete frames",
+			m:    testMaster(),
+			o:    GIFOptions{HasAlpha: true, CompleteFrames: true},
+			want: append(append([]string{}, raw...), "-filter_complex", gifAlphaFilter, "-map", "[out]",
+				"-gifflags", "-offsetting-transdiff", "-loop", "0", "-f", "gif", "out.gif"),
+		},
+		{
+			name: "complete frames without alpha changes nothing",
+			m:    testMaster(),
+			o:    GIFOptions{CompleteFrames: true},
+			want: append(append([]string{}, raw...), gifTail(
+				"[0:v]split[p1][p2];"+
+					"[p1]palettegen=max_colors=256:reserve_transparent=0:stats_mode=diff[pal];"+
+					"[p2][pal]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle[out]", "0")...),
 		},
 		{
 			name: "defaults without alpha",
@@ -1014,7 +1037,7 @@ func TestGIFArgs(t *testing.T) {
 				Colors: 128, Dither: "sierra2_4a", AlphaThreshold: 180, Matte: "#FFFFFF",
 				Loop: 3, StatsMode: "full", HasAlpha: true,
 			},
-			want: append(append([]string{}, raw...), gifTail(
+			want: append(append([]string{}, raw...), gifAlphaTail(
 				"[0:v]split[c][a];"+
 					"[a]alphaextract,lut=c0='gte(val,180)*255'[m];"+
 					"color=c=0xffffff:s=320x240:r=25,format=rgba[bg];"+
@@ -1048,7 +1071,7 @@ func TestGIFArgs(t *testing.T) {
 				Colors: 999, Dither: "bogus", BayerScale: 9, AlphaThreshold: 300,
 				Matte: "not-a-colour", Loop: -5, StatsMode: "weird", HasAlpha: true,
 			},
-			want: append(append([]string{}, raw...), gifTail(
+			want: append(append([]string{}, raw...), gifAlphaTail(
 				"[0:v]split[c][a];"+
 					"[a]alphaextract,lut=c0='gte(val,255)*255'[m];"+
 					"color=c=0x313338:s=320x240:r=25,format=rgba[bg];"+
@@ -1063,7 +1086,7 @@ func TestGIFArgs(t *testing.T) {
 			name: "low clamps and RRGGBBAA matte: alpha keeps room for the transparent slot",
 			m:    Master{Path: "/dev/shm/ezl/job1/frames.rgba", Width: 320, Height: 240, FPS: 25},
 			o:    GIFOptions{Colors: 1, AlphaThreshold: -4, Matte: "AbCdEf80", Dither: "none", HasAlpha: true},
-			want: append(append([]string{}, raw...), gifTail(
+			want: append(append([]string{}, raw...), gifAlphaTail(
 				"[0:v]split[c][a];"+
 					"[a]alphaextract,lut=c0='gte(val,1)*255'[m];"+
 					"color=c=0xabcdef:s=320x240:r=25,format=rgba[bg];"+
@@ -1076,14 +1099,14 @@ func TestGIFArgs(t *testing.T) {
 			name: "2 colours with alpha is raised to 3",
 			m:    testMaster(),
 			o:    GIFOptions{Colors: 2, HasAlpha: true},
-			want: append(append([]string{}, raw...), gifTail(
+			want: append(append([]string{}, raw...), gifAlphaTail(
 				strings.Replace(gifAlphaFilter, "max_colors=256", "max_colors=3", 1), "0")...),
 		},
 		{
 			name: "3 colours with alpha passes through",
 			m:    testMaster(),
 			o:    GIFOptions{Colors: 3, HasAlpha: true},
-			want: append(append([]string{}, raw...), gifTail(
+			want: append(append([]string{}, raw...), gifAlphaTail(
 				strings.Replace(gifAlphaFilter, "max_colors=256", "max_colors=3", 1), "0")...),
 		},
 		{
@@ -1109,14 +1132,14 @@ func TestGIFArgs(t *testing.T) {
 			m:    Master{Path: "/dev/shm/ezl/job1/frames.rgba", Width: 128, Height: 128, FPS: 100.0 / 3, HasAlpha: true},
 			o:    GIFOptions{HasAlpha: true},
 			want: append([]string{"-f", "rawvideo", "-pix_fmt", "rgba", "-s", "128x128", "-r", "33.333333", "-i", "/dev/shm/ezl/job1/frames.rgba"},
-				gifTail(strings.NewReplacer("s=320x240:r=25", "s=128x128:r=33.333333").Replace(gifAlphaFilter), "0")...),
+				gifAlphaTail(strings.NewReplacer("s=320x240:r=25", "s=128x128:r=33.333333").Replace(gifAlphaFilter), "0")...),
 		},
 		{
 			name: "NTSC fps (what a gif plan of a 29.97 source now carries) is written as 29.97",
 			m:    Master{Path: "/dev/shm/ezl/job1/frames.rgba", Width: 128, Height: 128, FPS: 29.97, HasAlpha: true},
 			o:    GIFOptions{HasAlpha: true},
 			want: append([]string{"-f", "rawvideo", "-pix_fmt", "rgba", "-s", "128x128", "-r", "29.97", "-i", "/dev/shm/ezl/job1/frames.rgba"},
-				gifTail(strings.NewReplacer("s=320x240:r=25", "s=128x128:r=29.97").Replace(gifAlphaFilter), "0")...),
+				gifAlphaTail(strings.NewReplacer("s=320x240:r=25", "s=128x128:r=29.97").Replace(gifAlphaFilter), "0")...),
 		},
 	}
 	for _, tc := range tests {
@@ -1186,6 +1209,18 @@ func TestGifsicleArgs(t *testing.T) {
 			name: "coalesce rung with lossy and a loop count",
 			o:    GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true, Lossy: 40, Loop: 3},
 			want: []string{"-U", "--disposal=background", "--careful", "--lossy=40", "--loopcount=3", "in.gif", "-o", "out.gif"},
+		},
+		{
+			// The coalesce of an input with a transparent lead-in frame: the
+			// selection follows the input it applies to.
+			name: "coalesce rung, lead-in frame skipped",
+			o:    GifsicleOptions{Unoptimize: true, DisposeBackground: true, NoOptimize: true, SkipFirstFrame: true, Loop: 3},
+			want: []string{"-U", "--disposal=background", "--careful", "--loopcount=3", "in.gif", "#1-", "-o", "out.gif"},
+		},
+		{
+			name: "SkipFirstFrame alone keeps the default optimiser pass",
+			o:    GifsicleOptions{SkipFirstFrame: true},
+			want: []string{"-O2", "--careful", "--loopcount=forever", "in.gif", "#1-", "-o", "out.gif"},
 		},
 		{
 			name: "NoOptimize alone is a plain rewrite; OptimizeLevel is ignored",

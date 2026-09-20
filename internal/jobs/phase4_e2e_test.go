@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duckautomata/ez-local-gif/internal/discordlint"
 	"github.com/duckautomata/ez-local-gif/internal/recipe"
 	"github.com/duckautomata/ez-local-gif/internal/store"
 )
@@ -407,4 +408,129 @@ func TestGifskiE2E(t *testing.T) {
 			t.Errorf("restated loop count = %d, want 4", g.LoopCount)
 		}
 	}
+
+	// Fit candidates walk the same re-encode ladder as the single-output
+	// render above. gifski writes a local colour table on every frame and
+	// marks unchanged pixels transparent from frame 1 on, so its raw output
+	// fails gif.frame0-transparency for ANY target, opaque clips included (the
+	// fixer cannot give a frame 0 with a local table its flag), and
+	// gif.global-palette for the Discord ones — without the ladder no
+	// loop-forever candidate ever passed. The rich sources carry far more
+	// than 256 colours over the clip, so no plain gifsicle rewrite (the
+	// loop-count pass) can globalise the palette by accident, as it does for
+	// the simple source; with a finite loop and target none that pass still
+	// let the old code find a candidate, but only at a halved size — hence
+	// the size/quality assertion below. The tight budget makes the search
+	// encode several rungs; what each candidate hands the ladder is pinned
+	// tool-free by TestFitEncodeGifskiLadderCall.
+	if tools.Gifsicle == "" {
+		return
+	}
+	sources := map[string]string{
+		"simple":           src,
+		"rich":             putGIFSource(t, st, richGIF(t, false)),
+		"rich-transparent": putGIFSource(t, st, richGIF(t, true)),
+	}
+	for _, c := range []struct {
+		name, source, target string
+		loop                 int
+		tight                bool // budget below the first candidate: the search has to work
+	}{
+		{"attachment loop forever", "simple", "attachment", 0, false},
+		{"attachment loop 2", "simple", "attachment", 2, false},
+		{"attachment rich loop forever", "rich", "attachment", 0, false},
+		{"attachment rich loop 2", "rich", "attachment", 2, false},
+		{"attachment rich tight budget", "rich", "attachment", 0, true},
+		{"attachment rich transparent", "rich-transparent", "attachment", 0, false},
+		{"no target rich", "rich", "", 0, false},
+		{"no target rich loop 2", "rich", "", 2, false},
+		{"no target rich transparent", "rich-transparent", "", 0, false},
+		{"no target rich transparent loop 2", "rich-transparent", "", 2, false},
+	} {
+		t.Run("fit/"+c.name, func(t *testing.T) {
+			out := recipe.Output{Format: "gif", Encoder: "gifski", Target: c.target, Loop: c.loop, FitBytes: 1 << 20}
+			r := recipe.Recipe{Sources: []string{sources[c.source]}, Output: out}
+			f := primaryFile(t, runJob(t, m, r))
+			if c.tight {
+				r.Output.FitBytes = f.Bytes * 7 / 10
+				f = primaryFile(t, runJob(t, m, r))
+				if f.Bytes > r.Output.FitBytes {
+					t.Errorf("%d bytes delivered for a %d byte budget (desc %q)", f.Bytes, r.Output.FitBytes, f.Desc)
+				}
+			}
+			t.Logf("%s: %d bytes, desc %q", f.Name, f.Bytes, f.Desc)
+			if !strings.Contains(f.Desc, "gifski") {
+				t.Errorf("desc = %q, must name gifski", f.Desc)
+			}
+			if f.Report == nil || !f.Report.OK {
+				t.Fatalf("report not OK (desc %q): %+v", f.Desc, f.Report)
+			}
+			if want := c.source == "rich-transparent"; f.Report.HasAlpha != want {
+				t.Errorf("report HasAlpha = %v, want %v (the master's alpha scan must survive the ladder)", f.Report.HasAlpha, want)
+			}
+			// 1 MiB is far above the full-quality file: anything but the first
+			// candidate means the full-size ones were rejected (a finite loop
+			// with target none used to "succeed" that way, at 20x15).
+			if !c.tight && (f.Width != 40 || f.Height != 30 || !strings.Contains(f.Desc, "quality 90")) {
+				t.Errorf("a 1 MiB budget must deliver the undegraded first candidate (40x30, quality 90), got %dx%d, desc %q", f.Width, f.Height, f.Desc)
+			}
+			data, err := os.ReadFile(filepath.Join(st.ResultDir(ResultKey(r)), f.Name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if int64(len(data)) != f.Bytes {
+				t.Errorf("delivered %d bytes, reported %d", len(data), f.Bytes)
+			}
+			// The delivered bytes, not the report the search kept.
+			rep, _, err := discordlint.LintGIF(data, discordlint.Target(c.target), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !rep.OK {
+				t.Errorf("delivered file fails the lint: %+v", rep.Checks)
+			}
+			g, err := gif.DecodeAll(bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Discord targets always loop forever (the linter forces it).
+			if want := c.loop; c.target == "" && g.LoopCount != want {
+				t.Errorf("loop count = %d, want %d", g.LoopCount, want)
+			}
+		})
+	}
+}
+
+// richGIF builds a 12-frame 40x30 clip (gifSourceInfo's shape) whose frames
+// each use their own 216-colour cube — about 2600 colours over the clip, so
+// no encoder can carry it in one palette without quantising and gifski's
+// per-frame local tables cannot be merged into a global one by a plain
+// gifsicle rewrite. With transparent, frame 0 is fully opaque and every later
+// frame has a 4 px transparent border: the animation is transparent while
+// frame 0's GCE has no transparency flag to start from.
+func richGIF(t *testing.T, transparent bool) []byte {
+	t.Helper()
+	g := &gif.GIF{LoopCount: 0}
+	for i := 0; i < 12; i++ {
+		pal := color.Palette{color.RGBA{A: 255}}
+		if transparent {
+			pal[0] = color.RGBA{}
+		}
+		for n := 0; n < 216; n++ {
+			pal = append(pal, color.RGBA{uint8(n/36*51 + i*4), uint8(n/6%6*51 + i*2), uint8(n%6*51 + i*3), 255})
+		}
+		fr := image.NewPaletted(image.Rect(0, 0, 40, 30), pal)
+		for y := 0; y < 30; y++ {
+			for x := 0; x < 40; x++ {
+				if transparent && i > 0 && (x < 4 || y < 4 || x >= 36 || y >= 26) {
+					continue // index 0: transparent
+				}
+				fr.SetColorIndex(x, y, uint8(1+x*6/40*36+y*6/30*6+(x+y+i)%6))
+			}
+		}
+		g.Image = append(g.Image, fr)
+		g.Delay = append(g.Delay, 8)
+		g.Disposal = append(g.Disposal, gif.DisposalBackground)
+	}
+	return encodeTestGIF(t, g)
 }

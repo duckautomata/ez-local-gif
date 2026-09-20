@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/gif"
 	"image/png"
 	"os"
@@ -787,6 +788,106 @@ func unsafeHoldsGIF(t *testing.T) []byte {
 	return encodeTestGIF(t, g)
 }
 
+// opaqueFirstHoldsGIF is unsafeHoldsGIF for a clip whose FIRST pose stands on
+// a fully opaque (blue) background while the later ones stand on the
+// transparent one: the structure gifsicle -O2 writes for it, with the same
+// unsafe clear-only frames 1 and 3. gifsicle's unoptimiser decides from the
+// first frame whether the canvas is transparent at all — here it is not used
+// there — so an unguarded "-U" coalesce paints the later poses' background
+// blue. opaqueFirstHoldsFlat is the same animation as three complete frames.
+func opaqueFirstHoldsGIF(t *testing.T) []byte {
+	t.Helper()
+	g := &gif.GIF{LoopCount: 0, Config: image.Config{Width: 64, Height: 48, ColorModel: holdsPalette}}
+	for k, pose := range holdPoses {
+		fr := image.NewPaletted(image.Rect(0, 0, 64, 48), holdsPalette)
+		clearRect := pose
+		if k == 0 {
+			fillRect(fr, fr.Rect, 2)
+			clearRect = fr.Rect
+		}
+		fillRect(fr, pose, 1)
+		g.Image = append(g.Image, fr, image.NewPaletted(clearRect, holdsPalette))
+		g.Delay = append(g.Delay, 96, 4)
+		g.Disposal = append(g.Disposal, gif.DisposalNone, gif.DisposalBackground)
+	}
+	return encodeTestGIF(t, g)
+}
+
+// opaqueFirstHoldsFlat renders opaqueFirstHoldsGIF as complete full-canvas
+// disposal-2 frames, one per pose. With opaque, the transparent background of
+// poses 1 and 2 is painted blue as well — what gifsicle -U makes of the clip
+// without the lead-in frame.
+func opaqueFirstHoldsFlat(t *testing.T, opaque bool) []byte {
+	t.Helper()
+	g := &gif.GIF{LoopCount: 0, Config: image.Config{Width: 64, Height: 48, ColorModel: holdsPalette}}
+	for k, pose := range holdPoses {
+		fr := image.NewPaletted(image.Rect(0, 0, 64, 48), holdsPalette)
+		if k == 0 || opaque {
+			fillRect(fr, fr.Rect, 2)
+		}
+		fillRect(fr, pose, 1)
+		g.Image = append(g.Image, fr)
+		g.Delay = append(g.Delay, 100)
+		g.Disposal = append(g.Disposal, gif.DisposalBackground)
+	}
+	return encodeTestGIF(t, g)
+}
+
+// assertOpaqueFirstHolds checks a rendering of opaqueFirstHoldsGIF per the GIF
+// spec: three pictures of 1 s, the first fully opaque, the others showing the
+// background everywhere but on their pose — and, when exact, the very
+// animation of the source (colours included).
+func assertOpaqueFirstHolds(t *testing.T, data []byte, exact bool) {
+	t.Helper()
+	g, err := gif.DecodeAll(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	type shown struct{ clear, cs int }
+	var got []shown
+	var last []byte // the previous frame's picture
+	canvas := image.NewRGBA(image.Rect(0, 0, g.Config.Width, g.Config.Height))
+	for k, fr := range g.Image {
+		b := fr.Bounds()
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				if c := fr.At(x, y); !isTransparent(c) {
+					canvas.Set(x, y, c)
+				}
+			}
+		}
+		clear := 0
+		for i := 3; i < len(canvas.Pix); i += 4 {
+			if canvas.Pix[i] == 0 {
+				clear++
+			}
+		}
+		if len(got) > 0 && bytes.Equal(canvas.Pix, last) {
+			got[len(got)-1].cs += g.Delay[k] // the same picture: one stretch
+		} else {
+			got = append(got, shown{clear, g.Delay[k]})
+		}
+		last = append(last[:0], canvas.Pix...)
+		switch g.Disposal[k] {
+		case gif.DisposalBackground:
+			draw.Draw(canvas, b, image.Transparent, image.Point{}, draw.Src)
+		case gif.DisposalPrevious:
+			t.Fatalf("frame %d uses disposal 3", k)
+		}
+	}
+	area := func(r image.Rectangle) int { return r.Dx() * r.Dy() }
+	want := []shown{{0, 100}, {64*48 - area(holdPoses[1]), 100}, {64*48 - area(holdPoses[2]), 100}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("background pixels / centiseconds per picture = %v, want %v (an opaque first pose, then two on the transparent background)", got, want)
+	}
+	if !exact {
+		return
+	}
+	if same, detail, err := discordlint.SameGIFAnimation(opaqueFirstHoldsGIF(t), data); err != nil || !same {
+		t.Errorf("not the source's animation: %s (err %v)", detail, err)
+	}
+}
+
 func fillRect(fr *image.Paletted, r image.Rectangle, idx uint8) {
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		for x := r.Min.X; x < r.Max.X; x++ {
@@ -1015,6 +1116,86 @@ func TestLintGIFRepairsUnsafeHolds(t *testing.T) {
 		}
 	})
 
+	// A clip whose first frame is opaque: gifsicle's coalesce needs the
+	// transparent lead-in frame, or the later poses lose their transparency.
+	t.Run("ladder, opaque first frame", func(t *testing.T) {
+		mixed := opaqueFirstHoldsGIF(t)
+		first, _, err := discordlint.LintGIF(mixed, discordlint.TargetAttachment, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chk := holdsCheck(t, &first); chk.OK || !onlyHoldsFailed(first) {
+			t.Fatalf("fixture must fail %s only: %+v", discordlint.RuleGIFNoopFrameDisposal, first.Checks)
+		}
+		j := &job{snap: Job{ID: "holds", State: StateRunning, Stage: StageLint}, cancel: func() {}, subs: map[int]*subscriber{}}
+		data, rep, err := m.lintGIF(ctx, j, t.TempDir(), mixed, discordlint.TargetAttachment, recipe.Output{Format: "gif"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chk := holdsCheck(t, &rep); !chk.OK || !rep.OK {
+			t.Errorf("after the ladder: %+v", rep.Checks)
+		}
+		assertOpaqueFirstHolds(t, data, true)
+		// Step A on its own (what the fallback delivers) is exact as well.
+		scratch := t.TempDir()
+		flat, _, err := m.repairGIFHolds(ctx, scratch, "-y", mixed, discordlint.TargetNone, enc.GifsicleOptions{Lossy: 200}, nil)
+		if err != nil {
+			t.Fatalf("repairGIFHolds: %v", err)
+		}
+		assertOpaqueFirstHolds(t, flat, false)
+	})
+
+	// A local colour table makes gifsicle give up on the coalesce ("too
+	// complex to unoptimize", exit 0) while it still rewrites every disposal:
+	// the poses would vanish 4 cs early. The check refuses that result. For
+	// target none (where a local table is only a warning, so the --colors rung
+	// does not merge it first) the file is delivered as it came, the hold rule
+	// still failing; for a Discord target the --colors rung makes it
+	// coalescible and the repair goes through.
+	t.Run("too complex to unoptimize", func(t *testing.T) {
+		lct := unsafeHoldsLocalPaletteGIF(t)
+		if _, _, err := m.repairGIFHolds(ctx, t.TempDir(), "-z", lct, discordlint.TargetNone, enc.GifsicleOptions{}, nil); err == nil || !strings.Contains(err.Error(), "picture changed") {
+			t.Fatalf("repairGIFHolds err = %v, want the coalesce refused because the picture changed", err)
+		}
+		j := &job{snap: Job{ID: "holds", State: StateRunning, Stage: StageLint}, cancel: func() {}, subs: map[int]*subscriber{}}
+		data, rep, err := m.lintGIF(ctx, j, t.TempDir(), lct, discordlint.TargetNone, recipe.Output{Format: "gif"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if holdsCheck(t, &rep).OK {
+			t.Errorf("target none: the hold check passes — was a changed picture delivered? %+v", rep.Checks)
+		}
+		if same, detail, err := discordlint.SameGIFAnimation(lct, data); err != nil || !same {
+			t.Errorf("target none: the delivered file does not play like the input: %s (err %v)", detail, err)
+		}
+		data, rep, err = m.lintGIF(ctx, j, t.TempDir(), lct, discordlint.TargetAttachment, recipe.Output{Format: "gif"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rep.OK || !holdsCheck(t, &rep).OK {
+			t.Errorf("attachment: %+v", rep.Checks)
+		}
+		assertOnePosePerFrame(t, data)
+	})
+
+	for _, fx := range []struct {
+		name  string
+		data  []byte
+		check func(t *testing.T, data []byte, exact bool)
+	}{
+		{"", src, func(t *testing.T, data []byte, _ bool) { assertOnePosePerFrame(t, data) }},
+		{"opaque-first/", opaqueFirstHoldsGIF(t), assertOpaqueFirstHolds},
+	} {
+		m.jobMatrixForHolds(t, ctx, st, tools, fx.name, fx.data, fx.check)
+	}
+}
+
+// jobMatrixForHolds renders a GIF source with unsafe clear-only frames through
+// every path that does not decode it — the lossless fast path and the optimize
+// preset, single-shot, lossy and fit, for a Discord target and for none — and
+// checks the delivered file.
+func (m *Manager) jobMatrixForHolds(t *testing.T, ctx context.Context, st *store.Store, tools ffrun.Tools, prefix string, src []byte, check func(t *testing.T, data []byte, exact bool)) {
+	t.Helper()
 	blob, err := st.PutBlob(bytes.NewReader(src), "unsafe-holds.gif")
 	if err != nil {
 		t.Fatal(err)
@@ -1038,7 +1219,7 @@ func TestLintGIFRepairsUnsafeHolds(t *testing.T) {
 		{"optimize-none", recipe.Output{Format: "gif", Preset: "optimize", Colors: 256, Dither: "bayer", Lossy: 30}}, // the SPA's defaults
 		{"optimize-fit-none", recipe.Output{Format: "gif", Preset: "optimize", FitBytes: 100000}},
 	} {
-		t.Run(c.name, func(t *testing.T) {
+		t.Run(prefix+c.name, func(t *testing.T) {
 			r := recipe.Recipe{Sources: []string{blob.Hash}, Output: c.out}
 			fin := runJob(t, m, r)
 			if fin.State != StateDone {
@@ -1064,7 +1245,8 @@ func TestLintGIFRepairsUnsafeHolds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertOnePosePerFrame(t, data)
+			// Exact (colours included) wherever nothing lossy ran.
+			check(t, data, c.out.Lossy == 0 && c.out.FitBytes == 0)
 			t.Logf("%s: %d bytes, desc %q", f.Name, len(data), f.Desc)
 			if _, merged, err := discordlint.MergeGIFHolds(data); err != nil || merged != 0 {
 				t.Errorf("MergeGIFHolds(final) merged %d frames (%v), want 0", merged, err)
@@ -1198,6 +1380,131 @@ func TestRenderFitRepairsLossyHolds(t *testing.T) {
 			}
 			if chk := holdsCheck(t, &rep); !chk.OK {
 				t.Errorf("delivered file fails %s: %s", chk.Rule, chk.Detail)
+			}
+		})
+	}
+}
+
+// mixedAlphaGIF is a 12-frame 40x30 clip (gifSourceInfo's shape) of a red
+// square moving over a transparent background — except on frames 4..7, where
+// the background is opaque blue: a transparent animation with fully opaque
+// frames in the middle (a keyed subject that fills the frame for a while).
+func mixedAlphaGIF(t *testing.T) []byte {
+	t.Helper()
+	pal := color.Palette{color.RGBA{}, color.RGBA{220, 30, 30, 255}, color.RGBA{30, 30, 220, 255}}
+	g := &gif.GIF{LoopCount: 0, Config: image.Config{Width: 40, Height: 30, ColorModel: pal}}
+	for i := 0; i < 12; i++ {
+		fr := image.NewPaletted(image.Rect(0, 0, 40, 30), pal)
+		for y := 0; y < 30; y++ {
+			for x := 0; x < 40; x++ {
+				fr.SetColorIndex(x, y, uint8(mixedAlphaClass(i, x, y)))
+			}
+		}
+		g.Image = append(g.Image, fr)
+		g.Delay = append(g.Delay, 8)
+		g.Disposal = append(g.Disposal, gif.DisposalBackground)
+	}
+	return encodeTestGIF(t, g)
+}
+
+// mixedAlphaClass is what mixedAlphaGIF shows at (x, y) of frame i:
+// 0 transparent, 1 red, 2 blue.
+func mixedAlphaClass(i, x, y int) int {
+	switch {
+	case y >= 8 && y < 22 && x >= 2+2*i && x < 14+2*i:
+		return 1
+	case i >= 4 && i < 8:
+		return 2
+	}
+	return 0
+}
+
+// TestRenderGIFMixedOpaqueFrames: a transparent clip with fully opaque frames
+// in it renders exactly. ffmpeg's gif encoder decides per frame — a frame
+// without a transparent pixel is diffed against the previous one ("unchanged"
+// pixels transparent, disposal 1) — which left holes in the opaque frames
+// after a disposed one and kept the opaque picture under the transparent
+// frames after it. jobs.encodeGIFAt sees the mix in the first encode's output
+// (discordlint.GIFNeedsCompleteFrames), encodes again with
+// enc.GIFOptions.CompleteFrames and discordlint.DisposeCompleteFrames disposes
+// every frame; gifsicle, when present, then re-optimises the correct picture.
+// Width 40 (the source's own) keeps the recipe off the lossless gifsicle fast
+// path, which would never reach the encoder.
+func TestRenderGIFMixedOpaqueFrames(t *testing.T) {
+	tools := realTools(t)
+	st := newTestStore(t)
+	src := putGIFSource(t, st, mixedAlphaGIF(t))
+	for _, c := range []struct {
+		name     string
+		gifsicle bool
+		target   string
+	}{
+		{"attachment", true, "attachment"},
+		{"no target", true, ""},
+		{"without gifsicle", false, "attachment"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tl := tools
+			if !c.gifsicle {
+				tl.Gifsicle = ""
+			} else if tl.Gifsicle == "" {
+				t.Skip("gifsicle not on PATH")
+			}
+			m := NewManager(st, tl, Options{Concurrency: 1})
+			r := recipe.Recipe{Sources: []string{src}, Output: recipe.Output{Format: "gif", Target: c.target, Matte: "FFFFFF", Width: 40}}
+			if !c.gifsicle {
+				// The same recipe as "attachment": a different threshold (the
+				// source alpha is 0 / 255 either way) keeps it off that result.
+				r.Output.AlphaThreshold = 127
+			}
+			job := runJob(t, m, r)
+			f := primaryFile(t, job)
+			if f.Desc == FastPathDesc {
+				t.Fatalf("the recipe took the lossless fast path: encodeGIFAt never ran")
+			}
+			if f.Report == nil || !f.Report.OK || !f.Report.HasAlpha {
+				t.Fatalf("report: %+v", f.Report)
+			}
+			g, err := gif.DecodeAll(bytes.NewReader(resultBytes(t, st, job, f.Name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(g.Image) != 12 {
+				t.Fatalf("%d frames, want 12 (the square moves on every frame)", len(g.Image))
+			}
+			canvas := image.NewRGBA(image.Rect(0, 0, 40, 30))
+			for k, fr := range g.Image {
+				b := fr.Bounds()
+				for y := b.Min.Y; y < b.Max.Y; y++ {
+					for x := b.Min.X; x < b.Max.X; x++ {
+						if px := fr.At(x, y); !isTransparent(px) {
+							canvas.Set(x, y, px)
+						}
+					}
+				}
+				wrong := 0
+				for y := 0; y < 30; y++ {
+					for x := 0; x < 40; x++ {
+						got := 0
+						if px := canvas.RGBAAt(x, y); px.A != 0 && px.R > px.B {
+							got = 1
+						} else if px.A != 0 {
+							got = 2
+						}
+						if got != mixedAlphaClass(k, x, y) {
+							wrong++
+						}
+					}
+				}
+				if wrong > 0 {
+					t.Errorf("frame %d (disposal %d, rect %v): %d pixels differ from the source", k, g.Disposal[k], b, wrong)
+				}
+				switch g.Disposal[k] {
+				case gif.DisposalBackground:
+					draw.Draw(canvas, b, image.Transparent, image.Point{}, draw.Src)
+				case gif.DisposalPrevious:
+					t.Fatalf("frame %d uses disposal 3", k)
+				}
 			}
 		})
 	}

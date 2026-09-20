@@ -279,6 +279,14 @@
   // low-res animation) is simply enlarged by the same factor.
   const zoomStyle = $derived(zoom === 'fit' || natural.w === 0 ? '' : `width:${natural.w * zoom}px;max-width:none;max-height:none;`);
   const position = $derived(canStep ? `${fmtTimecode(shown)} · f ${i + 1} / ${total}` : fmtSeconds(shown));
+  // The readout keeps ONE width while scrubbing. Its text gains a character
+  // whenever the frame number gains a digit (frame 10, 100, …), and in the
+  // wrapping scrub row that is enough to push it onto a line of its own when
+  // the column is about as wide as the row (a 1080 px portrait screen): the
+  // slider then jumps to the full row width, and back on the way down. The
+  // readout is set in the monospace face, so the length of its widest text —
+  // the last frame's — reserves exactly the room it will ever need.
+  const positionCh = $derived(canStep ? `${fmtTimecode(duration)} · f ${total} / ${total} · ${fmtTimecode(duration)}`.length : 0);
   const positionText = $derived(canStep ? `frame ${i + 1} of ${total}, ${fmtTimecode(shown)}` : `${fmtSeconds(shown)} of ${fmtSeconds(duration)}`);
 </script>
 
@@ -403,6 +411,7 @@
       aria-disabled={!canStep}
       onkeydown={onStageKey}
       title={canStep ? `${fmtSeconds(shown)} of ${fmtSeconds(duration)} at ${fmtNum(fps)} fps` : ''}
+      style:min-width={positionCh > 0 ? `${positionCh}ch` : undefined}
     >
       {position}
       {#if canStep}<span class="muted"> · {fmtTimecode(duration)}</span>{:else if duration > 0}<span class="muted"> / {fmtSeconds(duration)}</span>{/if}

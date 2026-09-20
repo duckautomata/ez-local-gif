@@ -151,6 +151,35 @@ describe('Preview (SSR)', () => {
     expect(html()).toContain('aria-valuemax="1"');
   });
 
+  it('reserves one readout width for every frame, so the scrub row never re-wraps while scrubbing', () => {
+    // 120 frames: the frame number is 1, 2 and 3 digits long over the clip.
+    setSource({ ...gifSrc, info: { ...gifInfo, fps: 25, duration: 4.8, frames: 120 } });
+    const readout = (frame: number) => {
+      app.ui.scrubFrame = frame;
+      const out = html();
+      const tag = out.match(/<span[^>]*class="time[^"]*"[^>]*>/)?.[0] ?? '';
+      // what the browser lays out: hydration comments and tags dropped, white space collapsed
+      // (the readout is the last child of the scrub row)
+      const text = (out.match(/<span[^>]*class="time[^"]*"[^>]*>([\s\S]*?)<\/span>\s*<\/div>/)?.[1] ?? '')
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return { width: Number(tag.match(/min-width:\s*(\d+)ch/)?.[1] ?? NaN), text };
+    };
+    const first = readout(0);
+    const mid = readout(54);
+    const last = readout(119);
+    expect(first.text).toBe('00:00.00 · f 1 / 120 · 00:04.80');
+    expect(last.text).toBe('00:04.76 · f 120 / 120 · 00:04.80');
+    expect(first.text.length).toBeLessThan(last.text.length); // the text itself still grows…
+    // …but the box is as wide as the widest text on every frame
+    expect(first.width).toBe(last.text.length);
+    expect(mid.width).toBe(last.text.length);
+    expect(last.width).toBe(last.text.length);
+    app.ui.scrubFrame = 0;
+  });
+
   it('keeps the readout slider present but disabled when frames cannot be stepped', () => {
     setSource({ ...gifSrc, info: { ...gifInfo, fps: 0, duration: 0, frames: 1, isStill: true, kind: 'image' } });
     const out = html();

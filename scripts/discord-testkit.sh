@@ -319,6 +319,13 @@ make_master_size() {
 # encoders (all read a master; args: MASTER W H OUT [knobs])
 # ----------------------------------------------------------------------------
 # GIF: matte → 1-bit threshold → single global palette → bayer dither.
+# -gifflags -offsetting as in the app's alpha path (enc.GIFArgs): ffmpeg's
+# bounding-box crop of transparent frames cuts off the part of the box's
+# bottom row that sticks out past the rows above; frames are written
+# full-canvas instead. (For a clip that mixes fully opaque and transparent
+# frames the app encodes a second time with -offsetting-transdiff and disposes
+# every frame in Go, discordlint.DisposeCompleteFrames — the kit's clip has
+# transparency on every frame and needs neither.)
 #   gif_palette MASTER W H OUT [colors=256] [out_fps=$fps] [max_seconds]
 gif_palette() {
   local m=$1 w=$2 h=$3 out=$4 colors=${5:-256} ofps=${6:-$fps} maxs=${7:-}
@@ -327,7 +334,7 @@ gif_palette() {
   mapfile -t in < <(read_master "$w" "$h" "$m")
   "$ffmpeg" -hide_banner -loglevel error -nostdin -y "${in[@]}" "${tail[@]+"${tail[@]}"}" \
     -filter_complex "[0:v]${ratef}split[c][a];[a]alphaextract,lut=c0='gte(val,${ALPHA_T})*255'[m];color=c=0x${MATTE}:s=${w}x${h}:r=${ofps},format=rgba[bg];[bg][c]overlay=format=auto:shortest=1,format=rgb24[f];[f][m]alphamerge,split[p1][p2];[p1]palettegen=max_colors=${colors}:reserve_transparent=1:stats_mode=diff[pal];[p2][pal]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle:alpha_threshold=${ALPHA_T}" \
-    -loop 0 -f gif "$out"
+    -gifflags -offsetting -loop 0 -f gif "$out"
 }
 #   gifsicle_o2 IN OUT [extra gifsicle args...]
 gifsicle_o2() { local i=$1 o=$2; shift 2; "$gifsicle" -O2 --careful --loopcount=forever "$@" "$i" -o "$o"; }

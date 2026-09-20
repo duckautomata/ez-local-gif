@@ -363,6 +363,13 @@ type GIFOptions struct {
 	// Variant (Phase 2) pre-filters the master (fps drop / downscale) before
 	// the palette chain: see VariantFilter. nil = encode the master as-is.
 	Variant *Variant
+	// CompleteFrames (HasAlpha only) also switches off the encoder's
+	// inter-frame transparency, so every frame is written as a complete
+	// full-canvas picture: for a clip that MIXES fully opaque frames and
+	// frames with transparency (see GIFArgs). jobs sets it for a second
+	// encode after finding both disposals in the first one's output, and
+	// then runs discordlint.DisposeCompleteFrames over the result.
+	CompleteFrames bool
 }
 
 // gifDithers lists every paletteuse dither mode ffmpeg accepts; anything
@@ -414,7 +421,7 @@ func (o GIFOptions) ditherArg() string {
 
 // GIFArgs encodes the master to a GIF with a single global palette:
 // [RawInputArgs] -filter_complex "<matte+threshold chain>;palettegen;paletteuse"
-// -loop N -f gif outPath. Must produce: GCE on every frame, disposal
+// [-gifflags -offsetting[-transdiff]] -loop N -f gif outPath. Must produce: GCE on every frame, disposal
 // 1/2 only, NETSCAPE loop, delays >= 2 cs. The delays follow from the
 // master rate alone: the gif muxer rounds every pts to its 1/100 s timebase,
 // so a master at <= 50 fps (graph.SnapFPS's GIF cap) never yields a delay
@@ -423,12 +430,54 @@ func (o GIFOptions) ditherArg() string {
 // With o.Variant the graph starts with "[0:v]<VariantFilter>[v];" and the
 // palette chain reads [v]; the matte colour source takes the variant's size
 // and rate. A nil or no-op variant leaves the graph exactly as before.
+//
+// With o.HasAlpha the encoder gets "-gifflags -offsetting" — and
+// "-gifflags -offsetting-transdiff" with o.CompleteFrames. Both of
+// libavcodec/gif.c's frame optimisations go wrong on frames with transparency
+// (FFmpeg 8.0, 9.0.1 and the 2026-08 git build):
+//
+//   - offsetting crops a frame that has transparent pixels to its opaque
+//     bounding box (gif_crop_translucent), but the left / right column scans
+//     skip the box's bottom row ("i < y_end" where gif_crop_opaque has
+//     "y <= y_end"): whatever part of that row sticks out past the columns
+//     the rows above use is cut off and turns transparent — one pixel, or a
+//     whole ground line or shadow wider than the body
+//     (TestGIFAlphaKeepsBottomRowEdgePixels). Switched off for every alpha
+//     master: frames are written full-canvas, which costs little (fully
+//     opaque frames still carry only their changed pixels, the rest is
+//     "unchanged" transparency) and nothing once gifsicle has re-cropped them.
+//   - transdiff and the disposal are chosen per frame: a frame with a
+//     transparent pixel is written whole with disposal 2, a fully opaque one
+//     is diffed against the previous frame ("unchanged" pixels transparent)
+//     with disposal 1. Each is right on its own, so a clip whose frames all
+//     have transparency, or are all opaque once thresholded, comes out
+//     exact. A clip that MIXES them does not: the opaque frame is diffed
+//     against a frame that was disposed (holes) and then stays on the canvas
+//     under the transparent frames after it. The first encode's output shows
+//     the mix (both disposals occur); jobs then encodes again with
+//     CompleteFrames — every frame a complete picture — and gives all of
+//     them disposal 2 (discordlint.DisposeCompleteFrames), which is exact
+//     (TestGIFAlphaOpaqueFramesAreComplete). That costs fully opaque frames
+//     their diffing, so it is not the default: without gifsicle to re-diff
+//     them a mostly opaque "alpha" clip would grow several times.
+//
+// The opaque path keeps ffmpeg's default flags: the inter-frame diff crop
+// (gif_crop_opaque) scans every row and keeps those files small.
 func GIFArgs(m Master, o GIFOptions, outPath string) []string {
 	o = o.normalized()
 	args := RawInputArgs(m)
 	args = append(args,
 		"-filter_complex", gifFilter(m, o),
 		"-map", "[out]",
+	)
+	if o.HasAlpha {
+		flags := "-offsetting"
+		if o.CompleteFrames {
+			flags += "-transdiff"
+		}
+		args = append(args, "-gifflags", flags)
+	}
+	args = append(args,
 		"-loop", strconv.Itoa(o.Loop),
 		"-f", "gif",
 		outPath,
@@ -488,9 +537,22 @@ type GifsicleOptions struct {
 	NoOptimize bool
 	// DisposeBackground emits --disposal=background (right after -U when
 	// Unoptimize, else first). With Unoptimize and NoOptimize every output
-	// frame is a full-canvas frame with disposal 2, pixel-exact against the
-	// input. Under -O the optimiser chooses disposals itself and overrides it.
+	// frame is a full-canvas frame with disposal 2 — pixel-exact against the
+	// input only when the input's FIRST frame declares and uses transparency
+	// (see SkipFirstFrame) and gifsicle can unoptimise it at all (it gives up
+	// on local colour tables or more than 256 colours per picture, "too
+	// complex to unoptimize", exit 0): jobs checks the result. Under -O the
+	// optimiser chooses disposals itself and overrides it.
 	DisposeBackground bool
+	// SkipFirstFrame emits the frame selection "#1-" right after the input
+	// file (gifsicle applies a selection to the input that precedes it): the
+	// output starts with the input's second frame. jobs sets it for the
+	// coalesce of an input it gave a transparent lead-in frame
+	// (discordlint.PrependTransparentFrame) — gifsicle's unoptimiser decides
+	// from the first frame whether the canvas is transparent at all, and
+	// without the lead-in a clip whose first frame is opaque comes out
+	// without any transparency.
+	SkipFirstFrame bool
 	// Dither selects gifsicle's --dither method when Colors > 0 ("" = no
 	// dithering; "o8" = ordered 8x8 as in DESIGN.md §4.2; other gifsicle
 	// methods such as "ro64", "o3", "o4", "ordered", "halftone",
@@ -513,7 +575,9 @@ type GifsicleOptions struct {
 // gifsicle applies options positionally, so the order is fixed: -U first
 // (coalesce before anything else), then --disposal=background, -O<level>
 // (unless NoOptimize), --careful, --lossy=N, --colors N [--dither=M], -jN,
-// and finally --loopcount=forever|N in -o out.
+// and finally --loopcount=forever|N in [#1-] -o out — the frame selection of
+// SkipFirstFrame has to follow the input it applies to (before it, gifsicle
+// reads stdin and fails).
 func GifsicleArgs(in, out string, o GifsicleOptions) []string {
 	args := make([]string, 0, 12)
 	if o.Unoptimize {
@@ -550,7 +614,11 @@ func GifsicleArgs(in, out string, o GifsicleOptions) []string {
 	if o.Loop > 0 {
 		loop = strconv.Itoa(min(o.Loop, maxLoopCount))
 	}
-	args = append(args, "--loopcount="+loop, in, "-o", out)
+	args = append(args, "--loopcount="+loop, in)
+	if o.SkipFirstFrame {
+		args = append(args, "#1-")
+	}
+	args = append(args, "-o", out)
 	return args
 }
 

@@ -79,9 +79,11 @@ type fitCandidate struct {
 	rung   fit.Rung
 	knob   int
 	ok     bool // no LevelError check failed
-	// holdsRepaired: the GIF failed gif.noop-frame-disposal only (at any
-	// level, i.e. for every target) and the hold repair (repairGIFHolds)
-	// replaced its bytes; descriptions say so.
+	// holdsRepaired: the hold repair (repairGIFHolds) replaced the bytes of
+	// a GIF that failed gif.noop-frame-disposal (at any level, i.e. for every
+	// target) — as its only structural failure, or, for a gifski candidate,
+	// when the ladder reached that rung with the rule failing; descriptions
+	// say so.
 	holdsRepaired bool
 }
 
@@ -167,6 +169,9 @@ type fitRun struct {
 	// Per-variant intermediates shared by every knob probe of a rung.
 	sheets sync.Map // variantKey → *sheetEntry
 	pngs   sync.Map // variantKey → *pngEntry
+	// gifComplete: variantKey → bool, the mix verdict of the variant's first
+	// default-encoder GIF candidate (see encodeCandidate).
+	gifComplete sync.Map
 
 	gifsicleWarned atomic.Bool
 }
@@ -718,17 +723,40 @@ func (r *fitRun) encode(ctx context.Context, rung fit.Rung, knob int, attempt in
 	// candidate on disk and the size the search sees are the repaired file's.
 	// Known limitation: the repair's -O2 pass applies --lossy=knob to bytes
 	// that already carry it (second-generation lossy, DESIGN.md §5.3).
-	repaired := false
+	//
+	// gifski candidates walk the whole ladder instead (gifLadder, the one
+	// behind the single-output gifski render: produceGifski → lintGIF), minus
+	// --lossy: lintGIF hands Output.Lossy to the rungs, the fit passes none
+	// because its knob is gifski's quality, not gifsicle's lossy. gifski puts
+	// a local colour table on every frame and marks unchanged pixels
+	// transparent from frame 1 on, so its raw output fails
+	// gif.frame0-transparency for every target (the fixer cannot give a frame
+	// 0 with a local table its flag) and gif.global-palette for the Discord
+	// ones — only the "gifsicle --colors" rung makes such a file pass.
+	// Without it a loop-forever fit never found a candidate, and a finite
+	// loop count's gifsicle pass let one through by accident (a <= 256-colour
+	// clip) or only at the small rungs (target none, richer clips).
+	// TestFitEncodeGifskiLadderCall pins this call.
+	repaired, replaced := false, false
 	if format == recipe.FormatGIF {
 		sopts := enc.GifsicleOptions{Loop: r.out.Loop}
-		if !isGifskiOutput(r.out) {
-			sopts.Lossy = knob // gifski's knob is its quality, not gifsicle's lossy
+		switch {
+		case !isGifskiOutput(r.out):
+			sopts.Lossy = knob
+			data, report, repaired = r.m.repairIfOnlyHolds(ctx, r.dir, "-"+id, data, report, r.target, sopts)
+			replaced = repaired
+		case hasStructuralError(report) && r.m.tools.Gifsicle != "":
+			var did ladderOutcome
+			if data, report, did, err = r.m.gifLadder(ctx, r.dir, "-"+id, data, report, r.target, r.out.Colors, sopts, nil); err != nil {
+				return "", 0, err
+			}
+			repaired, replaced = did.holds, did.replaced
 		}
-		if data, report, repaired = r.m.repairIfOnlyHolds(ctx, r.dir, "-"+id, data, report, r.target, sopts); repaired {
+		if replaced {
 			applyMasterAlpha(&report, r.master)
 		}
 	}
-	if changed || repaired {
+	if changed || replaced {
 		if err := os.WriteFile(path, data, 0o644); err != nil {
 			return "", 0, fmt.Errorf("write candidate: %w", err)
 		}
@@ -825,7 +853,19 @@ func (r *fitRun) encodeCandidate(ctx context.Context, format, id string, rung fi
 		// The palette pass already quantised to min(rung, user) colours;
 		// passing --colors to gifsicle as well would median-cut + dither the
 		// frames a second time, so it only applies the lossy knob and loop.
-		return m.encodeGIFAt(ctx, r.j, r.dir, tag, master, gopts, enc.GifsicleOptions{Lossy: knob, Loop: out.Loop})
+		// Whether a clip mixes opaque and transparent frames (and so needs
+		// the complete-frames encode, encodeGIFMixed) depends on the variant
+		// alone: remember it, so only the first candidate of a variant pays
+		// for the discarded first encode.
+		key := variantKey(v)
+		if known, ok := r.gifComplete.Load(key); ok && known.(bool) {
+			gopts.CompleteFrames = true
+		}
+		path, complete, err := m.encodeGIFMixed(ctx, r.j, r.dir, tag, master, gopts, enc.GifsicleOptions{Lossy: knob, Loop: out.Loop})
+		if err == nil {
+			r.gifComplete.Store(key, complete)
+		}
+		return path, err
 	case recipe.FormatWebP:
 		return m.encodeWebPAt(ctx, r.j, r.dir, tag, master, enc.WebPOptions{Quality: qualityFromKnob(knob), Lossless: rung.Truecolor, Loop: out.Loop, Variant: v})
 	case recipe.FormatAPNG:

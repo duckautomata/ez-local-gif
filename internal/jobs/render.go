@@ -633,26 +633,58 @@ func gifOptionsFor(out recipe.Output, v *enc.Variant, master enc.Master) enc.GIF
 // a short clear-only frame that Discord drops together with its disposal
 // (discordlint gif.noop-frame-disposal) — the optimiser must never see a
 // hold run. Without gifsicle the merge still runs: it is pixel-exact and the
-// file only gets smaller.
+// file only gets smaller. Before the merge, an alpha master whose GIF mixes
+// fully opaque frames and frames with transparency (ffmpeg's output says so:
+// needsCompleteFrames) is encoded a second time as complete frames and every
+// frame gets disposal 2 — ffmpeg's per-frame diffing and disposal render such
+// a clip wrong (enc.GIFArgs). That second palette pass is the price of a
+// mixed clip; encodeGIFMixed lets the fit search pay the first one only once
+// per variant.
 func (m *Manager) encodeGIFAt(ctx context.Context, j *job, scratch, tag string, master enc.Master, gopts enc.GIFOptions, sopts enc.GifsicleOptions) (string, error) {
+	path, _, err := m.encodeGIFMixed(ctx, j, scratch, tag, master, gopts, sopts)
+	return path, err
+}
+
+// encodeGIFMixed is encodeGIFAt plus the verdict of the mix check: complete
+// reports that the delivered file comes from a complete-frames encode. A
+// caller that already knows (the fit search: the verdict depends on the
+// variant's size, rate and the alpha threshold only, never on the palette,
+// dither or lossy knobs) presets gopts.CompleteFrames and saves the first,
+// discarded encode of every further candidate.
+func (m *Manager) encodeGIFMixed(ctx context.Context, j *job, scratch, tag string, master enc.Master, gopts enc.GIFOptions, sopts enc.GifsicleOptions) (path string, complete bool, err error) {
 	base := filepath.Join(scratch, "base"+tag+".gif")
-	args := enc.GIFArgs(master, gopts, base)
-	var onProgress func(ffrun.Progress)
-	if tag == "" {
-		onProgress = func(p ffrun.Progress) {
-			frac := progressFraction(p, master.Frames, 0)
-			m.progress(j, pctEncodeStart+frac*(pctEncodeEnd-pctEncodeStart)*0.8, fmt.Sprintf("gif palette pass: frame %d/%d", p.Frame, master.Frames))
+	// The palette pass gets 80 % of the encode band; a mixed clip's second
+	// pass repeats the counter at the band's end (Percent never goes back).
+	passProgress := func(label string, from, to float64) func(ffrun.Progress) {
+		if tag != "" {
+			return nil
+		}
+		return func(p ffrun.Progress) {
+			frac := from + (to-from)*progressFraction(p, master.Frames, 0)
+			m.progress(j, pctEncodeStart+frac*(pctEncodeEnd-pctEncodeStart)*0.8, fmt.Sprintf("%s: frame %d/%d", label, p.Frame, master.Frames))
 		}
 	}
-	if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, args, onProgress); err != nil {
-		return "", fmt.Errorf("gif encode: %w", err)
+	complete = gopts.HasAlpha && gopts.CompleteFrames
+	if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, enc.GIFArgs(master, gopts, base), passProgress("gif palette pass", 0, 1)); err != nil {
+		return "", false, fmt.Errorf("gif encode: %w", err)
+	}
+	if gopts.HasAlpha && !complete && needsCompleteFrames(base) {
+		// ffmpeg renders such a clip wrong (enc.GIFArgs): encode it again as
+		// complete frames.
+		gopts.CompleteFrames, complete = true, true
+		if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, enc.GIFArgs(master, gopts, base), passProgress("gif palette pass (opaque and transparent frames mixed: complete frames)", 1, 1)); err != nil {
+			return "", false, fmt.Errorf("gif encode (complete frames): %w", err)
+		}
+	}
+	if complete {
+		disposeCompleteFramesInFile(base) // the encoder leaves fully opaque frames at disposal 1
 	}
 	if tag == "" {
 		m.progress(j, pctEncodeStart+(pctEncodeEnd-pctEncodeStart)*0.8, "merging held frames")
 	}
 	mergeHoldsInFile(base)
 	if m.tools.Gifsicle == "" {
-		return base, nil
+		return base, complete, nil
 	}
 	if tag == "" {
 		m.progress(j, pctEncodeStart+(pctEncodeEnd-pctEncodeStart)*0.8, "gifsicle optimise")
@@ -662,10 +694,10 @@ func (m *Manager) encodeGIFAt(ctx context.Context, j *job, scratch, tag string, 
 		sopts.Dither = "o8"
 	}
 	if err := ffrun.Run(ctx, m.tools.Gifsicle, enc.GifsicleArgs(base, opt, sopts)); err != nil {
-		return "", fmt.Errorf("gifsicle: %w", err)
+		return "", false, fmt.Errorf("gifsicle: %w", err)
 	}
 	os.Remove(base)
-	return opt, nil
+	return opt, complete, nil
 }
 
 // encodeWebP runs libwebp_anim. v pre-filters the master (nil = as-is);
@@ -689,6 +721,56 @@ func (m *Manager) encodeWebPAt(ctx context.Context, j *job, scratch, tag string,
 		return "", fmt.Errorf("webp encode: %w", err)
 	}
 	return path, nil
+}
+
+// needsCompleteFrames reports whether ffmpeg's GIF of an alpha master is one
+// its encoder renders wrong and must be encoded again as complete frames
+// (discordlint.GIFNeedsCompleteFrames: fully opaque frames and frames with
+// transparency mixed — the encoder marks them with different disposals, at
+// the very size and alpha threshold it encodes — unless the transparent ones
+// are only an empty lead-in). An unreadable file counts as fine (the encode
+// carries on as it always did).
+func needsCompleteFrames(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("jobs: gif frame kinds: %v", err)
+		return false
+	}
+	mixed, err := discordlint.GIFNeedsCompleteFrames(data)
+	if err != nil {
+		log.Printf("jobs: gif frame kinds of %s: %v", filepath.Base(path), err)
+		return false
+	}
+	return mixed
+}
+
+// disposeCompleteFramesInFile gives every frame of a complete-frames encode
+// (enc.GIFOptions.CompleteFrames) disposal 2
+// (discordlint.DisposeCompleteFrames): ffmpeg still picks the disposal per
+// frame, and a fully opaque frame's disposal 1 keeps it on the canvas under
+// the transparent frame that follows it. It runs before the hold merge (a
+// repeated opaque frame is only a harmless no-op once it has its neighbours'
+// disposal) and is best effort like it: a failure is logged and the file
+// stays as ffmpeg wrote it.
+func disposeCompleteFramesInFile(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("jobs: dispose complete frames: %v", err)
+		return 0
+	}
+	out, patched, err := discordlint.DisposeCompleteFrames(data)
+	if err != nil {
+		log.Printf("jobs: dispose complete frames of %s: %v", filepath.Base(path), err)
+		return 0
+	}
+	if patched == 0 {
+		return 0
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		log.Printf("jobs: dispose complete frames: %v", err)
+		return 0
+	}
+	return patched
 }
 
 // mergeHoldsInFile rewrites the GIF at path with its held frames merged
@@ -720,7 +802,7 @@ func mergeHoldsInFile(path string) int {
 // lintGIF lints+fixes data and, when structural failures remain
 // (hasStructuralError: error-level checks, or gif.noop-frame-disposal at any
 // level — so held frames are repaired for target none too) and gifsicle is
-// available, walks the re-encode ladder, re-linting after each rung:
+// available, walks the re-encode ladder (gifLadder), re-linting after each rung:
 // "gifsicle --colors N" (skipped when gif.noop-frame-disposal is the only
 // structural failure — a palette pass keeps the frame structure), then the
 // hold repair (repairGIFHolds: coalesce → merge held frames → -O2 --careful,
@@ -737,42 +819,81 @@ func (m *Manager) lintGIF(ctx context.Context, j *job, scratch string, data []by
 	if !hasStructuralError(report) || m.tools.Gifsicle == "" {
 		return data, report, nil
 	}
+	note := func(step string) { m.progress(j, pctLint, fmt.Sprintf("re-encoding for Discord (%s)", step)) }
+	data, report, _, err = m.gifLadder(ctx, scratch, "", data, report, target, out.Colors, enc.GifsicleOptions{Lossy: out.Lossy, Loop: out.Loop}, note)
+	return data, report, err
+}
 
-	colors := out.Colors
+// ladderOutcome says what gifLadder did to the bytes it was given.
+type ladderOutcome struct {
+	replaced bool // some rung's output replaced the input bytes
+	holds    bool // the hold repair replaced the bytes of a file that failed gif.noop-frame-disposal
+}
+
+// gifLadder is the re-encode ladder behind lintGIF, for a linted GIF whose
+// report has a structural failure (the caller checks hasStructuralError and
+// that gifsicle is available): "gifsicle --colors N" (colors, 0 = the
+// default palette size) when ladderTriesColors, then the hold repair while a
+// structural failure remains. sopts carries the caller's Lossy and Loop —
+// every rung restates the loop count (gifsicle would otherwise reset the
+// NETSCAPE block to forever). tag keeps the scratch file names unique: the
+// gifski fit candidates walk the ladder concurrently (fitRun.encode); note,
+// when not nil, is told which step runs. A failed rung is logged and the
+// bytes it was given carry on; the only error is ctx's.
+func (m *Manager) gifLadder(ctx context.Context, scratch, tag string, data []byte, report discordlint.Report, target discordlint.Target, colors int, sopts enc.GifsicleOptions, note func(step string)) ([]byte, discordlint.Report, ladderOutcome, error) {
+	var did ladderOutcome
+	if note == nil {
+		note = func(string) {}
+	}
 	if colors <= 0 {
 		colors = enc.DefaultColors
 	}
-	// Every rung restates Output.Loop (gifsicle would otherwise reset the
-	// NETSCAPE count to forever).
 	if ladderTriesColors(report) {
 		const name = "gifsicle --colors"
 		if err := ctx.Err(); err != nil {
-			return nil, report, err
+			return nil, report, did, err
 		}
-		m.progress(j, pctLint, fmt.Sprintf("re-encoding for Discord (%s)", name))
-		cand, rep, err := m.ladderColors(ctx, scratch, data, target, enc.GifsicleOptions{Colors: colors, Lossy: out.Lossy, Loop: out.Loop})
+		note(name)
+		cand, rep, err := m.ladderColors(ctx, scratch, tag, data, target, enc.GifsicleOptions{Colors: colors, Lossy: sopts.Lossy, Loop: sopts.Loop})
 		if err != nil {
 			log.Printf("jobs: %s failed: %v", name, err)
 		} else {
-			data, report = cand, rep
+			data, report, did.replaced = cand, rep, true
 		}
 		if !hasStructuralError(report) {
-			return data, report, nil
+			return data, report, did, nil
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, report, err
+		return nil, report, did, err
 	}
-	note := func(step string) { m.progress(j, pctLint, fmt.Sprintf("re-encoding for Discord (%s)", step)) }
-	cand, rep, err := m.repairGIFHolds(ctx, scratch, "", data, target, enc.GifsicleOptions{Lossy: out.Lossy, Loop: out.Loop}, note)
+	// The report going INTO this rung decides what the outcome may claim: the
+	// repair is also the generic structural re-encode, and a file that never
+	// had clear-only frames must not be described as repaired for them (the
+	// --colors rung can create them — it re-runs the optimiser — so this is
+	// the post-colours report, not the caller's).
+	held := failsHoldRule(report)
+	cand, rep, err := m.repairGIFHolds(ctx, scratch, tag, data, target, enc.GifsicleOptions{Lossy: sopts.Lossy, Loop: sopts.Loop}, note)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, report, ctx.Err()
+			return nil, report, did, ctx.Err()
 		}
 		log.Printf("jobs: hold repair failed: %v", err)
-		return data, report, nil
+		return data, report, did, nil
 	}
-	return cand, rep, nil
+	did.replaced, did.holds = true, held
+	return cand, rep, did, nil
+}
+
+// failsHoldRule reports whether rep failed gif.noop-frame-disposal (at any
+// level).
+func failsHoldRule(rep discordlint.Report) bool {
+	for _, c := range rep.Checks {
+		if c.Rule == discordlint.RuleGIFNoopFrameDisposal && !c.OK {
+			return true
+		}
+	}
+	return false
 }
 
 // ladderTriesColors reports whether the ladder's "gifsicle --colors" rung is
@@ -784,10 +905,11 @@ func ladderTriesColors(rep discordlint.Report) bool {
 }
 
 // ladderColors is the ladder's first rung: one "gifsicle -O2 --colors N"
-// pass over data, linted and fixed.
-func (m *Manager) ladderColors(ctx context.Context, scratch string, data []byte, target discordlint.Target, opts enc.GifsicleOptions) ([]byte, discordlint.Report, error) {
-	in := filepath.Join(scratch, "ladder-in.gif")
-	outPath := filepath.Join(scratch, "ladder-colors.gif")
+// pass over data, linted and fixed. tag keeps the scratch file names unique
+// (see gifLadder).
+func (m *Manager) ladderColors(ctx context.Context, scratch, tag string, data []byte, target discordlint.Target, opts enc.GifsicleOptions) ([]byte, discordlint.Report, error) {
+	in := filepath.Join(scratch, "ladder"+tag+"-in.gif")
+	outPath := filepath.Join(scratch, "ladder"+tag+"-colors.gif")
 	defer os.Remove(in)
 	defer os.Remove(outPath)
 	if err := os.WriteFile(in, data, 0o644); err != nil {
@@ -838,9 +960,16 @@ func holdRepairOptions(sopts enc.GifsicleOptions) (coalesce, reopt enc.GifsicleO
 // doubles as the generic structural re-encode of the fallback ladder:
 //
 //	A. gifsicle -U --disposal=background, no optimiser: every frame becomes a
-//	   full-canvas disposal-2 frame (pixel-exact), in which every held frame
-//	   is a harmless no-op — discordlint.MergeGIFHolds then folds the holds
-//	   into their first frame.
+//	   full-canvas disposal-2 frame, in which every held frame is a harmless
+//	   no-op — discordlint.MergeGIFHolds then folds the holds into their
+//	   first frame. gifsicle only gets this right when the FIRST frame
+//	   declares and uses transparency, so a clip that shows the background
+//	   anywhere is given a transparent 1x1 lead-in frame
+//	   (discordlint.PrependTransparentFrame) that the frame selection "#1-"
+//	   drops again; and it silently gives up on local colour tables or more
+//	   than 256 colours per picture. The result is therefore CHECKED against
+//	   the input (discordlint.PlayGIF / GIFPlayback.Same): a coalesce that
+//	   changed the picture is an error, never a repair.
 //	B. gifsicle -O2 --careful (+ the caller's Lossy/Colors/Dither) over A:
 //	   with no run of identical frames left the optimiser has nothing to
 //	   turn into a clear-only frame.
@@ -849,9 +978,11 @@ func holdRepairOptions(sopts enc.GifsicleOptions) (coalesce, reopt enc.GifsicleO
 // (hasStructuralError, which counts the hold rule at any level) or the pass
 // failed, in which case A's are — larger, but structurally the
 // plainest file gifsicle can write. With Lossy 0 and Colors 0 both are
-// pixel-exact against data. tag keeps the scratch file names unique (fit
-// candidates run concurrently); note, when not nil, is told which step
-// runs. An error means step A failed and the caller keeps what it had.
+// pixel-exact against data — B is checked too, and A kept when it is not.
+// tag keeps the scratch file names unique (fit candidates run concurrently);
+// note, when not nil, is told which step runs. An error means step A failed —
+// gifsicle itself, or the check of its output — and the caller keeps what it
+// had.
 func (m *Manager) repairGIFHolds(ctx context.Context, scratch, tag string, data []byte, target discordlint.Target, sopts enc.GifsicleOptions, note func(step string)) ([]byte, discordlint.Report, error) {
 	if m.tools.Gifsicle == "" {
 		return nil, discordlint.Report{}, errors.New("gifsicle is not available")
@@ -869,12 +1000,52 @@ func (m *Manager) repairGIFHolds(ctx context.Context, scratch, tag string, data 
 	}()
 	coalesce, reopt := holdRepairOptions(sopts)
 
+	// What the input shows is the reference every step is checked against.
+	// A file that cannot be played (a frame outside the logical screen, a
+	// reserved disposal, broken pixel data, the analysis caps) cannot be
+	// checked either: it still gets the lead-in frame below (nothing says it
+	// is opaque), but no result is compared.
+	ref, err := discordlint.PlayGIF(data)
+	if err != nil {
+		log.Printf("jobs: hold repair: the input cannot be played, the result is not checked: %v", err)
+	}
+	// gifsicle's unoptimiser decides from the FIRST frame whether the canvas
+	// is transparent at all: unless that frame declares and uses a transparent
+	// index, every coalesced frame comes out opaque. A clip that shows the
+	// background anywhere therefore gets a transparent lead-in frame, which the
+	// frame selection drops again (byte-identical where -U worked without it;
+	// an opaque clip is left alone).
+	src := data
+	if ref == nil || ref.ShowsBackground() {
+		if led, err := discordlint.PrependTransparentFrame(data); err != nil {
+			log.Printf("jobs: hold repair: no lead-in frame: %v", err)
+		} else {
+			src, coalesce.SkipFirstFrame = led, true
+		}
+	}
+
 	note("gifsicle -U --disposal=background")
-	if err := os.WriteFile(in, data, 0o644); err != nil {
+	if err := os.WriteFile(in, src, 0o644); err != nil {
 		return nil, discordlint.Report{}, err
 	}
 	if err := ffrun.Run(ctx, m.tools.Gifsicle, enc.GifsicleArgs(in, flat, coalesce)); err != nil {
 		return nil, discordlint.Report{}, fmt.Errorf("gifsicle coalesce: %w", err)
+	}
+	// The guard. gifsicle exits 0 on coalesces it got wrong: with local colour
+	// tables or more than 256 colours per picture it gives up ("too complex to
+	// unoptimize") yet still rewrites every disposal. A file that no longer
+	// shows the input's animation is never a repair: the caller keeps what it
+	// had, with the failing check visible. A coalesced file that is merely too
+	// large to play (full-canvas frames cost far more than the optimised
+	// input's sub-rectangles) is not wrong, only beyond judging: like an input
+	// over the cap it goes on unchecked.
+	if ref != nil {
+		if err := sameAnimationAsFile(ref, flat); errors.Is(err, discordlint.ErrAnalysisCap) {
+			log.Printf("jobs: hold repair: the coalesced file is too large to play, the result is not checked: %v", err)
+			ref = nil
+		} else if err != nil {
+			return nil, discordlint.Report{}, fmt.Errorf("gifsicle coalesce: %w", err)
+		}
 	}
 	mergeHoldsInFile(flat)
 
@@ -887,9 +1058,37 @@ func (m *Manager) repairGIFHolds(ctx context.Context, scratch, tag string, data 
 	} else if cand, rep, err := lintGIFFile(opt, target); err != nil {
 		log.Printf("jobs: hold repair: lint after gifsicle -O2: %v", err)
 	} else if !hasStructuralError(rep) {
-		return cand, rep, nil
+		// Without lossy / colour reduction step B must be exact as well.
+		if ref == nil || reopt.Lossy > 0 || reopt.Colors > 0 {
+			return cand, rep, nil
+		}
+		err := sameAnimation(ref, cand)
+		if err == nil || errors.Is(err, discordlint.ErrAnalysisCap) {
+			return cand, rep, nil
+		}
+		log.Printf("jobs: hold repair: gifsicle -O2: %v; keeping the coalesced file", err)
 	}
 	return lintGIFFile(flat, target)
+}
+
+// sameAnimation checks that data plays like ref (discordlint.GIFPlayback.Same).
+func sameAnimation(ref *discordlint.GIFPlayback, data []byte) error {
+	got, err := discordlint.PlayGIF(data)
+	if err != nil {
+		return fmt.Errorf("the result cannot be played: %w", err)
+	}
+	if same, detail := ref.Same(got); !same {
+		return fmt.Errorf("the picture changed: %s", detail)
+	}
+	return nil
+}
+
+func sameAnimationAsFile(ref *discordlint.GIFPlayback, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return sameAnimation(ref, data)
 }
 
 // RuleRenderAlpha is the info-level check jobs appends to a report when the
@@ -958,7 +1157,9 @@ func isStructuralFailure(c discordlint.Check) bool {
 }
 
 // repairIfOnlyHolds is the lint step of the paths that do not walk the full
-// ladder (the optimize preset and the fit candidates): when the only
+// ladder (the optimize preset, optimizeFit's candidates and the render fit's
+// default-encoder GIF candidates — gifski fit candidates walk gifLadder
+// instead, see fitRun.encode): when the only
 // structural failure of report is gif.noop-frame-disposal — at any level, so
 // for every target including none (isStructuralFailure) — and gifsicle is
 // available, the hold repair replaces data and report (repaired = true).
@@ -991,7 +1192,8 @@ func (m *Manager) repairIfOnlyHolds(ctx context.Context, scratch, tag string, da
 // structural failure (hasStructuralError's notion: byte/dimension/duration
 // limits and the other rules' warnings do not count). That is the one
 // structural failure a palette pass cannot touch and the hold repair
-// (repairGIFHolds) always can.
+// (repairGIFHolds) usually can — it refuses a coalesce that changed the
+// picture, see repairIfOnlyHolds.
 func onlyHoldsFailed(rep discordlint.Report) bool {
 	holds := false
 	for _, c := range rep.Checks {

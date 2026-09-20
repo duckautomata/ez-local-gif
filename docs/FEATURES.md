@@ -166,12 +166,70 @@ Polish + extras, DESIGN.md §10 item 4 — built 2026-08-29:
   through the ladder; the optimize preset (which, like the fast path, cannot merge first:
   frame selection and crop happen inside the same gifsicle call) and the fit candidates run it
   when the check is their only structural failure (their description then says "held frames
-  re-encoded for Discord"). The old `-U -O2` / plain `-U` rungs are gone (plain `-U` kept the bad frames).
+  re-encoded for Discord"; gifski fit candidates walk the whole ladder — next entry). The old `-U -O2` / plain `-U` rungs are gone (plain `-U` kept the bad frames).
   Cached results are re-rendered (`PipelineVersion` 2026-09-19.2, `RulesVersion` 2026-09-19.1);
   DESIGN.md §5.2 item 9 and §5.3. **Verified on Discord:** the six-variant matrix, and the
-  pipeline's output for the reported recipe is byte-identical to its variant 2 (58,640 B, ok).
+  pipeline's output for the reported recipe was byte-identical to its variant 2 (58,640 B, ok)
+  at `PipelineVersion` .2 (the .4 output differs by one restored pixel — see the entries below).
   The repaired / coalesced forms and other inputs have not been uploaded. Known limits
   (DESIGN.md §11): in the optimize preset and fit candidates the repair applies `--lossy` a
   second time; a GIF too large to analyse (16 M canvas pixels / 2³¹ decoded pixels), a frame
   outside the logical screen or a reserved disposal value ends the analysis and the check passes
   with a "not analysed" note.
+- **gifski + fit-to-size finds a result again (2026-09-19)** — with the gifski encoder and a
+  byte budget a search with loop forever ended in "no candidate passes the Discord rules", for
+  every target:
+  gifski writes a local colour table on each frame, which the linter refuses (frame 0 cannot
+  get its transparency flag; Discord tiers also need one global palette), and only the
+  single-output render ran the re-encode ladder that fixes it. Fit candidates of the gifski
+  encoder now walk the same ladder (`gifsicle --colors N`, then the hold repair), each with its
+  own scratch files since candidates encode concurrently. A finite loop count hid the bug on
+  clips of ≤ 256 colours (its gifsicle pass merged the palettes by accident) and, for target
+  none, turned it into a needlessly down-scaled result on richer clips. Note that whenever
+  gifsicle is present the delivered gifski file is therefore re-quantised to one global palette
+  by the lint ladder (single renders always were). Cached results are re-rendered
+  (`PipelineVersion` 2026-09-19.3); DESIGN.md §4.2 (gifski row), §5.3.
+- **Transparent GIFs: two ffmpeg encoder defects worked around (2026-09-19)** — ffmpeg's GIF
+  encoder optimises frames in two ways that are wrong once frames have transparency. (1) It crops
+  such a frame to its opaque bounding box, but the column scan skips the box's bottom row:
+  whatever part of that row sticks out past the rows above was cut off and came out transparent
+  (one pixel on 11 frames of the clip the held-frames fix was reported with; a whole ground line
+  or shadow wider than the body on pixel art). (2) It decides per frame how to store it: a
+  **fully opaque** frame inside a transparent clip — a keyed subject that fills the frame for a
+  while, an alpha fade — was diffed against the previous frame and kept on the canvas, which left
+  holes in it and then showed it *under* the transparent frames after it. Alpha GIFs are now
+  encoded with `-gifflags -offsetting` (full-canvas frames: no crop, nothing cut off); when
+  ffmpeg's output shows the mix — it marks the two kinds of frame with different disposals; an
+  entirely transparent lead-in before opaque frames is exact already and is left alone — the
+  clip is encoded a second time as complete frames (`-gifflags -offsetting-transdiff`) and every
+  frame gets disposal 2 (`discordlint.DisposeCompleteFrames`), before the hold merge and
+  gifsicle: both cases are exact, and clips without the mix keep ffmpeg's diffing (and their
+  size). gifsicle re-crops the frames, so the final file grows by well under 1 KB (58,665 B vs
+  58,640 B on the reported clip; without gifsicle the delivered full-canvas file is larger,
+  noticeably so for a small sprite on a large canvas). Opaque GIFs
+  were never affected (different, correct code path — verified) and keep their bytes.
+  Real-ffmpeg regression tests reproduce both upstream bugs and pin the workaround. Cached
+  results are re-rendered (`PipelineVersion` 2026-09-19.4); DESIGN.md §4.2 (GIF row), §5.2
+  item 8. A mixed clip costs a second palette pass (once per size/rate in a fit search). Known
+  limits, older than this fix: the *colours* of a picture that appears after the first frame and
+  then holds still to the end can be off (ffmpeg's `stats_mode=diff` palette never counts them).
+  Not yet uploaded to Discord in this form: the reported clip's pre-gifsicle file is
+  byte-identical to the verified variant 6, the final file has variant 2's structure.
+- **The held-frames repair no longer loses transparency (2026-09-20)** — repairing a GIF whose
+  *first* frame is fully opaque while later frames are transparent (through the lossless fast
+  path or the Optimize preset) painted the later frames' background solid, and the file was
+  still reported as fine. gifsicle's coalesce decides from the first frame whether the canvas is
+  transparent at all. The repair now hands gifsicle a tiny transparent lead-in frame (dropped
+  again with `#1-`), which makes the coalesce exact, and the coalesced file — plus the
+  re-optimised one when nothing lossy ran — is played and compared with the input (a file that
+  cannot be played, or is too large to, is repaired unchecked): a repair that changed the picture — gifsicle also silently gives up on local
+  colour tables or more than 256 colours per picture, yet still rewrites the disposals — is
+  refused, and the file is delivered as it came with the failing check visible. Cached results
+  are re-rendered (`PipelineVersion` 2026-09-20.1); DESIGN.md §5.3 rung 2.
+- **The scrubber keeps its size while scrubbing (2026-09-19)** — the frame readout beside the
+  preview slider gained a character whenever the frame number gained a digit (frame 10, 100, …).
+  In the wrapping scrub row that shrank the slider a little each time and, on a column about as
+  wide as the row (a 1080 px portrait monitor), pushed the readout onto its own line, so the
+  slider jumped to the full row width in the later part of a clip and back again. The readout
+  now reserves the width of its widest text (it is monospaced, so that is exact): slider and
+  readout are the same size on every frame.

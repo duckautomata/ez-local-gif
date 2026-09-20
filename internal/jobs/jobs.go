@@ -29,8 +29,11 @@
 //     Percent, using plan.Frames or plan.Duration for the denominator);
 //     scan alpha; fill enc.Master.
 //  5. Encode per output.Format (encoders.go, frames.go, phase4.go):
-//     gif → enc.GIFArgs, discordlint.MergeGIFHolds (held frames become one
-//     long frame before the optimiser can see the run), then
+//     gif → enc.GIFArgs; an alpha master whose output mixes fully opaque
+//     and transparent frames is encoded again as complete frames and gets
+//     disposal 2 on every frame (discordlint.DisposeCompleteFrames), then
+//     discordlint.MergeGIFHolds (held frames become one long frame before the
+//     optimiser can see the run), then
 //     enc.GifsicleArgs (output.Loop restated as --loopcount) — or, with
 //     Output.Encoder "gifski", PNG frames → gifski;
 //     webp → enc.WebPArgs; apng → enc.APNGArgs (RGBA) or,
@@ -51,7 +54,9 @@
 //     --colors N, then the hold repair — coalesce to all-disposal-2 frames,
 //     merge held frames, re-optimise; the optimize preset and the fit
 //     candidates run the hold repair alone when gif.noop-frame-disposal is
-//     their only structural failure),
+//     their only structural failure — except gifski's fit candidates, which
+//     walk the whole ladder: their local colour tables need the --colors
+//     rung),
 //     LintWebP, LintAPNG, LintStatic, LintVideo; frames are not linted. Report.HasAlpha
 //     is overridden with the master's pixel alpha scan (the linter's flag is
 //     structural and over-reports on frame-diff optimised opaque animations;
@@ -505,7 +510,42 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames, mp4, webm
 // candidates no longer deliver the clear-only frames gifsicle -O makes out of
 // a source's holds. Every GIF with a hold renders to different bytes, and
 // the memoised ones stack their poses on Discord. (.1 was never committed.)
-const PipelineVersion = "2026-09-19.2"
+// 2026-09-19.3: gifski fit candidates walk the re-encode ladder (gifLadder:
+// "gifsicle --colors", then the hold repair) like the single-output gifski
+// render always did. gifski's per-frame local colour tables fail
+// gif.frame0-transparency for every target and gif.global-palette for the
+// Discord ones, so a gifski fit used to end in "no candidate passes the
+// Discord rules" with loop forever, and with a finite loop count its
+// gifsicle pass let a candidate through by accident (<= 256-colour clips) or
+// only at a down-scaled rung (target none); those memoised non-results and
+// degraded fits must not be served.
+// 2026-09-19.4: alpha GIFs are encoded with "-gifflags -offsetting"
+// (enc.GIFArgs), and when that output mixes frames with transparency and
+// fully opaque ones in a way the encoder renders wrong
+// (discordlint.GIFNeedsCompleteFrames) it is encoded again as complete frames
+// ("-gifflags -offsetting-transdiff") with every frame given disposal 2
+// (discordlint.DisposeCompleteFrames) before the hold merge. Two defects of
+// ffmpeg's gif encoder on frames with transparency: its bounding-box crop
+// skips the box's bottom row in the column scans, so the part of that row
+// sticking out past the rows above turned transparent (11 frames x 1 px on
+// the clip the held-frames fix was reported with; a whole ground line or
+// shadow on pixel art), and it picks diffing and disposal per frame, so in a
+// mixed clip the opaque frames got holes (their "unchanged" pixels, after a
+// disposed frame) and stayed on the canvas under the transparent frames after
+// them. Every transparent GIF is re-rendered: full-canvas frames before the
+// hold merge and gifsicle, a slightly different file after them. Opaque GIFs
+// keep the default flags and their bytes.
+// 2026-09-20.1: the hold repair (repairGIFHolds) is prepared and checked.
+// gifsicle's coalesce decides from the first frame whether the canvas is
+// transparent at all, so a GIF that starts on a fully opaque picture and turns
+// transparent later came out of the repair with every frame opaque — and with
+// a passing report; with local colour tables (or > 256 colours per picture)
+// gifsicle gives up at exit 0 yet still rewrites the disposals. The repair now
+// hands gifsicle a transparent lead-in frame and compares what comes back with
+// the input (a changed picture is refused). The repaired files of such clips
+// — fast path, optimize preset, fit candidates, ladder — change; the memoised
+// ones are wrong.
+const PipelineVersion = "2026-09-20.1"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what

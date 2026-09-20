@@ -135,7 +135,9 @@ local test can stand in for an upload: after any change to the GIF path, the lad
 flags, also upload a transparent GIF whose subject holds still for a run of frames between poses
 and then moves somewhere that needs the old pixels cleared (the kit has no such variant yet). What
 an upload has verified so far is the six-variant matrix, plus the fact that the rebuilt pipeline's
-output for the reported recipe is byte-identical to its variant 2 (58,640 B, ok on Discord); the
+output for the reported recipe was byte-identical to its variant 2 (58,640 B, ok on Discord) at
+`PipelineVersion` 2026-09-19.2 — the .4 output (58,665 B, one restored edge pixel; its pre-gifsicle
+form equals verified variant 6) still needs one upload; the
 repair's outputs (in particular the coalesced last rung: full canvas *and* a per-frame transparent
 index) and other inputs have not been uploaded. The rule's exact definition is in
 [`DESIGN.md`](DESIGN.md) §5.3.

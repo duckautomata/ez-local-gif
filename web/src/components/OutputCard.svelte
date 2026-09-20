@@ -486,7 +486,7 @@
               value={out.encoder === 'gifski' ? 'gifski' : ''}
               onchange={(e) => (app.output.encoder = e.currentTarget.value === 'gifski' ? 'gifski' : '')}
               aria-label="GIF encoder"
-              title="gifski builds per-frame local palettes: noticeably better gradients, much slower — attachments / no target only (Discord emotes break with it)"
+              title="gifski quantises and dithers every frame itself (much slower). To pass the GIF checks the result is then re-quantised to one shared palette, so the gain over the default encoder is small on colour-rich clips — attachments / no target only (Discord emotes break with it)"
             >
               <option value="">ffmpeg palette (default)</option>
               <option value="gifski">gifski (HQ, slow)</option>
