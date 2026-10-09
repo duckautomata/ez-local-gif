@@ -26,7 +26,11 @@ import (
 // serving frames the old code produced. 1: reversed stills of VFR animation
 // sources decode from TrimStart (enc reversedSeekFor honours
 // Plan.SourceVFR) — the frames memoised before that fix were wrong.
-const stillMemoVersion = "2026-08-22.1"
+// 2026-10-08.1: Phase 5a — the compiler keys chromakey recipes against the
+// limited-range YUV colour (yuv=1 after an rgba pass) and the chroma/colour
+// default similarities changed (0.2 → 0.1 / 0.1 → 0.08), so the memoised
+// stills of keyed recipes show the off-range key and the old defaults.
+const stillMemoVersion = "2026-10-08.1"
 
 // Still renders a single preview frame (PNG bytes) for the recipe's op stack
 // at time t seconds, at most maxW pixels wide (0 = 480). Results are
@@ -88,13 +92,17 @@ func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.
 		}
 		return nil, err
 	}
-	ops = stripAutoCropResolved(ops)
+	ops = stripMatteResolved(stripAutoCropResolved(ops))
 	s, err := m.resolveSources(srcs)
 	if err != nil {
 		return nil, err
 	}
 	subset := stillOutput(out)
-	plan, err := m.compile(ctx, s, ops, subset)
+	// Phase 5b: a stack with a matte op resolves its mattes inside compile
+	// (preview mode: a matte not on disk yet comes back as *ErrMattePending
+	// — the server's 202 — after mattePreviewWait, honouring the eager flag
+	// the server put on ctx); the memo key folds their clip keys in.
+	plan, mattes, err := m.compile(ctx, s, ops, subset)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +111,7 @@ func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.
 	}
 	t = clampStillTime(plan, t, s.main().Info.IsStill)
 
-	key, err := stillKey(srcs, ops, subset, t, maxW)
+	key, err := stillKeyFor(srcs, ops, subset, t, maxW, mattes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
@@ -124,6 +132,11 @@ func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.
 			return nil, err
 		}
 		defer release()
+		unprotect, err := protectMattes(m.st, mattes) // the matte memo stays for the run
+		if err != nil {
+			return nil, err
+		}
+		defer unprotect()
 		if len(plan.TextFiles) > 0 {
 			dir, cleanup, err := m.st.ScratchDir("still-" + store.RandomID(8))
 			if err != nil {
@@ -205,13 +218,27 @@ func clampStillTime(plan *graph.Plan, t float64, still bool) float64 {
 }
 
 // stillKey hashes (stillMemoVersion, every source, canonical ops, geometry
-// output, t, maxW).
+// output, t, maxW) for a stack without AI mattes.
 func stillKey(srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int) (string, error) {
-	return stillKeyV(srcs, ops, out, t, maxW, stillMemoVersion)
+	return stillKeyFor(srcs, ops, out, t, maxW, nil)
+}
+
+// stillKeyFor is stillKey with the stack's resolved mattes folded in
+// (Phase 5b: their clip keys carry the weights and processing version from
+// the persisted facts, so a re-pinned sidecar never serves a stale still
+// from the scratch memo, which outlives sidecar restarts); the key of a
+// stack without a matte op is unchanged.
+func stillKeyFor(srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int, mattes []resolvedMatte) (string, error) {
+	return stillKeyVM(srcs, ops, out, t, maxW, stillMemoVersion, mattes)
 }
 
 // stillKeyV is stillKey with an explicit version salt.
 func stillKeyV(srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int, version string) (string, error) {
+	return stillKeyVM(srcs, ops, out, t, maxW, version, nil)
+}
+
+// stillKeyVM is stillKeyFor with an explicit version salt.
+func stillKeyVM(srcs []string, ops []recipe.Op, out recipe.Output, t float64, maxW int, version string, mattes []resolvedMatte) (string, error) {
 	canon, err := recipe.Recipe{Sources: srcs, Ops: ops, Output: out}.Canonical()
 	if err != nil {
 		return "", err
@@ -219,7 +246,7 @@ func stillKeyV(srcs []string, ops []recipe.Op, out recipe.Output, t float64, max
 	h := sha256.New()
 	h.Write([]byte("still|" + version + "\n"))
 	h.Write(canon)
-	h.Write([]byte("|t=" + strconv.FormatFloat(t, 'f', 3, 64) + "|w=" + strconv.Itoa(maxW)))
+	h.Write([]byte("|t=" + strconv.FormatFloat(t, 'f', 3, 64) + "|w=" + strconv.Itoa(maxW) + matteKeySuffix(mattes)))
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 

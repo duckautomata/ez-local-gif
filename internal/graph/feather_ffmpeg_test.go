@@ -126,7 +126,7 @@ func TestFeatherPixels(t *testing.T) {
 			{Kind: recipe.OpFeather, Params: []byte(`{"radius":3}`)},
 		}, out)
 		// The key on the opaque source is bare and the feather follows it.
-		if !strings.Contains(p.Filter, "chromakey=color=0x00ff00") ||
+		if !strings.Contains(p.Filter, "chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1") ||
 			!strings.Contains(p.Filter, "despill=type=green:mix=0.6:expand=0.3,format=gbrap,gblur=sigma=3:planes=8,format=rgba") {
 			t.Fatalf("filter: %s", p.Filter)
 		}
@@ -135,12 +135,17 @@ func TestFeatherPixels(t *testing.T) {
 			t.Fatalf("%d frames, want 2", len(frames))
 		}
 		for i, f := range frames {
-			// The chromakey leaves the last screen pixel before the subject
-			// partially opaque (its 3x3 neighbourhood sees the subject), so
-			// the 50% point shifts a little towards the screen; the shape is
-			// the same monotonic gradient. Window [16, 48]: >= 16 px from
-			// the frame borders, clear of chromakey's border quirk (above).
-			checkFeatheredEdge(t, f, w, 16, edge, edge-16, edge+16, 4, 40, "keyed feather")
+			// The chromakey keeps the last screen column before the subject
+			// opaque: its 3x3 neighbourhood averages six screen pixels (0)
+			// with three subject pixels (~0.58), 0.19 > the default
+			// similarity 0.1 + blend 0.05 (at the former default 0.2 that
+			// column was keyed). So the keyed edge is a hard step one column
+			// into the screen, between edge-2 and edge-1 (measured 0 | 255 at
+			// columns 30 | 31, and 98 | 157 after the blur — the plain
+			// profile shifted by one), and the shape is the same monotonic
+			// gradient. Window [16, 48]: >= 16 px from the frame borders,
+			// clear of chromakey's border quirk (above).
+			checkFeatheredEdge(t, f, w, 16, edge-1, edge-16, edge+16, 4, 40, "keyed feather")
 			// Deep inside the subject: still red (despill leaves pure red
 			// alone; the yuva444p round trip costs a little).
 			if px := pixel(f, w, w-2, 16); !near(px[0], 255, 4) || !near(px[1], 0, 4) || !near(px[2], 0, 4) {

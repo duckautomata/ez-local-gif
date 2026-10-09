@@ -28,6 +28,10 @@
 //   GET  /api/input                                   -> InputResponse ({files: [...]}, features.inputPick)
 //   POST /api/sources/from-input {name}               -> Source (ingests a /input file like an upload)
 //   POST /api/results/{recipeHash}/save {file, name?} -> {name} (writes a result file to /output, features.outputSave)
+// Phase 5b (the AI matte sidecar, features.matte):
+//   GET  /api/matte                                   -> MatteStatus (the app's last probe of the sidecar)
+//   POST /api/still | /api/proxy with a matte op      -> 202 MattePendingBody while the matte pass runs / the
+//                                                        model loads (fetchStill / fetchProxy throw MattePending)
 // Errors are {"error": "message"} with a 4xx/5xx status.
 
 // ---------------------------------------------------------------------------
@@ -92,7 +96,11 @@ export type OpKind =
   // Phase 4 (review R4)
   | 'feather'
   // Phase 4: forward then backward ("ping-pong"), no params — frames and duration double
-  | 'bounce';
+  | 'bounce'
+  // Phase 5a: 3×3 morphology on the alpha plane (fill pinholes / grow), hoisted with the keys like feather
+  | 'morph'
+  // Phase 5b: the AI matte of the sidecar (one alpha frame per master frame), hoisted with the keys
+  | 'matte';
 
 export type FitMode = 'contain' | 'cover' | 'exact';
 
@@ -103,7 +111,7 @@ export type FitMode = 'contain' | 'cover' | 'exact';
 export type Anchor = 'tl' | 'tc' | 'tr' | 'ml' | 'mc' | 'mr' | 'bl' | 'bc' | 'br';
 export const ANCHORS: readonly Anchor[] = ['tl', 'tc', 'tr', 'ml', 'mc', 'mr', 'bl', 'bc', 'br'];
 
-/** Go: recipe.ChromaKeyParams — greenscreen / bluescreen keying in YUV plus despill. Zero values: 00ff00, 0.2, 0.05, despill on with 0.6 / 0.3. */
+/** Go: recipe.ChromaKeyParams — greenscreen / bluescreen keying in YUV plus despill. Zero values (Phase 5a): 00ff00, similarity 0.1, blend 0.05, despill on with 0.6 / 0.3. */
 export interface ChromaKeyParams {
   color?: string;
   similarity?: number;
@@ -112,12 +120,65 @@ export interface ChromaKeyParams {
   despillMix?: number;
   despillExpand?: number;
 }
-/** Go: recipe.ColorKeyParams — one RGB colour (the eyedropper's) becomes transparent. Zero values: similarity 0.1, blend 0. */
+/** Go: recipe.ColorKeyParams — one RGB colour (the eyedropper's) becomes transparent; the Colour mode emits one per colour. Zero values (Phase 5a): similarity 0.08, blend 0. */
 export interface ColorKeyParams {
   color: string;
   similarity?: number;
   blend?: number;
 }
+/**
+ * Go: recipe.MorphParams (Phase 5a) — 3×3 morphology on the alpha plane,
+ * hoisted into the keying group like feather (it acts on whatever key
+ * precedes it; skipped while the frames carry no alpha). `close` = a
+ * dilation then an erosion (fills pinholes of up to 1 px without growing
+ * the silhouette); `grow` 0..4 = that many extra dilations (recovers eaten
+ * interiors at a fringe of as many SOURCE pixels). At least one of the two
+ * must be set — a bare `{kind:"morph"}` is a compile error server-side, so
+ * the serialiser emits nothing instead. The colour planes are never touched.
+ */
+export interface MorphParams {
+  close?: boolean;
+  grow?: number;
+}
+/**
+ * Go: recipe.MatteResolved (Phase 5b) — the identity of the matte a render
+ * used, filled by the server from the sidecar's pinned facts and kept in
+ * the recipe hash (a result rendered with other weights is another
+ * result). Informational on this side: it shows in a result's recipe.
+ */
+export interface MatteResolved {
+  weights: string;
+  proc: string;
+  size: number;
+  precision: string;
+}
+/**
+ * Go: recipe.MatteParams (Phase 5b) — key the main source with the AI
+ * matte of the sidecar, hoisted into the keying group like chromakey /
+ * colorkey / morph / feather: on opaque frames the matte becomes the alpha,
+ * on alpha-carrying frames it is multiplied in. `model` is an id the
+ * sidecar offers (GET /api/matte lists them); "" / omitted is the recipe
+ * default MATTE_MODEL_DEFAULT, not the sidecar's own default — the card
+ * sends the id it shows. `size` (the model input square) is API-only; 0 =
+ * the server's default for its device. `resolved` is the server's: a
+ * client-sent one is stripped.
+ */
+export interface MatteParams {
+  model?: string;
+  size?: number;
+  resolved?: MatteResolved;
+}
+/**
+ * Go: recipe.MatteModel* — the two shipped model ids and the recipe
+ * default a `matte` op without `model` resolves to (isnet-anime, "Anime
+ * (fast)"; birefnet-lite is "General (precise)"). The sidecar may offer
+ * others (MATTE_MODELS) and preselect another (MATTE_DEFAULT_MODEL —
+ * MatteStatus.defaultModel), which is why the op always names the model
+ * unless it is this constant.
+ */
+export const MATTE_MODEL_ISNET_ANIME = 'isnet-anime';
+export const MATTE_MODEL_BIREFNET_LITE = 'birefnet-lite';
+export const MATTE_MODEL_DEFAULT = MATTE_MODEL_ISNET_ANIME;
 /**
  * Go: recipe.FeatherParams — Gaussian blur of the alpha plane (soft
  * transparency edge). `radius` is the sigma in SOURCE pixels; 0 (the Go zero
@@ -219,12 +280,30 @@ export type OpParams =
   | AutoCropParams
   | TextParams
   | OverlayParams
-  | FeatherParams;
+  | FeatherParams
+  | MorphParams
+  | MatteParams;
 
 /** One step of the non-destructive op stack (Go: recipe.Op; params is json.RawMessage). */
 export interface Op {
   kind: OpKind;
   params?: OpParams;
+}
+
+/** hasMatteOp: the stack carries an AI matte (the previews may answer 202 while its pass runs). */
+export function hasMatteOp(ops: readonly Op[] | null | undefined): boolean {
+  return (ops ?? []).some((o) => o.kind === 'matte');
+}
+
+/**
+ * matteModelOf is the model id a stack's matte op names (the recipe default
+ * when the op carries none); '' without a matte op.
+ */
+export function matteModelOf(ops: readonly Op[] | null | undefined): string {
+  const op = (ops ?? []).find((o) => o.kind === 'matte');
+  if (!op) return '';
+  const model = (op.params as MatteParams | undefined)?.model;
+  return typeof model === 'string' && model !== '' ? model : MATTE_MODEL_DEFAULT;
 }
 
 /** Go: recipe.Format* constants ("mp4"/"webm" are the Phase 4 opaque video exports). */
@@ -335,7 +414,8 @@ export interface Report {
 // jobs
 
 export type JobState = 'queued' | 'running' | 'done' | 'error';
-export type Stage = 'probe' | 'master' | 'encode' | 'lint' | 'verify' | 'done' | (string & {});
+/** Go: jobs.Stage* — "matte" (Phase 5b) is the AI matte pass before the master, its message "24/45 · GPU" / "loading model (12 s)". */
+export type Stage = 'probe' | 'matte' | 'master' | 'encode' | 'lint' | 'verify' | 'done' | (string & {});
 
 /** Go: jobs.FileKind* — "" and "output" are the primary file. */
 export type FileKind = '' | 'output' | 'alternative' | 'frame' | 'archive';
@@ -409,6 +489,13 @@ export interface StillRequest {
   output: Output;
   t: number;
   maxW: number;
+  /**
+   * Phase 5b: start the AI matte pass even when its estimate is over the
+   * server's eager bound for stills (jobs.matteEagerSeconds, 90 s) —
+   * "Compute now" on a deferred still; Play and Render always start it.
+   * Sent only with a matte op in the stack (lib/still.ts computeNow).
+   */
+  eager?: boolean;
 }
 
 /** Body of POST /api/proxy (Phase 3): the animated low-res preview behind Play. */
@@ -420,6 +507,78 @@ export interface ProxyRequest {
   maxW: number;
   /** first N seconds of the output (server default 10) */
   maxSeconds: number;
+  /** Phase 5b: Play always starts a deferred matte pass (see StillRequest.eager); sent only with a matte op */
+  eager?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5b: the AI matte sidecar (GET /api/matte, the 202 preview answer)
+
+/** Go: jobs.MattePending* — the "state" of a 202 preview answer (a newer server may add one). */
+export type MattePendingState = 'running' | 'deferred' | 'loading' | 'downloading' | (string & {});
+/** The sidecar's per-model state (sidecar /v1/ping, through jobs.MatteModelStatus). */
+export type MatteModelState = 'ready' | 'loading' | 'downloading' | 'missing' | 'unavailable' | (string & {});
+/** Go: matte.GPUInfo — the sidecar's card, when it has one. */
+export interface MatteGPUInfo {
+  name: string;
+  totalGiB: number;
+  freeGiB: number;
+}
+/** Go: jobs.MatteModelStatus — one offered model in MatteStatus.models. */
+export interface MatteModelStatus {
+  /** the UI label ("Anime (fast)", "General (precise)"); may be empty on an older sidecar — lib/matte fills the shipped ids' */
+  label: string;
+  state: MatteModelState;
+  /** download / load progress for the transient states */
+  percent?: number;
+  /** the sidecar's measured ms per frame at its default size (0 / absent = unknown) */
+  msPerFrame?: number;
+  /** why the model is missing / unavailable */
+  reason?: string;
+  licence?: string;
+  sizes?: number[] | null;
+}
+/**
+ * Go: jobs.MatteStatus — what GET /api/matte answers (the app's last probe
+ * of the sidecar, never a live round trip) and what every 202 preview
+ * answer carries next to its pending fields. `enabled` is features.matte;
+ * with it off only `reason`, `maxSeconds` and `maxFrames` say anything.
+ */
+export interface MatteStatus {
+  enabled: boolean;
+  /** "cuda" / "cpu" / "unavailable" / "" (never probed) */
+  device: string;
+  /** why the feature or the device is off */
+  reason?: string;
+  gpu?: MatteGPUInfo | null;
+  /** the id the UI preselects (the sidecar's MATTE_DEFAULT_MODEL) */
+  defaultModel: string;
+  /** the models the sidecar offers, by id (null / absent on a bare answer) */
+  models?: Record<string, MatteModelStatus> | null;
+  /** EZLG_MATTE_MAX_SECONDS as applied: a pass whose estimate is over it is refused */
+  maxSeconds: number;
+  /** EZLG_MATTE_MAX_FRAMES as applied */
+  maxFrames: number;
+}
+/**
+ * The pending part of a 202 preview answer (Go: the server's mapping of
+ * jobs.ErrMattePending): the pass is running (done / total / percent live),
+ * was deferred to Play / "Compute now" / Render (the estimate is over the
+ * eager bound), or waits on the model loading / downloading. `device` is
+ * the sidecar's ("cuda" / "cpu"), for the pill; `estimateMs` the pass's
+ * estimated wall time (0 = unknown).
+ */
+export interface MattePendingInfo {
+  state: MattePendingState;
+  done: number;
+  total: number;
+  percent: number;
+  estimateMs: number;
+  device: string;
+}
+/** The whole 202 body: `pending: "matte"` + MattePendingInfo + the MatteStatus object. */
+export interface MattePendingBody extends MattePendingInfo, MatteStatus {
+  pending: 'matte';
 }
 
 /** Go: enc.Font — one drawtext-usable face of the container (GET /api/fonts). */
@@ -470,8 +629,9 @@ export interface Capabilities {
   /**
    * What this build can do (server: features()): fit, sequence, optimize
    * (Phase 2); keying, overlays, proxy, fonts (Phase 3 — "fonts" is true
-   * only when /api/fonts lists a face). Absent on a Phase 1 server; a name
-   * that is absent is off. See lib/capabilities.svelte.ts.
+   * only when /api/fonts lists a face); matte (Phase 5b — true only while
+   * the app's probe of the matte sidecar answers). Absent on a Phase 1
+   * server; a name that is absent is off. See lib/capabilities.svelte.ts.
    */
   features?: Record<string, boolean> | null;
 }
@@ -535,6 +695,104 @@ export class ApiError extends Error {
 
 export function isAbortError(e: unknown): boolean {
   return e instanceof DOMException && e.name === 'AbortError';
+}
+
+/**
+ * MattePending is what fetchStill / fetchProxy throw on a 202 answer
+ * (Phase 5b): the preview is not an error — its AI matte is being computed,
+ * deferred, or waits on the model — so the still / proxy schedulers keep
+ * the picture on stage, show the pending pill and re-request after
+ * MATTE_RETRY_MS. `status` is the /api/matte object the body carries (the
+ * live model states, for the Background card).
+ */
+export class MattePending extends Error {
+  readonly state: MattePendingState;
+  readonly done: number;
+  readonly total: number;
+  readonly percent: number;
+  readonly estimateMs: number;
+  readonly device: string;
+  readonly status: MatteStatus;
+  constructor(body: MattePendingBody) {
+    super(`AI matte pending: ${body.state}`);
+    this.name = 'MattePending';
+    this.state = body.state;
+    this.done = body.done;
+    this.total = body.total;
+    this.percent = body.percent;
+    this.estimateMs = body.estimateMs;
+    this.device = body.device;
+    this.status = {
+      enabled: body.enabled,
+      device: body.device,
+      reason: body.reason,
+      gpu: body.gpu,
+      defaultModel: body.defaultModel,
+      models: body.models,
+      maxSeconds: body.maxSeconds,
+      maxFrames: body.maxFrames,
+    };
+  }
+
+  /** the pending fields alone (what a preview view keeps) */
+  get info(): MattePendingInfo {
+    return { state: this.state, done: this.done, total: this.total, percent: this.percent, estimateMs: this.estimateMs, device: this.device };
+  }
+
+  /**
+   * fromBody validates a decoded 202 body: `pending` must be "matte" and
+   * `state` a string; the numbers default to 0 and the strings to "" when
+   * absent or of another type (a newer server may add fields, never drop
+   * these). null for anything else (the caller reports a malformed answer).
+   */
+  static fromBody(v: unknown): MattePending | null {
+    if (!v || typeof v !== 'object') return null;
+    const b = v as Record<string, unknown>;
+    if (b.pending !== 'matte' || typeof b.state !== 'string') return null;
+    const num = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) ? x : 0);
+    const str = (x: unknown) => (typeof x === 'string' ? x : '');
+    const models = b.models && typeof b.models === 'object' ? (b.models as Record<string, MatteModelStatus>) : null;
+    const gpu = b.gpu && typeof b.gpu === 'object' ? (b.gpu as MatteGPUInfo) : null;
+    return new MattePending({
+      pending: 'matte',
+      state: b.state,
+      done: num(b.done),
+      total: num(b.total),
+      percent: num(b.percent),
+      estimateMs: num(b.estimateMs),
+      device: str(b.device),
+      enabled: b.enabled === true,
+      reason: str(b.reason),
+      gpu,
+      defaultModel: str(b.defaultModel),
+      models,
+      maxSeconds: num(b.maxSeconds),
+      maxFrames: num(b.maxFrames),
+    });
+  }
+}
+
+export function isMattePending(e: unknown): e is MattePending {
+  return e instanceof MattePending;
+}
+
+/**
+ * throwIfPending turns a 202 preview answer into a MattePending (the body
+ * is JSON, never an image); any other status passes. A 202 whose body is
+ * not the documented shape is reported as an ApiError, never handed to
+ * res.blob() as if it were a picture.
+ */
+async function throwIfPending(res: Response, url: string): Promise<void> {
+  if (res.status !== 202) return;
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new ApiError(`Malformed JSON from ${url} (202)`, res.status);
+  }
+  const p = MattePending.fromBody(body);
+  if (!p) throw new ApiError(`Unexpected 202 answer from ${url}`, res.status);
+  throw p;
 }
 
 /** messageOf turns any thrown value into a human-readable string. */
@@ -692,20 +950,38 @@ export function sourceURL(hash: string | null): string {
   return hash ? `/?src=${hash}` : '/';
 }
 
-/** fetchStill renders one preview frame (PNG) for the given op stack at output time t. */
+/**
+ * fetchStill renders one preview frame (PNG) for the given op stack at
+ * output time t. A 202 (the recipe's AI matte is not ready — Phase 5b)
+ * throws MattePending: request() only throws on !res.ok, and the 202 body
+ * is JSON, not a picture.
+ */
 export async function fetchStill(req: StillRequest, signal?: AbortSignal): Promise<Blob> {
   const res = await request('/api/still', jsonInit('POST', req, signal));
+  await throwIfPending(res, '/api/still');
   return res.blob();
 }
 
 /**
  * fetchProxy renders the animated low-res preview (lossy WebP with alpha: the
  * first maxSeconds of the output, at most maxW wide, <= 15 fps) behind the
- * Play button. Memoised server-side like stills.
+ * Play button. Memoised server-side like stills; 202 throws MattePending
+ * like fetchStill.
  */
 export async function fetchProxy(req: ProxyRequest, signal?: AbortSignal): Promise<Blob> {
   const res = await request('/api/proxy', jsonInit('POST', req, signal, 'application/json, image/webp'));
+  await throwIfPending(res, '/api/proxy');
   return res.blob();
+}
+
+/**
+ * getMatte reads the app's last probe of the AI matte sidecar (Phase 5b):
+ * the device, the offered models with their states and measured ms per
+ * frame, the default model and the pass caps. 404 on an older server (the
+ * caller keeps AI greyed with the standard note).
+ */
+export function getMatte(signal?: AbortSignal): Promise<MatteStatus> {
+  return requestJSON<MatteStatus>('/api/matte', { signal, cache: 'no-store' });
 }
 
 /** getFonts lists the font faces drawtext can use on the server (empty when fc-list is unavailable). */

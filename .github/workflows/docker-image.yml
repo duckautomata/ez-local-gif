@@ -7,6 +7,9 @@ concurrency:
 on:
     push:
         branches: ["master"]
+        # A release tag (v0.5.0) also tags every image with it: compose.yaml pins
+        # the sidecar to the release tag it ships with (EZLG_MATTE_TAG's default).
+        tags: ["v*"]
     workflow_dispatch:
 
 jobs:
@@ -78,19 +81,111 @@ jobs:
             - name: Build Static Files
               run: npm run build
 
-    build-push:
-        needs: [go-test, web-test]
+    # Mirrors the `sidecar` job in test.yml — keep the steps identical in both files.
+    # The matte sidecar's pytest on the CPU runtime (no GPU on the runner; the
+    # tests use synthetic ONNX graphs and fixtures, no weight download).
+    sidecar-test:
         runs-on: ubuntu-latest
-        timeout-minutes: 45
+        timeout-minutes: 15
         permissions:
             contents: read
+        defaults:
+            run:
+                working-directory: sidecar
 
         steps:
             - name: Checkout Code
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-            - name: Set Version From Commit
-              run: echo "VERSION=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+            - name: Setup Python
+              uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+              with:
+                  python-version: "3.12"
+                  cache: pip
+                  cache-dependency-path: sidecar/requirements-cpu.txt
+
+            # The same hashed pins the cpu image installs (sidecar/Dockerfile);
+            # pytest is a test-only extra, installed without the hash check.
+            - name: Install Dependencies
+              run: |
+                  python -m pip install --require-hashes -r requirements-cpu.txt
+                  python -m pip install pytest
+
+            - name: Run Tests
+              run: python -m pytest -q tests
+
+    # One run builds the app and both sidecar targets so their SHAs match. Each
+    # image gets latest, the short SHA and — on a v* tag push — the release tag:
+    #   duckautomata/ez-local-gif:latest | :<sha> | :v0.5.0
+    #   duckautomata/ezlg-matte:latest   | :<sha> | :v0.5.0        (cpu target)
+    #   duckautomata/ezlg-matte:latest-cuda | :<sha>-cuda | :v0.5.0-cuda  (cuda target)
+    build-push:
+        needs: [go-test, web-test, sidecar-test]
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                # cache_mode: what each build exports to the GHA cache (10 GB per
+                # repository, shared by the three scopes). The cuda image is 4-5 GB of
+                # layers (~2.3 GB of CUDA / cuDNN wheels); `max` would export all of
+                # it on every master push — minutes of upload, eviction churn for the
+                # other two scopes — so it exports the final layers only (`min`); the
+                # Dockerfile's pip RUN cache mount is not exported by the gha backend
+                # either way.
+                include:
+                    - name: app
+                      context: .
+                      target: runtime
+                      image: duckautomata/ez-local-gif
+                      suffix: ""
+                      cache_mode: max
+                    - name: matte-cpu
+                      context: sidecar
+                      target: cpu
+                      image: duckautomata/ezlg-matte
+                      suffix: ""
+                      cache_mode: max
+                    - name: matte-cuda
+                      context: sidecar
+                      target: cuda
+                      image: duckautomata/ezlg-matte
+                      suffix: "-cuda"
+                      cache_mode: min
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            # VERSION is baked into `ezlg version` / /api/capabilities and the
+            # sidecar's /v1/ping "version": the release tag when one was pushed,
+            # else the short SHA (which also always tags the image).
+            - name: Set Version And Tags
+              env:
+                  IMAGE: ${{ matrix.image }}
+                  SUFFIX: ${{ matrix.suffix }}
+              run: |
+                  short_sha="${GITHUB_SHA::7}"
+                  tags="${IMAGE}:latest${SUFFIX},${IMAGE}:${short_sha}${SUFFIX}"
+                  version="${short_sha}"
+                  if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+                      tags="${tags},${IMAGE}:${GITHUB_REF_NAME}${SUFFIX}"
+                      version="${GITHUB_REF_NAME}"
+                  fi
+                  echo "VERSION=${version}" >> "$GITHUB_ENV"
+                  echo "TAGS=${tags}" >> "$GITHUB_ENV"
+
+            # The cuda build unpacks ~2.3 GB of wheels into 4-5 GB of layers next
+            # to two parallel builds on a 14 GB runner disk: drop the preinstalled
+            # toolchains it never uses first (the standard ubuntu-latest trim).
+            - name: Free Runner Disk (cuda)
+              if: matrix.name == 'matte-cuda'
+              run: |
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+                  docker system prune -af >/dev/null
+                  df -h /
 
             - name: Setup Docker Buildx
               uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -101,14 +196,14 @@ jobs:
                   username: ${{ secrets.DOCKER_USERNAME }}
                   password: ${{ secrets.DOCKER_TOKEN }}
 
-            - name: Build and Push Runtime Image
+            - name: Build and Push ${{ matrix.name }}
               uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
               with:
-                  context: .
-                  target: runtime
+                  context: ${{ matrix.context }}
+                  target: ${{ matrix.target }}
                   push: true
-                  tags: duckautomata/ez-local-gif:latest
+                  tags: ${{ env.TAGS }}
                   build-args: |
                       VERSION=${{ env.VERSION }}
-                  cache-from: type=gha
-                  cache-to: type=gha,mode=max
+                  cache-from: type=gha,scope=${{ matrix.name }}
+                  cache-to: type=gha,mode=${{ matrix.cache_mode }},scope=${{ matrix.name }}

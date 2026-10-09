@@ -14,6 +14,9 @@ import {
   type FitMode,
   type FlipParams,
   type FPSParams,
+  MATTE_MODEL_DEFAULT,
+  type MatteParams,
+  type MorphParams,
   type Op,
   type Output,
   type OverlayParams,
@@ -23,11 +26,13 @@ import {
   type RotateParams,
   type Source,
   type SpeedParams,
+  type StillRequest,
   type Target,
   type TextParams,
   type TrimParams,
 } from './api';
-import { clamp, fitSize, frameCount, frameSpan, GIF_MAX_FPS, round, snapFPS, trimTime } from './format';
+import { landPick } from './eyedropper';
+import { clamp, fitSize, frameCount, frameSpan, GIF_MAX_FPS, normalizeHex, round, snapFPS, trimTime } from './format';
 import {
   isAnimatedAsset,
   newImageOverlay,
@@ -85,35 +90,88 @@ export interface DelayCfg {
   ms: number;
 }
 
-/** Key colours of the Greenscreen / Bluescreen modes (recipe.ChromaKeyParams defaults). */
+/** Key colours of the Screen mode's Green / Blue sub-choice (recipe.ChromaKeyParams defaults). */
 export const CHROMA_GREEN = '00ff00';
 export const CHROMA_BLUE = '0000ff';
-/** CHROMA_DEFAULTS mirrors recipe.ChromaKeyParams' zero values. */
-export const CHROMA_DEFAULTS = { similarity: 0.2, blend: 0.05, despillMix: 0.6, despillExpand: 0.3 };
-/** COLORKEY_DEFAULTS mirrors recipe.ColorKeyParams' zero values. */
-export const COLORKEY_DEFAULTS = { similarity: 0.1, blend: 0 };
-
-export type BackgroundMode = 'green' | 'blue' | 'pick';
+/**
+ * CHROMA_DEFAULTS mirrors recipe.ChromaKeyParams' zero values (Phase 5a:
+ * similarity 0.1). These live in internal/graph (phase3.go) AND here, and
+ * must change together with a jobs.PipelineVersion bump — the serialisers
+ * omit the default, so the Go zero value is what renders.
+ */
+export const CHROMA_DEFAULTS = { similarity: 0.1, blend: 0.05, despillMix: 0.6, despillExpand: 0.3 };
+/** COLORKEY_DEFAULTS mirrors recipe.ColorKeyParams' zero values (Phase 5a: similarity 0.08); same rule as CHROMA_DEFAULTS. */
+export const COLORKEY_DEFAULTS = { similarity: 0.08, blend: 0 };
+/** MORPH_DEFAULTS is the Edge cleanup of a new session: fill pinholes on (never hurt in any measurement), no grow. */
+export const MORPH_DEFAULTS = { close: true, grow: 0 };
+/** MAX_KEY_COLORS caps the Colour mode's rows ("+ add colour"): one colorkey op each. */
+export const MAX_KEY_COLORS = 6;
+/** MORPH_MAX_GROW mirrors recipe.MorphParams' Grow range (0..4 extra dilations). */
+export const MORPH_MAX_GROW = 4;
 
 /**
- * BackgroundCfg: background removal. Greenscreen / Bluescreen key in YUV
- * (op "chromakey", with despill); "Pick a colour" keys one RGB colour from
- * the eyedropper (op "colorkey"). Each mode keeps its own tolerances.
+ * BackgroundMode: 'colour' (Phase 5a) keys 1..MAX_KEY_COLORS RGB colours
+ * (one "colorkey" op each, the eyedropper's picks or typed hex); 'screen'
+ * keys a green / blue screen in YUV ("chromakey", with despill); 'ai'
+ * (Phase 5b) keys with the matte sidecar's model ("matte" op — needs
+ * features.matte). Nothing is persisted between page loads, so the pre-5a
+ * 'green' / 'blue' / 'pick' values need no migration (a URL carries only
+ * the source hash).
+ */
+export type BackgroundMode = 'ai' | 'colour' | 'screen';
+export type ScreenColor = 'green' | 'blue';
+
+/**
+ * AiCfg: the AI mode (Phase 5b). `model` is the sidecar model id the card's
+ * Model select shows ('' = not chosen yet: the card fills in the server's
+ * defaultModel from GET /api/matte as soon as it answers, so what the
+ * select shows is always what the op names — the recipe default of a
+ * `matte` op WITHOUT a model is the fixed MATTE_MODEL_DEFAULT, not the
+ * sidecar's, which an operator may set to another id).
+ */
+export interface AiCfg {
+  model: string;
+}
+
+/** MorphCfg: the Edge cleanup fold (op "morph", emitted after the keys and before feather). */
+export interface MorphCfg {
+  /** fill pinholes: a 3×3 close (dilation then erosion) of the alpha */
+  close: boolean;
+  /** grow the matte by N source px (0..MORPH_MAX_GROW extra dilations) */
+  grow: number;
+}
+
+/**
+ * BackgroundCfg: background removal. AI keys with the sidecar's matte (op
+ * "matte", `ai.model`); Colour keys each of `colors` in RGB (op "colorkey"
+ * per colour, sharing pickSimilarity / pickBlend); Screen keys `color` in
+ * YUV (op "chromakey", with despill). Each mode keeps its own settings;
+ * the morph cleanup applies to whichever is on.
  */
 export interface BackgroundCfg {
   enabled: boolean;
   mode: BackgroundMode;
-  /** chroma key colour RRGGBB: CHROMA_GREEN / CHROMA_BLUE, or a custom one */
+  /** AI mode (Phase 5b): the model the matte op names */
+  ai: AiCfg;
+  /** Screen sub-choice: which preset the Green / Blue segment shows pressed */
+  screen: ScreenColor;
+  /** chroma key colour RRGGBB: CHROMA_GREEN / CHROMA_BLUE (the sub-choice sets it), or a custom one */
   color: string;
   similarity: number;
   blend: number;
   despill: boolean;
   despillMix: number;
   despillExpand: number;
-  /** colour picked from the preview (RRGGBB); '' = none yet */
-  pickColor: string;
+  /**
+   * Colour mode rows (RRGGBB each; '' = a row waiting for its pick): the
+   * eyedropper's picks or typed hex, at most MAX_KEY_COLORS. Empty rows emit
+   * nothing; a session starts with one empty row.
+   */
+  colors: string[];
+  /** Colour mode's similarity / blend, shared by every colorkey op */
   pickSimilarity: number;
   pickBlend: number;
+  morph: MorphCfg;
 }
 
 /**
@@ -152,7 +210,7 @@ export interface OpsCfg {
   bounce: boolean;
   flipRotate: FlipRotateCfg;
   background: BackgroundCfg;
-  /** soft transparency edge (op "feather", emitted right after the keying op) */
+  /** soft transparency edge (op "feather", emitted right after the keying ops and their morph) */
   feather: FeatherCfg;
   /** text / image overlays in their own order (the last draws on top) */
   overlays: OverlayCfg[];
@@ -184,6 +242,12 @@ export interface UiState {
   cropOpen: boolean;
   /** the eyedropper is armed: the next click on the preview picks the colour to key */
   pickColor: boolean;
+  /**
+   * the Colour mode row the armed eyedropper fills (0-based index into
+   * background.colors; the "+ add colour" row arms its new index). Read by
+   * applyPickedColor; an index past the rows appends (eyedropper.landPick).
+   */
+  pickRow: number;
   /** id of the overlay whose drag box is highlighted (0 = none) */
   selectedOverlay: number;
 }
@@ -191,19 +255,28 @@ export interface UiState {
 /** DEFAULT_DELAY_MS is the sequence frame delay the server assumes when the client sends none. */
 export const DEFAULT_DELAY_MS = 100;
 
+/**
+ * defaultBackground is the card's state for a new source: off, landing on
+ * Colour (instant, classical — spec §9) with one empty row, the Screen
+ * sub-choice on green, every tolerance at the recipe default and fill
+ * pinholes on.
+ */
 export function defaultBackground(): BackgroundCfg {
   return {
     enabled: false,
-    mode: 'green',
+    mode: 'colour',
+    ai: { model: '' },
+    screen: 'green',
     color: CHROMA_GREEN,
     similarity: CHROMA_DEFAULTS.similarity,
     blend: CHROMA_DEFAULTS.blend,
     despill: true,
     despillMix: CHROMA_DEFAULTS.despillMix,
     despillExpand: CHROMA_DEFAULTS.despillExpand,
-    pickColor: '',
+    colors: [''],
     pickSimilarity: COLORKEY_DEFAULTS.similarity,
     pickBlend: COLORKEY_DEFAULTS.blend,
+    morph: { ...MORPH_DEFAULTS },
   };
 }
 
@@ -234,7 +307,7 @@ export function defaultOps(info?: ProbeInfo | null): OpsCfg {
 export const FEATHER_DEFAULT = 3;
 
 function defaultUi(): UiState {
-  return { backdrop: 'checker', resultBackdrop: 'dark', cropRatio: 0, scrubFrame: 0, cropOpen: false, pickColor: false, selectedOverlay: 0 };
+  return { backdrop: 'checker', resultBackdrop: 'dark', cropRatio: 0, scrubFrame: 0, cropOpen: false, pickColor: false, pickRow: 0, selectedOverlay: 0 };
 }
 
 export const app = $state({
@@ -250,6 +323,7 @@ function resetUi(): void {
   app.ui.cropOpen = false;
   app.ui.cropRatio = 0;
   app.ui.pickColor = false;
+  app.ui.pickRow = 0;
   app.ui.selectedOverlay = 0;
 }
 
@@ -357,10 +431,10 @@ export function recipeSources(mainHash: string, c: OpsCfg, out: Pick<OutputCfg, 
 }
 
 /**
- * chromaKeyOp serialises the Greenscreen / Bluescreen mode; defaults (the
- * recipe's zero values: similarity 0.2, blend 0.05, despill 0.6 / 0.3) are
- * left out. A blend of exactly 0 cannot be expressed (the Go zero value is
- * the default 0.05), which is why the card's blend slider starts at 0.01.
+ * chromaKeyOp serialises the Screen mode; defaults (the recipe's zero
+ * values: similarity 0.1, blend 0.05, despill 0.6 / 0.3) are left out. A
+ * blend of exactly 0 cannot be expressed (the Go zero value is the default
+ * 0.05), which is why the card's blend slider starts at 0.01.
  */
 function chromaKeyOp(b: BackgroundCfg): Op {
   const p: ChromaKeyParams = {};
@@ -375,19 +449,188 @@ function chromaKeyOp(b: BackgroundCfg): Op {
   return Object.keys(p).length ? { kind: 'chromakey', params: p } : { kind: 'chromakey' };
 }
 
-/** colorKeyOp serialises the Pick-a-colour mode (null until a colour was picked). */
-function colorKeyOp(b: BackgroundCfg): Op | null {
-  if (!b.pickColor) return null;
-  const p: ColorKeyParams = { color: b.pickColor };
-  if (b.pickSimilarity > 0 && b.pickSimilarity !== COLORKEY_DEFAULTS.similarity) p.similarity = round(clamp(b.pickSimilarity, 0.01, 1));
-  if (b.pickBlend > 0) p.blend = round(clamp(b.pickBlend, 0, 1));
-  return { kind: 'colorkey', params: p };
+/**
+ * colorKeyOps serialises the Colour mode: one colorkey op per picked row, in
+ * row order, all with the same similarity / blend (defaults left out);
+ * empty rows emit nothing and a colour picked twice is keyed once (the
+ * second op would only redo the first's work). Empty until a colour was
+ * picked.
+ */
+function colorKeyOps(b: BackgroundCfg): Op[] {
+  const ops: Op[] = [];
+  const seen = new Set<string>();
+  for (const c of b.colors) {
+    if (!c || seen.has(c)) continue;
+    seen.add(c);
+    const p: ColorKeyParams = { color: c };
+    if (b.pickSimilarity > 0 && b.pickSimilarity !== COLORKEY_DEFAULTS.similarity) p.similarity = round(clamp(b.pickSimilarity, 0.01, 1));
+    if (b.pickBlend > 0) p.blend = round(clamp(b.pickBlend, 0, 1));
+    ops.push({ kind: 'colorkey', params: p });
+  }
+  return ops;
 }
 
-/** backgroundOp is the keying op of the Background card (null when off / nothing to key). */
-export function backgroundOp(b: BackgroundCfg): Op | null {
-  if (!b.enabled) return null;
-  return b.mode === 'pick' ? colorKeyOp(b) : chromaKeyOp(b);
+/**
+ * morphOp serialises the Edge cleanup: null when there is nothing to do
+ * (close off and grow 0 — the server rejects an empty morph, so none is
+ * sent), else close / grow with the recipe's zero values (false / 0) left
+ * out and grow clamped to 0..MORPH_MAX_GROW.
+ */
+function morphOp(m: MorphCfg): Op | null {
+  const grow = clamp(Math.round(m.grow), 0, MORPH_MAX_GROW);
+  if (!m.close && grow === 0) return null;
+  const p: MorphParams = {};
+  if (m.close) p.close = true;
+  if (grow > 0) p.grow = grow;
+  return { kind: 'morph', params: p };
+}
+
+/**
+ * matteOp serialises the AI mode (Phase 5b): a `matte` op naming the
+ * model, left out when it is the recipe default (MATTE_MODEL_DEFAULT —
+ * the Go zero value resolves to it) or not chosen yet (''; the card fills
+ * the server's default in as soon as /api/matte answers). `size` is never
+ * sent (API-only; the server picks its device's default) and `resolved`
+ * is the server's.
+ */
+function matteOp(b: BackgroundCfg): Op {
+  const model = b.ai.model.trim();
+  if (!model || model === MATTE_MODEL_DEFAULT) return { kind: 'matte' };
+  const p: MatteParams = { model };
+  return { kind: 'matte', params: p };
+}
+
+/**
+ * backgroundOps is what the Background card emits, in order: the key ops —
+ * AI: one matte; Colour: one colorkey per picked colour; Screen: one
+ * chromakey — and then, only when a key was emitted, the morph op of the
+ * Edge cleanup (the morph cleans the key's or matte's alpha; with nothing
+ * keyed there is nothing to clean, and a source's own alpha is not the
+ * card's business). Empty when the card is off or no colour was picked
+ * yet. Feather is not part of it: buildOps places it right after.
+ */
+export function backgroundOps(b: BackgroundCfg): Op[] {
+  if (!b.enabled) return [];
+  const ops = b.mode === 'ai' ? [matteOp(b)] : b.mode === 'colour' ? colorKeyOps(b) : [chromaKeyOp(b)];
+  if (!ops.length) return ops;
+  const m = morphOp(b.morph);
+  if (m) ops.push(m);
+  return ops;
+}
+
+/** aiActive: the Background card keys with the AI matte (the recipe carries a matte op). */
+export function aiActive(c: Pick<OpsCfg, 'background'>): boolean {
+  return c.background.enabled && c.background.mode === 'ai';
+}
+
+/** setMatteModel picks the AI mode's model (the card's select; '' = the server's default). */
+export function setMatteModel(id: string): void {
+  app.ops.background.ai.model = id.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Colour mode rows and the eyedropper (Phase 5a)
+
+/**
+ * addKeyColor appends an empty row to the Colour mode (the "+ add colour"
+ * button) and returns its index; −1 when the cap (MAX_KEY_COLORS) is hit.
+ */
+export function addKeyColor(): number {
+  const colors = app.ops.background.colors;
+  if (colors.length >= MAX_KEY_COLORS) return -1;
+  colors.push('');
+  return colors.length - 1;
+}
+
+/**
+ * removeKeyColor drops row i. The only row is cleared instead of removed
+ * (the mode always shows one; an eyedropper armed for it stays armed — the
+ * next pick refills it). Otherwise an eyedropper armed for that row is
+ * disarmed, and one armed for a later row follows its row down.
+ */
+export function removeKeyColor(i: number): void {
+  const colors = app.ops.background.colors;
+  if (i < 0 || i >= colors.length) return;
+  if (colors.length === 1) {
+    colors[0] = '';
+    return;
+  }
+  colors.splice(i, 1);
+  if (app.ui.pickRow === i) app.ui.pickColor = false;
+  else if (app.ui.pickRow > i) app.ui.pickRow--;
+}
+
+/**
+ * setKeyColor stores a typed hex in row i ('' clears the row; anything else
+ * must be RRGGBB, '#' tolerated — a malformed value is ignored and false
+ * returned). A valid colour enables the card and disarms an eyedropper that
+ * was waiting for this row.
+ */
+export function setKeyColor(i: number, hex: string): boolean {
+  const colors = app.ops.background.colors;
+  if (i < 0 || i >= colors.length) return false;
+  const t = hex.trim();
+  if (t === '' || t === '#') {
+    colors[i] = '';
+    return true;
+  }
+  const n = normalizeHex(t);
+  if (!n) return false;
+  colors[i] = n;
+  app.ops.background.enabled = true;
+  if (app.ui.pickColor && app.ui.pickRow === i) app.ui.pickColor = false;
+  return true;
+}
+
+/** armEyedropper arms the preview eyedropper for Colour mode row `row` (the next click lands there). */
+export function armEyedropper(row: number): void {
+  app.ui.pickRow = Math.max(0, Math.floor(row));
+  app.ui.pickColor = true;
+}
+
+/** disarmEyedropper cancels an armed eyedropper (Esc, mode change, a typed hex). */
+export function disarmEyedropper(): void {
+  app.ui.pickColor = false;
+}
+
+/**
+ * setBackgroundMode is the Background card's mode segment AND its header
+ * checkbox (which enables the card in the mode it holds): 'none' switches
+ * the card off and disarms the eyedropper; a mode enables the card in it.
+ * Colour seeds its first row and — with the preview eyedropper available
+ * (picker: the editor, not batch) and nothing picked yet — arms it for row
+ * 0 straight away, so ticking the checkbox is as quick as clicking the
+ * segment; Screen and AI disarm it. AI never starts a matte pass by itself
+ * here: the preview's next still does (and defers it over the eager bound).
+ */
+export function setBackgroundMode(m: BackgroundMode | 'none', opts: { picker: boolean }): void {
+  const b = app.ops.background;
+  if (m === 'none') {
+    b.enabled = false;
+    disarmEyedropper();
+    return;
+  }
+  b.mode = m;
+  b.enabled = true;
+  if (m === 'colour') {
+    if (!b.colors.length) b.colors = [''];
+    if (opts.picker && !b.colors.some((c) => c !== '')) armEyedropper(0);
+  } else disarmEyedropper();
+}
+
+/**
+ * applyPickedColor lands a sampled colour (RRGGBB) in the armed row
+ * (app.ui.pickRow; eyedropper.landPick appends when the row is gone),
+ * switches the card to Colour, enables it and disarms the eyedropper. A
+ * malformed hex changes nothing.
+ */
+export function applyPickedColor(hex: string): void {
+  if (!normalizeHex(hex)) return;
+  const b = app.ops.background;
+  b.colors = landPick(b.colors, app.ui.pickRow, hex, MAX_KEY_COLORS);
+  b.mode = 'colour';
+  b.enabled = true;
+  app.ui.pickColor = false;
 }
 
 /** timeRange adds start/end (output seconds, whole µs like trim bounds) when they are set. */
@@ -465,19 +708,19 @@ export function opsApply(out: Pick<OutputCfg, 'preset'>): boolean {
 export interface BuildOpsOptions {
   /** stop before crop: the still shows the full frame in source pixels for the drag rectangle */
   cropPreview?: boolean;
-  /** leave the keying op out: the eyedropper needs the original colours */
+  /** leave the Background card's ops (keys and their morph) out: the eyedropper needs the original colours */
   keyPreview?: boolean;
 }
 
 /**
  * buildOps serialises the op configuration in the documented order:
- * unpremultiply, delay, trim, speed, fps, chromakey/colorkey, feather,
- * crop/autocrop, resize, canvas, flip, rotate, reverse, bounce, then the
- * text/overlay ops in the user's order. With cropPreview the stack stops
- * before crop, so the still
+ * unpremultiply, delay, trim, speed, fps, the keys (matte, colorkey × N or
+ * chromakey) then morph (backgroundOps), feather, crop/autocrop, resize,
+ * canvas, flip, rotate, reverse, bounce, then the text/overlay ops in the
+ * user's order. With cropPreview the stack stops before crop, so the still
  * shows the full frame in source pixel coordinates for the drag rectangle;
- * with keyPreview the keying op is skipped (the eyedropper picks from the
- * unkeyed frame).
+ * with keyPreview the Background card's ops are skipped (the eyedropper
+ * picks from the unkeyed frame).
  */
 export function buildOps(c: OpsCfg, opts: BuildOpsOptions = {}): Op[] {
   const ops: Op[] = [];
@@ -503,12 +746,12 @@ export function buildOps(c: OpsCfg, opts: BuildOpsOptions = {}): Op[] {
     const p: FPSParams = { fps: round(c.fps.fps) };
     ops.push({ kind: 'fps', params: p });
   }
-  // Keying runs at full resolution before any geometry (DESIGN §4.3).
-  const key = opts.keyPreview ? null : backgroundOp(c.background);
-  if (key) ops.push(key);
+  // Keying runs at full resolution before any geometry (DESIGN §4.3); the
+  // morph cleanup follows its keys (Phase 5a).
+  if (!opts.keyPreview) ops.push(...backgroundOps(c.background));
   // Feather sits with the keying stages (the graph hoists it right after the
-  // keys, before any geometry — review R4), so it is emitted after the key op
-  // and before crop/autocrop; the crop preview shows it too.
+  // keys and the morph, before any geometry — review R4), so it is emitted
+  // after them and before crop/autocrop; the crop preview shows it too.
   if (c.feather.enabled && c.feather.radius > 0) {
     const p: FeatherParams = { radius: round(clamp(c.feather.radius, 0.1, 50)) };
     ops.push({ kind: 'feather', params: p });
@@ -709,6 +952,57 @@ export function previewOutput(o: Output): Output {
   if (o.fit) p.fit = o.fit;
   if (o.fps) p.fps = o.fps;
   return p;
+}
+
+/**
+ * cropPreviewOutput is the output of the crop-mode still: the format and
+ * the fps of previewOutput, without the geometry. Crop mode shows the full
+ * pre-crop frame in source pixels, so width / height / fit must go — but
+ * the rate must stay (spec §6.1): without Output.fps the server's plan
+ * falls back to the fps op or the SOURCE rate, so a 25 fps preset over a
+ * 30 fps clip would resolve the crop still to another frame grid than the
+ * normal still (and, with auto-crop, run a second detection; with an AI
+ * matte, compute a second matte set). Same fps as previewOutput, always.
+ */
+export function cropPreviewOutput(o: Output): Output {
+  const p: Output = { format: o.format };
+  if (o.fps) p.fps = o.fps;
+  return p;
+}
+
+/** What a preview still is requested for (Preview.svelte's stage state). */
+export interface StillRequestOptions {
+  /** the Crop card is open: the stack stops before crop, the output keeps only format + fps, the main source alone */
+  cropMode: boolean;
+  /** the eyedropper is armed: the Background card's ops (keys and their morph) are left out */
+  picking: boolean;
+  /** the still's time in seconds (mid-frame; on the forward timeline in crop mode) */
+  t: number;
+  /** the width cap (lib/still.stillMaxW) */
+  maxW: number;
+}
+
+/**
+ * stillRequest is the body of POST /api/still for the current state — the
+ * pure part of Preview.svelte's request, so the two shapes are testable:
+ * the normal still carries recipeOps / recipeSources and previewOutput; in
+ * crop mode the stack is cut before crop (buildOps cropPreview), the
+ * sources are the main one alone (an overlay op never survives the cut) and
+ * the output is cropPreviewOutput — the format and the fps, never the
+ * geometry, so the crop still resolves to the same frame grid as the normal
+ * one (spec §6.1). Null without a source.
+ */
+export function stillRequest(src: Source | null, c: OpsCfg, out: OutputCfg, o: StillRequestOptions): StillRequest | null {
+  if (!src) return null;
+  const output = buildOutput(out);
+  return {
+    src: src.hash,
+    sources: o.cropMode ? [src.hash] : recipeSources(src.hash, c, out),
+    ops: recipeOps(c, out, { cropPreview: o.cropMode, keyPreview: o.picking }),
+    output: o.cropMode ? cropPreviewOutput(output) : previewOutput(output),
+    t: o.t,
+    maxW: o.maxW,
+  };
 }
 
 /**

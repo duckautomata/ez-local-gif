@@ -344,10 +344,10 @@ func TestCapabilities(t *testing.T) {
 			t.Errorf("format %q is not a recipe.Format* constant", f)
 		}
 	}
-	// Phase 2 + Phase 3 flags and the Phase 4 op kinds; "fonts" is the only
-	// one of them that depends on the host (TestFontsEndpoint ties it to the
-	// font list).
-	for _, f := range []string{"fit", "sequence", "optimize", "keying", "overlays", "proxy", "feather", "bounce"} {
+	// Phase 2 + Phase 3 flags, the Phase 4 op kinds and the Phase 5a morph
+	// op kind; "fonts" is the only one of them that depends on the host
+	// (TestFontsEndpoint ties it to the font list).
+	for _, f := range []string{"fit", "sequence", "optimize", "keying", "overlays", "proxy", "feather", "bounce", "morph"} {
 		if !caps.Features[f] {
 			t.Errorf("features[%q] = false, want true (%v)", f, caps.Features)
 		}
@@ -361,8 +361,13 @@ func TestCapabilities(t *testing.T) {
 	if got, want := caps.Features["gifski"], e.jm.ToolVersions()["gifski"] != ""; got != want {
 		t.Errorf("features[gifski] = %v, want %v (tools.Gifski = %q, probed %q)", got, want, e.tools.Gifski, e.jm.ToolVersions()["gifski"])
 	}
-	if _, ok := caps.Features["fonts"]; !ok || len(caps.Features) != 12 {
-		t.Errorf("features = %v, want exactly fit/sequence/optimize/keying/overlays/proxy/fonts/feather/bounce/inputPick/outputSave/gifski", caps.Features)
+	// Phase 5b: "matte" is the manager's live MatteEnabled — false here, no
+	// sidecar is configured — and the flag is present either way.
+	if got, ok := caps.Features["matte"]; !ok || got || got != e.jm.MatteEnabled() {
+		t.Errorf("features[matte] = %v (present %v), want false without EZLG_MATTE_URL (manager says %v)", got, ok, e.jm.MatteEnabled())
+	}
+	if _, ok := caps.Features["fonts"]; !ok || len(caps.Features) != 14 {
+		t.Errorf("features = %v, want exactly fit/sequence/optimize/keying/overlays/proxy/fonts/feather/bounce/morph/inputPick/outputSave/gifski/matte", caps.Features)
 	}
 }
 

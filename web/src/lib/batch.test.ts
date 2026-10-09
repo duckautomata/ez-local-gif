@@ -120,7 +120,7 @@ describe('batchOpsCfg / rowRecipe (global ops only)', () => {
     c.reverse = true;
     c.bounce = true;
     c.feather = { enabled: true, radius: 3 };
-    c.background = { ...c.background, enabled: true };
+    c.background = { ...c.background, enabled: true, mode: 'screen' };
     const b = batchOpsCfg(c, true);
     expect(b.unpremultiply).toBe(true);
     expect(b.trim.enabled).toBe(false);
@@ -135,8 +135,20 @@ describe('batchOpsCfg / rowRecipe (global ops only)', () => {
 
     const recipe = rowRecipe({ source: src('a'), unpremultiply: true }, c, defaultOutput());
     expect(recipe?.sources).toEqual(['a'.repeat(64)]);
-    expect(recipe?.ops.map((o) => o.kind)).toEqual(['unpremultiply', 'speed', 'fps', 'chromakey', 'feather', 'reverse', 'bounce']);
+    expect(recipe?.ops.map((o) => o.kind)).toEqual(['unpremultiply', 'speed', 'fps', 'chromakey', 'morph', 'feather', 'reverse', 'bounce']);
     expect(rowRecipe({ source: null, unpremultiply: false }, c, defaultOutput())).toBeNull();
+    // Colour mode in batch: typed hex rows, one colorkey each, then the morph
+    c.background = { ...c.background, mode: 'colour', colors: ['313338', 'facc82'] };
+    expect(rowRecipe({ source: src('a'), unpremultiply: false }, c, defaultOutput())?.ops.map((o) => o.kind)).toEqual([
+      'speed',
+      'fps',
+      'colorkey',
+      'colorkey',
+      'morph',
+      'feather',
+      'reverse',
+      'bounce',
+    ]);
   });
 });
 

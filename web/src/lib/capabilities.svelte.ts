@@ -4,8 +4,14 @@
 // Background / Overlays cards (keying / overlays), and Phase 4's /input
 // picker (inputPick), "Save to /output" (outputSave), gifski encoder
 // toggle (gifski) and the Phase 4 op cards (feather / bounce,
-// phase4OpsOffered) when an older ezlg serves a newer SPA. The "formats"
-// list gates the MP4 / WebM Format options the same way (formatOffered).
+// phase4OpsOffered) when an older ezlg serves a newer SPA, Phase 5a's
+// "Edge cleanup" fold of the Background card (morph: the fold is hidden and
+// the morph op switched off on a server without it) and Phase 5b's AI mode
+// of the same card (matte: true only while the app's probe of the matte
+// sidecar answers — a plain install without the compose profile reports it
+// false and the mode is disabled with the reason; the live states behind
+// it come from GET /api/matte, lib/matte.svelte.ts). The "formats" list
+// gates the MP4 / WebM Format options the same way (formatOffered).
 // The same answer carries the server's frame-master cap ("maxMasterBytes",
 // jobs.Options.MaxMasterBytes) and scratch budget ("scratchBudgetBytes"),
 // which the Render panel judges its live master estimate against
@@ -24,7 +30,7 @@
 
 import { getCapabilities, type Capabilities } from './api';
 
-export const FEATURE_NAMES = ['fit', 'sequence', 'optimize', 'keying', 'overlays', 'proxy', 'fonts', 'feather', 'bounce', 'inputPick', 'outputSave', 'gifski'] as const;
+export const FEATURE_NAMES = ['fit', 'sequence', 'optimize', 'keying', 'overlays', 'proxy', 'fonts', 'feather', 'bounce', 'inputPick', 'outputSave', 'gifski', 'morph', 'matte'] as const;
 export type FeatureName = (typeof FEATURE_NAMES)[number];
 export type Features = Record<FeatureName, boolean>;
 

@@ -1,0 +1,7 @@
+# Source of requirements-cpu.txt. Regenerate the hashed pins for the image (linux x86_64, CPython 3.12) with:
+#   uv pip compile --python-platform x86_64-manylinux_2_28 --python-version 3.12 --generate-hashes \
+#      --no-strip-extras -o requirements-cpu.txt requirements-cpu.in
+# (pip-compile --generate-hashes works too but resolves markers for the host it runs on.)
+numpy==2.5.2
+onnx==1.23.2
+onnxruntime==1.30.0

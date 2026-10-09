@@ -10,9 +10,16 @@
 //     after the first are overlay assets (Phase 3, phase3.go) and must be
 //     single files. If store.HasResult(hash) → done immediately with the
 //     existing manifest.
-//  2. Resolve every autocrop op (autocrop.go), then plan :=
-//     graph.CompileWithSources(infos, ops, output) with the overlay input
-//     paths filled in. Estimate the RGBA master (plan.Frames*W*H*4 at the
+//     1b. (Phase 5b) A recipe with a matte op resolves its AI mattes BEFORE
+//     the render slot is taken (matte_recipe.go / matte.go: memo hits from
+//     the persisted sidecar facts, else the pass, with StageMatte
+//     progress), so a long pass never holds one of the EZLG_CONCURRENCY
+//     slots; the memo dirs are protected from the sweeper to the end of
+//     the job and the frame count is checked against the master after it
+//     is decoded (static renders skip the check; a bounce doubles it).
+//  2. Resolve every autocrop op (autocrop.go) with those mattes, then plan
+//     := graph.CompileWithSources(infos, ops, output) with the overlay and
+//     matte input paths filled in. Estimate the RGBA master (plan.Frames*W*H*4 at the
 //     output size; one frame for the static formats, whose master is cut
 //     to the first frame — a reversed static plan is first admitted by its
 //     reverse buffer on the uncut count, since "-frames:v 1" does not
@@ -110,9 +117,14 @@ const (
 	StateError   State = "error"
 )
 
-// Stage names, in pipeline order.
+// Stage names, in pipeline order. StageMatte (Phase 5b) is the AI matte
+// pre-stage of a render whose recipe holds a matte op: it runs after the
+// probe and BEFORE the render slot is taken, waiting on the sidecar with
+// "AI matte 24/45 · GPU" / "loading model" / "downloading weights 43 %"
+// messages (percent band 2 → 20; the master band then starts at 20).
 const (
 	StageProbe  = "probe"
+	StageMatte  = "matte"
 	StageMaster = "master"
 	StageEncode = "encode"
 	StageLint   = "lint"
@@ -256,6 +268,25 @@ type Options struct {
 	// never admits what an upload of the same bytes would refuse with 413.
 	// An over-limit pick fails with ErrInputTooLarge; 0 = no jobs-side cap.
 	MaxUploadBytes int64
+
+	// MatteURL (Phase 5b) is the base URL of the matte sidecar
+	// (http://matte:9402 under the compose matte / matte-gpu profiles); ""
+	// disables AI mattes entirely: MatteEnabled reports false, a recipe
+	// with a matte op is refused, and nothing is ever probed. Wire to
+	// EZLG_MATTE_URL.
+	MatteURL string
+
+	// MatteMaxSeconds caps the estimated wall time of one matte pass
+	// (frames x the sidecar's measured ms per frame): a clip over it is
+	// refused up-front with an ErrInvalidRecipe. 0 = DefaultMatteMaxSeconds
+	// (600). Wire to EZLG_MATTE_MAX_SECONDS.
+	MatteMaxSeconds int
+
+	// MatteMaxFrames caps the frames one matte pass may send to the
+	// sidecar, up-front from the plan's count and at run time from the
+	// frames streamed. 0 = DefaultMatteMaxFrames (3000). Wire to
+	// EZLG_MATTE_MAX_FRAMES.
+	MatteMaxFrames int
 }
 
 // Memo bounds.
@@ -293,8 +324,13 @@ const (
 	versionsTimeout = 10 * time.Second
 )
 
-// Percent milestones per stage (0..100); the probe stage sits at 0.
+// Percent milestones per stage (0..100); the probe stage sits at 0. The
+// matte pre-stage (Phase 5b, StageMatte) runs 2 → 20 when a recipe has a
+// matte op; the master band then starts where it ended (pctMatteEnd) rather
+// than at pctMasterStart.
 const (
+	pctMatteStart  = 2.0
+	pctMatteEnd    = 20.0
 	pctMasterStart = 2.0
 	pctMasterEnd   = 60.0
 	pctEncodeStart = 60.0
@@ -357,6 +393,10 @@ type Manager struct {
 	// NewManager time (see OutputSaveEnabled / InputPickEnabled).
 	outputSave bool
 	inputPick  bool
+
+	// Phase 5b: the AI matte sidecar — its client, the persisted facts,
+	// the probe state, the passes in flight and their progress (matte.go).
+	mt matteState
 }
 
 // NewManager wires the store, tools and options.
@@ -383,6 +423,12 @@ func NewManager(st *store.Store, tools ffrun.Tools, opts Options) *Manager {
 	}
 	if opts.MaxProxyBytes <= 0 {
 		opts.MaxProxyBytes = DefaultMaxProxyBytes
+	}
+	if opts.MatteMaxSeconds <= 0 {
+		opts.MatteMaxSeconds = DefaultMatteMaxSeconds
+	}
+	if opts.MatteMaxFrames <= 0 {
+		opts.MatteMaxFrames = DefaultMatteMaxFrames
 	}
 	budget := opts.ScratchBudgetBytes
 	switch {
@@ -415,6 +461,7 @@ func NewManager(st *store.Store, tools ffrun.Tools, opts Options) *Manager {
 		log.Printf("jobs: scratch %s holds %s, less than the %s frame-master cap; larger renders will be refused up-front (raise shm_size or lower EZLG_MAX_MASTER_BYTES)",
 			st.Scratch, humanBytes(budget), humanBytes(opts.MaxMasterBytes))
 	}
+	m.initMatte()
 	return m
 }
 
@@ -545,7 +592,23 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames, mp4, webm
 // the input (a changed picture is refused). The repaired files of such clips
 // — fast path, optimize preset, fit candidates, ladder — change; the memoised
 // ones are wrong.
-const PipelineVersion = "2026-09-20.1"
+// 2026-10-08.1: Phase 5a — the chromakey key colour is emitted as BT.601
+// limited-range YUV (chromakey=color=0xYYUUVV:…:yuv=1 after a format=rgba
+// pass; the RGB key used to be converted with full-range macros against the
+// limited-range chroma the frames carry, so the exact screen colour sat
+// ~0.047 away from the key and nothing below that similarity keyed), the
+// default similarities moved 0.2 → 0.1 (chromakey) and 0.1 → 0.08
+// (colorkey), and the morph op (alpha close / grow in the keying group) is
+// new. Every keyed recipe renders to a different picture; the memoised ones
+// were keyed against the off-range colour and the old defaults.
+// 2026-10-08.2: Phase 5b — the matte op (an AI matte merged into the alpha
+// in the keying group, read from a memoised image2 sequence input) is new,
+// the detection plan behind the autocrop follows the render's SnapFPS and
+// hoists matte ops, and the recipe hash of a matte recipe carries the
+// sidecar's identity (MatteParams.Resolved, filled by jobs). One bump per
+// shipped phase, the project's habit; the matte memo itself never sees
+// this version (matte.KeyVersion keys it).
+const PipelineVersion = "2026-10-08.2"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what
@@ -558,17 +621,30 @@ func ResultKey(r recipe.Recipe) string {
 // Submit validates and enqueues r; returns the job immediately (State
 // queued or, if the result is already on disk, done). A Resolved box a
 // client put into an autocrop op is dropped first (jobs resolves it
-// itself), so the recipe hash and the manifest never depend on it.
+// itself), so the recipe hash and the manifest never depend on it. A
+// matte op's Resolved identity (Phase 5b) is likewise dropped and then
+// FILLED from the persisted sidecar facts (fillMatteResolved) before
+// hashing: the weights / processing version / size / precision the render
+// will use are part of the recipe hash and so of the result key, so a new
+// sidecar image never serves a cached result made with the old weights —
+// no facts yet is ErrMatteUnavailable, an unoffered model ErrInvalidRecipe.
 func (m *Manager) Submit(r recipe.Recipe) (Job, error) {
 	if err := r.Validate(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
-	r.Ops = stripAutoCropResolved(r.Ops)
+	r.Ops = stripMatteResolved(stripAutoCropResolved(r.Ops))
 	if !supportedFormats[strings.ToLower(r.Output.Format)] {
 		return Job{}, fmt.Errorf("%w: unsupported output format %q (supported: %s)", ErrInvalidRecipe, r.Output.Format, supportedFormatList)
 	}
 	if err := validatePhase4Output(r.Output); err != nil {
 		return Job{}, err
+	}
+	if hasMatteOp(r.Ops) {
+		ops, err := m.fillMatteResolved(r.Ops)
+		if err != nil {
+			return Job{}, err
+		}
+		r.Ops = ops
 	}
 	if _, err := r.Canonical(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)

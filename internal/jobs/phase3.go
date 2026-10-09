@@ -45,6 +45,14 @@ import (
 // A Resolved crop a client sends along is stripped before hashing
 // (stripAutoCropResolved): jobs always resolves it itself, so the key must
 // not depend on it.
+//
+// Phase 5b adds the AI matte (recipe.OpMatte, matte_recipe.go): compile
+// resolves the stack's mattes first (resolveMattes: memo hits from the
+// persisted facts, else the pass) and threads them into the autocrop
+// resolution and the plan's matte inputs; a client-sent MatteParams.Resolved
+// is stripped the same way (stripMatteResolved) and Submit fills it from the
+// facts before hashing, so the identity DOES enter the recipe hash — but
+// only ever from the server's side.
 
 // ErrNotImplemented3 is kept for API compatibility with the Phase 3 stubs;
 // nothing in this package returns it any more.
@@ -99,10 +107,18 @@ func (s *sources) infos() []recipe.ProbeInfo {
 	return infos
 }
 
-// fillExtraInputs points every overlay input of p at its blob file.
-func (s *sources) fillExtraInputs(p *graph.Plan) error {
+// fillExtraInputs points every overlay input of p at its blob file and
+// every matte input (Phase 5b: ExtraInput.Matte, Source 0) at its memo
+// (fillMatteInputs: the %06d.png path, the frame count and the fps check).
+func (s *sources) fillExtraInputs(p *graph.Plan, mattes []resolvedMatte) error {
+	if err := fillMatteInputs(p, mattes); err != nil {
+		return err
+	}
 	for i := range p.ExtraInputs {
 		in := &p.ExtraInputs[i]
+		if in.Matte != nil {
+			continue
+		}
 		if in.Source < 1 || in.Source >= len(s.blobs) {
 			return fmt.Errorf("compiled plan references source %d, but the recipe has %d", in.Source, len(s.blobs))
 		}
@@ -111,13 +127,33 @@ func (s *sources) fillExtraInputs(p *graph.Plan) error {
 	return nil
 }
 
-// compile resolves every autocrop op against the main source, compiles the
-// op stack against all sources and fills the overlay input paths. The
-// returned plan's TextFiles are still unbound: bindTextFiles writes them
-// once a scratch directory exists. Compile errors are the client's
-// (ErrInvalidRecipe).
-func (m *Manager) compile(ctx context.Context, s *sources, ops []recipe.Op, out recipe.Output) (*graph.Plan, error) {
-	ops, err := m.resolveAutoCrop(ctx, s.main(), ops)
+// compile is the previews' compile (StillSources, Proxy): it resolves the
+// stack's AI mattes first (resolveMattes in preview mode — a matte not on
+// disk yet is *ErrMattePending, no sidecar is ErrMatteUnavailable), then
+// compileWith. It returns the resolved mattes with the plan so the preview
+// keys can fold their clip keys in and the ffmpeg run can protect their
+// dirs. A render resolves its mattes in its own pre-stage (render.go) and
+// calls compileWith directly.
+func (m *Manager) compile(ctx context.Context, s *sources, ops []recipe.Op, out recipe.Output) (*graph.Plan, []resolvedMatte, error) {
+	mattes, err := m.resolveMattes(ctx, s.main(), ops, out, matteModePreview)
+	if err != nil {
+		return nil, nil, err
+	}
+	plan, err := m.compileWith(ctx, s, ops, out, mattes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return plan, mattes, nil
+}
+
+// compileWith resolves every autocrop op against the main source (with the
+// stack's resolved mattes, so a detection reads the matted picture),
+// compiles the op stack against all sources and fills the overlay and matte
+// input paths. The returned plan's TextFiles are still unbound:
+// bindTextFiles writes them once a scratch directory exists. Compile errors
+// are the client's (ErrInvalidRecipe).
+func (m *Manager) compileWith(ctx context.Context, s *sources, ops []recipe.Op, out recipe.Output, mattes []resolvedMatte) (*graph.Plan, error) {
+	ops, err := m.resolveAutoCropFor(ctx, s.main(), ops, out, mattes)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +164,7 @@ func (m *Manager) compile(ctx context.Context, s *sources, ops []recipe.Op, out 
 	if plan.Width <= 0 || plan.Height <= 0 {
 		return nil, fmt.Errorf("compiled plan has an empty frame size (%dx%d)", plan.Width, plan.Height)
 	}
-	if err := s.fillExtraInputs(plan); err != nil {
+	if err := s.fillExtraInputs(plan, mattes); err != nil {
 		return nil, err
 	}
 	return plan, nil

@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from 'svelte';
-  import { fetchProxy, fetchStill, type ProxyRequest, type StillRequest } from '../lib/api';
+  import { fetchProxy, fetchStill, type ProxyRequest } from '../lib/api';
   import { caps } from '../lib/capabilities.svelte';
   import { displayToPixel, readPixel, rgbToHex } from '../lib/eyedropper';
   import { clamp, fmtNum, fmtSeconds, fmtTimecode, frameStart, stillTime } from '../lib/format';
+  import { mattePendingPill } from '../lib/matte';
+  import { notePending, pollWhilePending } from '../lib/matte.svelte';
   import { ProxyPlayer, type ProxyView } from '../lib/proxy';
   import {
     app,
+    applyPickedColor,
     buildOutput,
     effectiveOps,
     forwardFrame,
@@ -18,6 +21,7 @@
     previewOutput,
     recipeOps,
     recipeSources,
+    stillRequest,
   } from '../lib/state.svelte';
   import { registerPlayToggle } from '../lib/shortcuts';
   import { StillScheduler, stillMaxW, type StillView } from '../lib/still';
@@ -113,16 +117,20 @@
     e.preventDefault();
   }
 
-  // The still request. In crop mode the op stack stops before crop and no
+  // The still request (lib/state.stillRequest — pure, tested in
+  // Preview.test.ts). In crop mode the op stack stops before crop and no
   // output fitting is applied, so the frame is the full source in source
-  // pixel coordinates (the overlay maps display px → source px). While the
-  // eyedropper is armed the keying op is left out. With overlays on the
-  // stage, or at a fixed zoom, the still is unscaled (lib/still.stillMaxW:
-  // the zoom multiplies the still's natural size, so 4× must magnify real
-  // output pixels, not a 480-px preview). The output carries only what the
-  // server renders (and memoises) the preview from — format, size, fit, fps
-  // (previewOutput) — so a quality / lossy / colours / dither / matte / loop
-  // / fit-budget / preset / target change never re-requests a still.
+  // pixel coordinates (the overlay maps display px → source px) — but the
+  // output keeps its fps (cropPreviewOutput): geometry is what crop mode
+  // drops, never the rate, or its plan resolves to another frame grid than
+  // the normal still's. While the eyedropper is armed the keying ops (and
+  // their morph) are left out. With overlays on the stage, or at a fixed
+  // zoom, the still is unscaled (lib/still.stillMaxW: the zoom multiplies
+  // the still's natural size, so 4× must magnify real output pixels, not a
+  // 480-px preview). The output carries only what the server renders (and
+  // memoises) the preview from — format, size, fit, fps (previewOutput) —
+  // so a quality / lossy / colours / dither / matte / loop / fit-budget /
+  // preset / target change never re-requests a still.
   //
   // Crop mode's truncated stack also drops reverse and bounce, so its time
   // must be on the forward un-reversed timeline: the scrubber frame is folded
@@ -130,27 +138,20 @@
   // bounced clip clamps to the clip end and the crop rectangle is drawn on
   // the wrong frame.
   const stillT = $derived(cropMode && info ? stillTime(forwardFrame(info, app.ops, app.output, i), fps) : t);
-  const req = $derived.by((): StillRequest | null => {
-    const src = app.source;
-    if (!src) return null;
-    return {
-      src: src.hash,
-      sources: cropMode ? [src.hash] : recipeSources(src.hash, app.ops, app.output),
-      ops: recipeOps(app.ops, app.output, { cropPreview: cropMode, keyPreview: picking }),
-      output: cropMode ? { format: app.output.format } : previewOutput(buildOutput(app.output)),
-      t: stillT,
-      maxW: stillMaxW({ overlay: overlayMode, zoomed, wide }),
-    };
-  });
+  const req = $derived(
+    stillRequest(app.source, app.ops, app.output, { cropMode, picking, t: stillT, maxW: stillMaxW({ overlay: overlayMode, zoomed, wide }) }),
+  );
 
   // The still on screen (url), the in-flight flag and the last error live in a
   // $state object that StillScheduler mutates (debounce, abort of superseded
   // requests, object-URL lifecycle — see lib/still.ts).
-  const view = $state<StillView>({ url: null, loading: false, error: '' });
+  const view = $state<StillView>({ url: null, loading: false, error: '', pending: null });
   const still = new StillScheduler(view, {
     fetch: fetchStill,
     createURL: (b) => URL.createObjectURL(b),
     revokeURL: (u) => URL.revokeObjectURL(u),
+    // a 202 carries the live /api/matte object: install it for the Background card
+    onPending: notePending,
   });
   let natural = $state({ w: 0, h: 0 });
   let imgEl = $state<HTMLImageElement | null>(null);
@@ -175,11 +176,12 @@
   }
 
   // ---- Play: the animated proxy (POST /api/proxy), fetched on demand only.
-  const proxy = $state<ProxyView>({ url: null, playing: false, loading: false, stale: false, error: '' });
+  const proxy = $state<ProxyView>({ url: null, playing: false, loading: false, stale: false, error: '', pending: null });
   const player = new ProxyPlayer(proxy, {
     fetch: fetchProxy,
     createURL: (b) => URL.createObjectURL(b),
     revokeURL: (u) => URL.revokeObjectURL(u),
+    onPending: notePending,
   });
   // Like the still, the proxy is keyed on the geometry subset of the output
   // (previewOutput): a playing proxy is "changed — Play again" only when the
@@ -209,6 +211,32 @@
   const proxyOn = $derived(caps.features.proxy);
   const canPlay = $derived(proxyOn && !!info && !cropMode && !picking && (total > 1 || hasOverlays(ops)));
   const playing = $derived(proxy.playing && !!proxy.url);
+  /** Play is on its way: a fetch in flight, or its matte pending (Stop cancels either) */
+  const playBusy = $derived(proxy.loading || proxy.pending !== null);
+
+  // ---- Phase 5b: the AI matte pending pill. A still / proxy whose answer
+  // was 202 keeps the picture on the stage and shows what the sidecar is
+  // doing (lib/matte.mattePendingPill: "AI matte 24/45 · GPU", "loading
+  // model… (12 s)", "downloading weights 43 %"); a DEFERRED still (the
+  // estimate is over the server's eager bound) offers "Compute now", which
+  // re-requests it with `eager` and starts the pass — Play and Render start
+  // it anyway. The schedulers re-request by themselves (still.ts /
+  // proxy.ts); while anything is pending /api/matte is polled too, so the
+  // Background card's states follow.
+  const pendingView = $derived(proxy.pending ?? (playing ? null : view.pending));
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!pendingView) return;
+    now = Date.now();
+    const t = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
+  // A boolean, not the pending objects: the schedulers replace them on
+  // every 202, and an effect reading them would re-hold per answer
+  // (lib/matte.svelte pollWhilePending).
+  pollWhilePending(() => view.pending !== null || proxy.pending !== null);
+  const pillText = $derived(pendingView ? mattePendingPill(pendingView, now) : '');
+  const canComputeNow = $derived(!!view.pending && view.pending.state === 'deferred' && !proxy.pending && !playing);
   // While the proxy plays the still <img> is unmounted: pause the still
   // scheduler so scrubbing / editing renders no stills (full-resolution ones
   // in overlay mode) that nothing shows, and release the URLs it parked for
@@ -228,7 +256,7 @@
   // inert. The closure reads the current derived state at press time.
   onMount(() => {
     registerPlayToggle(() => {
-      if (proxy.playing || proxy.loading) player.stop();
+      if (proxy.playing || playBusy) player.stop();
       else if (canPlay) void player.play();
     });
     return () => registerPlayToggle(null);
@@ -259,9 +287,9 @@
     // (outside the image) and the hex field in the card is the alternative.
     const px = pixelAt(e);
     if (!px) return;
-    app.ops.background.pickColor = rgbToHex(px.r, px.g, px.b);
-    app.ops.background.enabled = true;
-    app.ui.pickColor = false;
+    // The pick lands in the Colour row that armed the eyedropper
+    // (app.ui.pickRow — state.applyPickedColor), enables the card and disarms.
+    applyPickedColor(rgbToHex(px.r, px.g, px.b));
     hover = '';
   }
   function onWindowKey(e: KeyboardEvent) {
@@ -354,7 +382,15 @@
     {:else if !view.error}
       <div class="placeholder muted">{view.loading ? 'Rendering preview…' : 'No preview yet'}</div>
     {/if}
-    {#if (view.loading && view.url && !playing) || proxy.loading}<div class="spinner" aria-label="Loading"></div>{/if}
+    {#if (view.loading && view.url && !playing && !view.pending) || (proxy.loading && !proxy.pending)}<div class="spinner" aria-label="Loading"></div>{/if}
+    {#if pendingView}
+      <div class="pill" role="status">
+        <span>{pillText}</span>
+        {#if canComputeNow}
+          <button type="button" class="sm" onclick={() => still.computeNow()} title="Start the AI matte pass now (Play and Render start it anyway)">Compute now</button>
+        {/if}
+      </div>
+    {/if}
     {#if view.error && !playing}
       <div class="err">
         <b>Preview failed</b>
@@ -373,7 +409,7 @@
   </div>
 
   <div class="scrub">
-    {#if playing || proxy.loading}
+    {#if playing || playBusy}
       <button type="button" class="sm play" onclick={() => player.stop()} title="Back to the still" aria-label="Stop the animated preview">■ Stop</button>
     {:else}
       <button type="button" class="sm play" onclick={() => void player.play()} disabled={!canPlay} title={playTitle} aria-label="Play an animated preview">▶ Play</button>
@@ -424,7 +460,7 @@
       {#if natural.w > 0}<span>still {natural.w}×{natural.h}</span>{/if}
       {#if picking}
         <span class="warn">
-          Eyedropper: click the colour to remove (the still is shown unkeyed){#if hover}
+          Eyedropper: click {app.ops.background.colors.length > 1 ? `colour ${app.ui.pickRow + 1}` : 'the colour'} to remove (the still is shown unkeyed){#if hover}
             &nbsp;· <span class="swatch" style:background={'#' + hover} aria-hidden="true"></span> #{hover}{/if} · <kbd>Esc</kbd> cancels
         </span>
       {:else if cropMode}
@@ -545,7 +581,8 @@
     align-self: flex-start;
     margin-top: 4px;
   }
-  .stale {
+  .stale,
+  .pill {
     position: absolute;
     top: 8px;
     left: 8px;
@@ -558,6 +595,15 @@
     border-radius: 999px;
     padding: 2px 6px 2px 10px;
     font-size: 12px;
+  }
+  /* the AI matte pending pill (Phase 5b) sits where the stale pill does; never both at once (a pending proxy is not playing) */
+  .pill {
+    border-color: var(--blue);
+    color: var(--blue);
+    max-width: calc(100% - 16px);
+  }
+  .pill button {
+    margin-left: 4px;
   }
   .scrub {
     display: flex;

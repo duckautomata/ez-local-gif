@@ -1,0 +1,8 @@
+# Local runs and tests; the images are built from the checked-in files only.
+__pycache__/
+.pytest_cache/
+.venv/
+venv*/
+/models/
+*.onnx
+*.part

@@ -1,12 +1,37 @@
 <script lang="ts">
   import { caps } from '../lib/capabilities.svelte';
   import { fmtBytesShort, fmtNum } from '../lib/format';
+  import { matteEstimateSuffix, matteModelFor, matteVerdict } from '../lib/matte';
+  import { holdMattePolling, matte } from '../lib/matte.svelte';
   import { cancelRender, render, startRender } from '../lib/render.svelte';
-  import { app, effectiveOps, masterVerdict, MAX_EXTRACT_FRAMES, planMaster } from '../lib/state.svelte';
+  import { stageLabel } from '../lib/stages';
+  import { aiActive, app, effectiveOps, masterVerdict, MAX_EXTRACT_FRAMES, planFrames, planMaster } from '../lib/state.svelte';
   import ResultCard from './ResultCard.svelte';
 
   const job = $derived(render.job);
   const canRender = $derived(app.source !== null && !render.running);
+
+  // Phase 5b: with the AI mode on, the estimate line appends the matte
+  // pass's predicted time ("· up to ~1 s AI matte (GPU)", from the frame
+  // count × the sidecar's measured ms per frame of the chosen model) and a
+  // refusal note appears when the clip is over the server's matte caps
+  // (EZLG_MATTE_MAX_FRAMES / _MAX_SECONDS — jobs refuses up-front, like the
+  // master cap). The figures come from GET /api/matte, kept live here while
+  // AI is on (the Background card polls only while its AI body is open).
+  const ai = $derived(app.source !== null && aiActive(effectiveOps(app.ops, app.output)));
+  $effect(() => {
+    if (ai) return holdMattePolling();
+  });
+  const aiModel = $derived(matteModelFor(app.ops.background.ai.model, matte.status));
+  /** the forward frame count (the pass mattes the temporal prefix; a bounce doubles the master, not the mattes) */
+  const aiFrames = $derived.by(() => {
+    const src = app.source;
+    if (!ai || !src) return 0;
+    const ops = effectiveOps(app.ops, app.output);
+    const n = planFrames(src.info, ops, app.output);
+    return ops.bounce && !src.info.isStill && n >= 2 ? n / 2 : n;
+  });
+  const aiVerdict = $derived(ai ? matteVerdict(matte.status, aiModel, aiFrames) : null);
 
   // The live frame-master estimate (state.planMaster mirrors jobs'
   // admission) and its verdict against the caps the server published.
@@ -29,6 +54,7 @@
     if (est.factor > 1) s += ` · about ${est.factor}× that on scratch`;
     if (est.bufferBytes > 0) s += ` · ~${fmtBytesShort(est.bufferBytes)} buffered by the reverse`;
     if (est.upperBound) s += ' before crop-to-content';
+    s += matteEstimateSuffix(aiVerdict?.estimate ?? null);
     return s;
   });
   /** what fits instead, for the refusal note: "At 2560×1440 about 145 frames fit (4.8 s at 30 fps)" */
@@ -67,16 +93,8 @@
   // jobs refuses a frames export above MaxExtractFrames on the plan's full
   // frame count before any decode; the master cap is a separate matter.
   const framesOver = $derived(est !== null && app.output.format === 'frames' && est.frames > MAX_EXTRACT_FRAMES);
-  const stageLabel: Record<string, string> = {
-    probe: 'Probing source',
-    master: 'Decoding frames',
-    encode: 'Encoding',
-    fit: 'Fitting to size',
-    lint: 'Discord lint',
-    verify: 'Verifying',
-    done: 'Done',
-  };
-  const stage = $derived(job ? (stageLabel[job.stage] ?? job.stage ?? job.state) : '');
+  // lib/stages: "AI matte" (Phase 5b) with the pass's progress in job.message
+  const stage = $derived(job ? stageLabel(job.stage) || job.state : '');
   const percent = $derived(job ? Math.min(100, Math.max(0, job.percent)) : 0);
   const indeterminate = $derived(render.running && (!job || job.state === 'queued' || percent <= 0));
 </script>
@@ -100,6 +118,9 @@
     {/if}
     {#if framesOver}
       <p class="note error estimate">Frames export is capped at {MAX_EXTRACT_FRAMES} frames — trim the clip or lower the fps.</p>
+    {/if}
+    {#if aiVerdict?.over}
+      <p class="note error estimate matte">{aiVerdict.note}</p>
     {/if}
   {/if}
 

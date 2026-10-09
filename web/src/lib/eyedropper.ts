@@ -1,7 +1,8 @@
-// Eyedropper for the "Pick a colour" background mode: maps a click on the
-// displayed still onto the still's own pixels and reads the colour there
-// through a canvas. The mapping is pure (eyedropper.test.ts); readPixel
-// needs a browser.
+// Eyedropper for the Colour background mode: maps a click on the displayed
+// still onto the still's own pixels and reads the colour there through a
+// canvas, and lands the pick in the colour row that armed it (landPick). The
+// mapping and the landing are pure (eyedropper.test.ts); readPixel needs a
+// browser.
 
 /** Rect is the displayed image's bounding box (DOMRect shape). */
 export interface Rect {
@@ -43,6 +44,28 @@ export function hexToRgb(hex: string): { r: number; g: number; b: number } | nul
   if (!m) return null;
   const v = parseInt(m[1], 16);
   return { r: (v >> 16) & 255, g: (v >> 8) & 255, b: v & 255 };
+}
+
+/**
+ * landPick returns the colour rows with `hex` (RRGGBB, '#' and case
+ * tolerated) landed in row `row` — the row whose "Pick from preview" armed
+ * the eyedropper (app.ui.pickRow). A row index past the end means the
+ * "+ add colour" row that was armed and removed meanwhile, or a stale index:
+ * the pick is appended while there is room (`max` rows) and otherwise
+ * replaces the last row, so a click never lands nowhere. A malformed hex
+ * leaves the rows as they are. Never mutates its input.
+ */
+export function landPick(colors: readonly string[], row: number, hex: string, max: number): string[] {
+  const out = [...colors];
+  const px = hexToRgb(hex);
+  if (!px) return out;
+  const n = rgbToHex(px.r, px.g, px.b);
+  const i = Math.max(0, Math.floor(row));
+  if (i < out.length) out[i] = n;
+  else if (out.length < max) out.push(n);
+  else if (out.length > 0) out[out.length - 1] = n;
+  else out.push(n);
+  return out;
 }
 
 export interface Pixel {

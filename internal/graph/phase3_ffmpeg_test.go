@@ -197,7 +197,7 @@ func TestChromaKeyPixels(t *testing.T) {
 
 	t.Run("green screen: background keyed, subject intact, despill pulls the green out of the edge", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{greenInfo}, []recipe.Op{{Kind: recipe.OpChromaKey}}, out)
-		if !p.HasAlpha || !strings.Contains(p.Filter, "format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05,despill=type=green:mix=0.6:expand=0.3") {
+		if !p.HasAlpha || !strings.Contains(p.Filter, "format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3") {
 			t.Fatalf("plan: alpha %v filter %s", p.HasAlpha, p.Filter)
 		}
 		// The (128,128,0) ring keeps alpha 255 (its chroma is far from the
@@ -240,7 +240,7 @@ func TestColorKeyPixels(t *testing.T) {
 
 	t.Run("exact colour keyed, edge and subject untouched", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{info}, []recipe.Op{{Kind: recipe.OpColorKey, Params: []byte(`{"color":"#00FF00"}`)}}, out)
-		if !p.HasAlpha || !strings.Contains(p.Filter, "format=rgba,colorkey=color=0x00ff00:similarity=0.1:blend=0,") {
+		if !p.HasAlpha || !strings.Contains(p.Filter, "format=rgba,colorkey=color=0x00ff00:similarity=0.08:blend=0,") {
 			t.Fatalf("plan: alpha %v filter %s", p.HasAlpha, p.Filter)
 		}
 		frames := p3Render(t, ff, clip, p, nil, nil)
@@ -341,8 +341,8 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 		op   recipe.Op
 		key  string // the bare key stages the wrapper must carry
 	}{
-		{"chromakey", chroma, "[k1]format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05,despill=type=green:mix=0.6:expand=0.3,format=rgba,split[k1k][k1km];"},
-		{"colorkey", colorGreen, "[k1]format=rgba,colorkey=color=0x00ff00:similarity=0.1:blend=0,split[k1k][k1km];"},
+		{"chromakey", chroma, "[k1]format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3,format=rgba,split[k1k][k1km];"},
+		{"colorkey", colorGreen, "[k1]format=rgba,colorkey=color=0x00ff00:similarity=0.08:blend=0,split[k1k][k1km];"},
 	} {
 		t.Run(tc.name+" on an rgba source keeps its alpha", func(t *testing.T) {
 			p := compileSrcs(t, []recipe.ProbeInfo{info}, []recipe.Op{tc.op}, out)
@@ -416,7 +416,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 		// key brought it back to 255), the subject and its edge stay opaque.
 		blue := recipe.Op{Kind: recipe.OpColorKey, Params: []byte(`{"color":"0000ff"}`)}
 		p := compileSrcs(t, []recipe.ProbeInfo{sinfo}, []recipe.Op{chroma, blue}, out)
-		if !strings.Contains(p.Filter, "fps=10:round=down,format=yuva444p,chromakey=") || !strings.Contains(p.Filter, "expand=0.3,"+wrapper+"format=rgba,colorkey=color=0x0000ff") {
+		if !strings.Contains(p.Filter, "fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=") || !strings.Contains(p.Filter, "expand=0.3,"+wrapper+"format=rgba,colorkey=color=0x0000ff") {
 			t.Fatalf("filter: %s", p.Filter)
 		}
 		for i, f := range p3Render(t, ff, screen, p, nil, nil) {
@@ -1174,7 +1174,7 @@ func TestCompileDetectPixels(t *testing.T) {
 	if p.Width != 16 || p.Height != 16 || !p.HasAlpha || p.Frames != 3 || p.Reversed || len(p.ExtraInputs) != 0 || len(p.TextFiles) != 0 {
 		t.Fatalf("plan: %dx%d alpha %v frames %d reversed %v extras %d texts %d", p.Width, p.Height, p.HasAlpha, p.Frames, p.Reversed, len(p.ExtraInputs), len(p.TextFiles))
 	}
-	if want := "[0:v]fps=10:round=down,format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05,despill=type=green:mix=0.6:expand=0.3,format=rgba[out]"; p.Filter != want {
+	if want := "[0:v]fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3,format=rgba[out]"; p.Filter != want {
 		t.Fatalf("filter\n got: %s\nwant: %s", p.Filter, want)
 	}
 	got := p3Render(t, ff, clip, p, nil, nil)

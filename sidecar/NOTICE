@@ -1,0 +1,47 @@
+ez-local-gif matte sidecar — third-party notices
+=================================================
+
+The sidecar itself (matte.py, png.py, tools/, tests/) is part of ez-local-gif
+and carries the repository's licence. The images built from sidecar/Dockerfile
+contain the following third-party software; the full licence texts are in
+LICENSES/ (copied verbatim from the wheels' own licence files or the upstream
+repositories, never retyped).
+
+Both images (cpu and cuda) — Python packages from requirements-{cpu,cuda}.txt
+----------------------------------------------------------------------------
+  onnxruntime 1.30.0 (cpu image) / onnxruntime-gpu 1.30.0 (cuda image)
+      MIT — Microsoft Corporation                       LICENSES/onnxruntime.MIT.txt
+  numpy 2.5.2         BSD-3-Clause — NumPy Developers    LICENSES/numpy.BSD-3-Clause.txt
+                      (the file also carries the notices of numpy's bundled components)
+  onnx 1.23.2         Apache-2.0 — ONNX Project          LICENSES/onnx.Apache-2.0.txt, LICENSES/onnx.NOTICE.txt
+  protobuf 7.36.2     BSD-3-Clause — Google Inc.         LICENSES/protobuf.BSD-3-Clause.txt
+  flatbuffers 25.12.19  Apache-2.0 — Google Inc.         LICENSES/flatbuffers.Apache-2.0.txt
+  ml_dtypes 0.6.0     Apache-2.0 — Google LLC;           LICENSES/ml_dtypes.Apache-2.0.txt,
+                      bundles Eigen headers (MPL-2.0)    LICENSES/ml_dtypes.LICENSE.eigen.txt
+  packaging 26.3      Apache-2.0 or BSD-2-Clause         LICENSES/packaging.LICENSE.txt, .LICENSE.APACHE.txt, .LICENSE.BSD.txt
+  typing_extensions 4.16.0  PSF-2.0                      LICENSES/typing_extensions.PSF-2.0.txt
+  python:3.12-slim base image: Python (PSF-2.0) on Debian; the licences of the
+      Debian packages are under /usr/share/doc/*/copyright inside the image.
+
+cuda image only — NVIDIA redistributable libraries (pulled by onnxruntime-gpu[cuda,cudnn])
+------------------------------------------------------------------------------------------
+  nvidia-cuda-runtime 13.4.92, nvidia-cuda-nvrtc 13.4.92, nvidia-cublas 13.8.1.7,
+  nvidia-cufft 12.4.0.43, nvidia-curand 10.4.4.72, nvidia-nvjitlink 13.4.92
+      NVIDIA CUDA Toolkit End User License Agreement    LICENSES/cuda/NVIDIA-CUDA-EULA.txt
+      (the six wheels ship one identical License.txt; one copy is kept)
+  nvidia-cudnn-cu13 9.27.0.42
+      NVIDIA Software License Agreement (cuDNN)         LICENSES/cuda/NVIDIA-cuDNN-SLA.txt
+  These libraries are redistributed under the terms of those agreements; the
+  image contains no NVIDIA driver — the host's driver (>= 580) is used through
+  nvidia-container-toolkit.
+
+Model weights (downloaded into the /models volume at run time, not in the image)
+----------------------------------------------------------------------------------
+  isnet-anime     SkyTNT/anime-segmentation (ISNet / DIS), Apache-2.0
+                  weights confirmed Apache-2.0 by the author                 LICENSES/isnet-anime.Apache-2.0.txt
+  birefnet-lite   ZhengPeng7/BiRefNet, BiRefNet_lite general, MIT           LICENSES/birefnet.MIT.txt
+  Both ONNX exports are fetched from the rembg project's model mirror
+  (github.com/danielgatis/rembg, MIT, (c) 2020 Daniel Gatis)                 LICENSES/rembg.MIT.txt
+  The isnet-anime file is byte-identical to the author's own upload on
+  Hugging Face (skytnt/anime-seg, isnetis.onnx), which models.json lists as
+  the second URL. Nothing non-commercial is shipped or listed.

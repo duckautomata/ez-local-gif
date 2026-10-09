@@ -46,7 +46,12 @@ const (
 	// only the tail they show (enc proxySeekFor; a plain seek on an
 	// animation source may land a frame off) and single-frame plans with an
 	// animated overlay drop the fps=15 stage (they failed before).
-	proxyMemoVersion = "2026-08-22.1"
+	// 2026-10-08.1: Phase 5a — the compiler keys chromakey recipes against
+	// the limited-range YUV colour (yuv=1 after an rgba pass) and the
+	// chroma/colour default similarities changed (0.2 → 0.1 / 0.1 → 0.08),
+	// so the memoised proxies of keyed recipes show the off-range key and
+	// the old defaults.
+	proxyMemoVersion = "2026-10-08.1"
 )
 
 // Proxy renders the animated low-resolution preview (enc.ProxyArgs: first
@@ -75,13 +80,16 @@ const (
 // memo key share one run; a memo hit waits for neither.
 func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64) ([]byte, error) {
 	maxW, maxSeconds = proxyBounds(maxW, maxSeconds)
-	ops = stripAutoCropResolved(ops)
+	ops = stripMatteResolved(stripAutoCropResolved(ops))
 	s, err := m.resolveSources(srcs)
 	if err != nil {
 		return nil, err
 	}
 	subset := stillOutput(out)
-	plan, err := m.compile(ctx, s, ops, subset)
+	// Phase 5b: the stack's mattes are resolved inside compile (preview
+	// mode — a matte not on disk yet is *ErrMattePending, which the server
+	// maps to 202; Play sets the eager flag on ctx) and fold into the key.
+	plan, mattes, err := m.compile(ctx, s, ops, subset)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +106,7 @@ func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out
 			return nil, err
 		}
 	}
-	key, err := proxyKey(srcs, ops, subset, maxW, maxSeconds)
+	key, err := proxyKeyFor(srcs, ops, subset, maxW, maxSeconds, mattes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
@@ -119,6 +127,11 @@ func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out
 			return nil, err
 		}
 		defer release()
+		unprotect, err := protectMattes(m.st, mattes) // the matte memo stays for the run
+		if err != nil {
+			return nil, err
+		}
+		defer unprotect()
 		ctx, cancel := context.WithTimeout(ctx, ProxyTimeout)
 		defer cancel()
 		dir, cleanup, err := m.st.ScratchDir("proxy-" + store.RandomID(8))
@@ -222,13 +235,24 @@ func proxySeekStart(args []string) (float64, bool) {
 }
 
 // proxyKey hashes (proxyMemoVersion, sources, canonical ops, geometry
-// output, maxW, maxSeconds).
+// output, maxW, maxSeconds) for a stack without AI mattes.
 func proxyKey(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64) (string, error) {
-	return proxyKeyV(srcs, ops, out, maxW, maxSeconds, proxyMemoVersion)
+	return proxyKeyFor(srcs, ops, out, maxW, maxSeconds, nil)
+}
+
+// proxyKeyFor is proxyKey with the stack's resolved mattes folded in (their
+// clip keys, like stillKeyFor); unchanged for a stack without a matte op.
+func proxyKeyFor(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64, mattes []resolvedMatte) (string, error) {
+	return proxyKeyVM(srcs, ops, out, maxW, maxSeconds, proxyMemoVersion, mattes)
 }
 
 // proxyKeyV is proxyKey with an explicit version salt.
 func proxyKeyV(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64, version string) (string, error) {
+	return proxyKeyVM(srcs, ops, out, maxW, maxSeconds, version, nil)
+}
+
+// proxyKeyVM is proxyKeyFor with an explicit version salt.
+func proxyKeyVM(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64, version string, mattes []resolvedMatte) (string, error) {
 	canon, err := recipe.Recipe{Sources: srcs, Ops: ops, Output: out}.Canonical()
 	if err != nil {
 		return "", err
@@ -236,6 +260,6 @@ func proxyKeyV(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxS
 	h := sha256.New()
 	h.Write([]byte("proxy|" + version + "\n"))
 	h.Write(canon)
-	h.Write([]byte("|w=" + strconv.Itoa(maxW) + "|s=" + strconv.FormatFloat(maxSeconds, 'f', 3, 64)))
+	h.Write([]byte("|w=" + strconv.Itoa(maxW) + "|s=" + strconv.FormatFloat(maxSeconds, 'f', 3, 64) + matteKeySuffix(mattes)))
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

@@ -88,8 +88,11 @@ type Master struct {
 // same holds for StillArgs, StillArgsFromStart and ProxyArgs.
 //
 // Every p.ExtraInputs entry (Phase 3) follows the main input as
-// "[Args...] -i Path"; a plan with an unbound drawtext placeholder or an
-// extra input without Path yields nil (see phase3.go).
+// "[Args...] -i Path" — a matte input (Phase 5b, ExtraInput.Matte) as its
+// full sequence "-f image2 -framerate F -start_number 1 -i <dir>/%06d.png"
+// (the decode starts at TrimStart = output t 0 = frame 1; see
+// matteInputArgs); a plan with an unbound drawtext placeholder or an extra
+// input without Path yields nil (see phase3.go).
 func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 	if !planUsable(p) {
 		return nil
@@ -171,6 +174,15 @@ func MasterArgs(srcPath string, p *graph.Plan, outPath string) []string {
 // replaces them; every other input option (e.g. -c:v libvpx-vp9) is kept.
 // The output label is always [outs].
 //
+// A matte input (Phase 5b, ExtraInput.Matte) takes the form the seek calls
+// for (stillMatteArgs / matteInputArgs): a forward plan reads ONE unlooped
+// PNG, the file of the selected output slot (clamped to the memo's count;
+// never "-loop 1"), which framesync pairs with every later main frame; a
+// reversed plan with a CFR tail seek reads the sequence from "-start_number
+// K+1", K being the slot count the seek was snapped to (the main's frames
+// after the seek carry timestamps from 0); a reversed plan decoded from
+// TrimStart and a bounced plan read the full sequence.
+//
 // The seek relies on frames existing at or after S; variable-frame-rate
 // sources whose last frame is held for longer than the seek-back (a GIF
 // ending in a 2 s hold) yield no image for t inside that hold. Callers
@@ -225,7 +237,7 @@ func stillArgs(srcPath string, p *graph.Plan, s stillSeek, maxW int) []string {
 	}
 	args = append(args, input...)
 	args = append(args, "-i", inputPath(srcPath, p))
-	args = append(args, extraInputArgs(p)...)
+	args = append(args, extraInputArgsFor(p, stillMatteArgs(p, s))...)
 	args = append(args,
 		"-frames:v", "1",
 		"-filter_complex", f.String(),
@@ -275,6 +287,10 @@ func stillArgs(srcPath string, p *graph.Plan, s stillSeek, maxW int) []string {
 // stage buffers the whole trimmed clip and mirrors it, so the plan's own
 // InputArgs (trim seek included) are passed through unchanged and the -t
 // cap alone limits the preview.
+//
+// A matte input (Phase 5b, ExtraInput.Matte) is read as its full sequence
+// ("-start_number 1") in every unseeked case above, and from "-start_number
+// K+1" when the reversed tail seek skips K output slots (matteInputArgs).
 func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outPath string) []string {
 	if !planUsable(p) {
 		return nil
@@ -300,18 +316,20 @@ func ProxyArgs(srcPath string, p *graph.Plan, maxW int, maxSeconds float64, outP
 	}
 	input := p.InputArgs
 	var seek []string
+	var matte matteArgs // the full sequence unless the tail seek skips K slots
 	if s, ok := proxySeekFor(p, maxSeconds); ok {
 		input = stripSeekArgs(p.InputArgs)
 		seek = append(seek, "-ss", formatFloat(s.start))
 		if s.end > s.start {
 			seek = append(seek, "-to", formatFloat(s.end))
 		}
+		matte.slot = s.slot
 	}
 	args := make([]string, 0, len(seek)+len(input)+30)
 	args = append(args, seek...)
 	args = append(args, input...)
 	args = append(args, "-i", inputPath(srcPath, p))
-	args = append(args, extraInputArgs(p)...)
+	args = append(args, extraInputArgsFor(p, matte)...)
 	args = append(args,
 		"-filter_complex", f.String(),
 		"-map", "[outp]",
@@ -788,6 +806,14 @@ type stillSeek struct {
 	reversed  bool
 	threshold float64 // select 'gte(t,threshold)' in output seconds
 	index     int     // select 'gte(n,index)'
+	// slot (Phase 5b) is what a matte input needs: the absolute output
+	// slot the still selects (forward plans; capped at the render's last
+	// slot — the file of a forward still's single matte PNG), or the slot
+	// count K the seek was snapped to after TrimStart (reversed plans; 0
+	// when the decode starts at TrimStart — the sequence then starts at
+	// -start_number K+1). Stored here, never re-derived from the time: that
+	// would bring back the float phase error alignedSlots exists to avoid.
+	slot int
 }
 
 // Reversed-still seek constants.
@@ -963,6 +989,7 @@ func stillSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 		offset:    slots * g.period,
 		threshold: math.Max((abs-0.5)/g.fps, 0),
 		pad:       slot/g.fps + stillPadSlack,
+		slot:      int(abs),
 	}
 	switch {
 	case seekUnsafe(p):
@@ -1068,7 +1095,8 @@ func reversedSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 		// halves; the j-th output frame is the render's j-th either way.
 		return s
 	}
-	s.start = g.reversedSeekStart(p.SourceFPS, j, true)
+	start, slots := g.reversedSeekPoint(p.SourceFPS, j, true)
+	s.start, s.slot = start, int(slots)
 	return s
 }
 
@@ -1080,15 +1108,25 @@ func reversedSeekFor(p *graph.Plan, t float64, fromStart bool) stillSeek {
 // seek is the plain grid-snapped time). TrimStart when the last slot is
 // unknown.
 func (g stillGrid) reversedSeekStart(srcFPS, j float64, align bool) float64 {
+	start, _ := g.reversedSeekPoint(srcFPS, j, align)
+	return start
+}
+
+// reversedSeekPoint is reversedSeekStart returning the slot count as well:
+// the start lies slots output slots after TrimStart (0 when the decode
+// starts there), which a matte input repeats as "-start_number slots+1"
+// (stillSeek.slot) — the main's frames after the seek carry timestamps from
+// 0, so the matte sequence must begin at that slot.
+func (g stillGrid) reversedSeekPoint(srcFPS, j float64, align bool) (start, slots float64) {
 	if g.last < 0 {
-		return g.trimStart
+		return g.trimStart, 0
 	}
 	k := g.last - j
-	_, slots := g.seekBefore(g.clampTarget(g.trimStart+(k+0.5)*g.period), false)
+	_, slots = g.seekBefore(g.clampTarget(g.trimStart+(k+0.5)*g.period), false)
 	if align {
 		slots = g.alignedSlots(srcFPS, slots)
 	}
-	return g.trimStart + slots*g.period
+	return g.trimStart + slots*g.period, slots
 }
 
 // proxySeekFor returns the input seek ProxyArgs applies to a reversed plan
@@ -1104,11 +1142,11 @@ func proxySeekFor(p *graph.Plan, maxSeconds float64) (stillSeek, bool) {
 	}
 	g := newStillGrid(p)
 	j := g.capSlot(math.Min(math.Floor(maxSeconds*g.fps+stillSlotEpsilon), maxStillIndex))
-	start := g.reversedSeekStart(p.SourceFPS, j, !p.SourceVFR)
+	start, slots := g.reversedSeekPoint(p.SourceFPS, j, !p.SourceVFR)
 	if !(start > g.trimStart) {
 		return stillSeek{}, false
 	}
-	s := stillSeek{reversed: true, start: start}
+	s := stillSeek{reversed: true, start: start, slot: int(slots)}
 	if p.TrimEnd > 0 {
 		s.end = p.TrimEnd
 	}

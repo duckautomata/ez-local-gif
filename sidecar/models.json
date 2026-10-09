@@ -1,0 +1,51 @@
+{
+  "_about": "Models the matte sidecar can offer (matte.py reads this file; MATTE_MODELS picks ids from it). Every file is a plain ONNX graph executed by onnxruntime — no remote code. `urls` are tried in order (the pinned rembg GitHub release v0.0.0 asset first, then a mirror holding the byte-identical file); the download is verified against `sha256` before the file is used, and that sha256 is the `weights` the app folds into its memo keys. The facts come from docs/reviews/background-removal-bench/models.json (research run 2026-10-08).",
+  "v": 1,
+  "models": {
+    "isnet-anime": {
+      "label": "Anime (fast)",
+      "file": "isnet-anime.onnx",
+      "bytes": 176069933,
+      "sha256": "f15622d853e8260172812b657053460e20806f04b9e05147d49af7bed31a6e99",
+      "urls": [
+        "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-anime.onnx",
+        "https://huggingface.co/skytnt/anime-seg/resolve/493cb60893f47441b26ec4fb9a306bce9e342982/isnetis.onnx"
+      ],
+      "upstream": "SkyTNT/anime-segmentation (ISNet / DIS); the HF mirror is the author's own upload, byte-identical (same LFS sha256)",
+      "licence": "Apache-2.0",
+      "licence_file": "LICENSES/isnet-anime.Apache-2.0.txt",
+      "offer": ["cuda", "cpu"],
+      "graph_size": 1024,
+      "sizes": [1024, 512],
+      "default_size": {"cuda": 1024, "cpu": 512},
+      "precision": {"cuda": "fp16", "cpu": "fp32"},
+      "rescalable": true,
+      "input": {"name": "img", "mean": [0.485, 0.456, 0.406], "std": [1.0, 1.0, 1.0]},
+      "output": {"name": "mask", "activation": "sigmoid"},
+      "notes": "opset 11, input float32 [1,3,1024,1024], output [1,1,1024,1024] with the sigmoid in the graph; /255 then minus mean, std 1 (rembg dis_anime.py — NOT the ImageNet std). The 34 Resize nodes carry absolute sizes, so other input sizes are derived with tools/rescale_graph.py; fp16 on CUDA with tools/to_fp16.py (MAE 0.00005 vs fp32)."
+    },
+    "birefnet-lite": {
+      "label": "General (precise)",
+      "file": "BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx",
+      "bytes": 224005088,
+      "sha256": "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333",
+      "urls": [
+        "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx"
+      ],
+      "upstream": "ZhengPeng7/BiRefNet, BiRefNet_lite (general-use training set, swin_v1_tiny backbone, epoch 232); rembg's ONNX export — no mirror with the same sha256 is known",
+      "licence": "MIT",
+      "licence_file": "LICENSES/birefnet.MIT.txt",
+      "offer": ["cuda"],
+      "graph_size": 1024,
+      "sizes": [1024],
+      "default_size": {"cuda": 1024, "cpu": 1024},
+      "precision": {"cuda": "fp32", "cpu": "fp32"},
+      "rescalable": false,
+      "input": {"name": null, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]},
+      "output": {"name": null, "activation": "logits"},
+      "vram": {"cap": true, "min_limit_gib": 6, "min_free_gib": 7},
+      "ram": {"min_available_gib": 14},
+      "notes": "fixed batch 1, float32 [1,3,1024,1024] input, [1,1,1024,1024] LOGITS output (the sidecar applies the sigmoid); ImageNet mean/std. ORT's CUDA arena grows to 14.5 GB uncapped: it runs under gpu_mem_limit = MATTE_GPU_MEM_LIMIT_GIB (6.3 GB footprint at 6 GiB; 5/4/3 GiB caps FAIL). Session create 10–20 s on an RTX 5080, ~170 ms/frame; on CPU 3.7–10 s/frame at 12.6 GB RSS."
+    }
+  }
+}

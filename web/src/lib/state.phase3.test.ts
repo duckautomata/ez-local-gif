@@ -1,27 +1,39 @@
 // Phase 3 op stack: buildOps ordering with the editing ops, recipe.sources
-// bookkeeping for overlay assets, and the preview-mode options.
+// bookkeeping for overlay assets, the preview-mode options, and (Phase 5a)
+// the Background card's Colour / Screen ops, the morph cleanup and the
+// crop-mode still output.
 import { describe, expect, it } from 'vitest';
 import type { ProbeInfo, Source } from './api';
 import { newImageOverlay, newTextOverlay, scrubberRange } from './overlay';
 import { defaultOutput, presetById } from './presets';
 import {
+  addKeyColor,
   addOverlay,
   app,
+  applyPickedColor,
+  armEyedropper,
   assetHashes,
-  backgroundOp,
+  backgroundOps,
   buildOps,
   buildOutput,
+  CHROMA_DEFAULTS,
+  COLORKEY_DEFAULTS,
   cropActive,
+  cropPreviewOutput,
   defaultBackground,
   defaultOps,
   hasOverlays,
+  MAX_KEY_COLORS,
   moveOverlay,
   planCanvas,
+  planFPS,
   previewOutput,
   recipeOps,
   recipeSources,
+  removeKeyColor,
   removeOverlay,
   resetApp,
+  setKeyColor,
   setSource,
 } from './state.svelte';
 
@@ -52,7 +64,7 @@ describe('buildOps — Phase 3 ordering', () => {
     ops.trim = { enabled: true, start: 0.5, end: 0 };
     ops.speed = { enabled: true, factor: 2 };
     ops.fps = { enabled: true, fps: 20 };
-    ops.background = { ...defaultBackground(), enabled: true, mode: 'green' };
+    ops.background = { ...defaultBackground(), enabled: true, mode: 'screen' };
     ops.crop = { enabled: true, x: 1, y: 2, w: 30, h: 40 };
     ops.resize = { enabled: true, width: 128, height: 0, fit: 'contain' };
     ops.flipRotate = { enabled: true, horizontal: true, vertical: false, degrees: 90 };
@@ -70,6 +82,7 @@ describe('buildOps — Phase 3 ordering', () => {
       'speed',
       'fps',
       'chromakey',
+      'morph',
       'crop',
       'resize',
       'flip',
@@ -102,10 +115,10 @@ describe('buildOps — Phase 3 ordering', () => {
     expect(buildOps(ops)).toEqual([{ kind: 'crop', params: { x: 1, y: 2, w: 30, h: 40 } }]);
     ops.crop.enabled = false;
     expect(cropActive(ops)).toBe(false);
-    // the crop preview stops before crop / autocrop but after the key op
+    // the crop preview stops before crop / autocrop but after the key op and its morph
     ops.autocrop.enabled = true;
-    ops.background = { ...defaultBackground(), enabled: true, mode: 'blue', color: '0000ff' };
-    expect(buildOps(ops, { cropPreview: true })).toEqual([{ kind: 'chromakey', params: { color: '0000ff' } }]);
+    ops.background = { ...defaultBackground(), enabled: true, mode: 'screen', screen: 'blue', color: '0000ff' };
+    expect(buildOps(ops, { cropPreview: true })).toEqual([{ kind: 'chromakey', params: { color: '0000ff' } }, { kind: 'morph', params: { close: true } }]);
   });
 
   it('reverse is emitted after the geometry and only when set', () => {
@@ -118,40 +131,175 @@ describe('buildOps — Phase 3 ordering', () => {
   });
 });
 
-describe('background op', () => {
-  it('greenscreen with defaults is a bare chromakey; changed knobs are carried', () => {
-    const b = { ...defaultBackground(), enabled: true };
-    expect(backgroundOp(b)).toEqual({ kind: 'chromakey' });
+describe('background ops (Phase 5a: Colour / Screen, then morph)', () => {
+  it('defaults mirror the recipe zero values of graph/phase3.go (Screen 0.1, Colour 0.08) and a new session lands on Colour with fill pinholes on', () => {
+    expect(CHROMA_DEFAULTS).toEqual({ similarity: 0.1, blend: 0.05, despillMix: 0.6, despillExpand: 0.3 });
+    expect(COLORKEY_DEFAULTS).toEqual({ similarity: 0.08, blend: 0 });
+    const b = defaultBackground();
+    expect(b).toMatchObject({ enabled: false, mode: 'colour', screen: 'green', color: '00ff00', similarity: 0.1, blend: 0.05, pickSimilarity: 0.08, pickBlend: 0 });
+    expect(b.colors).toEqual(['']); // one row waiting for its pick
+    expect(b.morph).toEqual({ close: true, grow: 0 });
+    expect(defaultOps(gifInfo).background).toEqual(b);
+  });
+
+  it('Screen with defaults is a bare chromakey (0.1 is now the zero value) plus the default morph; changed knobs are carried', () => {
+    const b = { ...defaultBackground(), enabled: true, mode: 'screen' as const };
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey' }, { kind: 'morph', params: { close: true } }]);
+    b.morph = { close: false, grow: 0 }; // the key alone from here on
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey' }]);
+    b.similarity = 0.2; // the pre-5a default is a real value now
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey', params: { similarity: 0.2 } }]);
     b.similarity = 0.35;
     b.blend = 0.1;
     b.despillMix = 0.8;
-    expect(backgroundOp(b)).toEqual({ kind: 'chromakey', params: { similarity: 0.35, blend: 0.1, despillMix: 0.8 } });
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey', params: { similarity: 0.35, blend: 0.1, despillMix: 0.8 } }]);
     b.despill = false;
-    expect(backgroundOp(b)).toEqual({ kind: 'chromakey', params: { similarity: 0.35, blend: 0.1, despillOff: true } });
-    b.mode = 'blue';
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey', params: { similarity: 0.35, blend: 0.1, despillOff: true } }]);
+    b.screen = 'blue';
     b.color = '0000ff';
-    b.similarity = 0.2;
+    b.similarity = 0.1;
     b.blend = 0;
     b.despill = true;
     b.despillMix = 0.6;
-    expect(backgroundOp(b)).toEqual({ kind: 'chromakey', params: { color: '0000ff' } });
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey', params: { color: '0000ff' } }]);
     b.enabled = false;
-    expect(backgroundOp(b)).toBeNull();
+    expect(backgroundOps(b)).toEqual([]);
   });
 
-  it('pick-a-colour is a colorkey once a colour was picked; the eyedropper preview leaves it out', () => {
-    const b = { ...defaultBackground(), enabled: true, mode: 'pick' as const };
-    expect(backgroundOp(b)).toBeNull();
-    b.pickColor = '313338';
-    expect(backgroundOp(b)).toEqual({ kind: 'colorkey', params: { color: '313338' } });
+  it('Colour is one colorkey per picked row, in row order, sharing similarity / blend (0.08 / 0 left out); empty rows and repeats emit nothing', () => {
+    const b = { ...defaultBackground(), enabled: true, morph: { close: false, grow: 0 } };
+    expect(backgroundOps(b)).toEqual([]); // nothing picked yet
+    b.colors = ['313338'];
+    expect(backgroundOps(b)).toEqual([{ kind: 'colorkey', params: { color: '313338' } }]);
+    b.colors = ['313338', '', '1e3a8a', '313338', 'facc82'];
+    expect(backgroundOps(b)).toEqual([
+      { kind: 'colorkey', params: { color: '313338' } },
+      { kind: 'colorkey', params: { color: '1e3a8a' } },
+      { kind: 'colorkey', params: { color: 'facc82' } },
+    ]);
     b.pickSimilarity = 0.25;
     b.pickBlend = 0.05;
-    expect(backgroundOp(b)).toEqual({ kind: 'colorkey', params: { color: '313338', similarity: 0.25, blend: 0.05 } });
+    expect(backgroundOps(b)).toEqual([
+      { kind: 'colorkey', params: { color: '313338', similarity: 0.25, blend: 0.05 } },
+      { kind: 'colorkey', params: { color: '1e3a8a', similarity: 0.25, blend: 0.05 } },
+      { kind: 'colorkey', params: { color: 'facc82', similarity: 0.25, blend: 0.05 } },
+    ]);
+    b.pickSimilarity = 0.1; // the pre-5a default is carried now
+    b.pickBlend = 0;
+    expect(backgroundOps(b)[0]).toEqual({ kind: 'colorkey', params: { color: '313338', similarity: 0.1 } });
+    b.enabled = false;
+    expect(backgroundOps(b)).toEqual([]);
+  });
+
+  it('morph follows the keys: close / grow with the zero values left out, grow clamped to 0..4, none without a key and none when both are off', () => {
+    const b = { ...defaultBackground(), enabled: true, colors: ['313338'] };
+    expect(backgroundOps(b)).toEqual([{ kind: 'colorkey', params: { color: '313338' } }, { kind: 'morph', params: { close: true } }]);
+    b.morph = { close: true, grow: 2 };
+    expect(backgroundOps(b)[1]).toEqual({ kind: 'morph', params: { close: true, grow: 2 } });
+    b.morph = { close: false, grow: 1 };
+    expect(backgroundOps(b)[1]).toEqual({ kind: 'morph', params: { grow: 1 } });
+    b.morph = { close: false, grow: 9 };
+    expect(backgroundOps(b)[1]).toEqual({ kind: 'morph', params: { grow: 4 } });
+    b.morph = { close: true, grow: 2.6 };
+    expect(backgroundOps(b)[1]).toEqual({ kind: 'morph', params: { close: true, grow: 3 } });
+    // nothing to do: no morph op at all (a bare morph is a compile error server-side)
+    b.morph = { close: false, grow: -3 };
+    expect(backgroundOps(b)).toEqual([{ kind: 'colorkey', params: { color: '313338' } }]);
+    b.morph = { close: false, grow: 0 };
+    expect(backgroundOps(b)).toEqual([{ kind: 'colorkey', params: { color: '313338' } }]);
+    // no key, no morph — the cleanup is the key's, never the source alpha's
+    b.morph = { close: true, grow: 4 };
+    b.colors = [''];
+    expect(backgroundOps(b)).toEqual([]);
+    // Screen: after the chromakey
+    b.mode = 'screen';
+    expect(backgroundOps(b)).toEqual([{ kind: 'chromakey' }, { kind: 'morph', params: { close: true, grow: 4 } }]);
+  });
+
+  it('buildOps: keys → morph → feather, before the geometry; keyPreview drops the card’s ops (keys and morph), the crop preview keeps them', () => {
     const ops = defaultOps(gifInfo);
-    ops.background = b;
+    ops.background = { ...defaultBackground(), enabled: true, colors: ['313338', 'facc82'], morph: { close: true, grow: 1 } };
+    ops.feather = { enabled: true, radius: 2 };
+    ops.crop = { enabled: true, x: 0, y: 0, w: 10, h: 10 };
     ops.reverse = true;
-    expect(buildOps(ops).map((o) => o.kind)).toEqual(['colorkey', 'reverse']);
-    expect(buildOps(ops, { keyPreview: true }).map((o) => o.kind)).toEqual(['reverse']);
+    expect(buildOps(ops).map((o) => o.kind)).toEqual(['colorkey', 'colorkey', 'morph', 'feather', 'crop', 'reverse']);
+    expect(buildOps(ops, { keyPreview: true }).map((o) => o.kind)).toEqual(['feather', 'crop', 'reverse']);
+    expect(buildOps(ops, { cropPreview: true }).map((o) => o.kind)).toEqual(['colorkey', 'colorkey', 'morph', 'feather']);
+    ops.background.mode = 'screen';
+    expect(buildOps(ops).map((o) => o.kind)).toEqual(['chromakey', 'morph', 'feather', 'crop', 'reverse']);
+  });
+});
+
+describe('Colour rows and the eyedropper (app helpers)', () => {
+  it('a pick lands in the armed row; "+ add colour" rows; typed hex; remove keeps the armed row in step; the cap', () => {
+    setSource({ hash: MAIN, name: 'x.gif', size: 1, info: gifInfo });
+    expect(app.ops.background.colors).toEqual(['']);
+    expect(app.ui.pickRow).toBe(0);
+    armEyedropper(0);
+    expect(app.ui.pickColor).toBe(true);
+    applyPickedColor('313338');
+    expect(app.ops.background).toMatchObject({ enabled: true, mode: 'colour', colors: ['313338'] });
+    expect(app.ui.pickColor).toBe(false);
+    // "+ add colour": a new empty row (the card arms the eyedropper for it)
+    expect(addKeyColor()).toBe(1);
+    expect(app.ops.background.colors).toEqual(['313338', '']);
+    armEyedropper(1);
+    expect(app.ui.pickRow).toBe(1);
+    applyPickedColor('#FACC82'); // what the card may hand over; the preview sends plain lowercase
+    expect(app.ops.background.colors).toEqual(['313338', 'facc82']);
+    expect(app.ui.pickColor).toBe(false);
+    // a row that is gone by the time the click lands: the pick is appended, never lost
+    armEyedropper(5);
+    applyPickedColor('1e3a8a');
+    expect(app.ops.background.colors).toEqual(['313338', 'facc82', '1e3a8a']);
+    // re-picking the same colour still disarms; a malformed pick changes nothing and stays armed
+    armEyedropper(0);
+    applyPickedColor('313338');
+    expect(app.ui.pickColor).toBe(false);
+    armEyedropper(0);
+    applyPickedColor('nope');
+    expect(app.ops.background.colors).toEqual(['313338', 'facc82', '1e3a8a']);
+    expect(app.ui.pickColor).toBe(true);
+    // typed hex: '#' and case tolerated, malformed refused, '' clears; a valid value disarms that row's eyedropper
+    expect(setKeyColor(0, '#ABCDEF')).toBe(true);
+    expect(app.ops.background.colors[0]).toBe('abcdef');
+    expect(app.ui.pickColor).toBe(false);
+    expect(setKeyColor(1, 'zzz')).toBe(false);
+    expect(app.ops.background.colors[1]).toBe('facc82');
+    expect(setKeyColor(1, '  ')).toBe(true);
+    expect(app.ops.background.colors[1]).toBe('');
+    expect(setKeyColor(9, 'abcdef')).toBe(false);
+    expect(backgroundOps(app.ops.background).map((o) => o.kind)).toEqual(['colorkey', 'colorkey', 'morph']);
+    // remove: an eyedropper armed for a later row follows its row down…
+    armEyedropper(2);
+    removeKeyColor(0);
+    expect(app.ops.background.colors).toEqual(['', '1e3a8a']);
+    expect(app.ui.pickRow).toBe(1);
+    expect(app.ui.pickColor).toBe(true);
+    // …removing the armed row disarms…
+    removeKeyColor(1);
+    expect(app.ops.background.colors).toEqual(['']);
+    expect(app.ui.pickColor).toBe(false);
+    // …and the only row is cleared, never removed
+    app.ops.background.colors = ['313338'];
+    removeKeyColor(0);
+    expect(app.ops.background.colors).toEqual(['']);
+    removeKeyColor(4); // unknown: no-op
+    expect(app.ops.background.colors).toEqual(['']);
+    // the cap: six rows, no seventh; a stale row index then replaces the last row
+    app.ops.background.colors = ['111111', '222222', '333333', '444444', '555555', '666666'];
+    expect(MAX_KEY_COLORS).toBe(6);
+    expect(addKeyColor()).toBe(-1);
+    armEyedropper(9);
+    applyPickedColor('abcdef');
+    expect(app.ops.background.colors).toEqual(['111111', '222222', '333333', '444444', '555555', 'abcdef']);
+    // a new source disarms and forgets the row
+    armEyedropper(3);
+    setSource({ hash: 'd'.repeat(64), name: 'y.gif', size: 1, info: gifInfo });
+    expect(app.ui.pickColor).toBe(false);
+    expect(app.ui.pickRow).toBe(0);
+    expect(app.ops.background.colors).toEqual(['']);
+    resetApp();
   });
 });
 
@@ -301,11 +449,13 @@ describe('overlay ops and asset bookkeeping', () => {
     expect(app.ui.selectedOverlay).toBe(0);
     removeOverlay(999); // unknown: no-op
     expect(app.ops.overlays).toHaveLength(2);
-    // a new source / reset starts with no overlays and a disarmed eyedropper
+    // a new source / reset starts with no overlays and a disarmed eyedropper (its row forgotten)
     app.ui.pickColor = true;
+    app.ui.pickRow = 2;
     setSource({ hash: 'd'.repeat(64), name: 'y.gif', size: 1, info: gifInfo });
     expect(app.ops.overlays).toEqual([]);
     expect(app.ui.pickColor).toBe(false);
+    expect(app.ui.pickRow).toBe(0);
     resetApp();
     expect(app.ops.background.enabled).toBe(false);
   });
@@ -348,6 +498,32 @@ describe('preview requests (still / proxy)', () => {
     expect(previewOutput(buildOutput(out))).toEqual({ format: 'webp' });
     // a chat GIF at the source size carries nothing but the format
     expect(previewOutput(buildOutput(defaultOutput()))).toEqual({ format: 'gif' });
+  });
+
+  it('the crop-mode still keeps the fps of the normal still: cropPreviewOutput is format + fps, no geometry (spec §6.1)', () => {
+    const out = defaultOutput();
+    out.preset = 'emote';
+    presetById('emote').apply(out); // 128×128 contain at 25 fps
+    const normal = previewOutput(buildOutput(out));
+    const crop = cropPreviewOutput(buildOutput(out));
+    expect(normal).toEqual({ format: 'gif', width: 128, height: 128, fit: 'contain', fps: 25 });
+    expect(crop).toEqual({ format: 'gif', fps: 25 });
+    expect(crop.fps).toBe(normal.fps);
+    // …so both plans resolve to the same grid over a 30 fps source (with
+    // only the format the server would fall back to the source rate: 30)
+    const clip30 = { ...gifInfo, fps: 30, duration: 2, frames: 60 };
+    const ops = defaultOps(clip30);
+    expect(planFPS(clip30, ops, out)).toBe(25);
+    expect(planFPS(clip30, ops, { ...out, fps: 0 })).toBe(30);
+    // an fps op wins on both sides anyway (it is part of the crop-mode stack)
+    ops.fps = { enabled: true, fps: 10 };
+    expect(buildOps(ops, { cropPreview: true })).toEqual([{ kind: 'fps', params: { fps: 10 } }]);
+    expect(planFPS(clip30, ops, out)).toBe(10);
+    // no Output.fps: neither carries one
+    expect(cropPreviewOutput(buildOutput(defaultOutput()))).toEqual({ format: 'gif' });
+    out.format = 'webp';
+    out.fps = 0;
+    expect(cropPreviewOutput(buildOutput(out))).toEqual({ format: 'webp' });
   });
 
   it('planCanvas is the output canvas after crop / resize / rotation and the Output fit; unknown with auto-crop (review W6)', () => {

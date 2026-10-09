@@ -159,9 +159,76 @@ type FeatherParams struct {
 	Radius float64 `json:"radius,omitempty"`
 }
 
+// OpMorph (Phase 5a) cleans the frame's alpha plane with 3x3 morphology
+// (MorphParams). Like feather it is hoisted into the keying group, in stack
+// order, so it acts on whatever key or matte precedes it in the stack, and
+// it is skipped entirely while the frames carry no alpha (an opaque source
+// with no key in front of it); its params are validated either way.
+const OpMorph = "morph"
+
+// MorphParams: Close applies a dilation followed by an erosion (a 3x3
+// "close": fills pinholes of up to 1 px without growing the silhouette);
+// Grow (0..4) applies that many extra dilations afterwards (recovers eaten
+// subject interiors at the cost of a fringe of as many source pixels). At
+// least one of Close / Grow > 0 must be set, else the op is a compile
+// error. The colour planes are never touched.
+type MorphParams struct {
+	Close bool `json:"close,omitempty"`
+	Grow  int  `json:"grow,omitempty"`
+}
+
+// OpMatte (Phase 5b) keys the main source with an AI matte (MatteParams):
+// one alpha frame per master frame, computed by the matte sidecar on the
+// frames the temporal stages yield (delay / unpremultiply / trim / speed /
+// fps — the output frame grid), memoised by jobs per frame and per clip,
+// and read back as an image2 sequence input of the plan. Like
+// chromakey / colorkey / feather it is hoisted into the keying group: full
+// resolution, before any geometry, in stack order. On opaque frames the
+// matte becomes the alpha; on frames that already carry alpha it is
+// multiplied in (intersected), never substituted. The model sees RGB only:
+// keys, morph, feather and geometry are not part of its memo key. A plan
+// with an unresolved matte input is unusable (enc returns nil argv).
+const OpMatte = "matte"
+
+// MatteParams: Model "" = MatteModelDefault and must otherwise be an id the
+// sidecar offers. Size is the model input square in px; 0 = the server's
+// default for its device (isnet-anime: 1024 on CUDA, 512 on CPU;
+// birefnet-lite: 1024) — API-only, no UI control; only sizes the sidecar
+// lists are valid. Resolved is filled by jobs (Submit, previews, render)
+// from the sidecar's pinned facts and STRIPPED from client input exactly
+// like AutoCropParams.Resolved — but, unlike the crop box, it is KEPT in
+// the recipe hash: a result rendered with other weights has another
+// ResultKey, so pulling a new sidecar image can never serve a cached
+// result made with the old weights.
+type MatteParams struct {
+	Model    string         `json:"model,omitempty"`
+	Size     int            `json:"size,omitempty"`
+	Resolved *MatteResolved `json:"resolved,omitempty"`
+}
+
+// MatteResolved is the identity of the matte a render used (the facts of
+// the sidecar's last successful ping, persisted by jobs).
+type MatteResolved struct {
+	Weights   string `json:"weights"`   // sha256 of the pinned source ONNX file (sidecar/models.json)
+	Proc      string `json:"proc"`      // the sidecar's processingVersion (pre/post-processing + derivation recipe)
+	Size      int    `json:"size"`      // the effective input square
+	Precision string `json:"precision"` // fp16 / fp32 of the graph the sidecar runs for this device
+}
+
+// Matte model ids (sidecar/models.json). The sidecar reports which of them
+// it offers (its MATTE_MODELS); the UI labels them "Anime (fast)" and
+// "General (precise)".
+const (
+	MatteModelISNetAnime   = "isnet-anime"   // Apache-2.0; the default
+	MatteModelBiRefNetLite = "birefnet-lite" // MIT; ~10x slower, every hair strand
+	MatteModelDefault      = MatteModelISNetAnime
+)
+
 // ChromaKeyParams keys out a colour in YUV (soft edges). Zero values:
-// Color "00ff00", Similarity 0.2 (0.01..1), Blend 0.05 (0..1), Despill
-// on with Mix 0.6 and Expand 0.3 (DespillOff disables it).
+// Color "00ff00", Similarity 0.1 (0.01..1; Phase 5a — was 0.2), Blend 0.05
+// (0..1), Despill on with Mix 0.6 and Expand 0.3 (DespillOff disables it).
+// The defaults are graph's (internal/graph/phase3.go) and are mirrored by
+// the SPA's CHROMA_DEFAULTS (web/src/lib/state.svelte.ts).
 //
 // Blend 0 therefore means the DEFAULT 0.05, not "no blend": a hard key edge
 // needs a small positive value such as 0.001 (the UI's slider floors at
@@ -181,7 +248,9 @@ type ChromaKeyParams struct {
 }
 
 // ColorKeyParams makes one RGB colour transparent (the eyedropper picks it).
-// Zero values: Similarity 0.1 (0.01..1), Blend 0 (0..1). Color is required.
+// Zero values: Similarity 0.08 (0.01..1; Phase 5a — was 0.1), Blend 0
+// (0..1); graph's defaults, mirrored by the SPA's COLORKEY_DEFAULTS. Color
+// is required.
 type ColorKeyParams struct {
 	Color      string  `json:"color"`
 	Similarity float64 `json:"similarity,omitempty"`

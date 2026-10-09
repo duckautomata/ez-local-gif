@@ -51,7 +51,13 @@ into the Go binary by `web/embed.go`.
     src/lib/fonts.ts             font families for the Text card (GET /api/fonts, DejaVu Sans fallback)
     src/lib/presets.ts           presets (Emote, Sticker, Chat GIF/WebP/AVIF, Optimize, Frames, Custom),
                                  formats per preset, fit budgets, matte / trim-fringe constants
-    src/lib/still.ts             StillScheduler: preview still debounce/abort/object-URL logic (unit-tested)
+    src/lib/still.ts             StillScheduler: preview still debounce/abort/object-URL logic (unit-tested),
+                                 the 202 "AI matte pending" re-request + "Compute now" (eager)
+    src/lib/matte.ts             Phase 5b pure helpers: model options / labels, the clip estimate and caps
+                                 verdict (jobs' up-front refusal), status line, pending pill, retry cadence
+    src/lib/matte.svelte.ts      the live GET /api/matte object: reference-counted 5 s polling while the AI
+                                 mode is visible or a preview is pending; a 202 installs its status too
+    src/lib/stages.ts            job stage labels (incl. "AI matte") for the Render panel and batch rows
     src/lib/render.svelte.ts     job submission / progress / result state
     src/lib/format.ts            formatting helpers, snapFPS/gifDelays, fitSize, fmtTimecode, frame grid
     src/lib/result.ts            result-manifest grouping (primary / alternatives / frames / archive), chat sizes
@@ -163,17 +169,47 @@ into the Go binary by `web/embed.go`.
 
 ### Phase 3 editing ops
 
-- **Background card** (`app.ops.background`): None · Greenscreen · Bluescreen ·
-  Pick a colour. Green/blue emit `chromakey` (key colour — preset `00ff00` /
-  `0000ff` or custom —, similarity, blend, despill on/off + mix/expand under
-  Advanced); recipe zero values are left out of the params, and because the
-  Go zero value of blend *is* the 0.05 default, the blend slider floors at
-  0.01. Pick a colour emits `colorkey` once a colour was picked: the
-  **eyedropper** (`app.ui.pickColor`) arms a transparent button layer over the
-  preview still, which is requested *without* the key op while armed
+- **Background card** (`app.ops.background`, Phase 5a/5b): None · AI ·
+  Colour · Screen. AI (Phase 5b, `ai.model`) emits one `matte` op — the
+  sidecar model named unless it is the recipe default `isnet-anime`
+  (`MATTE_MODEL_DEFAULT`; the Go zero value resolves to it); the Model
+  select is fed by `GET /api/matte` (`lib/matte.svelte.ts`: ids, labels,
+  live states — loading / downloading shown, missing / unavailable greyed
+  with the reason — and the server's `defaultModel`, which becomes the
+  explicit choice as soon as it is known), the status line reads "ready ·
+  GPU · up to ~N s for this clip" / "loading model…" / "downloading weights
+  43 %" / "sidecar unavailable — run `docker compose --profile matte-gpu up
+  -d`", and the mode is disabled with the reason when `features.matte` is
+  false (a plain install without the compose profile). A still / proxy of
+  a matte recipe may answer **202** while the pass runs: `fetchStill` /
+  `fetchProxy` throw `MattePending`, the schedulers keep the picture on
+  stage, show the pill ("AI matte 24/45 · GPU", "loading model… (12 s)",
+  "~3 min on CPU" + **Compute now** for a deferred pass) and re-request
+  after 500 ms (5 s while deferred); Play and "Compute now" send `eager`.
+  The Render panel appends "· up to ~N s AI matte (GPU|CPU)" to its
+  estimate line and shows the server's refusal note over
+  `EZLG_MATTE_MAX_FRAMES` / `_MAX_SECONDS`; the Result card shows the
+  `render.matte` info check as an "AI matte:" line. Screen (Green / Blue sub-choice, `screen`) emits `chromakey` (key
+  colour — preset `00ff00` / `0000ff` or custom —, similarity default 0.1,
+  blend, despill on/off + mix/expand under Advanced); recipe zero values are
+  left out of the params, and because the Go zero value of blend *is* the
+  0.05 default, the blend slider floors at 0.01. Colour emits one `colorkey`
+  per picked row (`colors`, up to 6 via "+ add colour"; similarity default
+  0.08; a colour picked twice is keyed once — duplicates collapsed, the
+  second op would only redo the first's work) — `backgroundOps` — and either
+  mode is followed by the `morph` op of
+  the "Edge cleanup" fold (`morph`: fill pinholes on by default, grow 0–4;
+  hidden and switched off on a server without `features.morph`), then
+  feather (`buildOps`). The **eyedropper** (`app.ui.pickColor`, the row it
+  fills in `app.ui.pickRow`) arms a transparent button layer over the
+  preview still, which is requested *without* the card's ops while armed
   (`buildOps({keyPreview})`); a click maps display px → still px
   (`lib/eyedropper.displayToPixel`), reads the pixel through a canvas and
-  stores the hex; the hex field is the keyboard path; Esc cancels.
+  lands the hex in the armed row (`lib/eyedropper.landPick` →
+  `state.applyPickedColor`); the hex field of each row is the keyboard path
+  (and the only path in batch, where the card is mounted with `picker`
+  off); Esc cancels. The crop-mode still sends `{ format, fps }`
+  (`cropPreviewOutput`), never the geometry but always the rate.
 - **Crop card**: "Auto-crop to content" (`app.ops.autocrop`: padding, alpha
   threshold under Advanced for alpha sources) emits `autocrop` instead of the
   manual `crop`; the rectangle fields are disabled while it is on and the
@@ -242,7 +278,9 @@ into the Go binary by `web/embed.go`.
   which was meant). One row per file (name, probe badge, per-row unpremultiply
   auto-default from `info.premultiplied`), the shared "Use for" chips + Output
   card once at the top. Only geometry-independent global ops are offered:
-  unpremultiply (per-row), fps, speed, feather, background removal, reverse,
+  unpremultiply (per-row), fps, speed, feather, background removal (AI
+  included — every row's render runs its own matte pass, one at a time
+  through the sidecar, and its row shows the "AI matte" stage), reverse,
   bounce — trim/crop/autocrop/resize/canvas/overlays/text are disabled ("Open
   in editor" on a row seeds the single view with that source). "Render all" =
   one ordinary `POST /api/jobs` per row (same ops + output, that row's source);

@@ -1,11 +1,12 @@
 package graph
 
-// Phase 3 stages (DESIGN.md §4.3): keying (chromakey / colorkey + despill),
+// Phase 3 stages (DESIGN.md §4.3): keying (chromakey / colorkey + despill,
+// and — Phase 5b — the AI matte merged from a memoised sequence input),
 // the resolved autocrop, reverse, and the final-canvas ops — drawtext and
 // image / animation / video overlays from the recipe's extra sources. Every
 // recipe emitted here was verified pixel-exact against FFmpeg 9.0.1 (host
-// and the ezlg-dev image); phase3_ffmpeg_test.go re-checks them whenever an
-// ffmpeg is on PATH.
+// and the ezlg-dev image); phase3_ffmpeg_test.go and matte_ffmpeg_test.go
+// re-check them whenever an ffmpeg is on PATH.
 
 import (
 	"fmt"
@@ -20,16 +21,50 @@ import (
 // Defaults of the Phase 3 ops (the recipe.*Params zero values) and their
 // bounds.
 const (
-	// Keying (recipe.ChromaKeyParams / ColorKeyParams).
+	// Keying (recipe.ChromaKeyParams / ColorKeyParams). The similarity
+	// defaults are mirrored by the SPA (web/src/lib/state.svelte.ts
+	// CHROMA_DEFAULTS / COLORKEY_DEFAULTS, whose serialisers omit them so the
+	// zero value renders through these); a change here changes what every
+	// keyed recipe renders to, so it goes with a jobs.PipelineVersion bump.
 	defaultKeyColor         = "00ff00"
-	defaultChromaSimilarity = 0.2
+	defaultChromaSimilarity = 0.1
 	defaultChromaBlend      = 0.05
 	defaultDespillMix       = 0.6
 	defaultDespillExpand    = 0.3
-	defaultColorSimilarity  = 0.1
+	defaultColorSimilarity  = 0.08
 	// MinSimilarity is the smallest accepted key similarity (ffmpeg's own
-	// minimum is 1e-5; anything below 0.01 keys nothing in practice).
+	// minimum is 1e-5). Since the key colour is emitted in the frame's own
+	// YUV (chromaKeyFormat + yuv=1) the exact screen colour keys at 0.02, so
+	// the floor means what it says.
 	MinSimilarity = 0.01
+	// chromaKeyFormat is the working format of every chromakey: 4:4:4 so
+	// chroma edges are not smeared by subsampling, pinned to BT.601 limited
+	// range so the key colour (LimitedYUV) matches the frame's chroma
+	// WHATEVER the source was tagged. The pin is not optional: libavfilter's
+	// colorspace / range negotiation carries the source's tags across the
+	// rgba pass in front of it, so a bare format=yuva444p re-encodes a
+	// bt709-tagged capture (or a full-range one) with ITS matrix — measured
+	// on the 2026-08 git build: pure green of a bt709 yuv420p clip came back
+	// U 42 V 27 (bt709) instead of U 54 V 35 (601), 0.04 from the key, and
+	// did not key below ~0.05; with the pin every tagging (bt709 tv and pc,
+	// bt470bg, untagged, RGB, bt709 ProRes 4444) yields 54/35 and keys at
+	// 0.02. bt470bg and smpte170m share swscale's 601 coefficients (the
+	// LimitedYUV formula); bt470bg is the one SWS_CS_DEFAULT names.
+	chromaKeyFormat = "format=yuva444p:color_spaces=bt470bg:color_ranges=tv"
+
+	// Morph (recipe.MorphParams): MaxMorphGrow bounds Grow (each extra
+	// dilation adds a ring of source pixels; four is already a visible
+	// fringe on an emote-sized source).
+	MaxMorphGrow = 4
+	// morphDilation / morphErosion are the 3x3 neighbourhood stages of the
+	// morph op on gbrap frames (planes G,B,R,A): ffmpeg's erosion/dilation
+	// (vf_neighbor) have NO planes option — every plane is filtered, each
+	// clamped to [p-threshold, p] (erosion) / [p, p+threshold] (dilation) —
+	// so threshold0..2=0 freeze G, B and R exactly and threshold3's default
+	// 65535 makes the alpha plane a plain 3x3 min / max; coordinates=255 is
+	// the full 8-neighbourhood (pixels beyond the frame edge replicate it).
+	morphDilation = "dilation=coordinates=255:threshold0=0:threshold1=0:threshold2=0"
+	morphErosion  = "erosion=coordinates=255:threshold0=0:threshold1=0:threshold2=0"
 
 	// Feather (recipe.FeatherParams): the default Gaussian sigma and its
 	// bounds, in source pixels.
@@ -79,11 +114,15 @@ const overlayHold = "tpad=stop_mode=clone:stop=-1"
 // before any crop or scale (DESIGN.md §4.1).
 // ---------------------------------------------------------------------------
 
-// keying applies every chromakey / colorkey / feather op in the order given
-// (the feather ops interleave with the keys per their stack order). Each key
-// is emitted bare while the frames are opaque and through keyKeepingAlpha
-// once they carry alpha (source alpha, a merged alpha stream, transparent
-// sequence padding or an earlier key): ffmpeg's chromakey and colorkey
+// keying applies every chromakey / colorkey / matte / morph / feather op in
+// the order given (the morph and feather ops interleave with the keys and
+// mattes per their stack order, so each cleans or softens whatever alpha
+// precedes it; a matte op — Phase 5b, compiler.matte — registers its matte
+// sequence as an extra input and merges it bare on opaque frames or
+// multiplied into existing alpha, see mergeMatte). Each key is emitted bare
+// while the frames are opaque and through keyKeepingAlpha once they carry
+// alpha (source alpha, a merged alpha stream, transparent sequence padding,
+// an earlier key or matte): ffmpeg's chromakey and colorkey
 // OVERWRITE the alpha plane from the colour distance alone, so on their own
 // they would turn every formerly transparent pixel whose colour is not the
 // key colour opaque (verified on FFmpeg 9.0.1: a (0,0,0,0) pixel of a ProRes
@@ -98,13 +137,184 @@ func (c *compiler) keying(ops []decodedOp) error {
 			err = c.chromaKey(d, p)
 		case *recipe.ColorKeyParams:
 			err = c.colorKey(d, p)
+		case *recipe.MorphParams:
+			err = c.morph(d, p)
 		case *recipe.FeatherParams:
 			err = c.feather(d, p)
+		case *recipe.MatteParams:
+			err = c.matte(d, p)
 		}
 		if err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// matteModelID validates a matte model id: a plain token of ASCII letters,
+// digits, '-', '_' and '.' (the sidecar's models.json ids; the id names a
+// memo directory and is compared verbatim with the sidecar's list, so
+// nothing else is accepted).
+func matteModelID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// matte applies a matte op (recipe.MatteParams, Phase 5b): it registers the
+// op's matte sequence as an ExtraInput of the main source — Source 0, Matte
+// set, Args "-f image2 -framerate F -start_number 1" with F = fnum(Plan.FPS)
+// (the text of the plan's fps stage, repeated in MatteInput.FPS so jobs can
+// check the memo string-exact; matte i then carries i/F like master slot i),
+// Path "" for jobs to fill with the memo's "<dir>/%06d.png" — once per
+// (model, size): a second matte op of the same model and size reads the
+// same input (c.matteRefs, like extraInput dedupes overlay sources). The
+// input's position is fixed here, inside the keying group, so its "[k:v]"
+// (k = position + 1) is known when the merge is emitted and the overlays
+// registered later by finalCanvas simply follow it. Then it merges the
+// sequence into the current frame's alpha (mergeMatte).
+//
+// Model "" is recipe.MatteModelDefault; any other id must be a plain token
+// (matteModelID) — whether the sidecar offers it is jobs' check. Size must
+// be >= 0 (0 = the server's default square; only sizes the sidecar lists
+// are valid, again jobs' check). Resolved is ignored: the identity of the
+// matte enters the recipe hash through it, never the filter text.
+func (c *compiler) matte(d decodedOp, p *recipe.MatteParams) error {
+	model := p.Model
+	if model == "" {
+		model = recipe.MatteModelDefault
+	}
+	if !matteModelID(model) {
+		return opErrorf(d, "model %q is not a model id (letters, digits, '-', '_', '.')", p.Model)
+	}
+	if p.Size < 0 {
+		return opErrorf(d, "size must be >= 0 (got %d)", p.Size)
+	}
+	key := matteKey{model: model, size: p.Size}
+	idx, ok := c.matteRefs[key]
+	if !ok {
+		fps := fnum(c.plan.FPS)
+		c.plan.ExtraInputs = append(c.plan.ExtraInputs, ExtraInput{
+			Source: 0,
+			Args:   []string{"-f", "image2", "-framerate", fps, "-start_number", "1"},
+			Matte:  &MatteInput{Model: model, Size: p.Size, FPS: fps},
+		})
+		idx = len(c.plan.ExtraInputs) - 1
+		c.matteRefs[key] = idx
+	}
+	c.mergeMatte(idx + 1)
+	return nil
+}
+
+// mergeMatte merges the matte sequence read as ffmpeg input k into the
+// current frame's alpha; the N-th merge uses the labels [mN…]. The matte
+// branch converts the sequence to 8-bit gray and scales it to the current
+// frame W x H (the model's square comes back at the source size; bicubic
+// for a smooth rim — GIF thresholds it anyway). Both shapes call ensureRGBA
+// first, so a > 8-bit RGB alpha source (the gbrap10le/12le head) reaches
+// alphamerge as rgba by an explicit conversion rather than one the
+// negotiator picks, and the chain always holds a stage in front of its
+// label (a bare "[0:v][m1]" is not a filterchain).
+//
+// On opaque frames the matte BECOMES the alpha:
+//
+//	<chain so far>,format=rgba[mN];
+//	[k:v]format=gray,scale=W:H:flags=bicubic[mNa];
+//	[mN][mNa]alphamerge,…
+//
+// On frames that already carry alpha (source alpha, a merged alpha stream,
+// transparent sequence padding, an earlier key or matte) it is intersected
+// with the incoming alpha, never substituted — the keyKeepingAlpha shape
+// with the key-on-a-copy chain replaced by the matte branch:
+//
+//	<chain so far>,format=rgba,split[mN][mNm];
+//	[mNm]alphaextract[mNa0];                        the incoming alpha
+//	[k:v]format=gray,scale=W:H:flags=bicubic[mNa1]; the matte
+//	[mNa0][mNa1]blend=all_mode=multiply[mNa];       straight-alpha intersection
+//	[mN][mNa]alphamerge,…
+//
+// (format=rgba only when the chain does not already end in one —
+// ensureRGBA's rule.) alphaextract off rgba is 8-bit gray like the matte
+// branch, so blend and alphamerge run at one depth. alphamerge gets no
+// shortest / eof_action: the sequence has exactly the main's frame count by
+// construction (jobs checks the count after the master instead of letting
+// framesync repeat a frame silently). Afterwards the chain continues from
+// the merge and the frames carry alpha. keyKeepingAlpha's own text is
+// untouched; this is its sibling. Verified pixel-exact on the 2026-08 git
+// build (matte_ffmpeg_test.go): opaque main → alpha == the matte scaled,
+// rgba main → the product, a reverse behind the merge reverses the mattes
+// with their frames.
+func (c *compiler) mergeMatte(k int) {
+	c.mattes++
+	n := c.mattes
+	c.ensureRGBA()
+	branch := fmt.Sprintf("[%d:v]format=gray,scale=%d:%d:flags=bicubic", k, c.w, c.h)
+	if !c.hasAlpha {
+		c.chains = append(c.chains,
+			fmt.Sprintf("%s%s[m%d]", c.input, strings.Join(c.stages, ","), n),
+			fmt.Sprintf("%s[m%da]", branch, n),
+		)
+	} else {
+		head := c.input + strings.Join(append(slices.Clone(c.stages), "split"), ",")
+		c.chains = append(c.chains,
+			fmt.Sprintf("%s[m%d][m%dm]", head, n, n),
+			fmt.Sprintf("[m%dm]alphaextract[m%da0]", n, n),
+			fmt.Sprintf("%s[m%da1]", branch, n),
+			fmt.Sprintf("[m%da0][m%da1]blend=all_mode=multiply[m%da]", n, n, n),
+		)
+	}
+	c.input, c.stages = fmt.Sprintf("[m%d][m%da]", n, n), nil
+	c.emit("alphamerge")
+	c.hasAlpha = true
+}
+
+// morph cleans the alpha plane with 3x3 morphology (recipe.MorphParams):
+// "format=gbrap,<dilation>,<erosion>,[<dilation> x Grow,]format=rgba" when
+// Close is set, "format=gbrap,<dilation> x Grow,format=rgba" otherwise,
+// every neighbourhood stage being morphDilation / morphErosion (see there
+// for why the colour planes are frozen through thresholds: the filters have
+// no planes option). Close — a dilation followed by an erosion — fills
+// holes of up to 1 px in the matte without growing the silhouette (a convex
+// shape comes back exactly); Grow adds that many dilations, each growing
+// the matte by one ring of source pixels (recovering eaten interiors at the
+// cost of a fringe). gbrap orders the planes G,B,R,A like the feather stage,
+// and the 8-bit gbrap↔rgba conversions on either side are lossless plane
+// repacks. The stage sits with the keying ops, before any geometry, so the
+// pixel counts are in source pixels (4 px on a 720 px source is under 1 px
+// after the emote fit).
+//
+// Grow must lie in 0..MaxMorphGrow and at least one of Close / Grow must be
+// set (else there is nothing to emit: an error, not a silent no-op). Like
+// feather the stage is skipped entirely while the frames carry no alpha at
+// this point (an opaque source with no key in front of the op: there is no
+// matte to clean), the params being validated either way.
+func (c *compiler) morph(d decodedOp, p *recipe.MorphParams) error {
+	if p.Grow < 0 || p.Grow > MaxMorphGrow {
+		return opErrorf(d, "grow must be between 0 and %d (got %d)", MaxMorphGrow, p.Grow)
+	}
+	if !p.Close && p.Grow == 0 {
+		return opErrorf(d, "at least one of close or grow (1..%d) must be set", MaxMorphGrow)
+	}
+	if !c.hasAlpha {
+		return nil
+	}
+	c.emit("format=gbrap")
+	if p.Close {
+		c.emit(morphDilation)
+		c.emit(morphErosion)
+	}
+	for i := 0; i < p.Grow; i++ {
+		c.emit(morphDilation)
+	}
+	c.emit("format=rgba")
 	return nil
 }
 
@@ -140,14 +350,30 @@ func (c *compiler) feather(d decodedOp, p *recipe.FeatherParams) error {
 	return nil
 }
 
-// chromaKey emits "format=yuva444p,chromakey=color=0xRRGGBB:similarity=S:
-// blend=B" (4:4:4 so chroma edges are not smeared by subsampling) followed,
-// unless DespillOff, by "despill=type=green|blue:mix=M:expand=E" to pull the
-// screen colour out of the subject's edge pixels (plus a trailing
-// "format=rgba" that only the alpha-keeping wrapper keeps, see key). The
-// despill type follows the dominant channel of the key colour; a colour that
-// is neither green- nor blue-dominant gets no despill (ffmpeg's despill
-// knows only those two screens). despill's "type" only selects how the
+// chromaKey emits "format=rgba,format=yuva444p:color_spaces=bt470bg:
+// color_ranges=tv,chromakey=color=0xYYUUVV:similarity=S:blend=B:yuv=1"
+// followed, unless DespillOff, by "despill=type=green|blue:mix=M:expand=E"
+// to pull the screen colour out of the subject's edge pixels (plus a
+// trailing "format=rgba" that only the alpha-keeping wrapper keeps, see
+// key). YYUUVV is the key colour as LimitedYUV converts it — the BT.601
+// limited-range triple the pinned chromaKeyFormat gives every frame —,
+// passed with yuv=1 so the filter uses it as is: without the flag ffmpeg
+// converts an RGB key with FULL-range coefficients (pure green → U 44 V 21
+// against the frame's 54/34), a fixed 0.047 offset that kept the exact
+// screen colour from keying below similarity ~0.05 and made the dead zone
+// the only thing MinSimilarity measured. The leading format=rgba (through
+// ensureRGBA inline) takes a yuv-decoded source — a bt709-tagged capture —
+// through RGB so the conversion into the pinned 601 format applies the
+// tagged matrix on the way out and the 601 one on the way back, instead of
+// a chroma-only upsample that keeps the source's matrix; see chromaKeyFormat
+// for why the pin is needed on top of it. Verified on the 2026-08 git build
+// (keying_ffmpeg_test.go): the exact key colour keys at similarity 0.02 for
+// green, blue and two arbitrary colours from an RGB-decoded and from a
+// bt709-tagged yuv420p source. The despill type follows the dominant channel
+// of the RGB key colour; a colour that is neither green- nor blue-dominant
+// gets no despill (ffmpeg's despill knows only those two screens; it works
+// in RGB, so the frames reach it through the pinned tags, correctly
+// converted). despill's "type" only selects how the
 // spill map is computed — which channel it is subtracted from is the
 // red/green/blue scale options, whose defaults (green=-1) suit a green
 // screen only, so the blue variant adds ":green=0:blue=-1". Verified: a
@@ -178,8 +404,9 @@ func (c *compiler) chromaKey(d decodedOp, p *recipe.ChromaKeyParams) error {
 		return opErrorf(d, "%v", err)
 	}
 	stages := []string{
-		"format=yuva444p",
-		fmt.Sprintf("chromakey=color=0x%s:similarity=%s:blend=%s", color, fnum(sim), fnum(blend)),
+		"format=rgba",
+		chromaKeyFormat,
+		fmt.Sprintf("chromakey=color=0x%s:similarity=%s:blend=%s:yuv=1", limitedYUVHex(color), fnum(sim), fnum(blend)),
 	}
 	if !p.DespillOff {
 		switch despillType(color) {
@@ -302,6 +529,36 @@ func keyColor(s, def string) (string, error) {
 		return "", fmt.Errorf("key colour %q must be RRGGBB (no alpha)", s)
 	}
 	return hex, nil
+}
+
+// LimitedYUV converts an 8-bit RGB colour to the BT.601 limited-range (tv:
+// Y 16..235, Cb/Cr 16..240) Y'CbCr triple — the values a frame carries in
+// the chromaKeyFormat the compiler pins every chromakey to, hence the key
+// colour a chromakey op is emitted with (chromakey=color=0xYYUUVV:yuv=1):
+//
+//	Y = round(16 + (65.481 R + 128.553 G + 24.966 B) / 255)
+//	U = round(128 + (-37.797 R - 74.203 G + 112.0 B) / 255)
+//	V = round(128 + (112.0 R - 93.786 G - 18.214 B) / 255)
+//
+// Pure green (0,255,0) → (145, 54, 34), pure blue → (41, 240, 110). swscale's
+// fixed-point conversion lands within 1 of these (measured: green 54/35),
+// far inside the 0.02 similarity band the pixel tests pin. Channels outside
+// 0..255 are clamped first.
+func LimitedYUV(r, g, b int) (y, u, v int) {
+	rf, gf, bf := float64(clamp8(r)), float64(clamp8(g)), float64(clamp8(b))
+	y = int(math.Round(16 + (65.481*rf+128.553*gf+24.966*bf)/255))
+	u = int(math.Round(128 + (-37.797*rf-74.203*gf+112.0*bf)/255))
+	v = int(math.Round(128 + (112.0*rf-93.786*gf-18.214*bf)/255))
+	return y, u, v
+}
+
+func clamp8(v int) int { return min(max(v, 0), 255) }
+
+// limitedYUVHex renders a normalised RRGGBB key colour as the "yyuuvv" hex
+// of its LimitedYUV triple (the chromakey color= argument with yuv=1).
+func limitedYUVHex(hex string) string {
+	y, u, v := LimitedYUV(hexChannels(hex))
+	return fmt.Sprintf("%02x%02x%02x", y, u, v)
 }
 
 // despillType returns "green" or "blue" for a key colour dominated by that

@@ -57,7 +57,8 @@ Editing ops, DESIGN.md §4.3 — built and reviewed 2026-08-22:
   `colorkey` (pick any RGB colour with the eyedropper) ops, applied at full resolution before
   scaling; the result keeps 8-bit alpha in WebP/APNG/AVIF and is matted + thresholded for GIF.
   On a source that already has alpha (a ProRes 4444 export) the key's matte is intersected with
-  the source alpha instead of replacing it.
+  the source alpha instead of replacing it. (Phase 5a fixed the chroma key's colour range, moved
+  the defaults and reworked the card — see [Phase 5a](#phase-5a) below.)
 - **Feather (soft edge)** — the `feather` op Gaussian-blurs the alpha edge (radius in source
   pixels, default 3; the soft band is ≈ 2–3× the radius), applied right after keying and before
   any geometry so it scales down with the output size; skipped on frames that carry no alpha.
@@ -233,3 +234,103 @@ Polish + extras, DESIGN.md §10 item 4 — built 2026-08-29:
   slider jumped to the full row width in the later part of a clip and back again. The readout
   now reserves the width of its widest text (it is monospaced, so that is exact): slider and
   readout are the same size on every frame.
+
+## Phase 5a
+
+Background removal, classical fixes — built 2026-10-08 from the user-approved
+[`background-removal-proposal.md`](background-removal-proposal.md) (its research notes:
+[`reviews/background-removal-research-2026-10-08.md`](reviews/background-removal-research-2026-10-08.md)).
+The AI matte of that proposal (an ONNX sidecar, a `matte` op) is [Phase 5b](#phase-5b) below —
+opt-in, off by default, the operator picks the model and where it runs.
+
+- **The chroma key keys the exact screen colour** — ffmpeg's `chromakey` converts the key colour
+  with full-range coefficients but compares it with limited-range chroma, so the exact green sat
+  0.047 away from its own key: nothing below that similarity keyed, and the old default 0.2 keyed
+  the subject on every non-green background. The compiler now pins the keying format to BT.601
+  limited range (`format=yuva444p:color_spaces=bt470bg:color_ranges=tv`) and passes the key as
+  limited-range YUV (`yuv=1`), so tagged yuv video (a bt709 screen capture) and RGB sources alike
+  key the exact colour at a similarity of 0.02 — the pin is what makes a tagged source key: a
+  conversion through RGB alone keeps the source's own matrix (measured U 42 / V 27 for bt709
+  green, 0.047 off). DESIGN.md §4.3.
+- **New defaults** — chroma key similarity 0.1 (was 0.2), colour key similarity 0.08 (was 0.1);
+  both the server and the card moved together. Cached results of keyed recipes are re-rendered
+  (`PipelineVersion` 2026-10-08.1; the still / Play previews and the auto-crop memo were bumped
+  too). One thing to know about the Screen default: the chroma key judges each pixel by its
+  3×3 neighbourhood, so at 0.1 a one-pixel rim of screen colour stays opaque (despilled to
+  grey) along the hard edges of a strongly coloured subject — flat line art on a green screen
+  shows it; a similarity around 0.15 keys that rim softly, and the old 0.2 keyed it outright.
+- **Background card: None · Colour · Screen** — *Colour* (the first classical mode: an RGB
+  distance with a hard edge, measured to beat the chroma key everywhere except single-hue ramps)
+  is the eyedropper pick plus **"+ add colour"** rows (up to 6, each armed through the same
+  eyedropper or typed as hex) for 2-colour ramps and gradients, one Similarity / Blend pair for
+  all of them — sent as one `colorkey` op per colour, each removing its own colour. *Screen* is
+  the green / blue choice with an editable key colour, Similarity 0.1 and the Advanced despill
+  fold as before. Summary lines: "2 colours · similarity 0.08", "greenscreen · similarity 0.10 ·
+  fill pinholes". In batch the Colour mode takes typed hex colours (there is no preview to pick
+  from); Screen as in single mode.
+- **Edge cleanup fold** (closed by default) — **Fill pinholes** (on for new sessions; a 3×3
+  close of the alpha: fills holes of up to 1 px without growing the silhouette, never hurt in
+  any measurement) and **Grow matte — N source px** (0–4 extra dilations: +1–2 recovers eaten
+  interiors at a 2 px fringe; in source pixels, like Feather, so 4 px on a 720 px source is
+  under 1 px after the emote fit). Sent as the new `morph` op after the keys and before
+  `feather`, so the feather softens the cleaned edge; auto-crop detects on the cleaned matte.
+  Soft edges stay the Feather card's job. Shown only when the server reports `features.morph`.
+- **Crop-mode still on the right frame grid** — the still the crop rectangle is drawn on now
+  sends the preset's fps like the normal still, so both compile to the same frame (a 25 fps
+  preset over a 30 / 60 fps source used to crop on the source's grid).
+- API: `morph` (`close`, `grow`), the new defaults and the stacked `colorkey` ops in
+  [`USAGE.md`](USAGE.md#http-api).
+
+## Phase 5b
+
+AI background removal — built 2026-10-08 from the same proposal (its §§4–9, 11–13), **off by
+default**: a plain `docker compose up -d` is the app exactly as before, and the AI mode appears
+only when the matte sidecar answers.
+
+- **Background card: None · AI · Colour · Screen** — *AI* sends the new `matte` op. The frames the
+  model sees are the clip after trim / speed / fps only, so every crop, resize, key, feather and
+  edge-cleanup change re-uses the mattes already computed; on frames that already carry alpha
+  (a ProRes 4444 export, an earlier key) the matte is multiplied in, never substituted. The
+  **Model** select lists exactly what the sidecar offers (`GET /api/matte`): `isnet-anime`
+  "Anime (fast)" and `birefnet-lite` "General (precise)" are shipped; the operator chooses which
+  are offered and which is preselected, the user picks per recipe; a model that is loading or
+  downloading says so, one the sidecar cannot run is greyed with its reason. A status line says
+  "ready · GPU · up to ~1 s for this clip", "CPU", "loading model…", "downloading weights 43 %"
+  or "sidecar unavailable — run `docker compose --profile matte-gpu up -d`". The Edge cleanup
+  fold applies to the AI matte too.
+- **The matte sidecar** — a second container behind a compose profile, pull-only images:
+  `docker compose --profile matte up -d` (CPU) or `--profile matte-gpu up -d` (CUDA; needs
+  nvidia-container-toolkit on bare-metal Linux / inside a WSL distro and a host driver ≥ 580,
+  nothing extra under Docker Desktop), or `COMPOSE_PROFILES=matte-gpu` in `.env` once. Start one,
+  never both. The first start downloads the weights into the `ezlg-models` volume and self-tests
+  them (the UI shows the state meanwhile); `docker compose run --rm matte download` pre-fetches
+  every model for an air-gapped box. No published port, no auth: reachable on the compose
+  network only. The device and the models are the operator's: `MATTE_DEVICE`, `MATTE_MODELS`,
+  `MATTE_DEFAULT_MODEL`, the preload list and the idle-unload TTL — the table in
+  [`USAGE.md`](USAGE.md#ai-background-removal-optional-matte-sidecar).
+- **Previews while a matte is computed** — the still and Play answer **202** with the pass's
+  progress instead of blocking: the picture on stage stays, a pill shows "AI matte 24/45 · GPU",
+  "AI matte: loading model… (12 s)" or "downloading weights 43 %", and the preview re-requests
+  itself every half second until the matte is on disk. A still over a long clip on CPU (an
+  estimated 90 s or more) defers the pass and offers **Compute now**; Play and Render always
+  start it. Renders run the pass as a pre-stage with its own SSE progress line, outside the
+  render slots, so queued AI renders never hold up plain ones.
+- **Estimate line under Render** — appends `· up to ~N s AI matte (GPU|CPU)` from the sidecar's
+  measured speed for the model picked (frames × (ms per frame + 2 ms), the server's own
+  figure — "up to", since frames already computed cost nothing); over the server's caps
+  (`EZLG_MATTE_MAX_SECONDS` 600 / `EZLG_MATTE_MAX_FRAMES` 3000) an error note names the bound
+  and the remedy (trim, lower the fps, pick the fast model) before Render is pressed.
+- **Mattes are cached on `/data`** — per frame (keyed by the pixels the model saw, so a held
+  pose, an fps-upsampled duplicate or a re-trim of the same clip is free) and per clip; a sidecar
+  that is restarted, stopped or still downloading never blacks out previews of recipes whose
+  mattes exist. The weights' identity is part of every result's hash, so pulling a sidecar image
+  with new weights re-renders results under a new URL rather than mixing old results with new
+  previews; the result card's **`render.matte`** info check says which model and weights made
+  the file.
+- **Failure modes** — the sidecar down mid-pass fails the job with "sidecar unreachable — is
+  the matte profile up?"; the AI mode greys out after three missed probes (about 90 s) and
+  returns at the first answer; `MATTE_DEVICE=cuda` on a box without GPU access stays up and
+  reports "device unavailable" with the reason instead of crash-looping; a `matte` op is refused
+  with 400 naming the profile while the feature is off. Never a silent fallback to a colour key.
+- API: `matte` (`model`, `size`), `GET /api/matte`, the 202 preview answer and `"eager"`, the
+  `EZLG_MATTE_*` variables and the sidecar's own table in [`USAGE.md`](USAGE.md).

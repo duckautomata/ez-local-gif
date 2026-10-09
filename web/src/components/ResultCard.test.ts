@@ -166,6 +166,42 @@ describe('ResultCard (SSR)', () => {
     app.ui.resultBackdrop = 'dark';
   });
 
+  // Phase 5b: the render.matte info check says which model produced the file
+  it('shows the render.matte info check as an "AI matte:" line and in the Discord checks with its label', () => {
+    const report = {
+      rulesVersion: 'x',
+      format: 'gif',
+      target: 'emote' as const,
+      bytes: 200_000,
+      limit: 262_144,
+      width: 128,
+      height: 128,
+      frames: 45,
+      durationMs: 1800,
+      minDelayMs: 40,
+      loopForever: true,
+      hasAlpha: true,
+      ok: true,
+      checks: [check('gif.emote-dims', 'warn', true), { ...check('render.matte', 'info', true, 'isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes') }],
+    };
+    const res = result([file('out.gif', { kind: 'output', report })], {
+      recipe: { v: 1, sources: ['c'.repeat(64)], ops: [{ kind: 'matte', params: { model: 'isnet-anime', resolved: { weights: 'f15622d8', proc: '1', size: 1024, precision: 'fp16' } } }], output: { format: 'gif', target: 'emote', preset: 'emote' } },
+    });
+    let out = html(res);
+    expect(out).toMatch(/<p class="fitline matte[^"]*"[^>]*><span class="muted">AI matte:<\/span> isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes<\/p>/);
+    expect(out).toContain('AI matte as rendered'); // the DiscordChecks label
+    expect(out).toContain('render.matte');
+    // a detail that already starts with "AI matte:" is not doubled
+    report.checks[1] = check('render.matte', 'info', true, 'AI matte: birefnet-lite fp32 1024², weights 9c0e1a2b…, 45 mattes');
+    out = html(result([file('out.gif', { kind: 'output', report })]));
+    expect(out).toContain('<span class="muted">AI matte:</span> birefnet-lite fp32 1024², weights 9c0e1a2b…, 45 mattes</p>');
+    expect(out).not.toContain('AI matte: AI matte');
+    // no check, no line
+    out = html(result([file('out.gif', { kind: 'output', report: { ...report, checks: [check('gif.emote-dims', 'warn', true)] } })]));
+    expect(out).not.toContain('fitline matte');
+    expect(out).not.toContain('AI matte:');
+  });
+
   it('a static PNG whose recipe carries fitBytes never claims a fit ran (the server ignores it)', () => {
     const res = result([file('out.png', { kind: 'output', format: 'png', frames: 1, fps: 0, duration: 0, bytes: 300_000, report: null })], {
       recipe: { v: 1, sources: ['c'.repeat(64)], ops: [], output: { format: 'png', target: 'emote', preset: 'emote', fitBytes: 262_144 } },

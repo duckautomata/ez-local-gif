@@ -1,0 +1,12 @@
+# Nothing from local runs reaches the image: the Dockerfile copies named files and tools/, LICENSES/.
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.venv/
+venv*/
+models/
+*.onnx
+*.part
+tests/
+README.md
+requirements-*.in

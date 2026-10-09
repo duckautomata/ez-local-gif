@@ -2,7 +2,7 @@
   import type { ProbeInfo } from '../../lib/api';
   import { ratioLabel, sizeForHeight, sizeForWidth } from '../../lib/croprect';
   import { clamp } from '../../lib/format';
-  import { app, backgroundOp, centerSquareCrop, setCropRatioLock } from '../../lib/state.svelte';
+  import { app, backgroundOps, centerSquareCrop, setCropRatioLock } from '../../lib/state.svelte';
   import NumField from '../NumField.svelte';
   import OpCard from '../OpCard.svelte';
 
@@ -21,7 +21,7 @@
   // geometry), so with a Background op on auto-crop finds the box of what is
   // left after background removal — and that content has alpha whatever the
   // source, so the threshold applies to it too.
-  const keyed = $derived(backgroundOp(app.ops.background) !== null);
+  const keyed = $derived(backgroundOps(app.ops.background).length > 0);
   const alphaContent = $derived(info.hasAlpha || keyed);
   const summary = $derived.by(() => {
     if (auto.enabled) return `auto-crop to content${auto.padding > 0 ? ` + ${auto.padding} px` : ''}`;

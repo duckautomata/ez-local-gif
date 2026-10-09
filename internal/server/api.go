@@ -135,20 +135,143 @@ func outputFormats() []string {
 // time; the probe hides it instead. "feather" and "bounce" name the Phase 4
 // op kinds explicitly so the SPA can gate those cards without inferring
 // support from the formats list (web capabilities.svelte.ts
-// phase4OpsOffered). Every flag but those four is a property of this build.
+// phase4OpsOffered). Phase 5a: "morph" names the morph op kind
+// (recipe.OpMorph — the 3x3 alpha close / grow cleanup hoisted into the
+// keying group like feather) the same way, so the SPA can gate the
+// Background card's Edge cleanup fold on older servers, which 400 the
+// unknown kind. Phase 5b: "matte" is the AI matte op kind (recipe.OpMatte)
+// AND a live condition — jobs.Manager.MatteEnabled: a matte sidecar is
+// configured (EZLG_MATTE_URL, the compose matte / matte-gpu profiles) and
+// answered its last probes. It is false on a plain install, so the SPA
+// greys the Background card's AI mode with the reason GET /api/matte
+// carries; POST /api/jobs refuses a matte op with 400 while it is false.
+// Every flag but the five host-dependent ones (fonts, inputPick,
+// outputSave, gifski, matte) is a property of this build.
 func (s *Server) features(fonts bool, versions map[string]string) map[string]bool {
-	inputPick, outputSave := false, false
+	inputPick, outputSave, matte := false, false, false
 	if s.jm != nil {
 		inputPick = s.jm.InputPickEnabled()
 		outputSave = s.jm.OutputSaveEnabled()
+		matte = s.jm.MatteEnabled()
 	}
 	return map[string]bool{
 		"fit": true, "sequence": true, "optimize": true,
 		"keying": true, "overlays": true, "proxy": true, "fonts": fonts,
-		"feather": true, "bounce": true,
+		"feather": true, "bounce": true, "morph": true,
 		"inputPick": inputPick, "outputSave": outputSave,
 		"gifski": versions["gifski"] != "",
+		"matte":  matte,
 	}
+}
+
+// ---- matte (Phase 5b) -----------------------------------------------------------
+
+// matteProfileHint names the compose profile that starts the sidecar; every
+// "AI matte is off" message ends with it so an operator knows what to run.
+const matteProfileHint = "start the matte sidecar with \"docker compose --profile matte-gpu up -d\" (CPU: \"--profile matte\")"
+
+// matteStatus is the manager's live view of the sidecar (jobs.MatteStatus:
+// the last probe), or a disabled status on a server without a manager —
+// Models is always an object, never null, so the SPA can iterate it.
+func (s *Server) matteStatus() jobs.MatteStatus {
+	if s.jm == nil {
+		return jobs.MatteStatus{
+			Reason:       "no job manager",
+			DefaultModel: recipe.MatteModelDefault,
+			Models:       map[string]jobs.MatteModelStatus{},
+		}
+	}
+	st := s.jm.MatteStatus()
+	if st.Models == nil {
+		st.Models = map[string]jobs.MatteModelStatus{}
+	}
+	return st
+}
+
+// matteEnabled is features.matte: whether a matte pass can run right now.
+func (s *Server) matteEnabled() bool {
+	return s.jm != nil && s.jm.MatteEnabled()
+}
+
+// handleMatte answers GET /api/matte with the matte sidecar's state as of
+// the app's last probe (jobs.Manager.MatteStatus — a snapshot, never a
+// network round trip): {enabled, device, reason, gpu, defaultModel,
+// models: {id: {label, state, percent, msPerFrame, reason, licence, sizes}},
+// maxSeconds, maxFrames}. The SPA polls it every few seconds while the AI
+// mode is visible or a pass is pending, so it must never be cached.
+func (s *Server) handleMatte(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache")
+	writeJSON(w, http.StatusOK, s.matteStatus())
+}
+
+// mattePendingResponse is the body of the 202 a still or proxy answers
+// while its matte is not on disk yet (jobs.ErrMattePending): the pending
+// fields — "pending" is always "matte" — flattened together with the
+// GET /api/matte object (jobs.MatteStatus embedded, so its fields sit at
+// the top level: enabled, device, reason, gpu, defaultModel, models,
+// maxSeconds, maxFrames), which the SPA would otherwise have to fetch
+// separately for the pill text. The names never collide: the status has no
+// pending/state/done/total/percent/estimateMs.
+type mattePendingResponse struct {
+	Pending    string `json:"pending"`    // "matte"
+	State      string `json:"state"`      // running / deferred / loading / downloading (jobs.MattePending*)
+	Done       int    `json:"done"`       // frames matted so far
+	Total      int    `json:"total"`      // frames the pass will matte (0 = unknown)
+	Percent    int    `json:"percent"`    // the pass's or the download's progress, 0..100
+	EstimateMS int64  `json:"estimateMs"` // the pass's estimated wall time (0 = unknown)
+	jobs.MatteStatus
+}
+
+// mattePendingBody builds the 202 body for one pending error: the error's
+// own figures plus the live status; the error's Device (the device the pass
+// runs on) wins over the status's when it is set.
+func (s *Server) mattePendingBody(e *jobs.ErrMattePending) mattePendingResponse {
+	body := mattePendingResponse{
+		Pending:     "matte",
+		State:       e.State,
+		Done:        e.Done,
+		Total:       e.Total,
+		Percent:     e.Percent,
+		EstimateMS:  e.EstimateMS,
+		MatteStatus: s.matteStatus(),
+	}
+	if e.Device != "" {
+		body.Device = e.Device
+	}
+	return body
+}
+
+// hasOp reports whether ops holds an op of the given kind.
+func hasOp(ops []recipe.Op, kind string) bool {
+	for _, op := range ops {
+		if op.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// matteOffMessage is the 400 text for a recipe with a matte op while
+// features.matte is false: the manager's reason (no EZLG_MATTE_URL, the
+// sidecar not answering, …) followed by the compose profile to start.
+func (s *Server) matteOffMessage() string {
+	reason := s.matteStatus().Reason
+	if reason == "" {
+		reason = "the matte sidecar is not available"
+	}
+	return "AI matte is off on this server: " + reason + " — " + matteProfileHint + ", or remove the matte op"
+}
+
+// matteUnavailableMessage is the text for a jobs.ErrMatteUnavailable from
+// a render or preview: the manager's own message (it carries the sidecar's
+// reason when there is one), then the profile hint unless it already names
+// the profile.
+func matteUnavailableMessage(err error) string {
+	msg := errText(err)
+	if strings.Contains(msg, "--profile") {
+		return msg
+	}
+	return msg + " — " + matteProfileHint
 }
 
 // ---- fonts --------------------------------------------------------------------
@@ -503,6 +626,10 @@ func resultFile(res *jobs.Result, name string) *jobs.File {
 // first, overlay assets after it — Phase 3) are alternatives; when both are
 // given they must name the same main source. T is the still's output time,
 // MaxSeconds the proxy's length cap; each endpoint ignores the other's.
+// Eager (Phase 5b) says the user asked for the AI matte pass explicitly —
+// Play, "Compute now" or a render-bound preview — so a pass over the eager
+// bound is started instead of deferred (jobs.WithMatteEager; a plain still
+// leaves it false and gets a 202 "deferred" above the bound).
 type previewRequest struct {
 	Src        string        `json:"src"`
 	Sources    []string      `json:"sources"`
@@ -511,6 +638,7 @@ type previewRequest struct {
 	T          float64       `json:"t"`
 	MaxW       int           `json:"maxW"`
 	MaxSeconds float64       `json:"maxSeconds"`
+	Eager      bool          `json:"eager"`
 }
 
 // sourceList resolves src/sources into the recipe's source list, every
@@ -580,9 +708,10 @@ func (s *Server) handleStill(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), stillTimeout)
 	defer cancel()
+	ctx = jobs.WithMatteEager(ctx, req.Eager)
 	png, err := s.jm.StillSources(ctx, srcs, req.Ops, req.Output, req.T, req.MaxW)
 	if err != nil {
-		previewError(w, r, err, http.StatusNotFound, "still render")
+		s.previewError(w, r, err, http.StatusNotFound, "still render")
 		return
 	}
 	writePreview(w, "image/png", png)
@@ -611,21 +740,35 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), proxyTimeout)
 	defer cancel()
+	ctx = jobs.WithMatteEager(ctx, req.Eager)
 	webp, err := s.jm.Proxy(ctx, srcs, req.Ops, req.Output, req.MaxW, req.MaxSeconds)
 	if err != nil {
-		previewError(w, r, err, http.StatusBadRequest, "proxy render")
+		s.previewError(w, r, err, http.StatusBadRequest, "proxy render")
 		return
 	}
 	writePreview(w, "image/webp", webp)
 }
 
-// previewError answers a failed still/proxy render: an unknown source gets
-// missingStatus, a recipe the compiler refused 400, a render past its
-// deadline 504, anything else 500. A client that hung up gets nothing.
-func previewError(w http.ResponseWriter, r *http.Request, err error, missingStatus int, what string) {
+// previewError answers a failed still/proxy render: a matte that is not on
+// disk yet (Phase 5b, jobs.ErrMattePending — the pass runs, was deferred,
+// or waits on the model loading / downloading) is a 202 Accepted carrying
+// mattePendingResponse, which the SPA polls on; a matte no sidecar can
+// produce (jobs.ErrMatteUnavailable) is a 503 naming the compose profile;
+// then an unknown source gets missingStatus, a recipe the compiler refused
+// 400, a render past its deadline 504, anything else 500. A client that
+// hung up gets nothing. The two matte cases come first: jobs may wrap
+// either together with ErrInvalidRecipe, and the pending one is not an
+// error at all.
+func (s *Server) previewError(w http.ResponseWriter, r *http.Request, err error, missingStatus int, what string) {
+	var pending *jobs.ErrMattePending
 	switch {
 	case r.Context().Err() != nil, errors.Is(err, context.Canceled):
 		return // client went away; nobody is listening
+	case errors.As(err, &pending):
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusAccepted, s.mattePendingBody(pending))
+	case errors.Is(err, jobs.ErrMatteUnavailable):
+		writeError(w, http.StatusServiceUnavailable, matteUnavailableMessage(err))
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, missingStatus, errText(err))
 	case errors.Is(err, jobs.ErrInvalidRecipe):
@@ -668,6 +811,15 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errText(err))
 		return
 	}
+	// Phase 5b: a matte op needs the sidecar. With features.matte false —
+	// no EZLG_MATTE_URL, or the sidecar stopped answering — the recipe is
+	// refused up front, before any source is looked at, naming the compose
+	// profile to start (the SPA greys the AI mode on the same flag; this
+	// guards scripted clients and a sidecar that went away mid-session).
+	if hasOp(rec.Ops, recipe.OpMatte) && !s.matteEnabled() {
+		writeError(w, http.StatusBadRequest, s.matteOffMessage())
+		return
+	}
 	// Every source — the main one and the overlay assets after it — must be
 	// an uploaded, probed blob before the render is queued.
 	if !s.checkSources(w, rec.Sources, http.StatusBadRequest) {
@@ -675,11 +827,16 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := s.jm.Submit(rec)
 	if err != nil {
-		if errors.Is(err, jobs.ErrInvalidRecipe) {
+		switch {
+		case errors.Is(err, jobs.ErrMatteUnavailable):
+			// Submit resolves the matte identity from the sidecar's persisted
+			// facts; none yet (or the model refused) is the same 400 as above.
+			writeError(w, http.StatusBadRequest, matteUnavailableMessage(err))
+		case errors.Is(err, jobs.ErrInvalidRecipe):
 			writeError(w, http.StatusBadRequest, errText(err))
-			return
+		default:
+			writeError(w, http.StatusInternalServerError, errText(err))
 		}
-		writeError(w, http.StatusInternalServerError, errText(err))
 		return
 	}
 	s.watchJob(job)

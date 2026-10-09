@@ -53,7 +53,10 @@
 //     as "fps=F:round=down" so the frame count is floor(Duration*F) and an
 //     fps drop never lengthens the clip past the trimmed source) →
 //     keying (Phase 3: chromakey/colorkey + despill, at full resolution,
-//     before any crop or scale; on frames that already carry alpha — source
+//     before any crop or scale; a chromakey is "format=rgba,format=yuva444p:
+//     color_spaces=bt470bg:color_ranges=tv,chromakey=color=0xYYUUVV:…:yuv=1"
+//     — the key colour in the pinned BT.601 limited-range YUV of the frames,
+//     see chromaKey / LimitedYUV —; on frames that already carry alpha — source
 //     alpha, a merged alpha stream, transparent sequence padding, an earlier
 //     key — the key is wrapped so the incoming alpha is intersected with the
 //     key's matte instead of overwritten, which makes the filter a
@@ -69,7 +72,29 @@
 //     (a 3 px feather on a 720 px source is ~0.5 px after a 128 px emote
 //     fit) — and the stage is skipped entirely while the frame carries no
 //     alpha at that point (blurring a constant opaque plane is a no-op that
-//     would waste two conversions; see compiler.feather))
+//     would waste two conversions; see compiler.feather); morph ops (Phase
+//     5a) are hoisted and interleaved the same way, each emitting
+//     "format=gbrap,[dilation,erosion,][dilation × Grow,]format=rgba" with
+//     the colour planes frozen through threshold0..2=0 (3x3 close / grow of
+//     the alpha plane, in source pixels; skipped on opaque frames like
+//     feather; see compiler.morph); matte ops (Phase 5b) sit in this group
+//     too, in stack order: each registers the matte sequence of its (model,
+//     size) once as an ExtraInput of Source 0 (ExtraInput.Matte; Args
+//     "-f image2 -framerate F -start_number 1", F = fnum(Plan.FPS), the
+//     text of the fps stage, so matte i carries the timestamp of master
+//     slot i; Path "" until jobs fills the memo's "%06d.png") and merges it
+//     as the alpha of the current frame, read as input k = position + 1:
+//     on opaque frames "…,format=rgba[mN];[k:v]format=gray,scale=W:H:
+//     flags=bicubic[mNa];[mN][mNa]alphamerge,…" (the matte BECOMES the
+//     alpha), on frames that already carry alpha the keyKeepingAlpha shape
+//     with the matte branch in place of the keyed copy — "…,format=rgba,
+//     split[mN][mNm];[mNm]alphaextract[mNa0];[k:v]format=gray,scale=W:H:
+//     flags=bicubic[mNa1];[mNa0][mNa1]blend=all_mode=multiply[mNa];[mN]
+//     [mNa]alphamerge,…" (the matte is intersected, never substituted);
+//     W x H is the current (source) frame, format=rgba only when the chain
+//     does not already end in one, and alphamerge gets no shortest /
+//     eof_action: the sequence has the main's frame count by construction
+//     and jobs checks it after the master; see compiler.matte / mergeMatte)
 //     → the geometry ops in the order given (crop — including a resolved
 //     autocrop —, premultiplied lanczos scale, canvas pad, flip/rotate; each
 //     sees the frame size produced by the previous one) → output fit
@@ -166,15 +191,26 @@
 //     probe with no Duration and no Frames/FPS) is a blind spot; jobs'
 //     admission passes need == 0 and only the ENOSPC mapping and the
 //     preview timeouts bound such a source.
-//   - Detection plans (Phase 3, CompileDetect): the autocrop op's content
-//     box must be found on the frames the crop will apply to — the source
-//     frame after keying, before any geometry. CompileDetect compiles only
-//     the stages in front of the geometry (source head, unpremultiply,
-//     trim/speed/fps, keying, feather) into a plan with the same contract (InputArgs,
-//     a Filter ending in "[out]" at format=rgba, Width x Height = the source
-//     frame) and no ExtraInputs/TextFiles; jobs appends its sampling and
-//     bbox/cropdetect stages after "[out]". Its frames are never materialised,
-//     so the size limits above do not apply to it.
+//   - Detection plans (Phase 3, CompileDetect / CompileDetectFor): the
+//     autocrop op's content box must be found on the frames the crop will
+//     apply to — the source frame after keying, before any geometry.
+//     CompileDetect compiles only the stages in front of the geometry (source
+//     head, unpremultiply, trim/speed/fps, keying, matte, morph, feather)
+//     into a plan with the same contract (InputArgs, a Filter ending in
+//     "[out]" at format=rgba, Width x Height = the source frame), no
+//     TextFiles and no ExtraInputs other than matte inputs; jobs appends its
+//     sampling and bbox/cropdetect stages after "[out]". Its frames are never
+//     materialised, so the size limits above do not apply to it.
+//     CompileDetectFor resolves the fps like the render does for its Output
+//     (CompileDetect uses an empty one: fps op, else source rate).
+//   - Matte input plans (Phase 5b, CompileMatteInput): the temporal prefix
+//     alone — source head, unpremultiply, trim/delay/speed/fps — ending in
+//     "[out]" at format=rgba at the source frame size, with the render's
+//     InputArgs and Output-aware fps, and nothing else: the frames the matte
+//     sidecar sees, one per master slot. The three entry points share one
+//     prefix (compiler.temporalPrefix), so the matte plan's stages minus its
+//     terminal format=rgba are the render's leading stages up to its first
+//     keying stage.
 package graph
 
 import (
@@ -286,6 +322,11 @@ type Plan struct {
 	// the frame by output time). That rule is enc's to implement; this flag
 	// only reports the fact.
 	Bounced bool
+	// Bounces (Phase 5b) is the number of bounce ops in the chain (Bounced ==
+	// Bounces > 0): each doubled Duration and Frames, so a consumer that
+	// knows the pre-bounce frame count (the matte memo's manifest) compares
+	// it with the master's count as manifest.frames x 2^Bounces.
+	Bounces int
 	// TextFiles lists every text op's body in filter order. The compiler
 	// emits "textfile=<Placeholder>" (a token of letters, digits and
 	// underscores; once per drawtext stage the op compiles to — a translucent
@@ -315,6 +356,31 @@ type ExtraInput struct {
 	Animated bool    // more than one frame
 	Duration float64 // the overlay's own duration in seconds (0 = unknown/still)
 	Loop     bool    // repeats until the base ends (else holds the last frame)
+
+	// Matte (Phase 5b) marks a matte-sequence input of the MAIN source
+	// (Source is 0 for such an input, never an overlay index): the AI
+	// mattes of a matte op, one 8-bit gray PNG per master frame, memoised by
+	// jobs. Args from the compiler are "-f image2 -framerate <fnum(Plan.FPS)>
+	// -start_number 1"; Path is "" until jobs fills "<dir>/%06d.png" and
+	// Matte.Frames from the memo's manifest. enc rewrites Args/Path per
+	// consumer (one unlooped frame for forward stills, a later -start_number
+	// for tail-seeked reversed plans; see enc.matteInputArgs) and treats an
+	// input without a Path as unusable (planUsable), like any extra input.
+	Matte *MatteInput
+}
+
+// MatteInput describes a matte-sequence extra input (ExtraInput.Matte).
+type MatteInput struct {
+	Model string // the resolved model id (recipe.MatteModelDefault for "")
+	Size  int    // the model input square requested by the op (0 = the server's default)
+	// FPS is fnum(Plan.FPS): the text of the plan's fps stage, which the
+	// input's -framerate repeats so matte i carries i/F like master slot i.
+	// jobs compares it string-exact with the memo manifest's fps.
+	FPS string
+	// Frames is the memo's frame count, set by jobs from the manifest (0 =
+	// unknown; the compiler leaves it 0). enc clamps a forward still's
+	// matte slot to Frames-1 when it is known.
+	Frames int
 }
 
 // TextFile is one drawtext body the compiler deferred to a file.
@@ -353,10 +419,7 @@ func CompileWithSources(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Out
 		return nil, err
 	}
 	c := newCompiler(srcs, out)
-	if err := c.source(decoded); err != nil {
-		return nil, err
-	}
-	if err := c.temporal(decoded); err != nil {
+	if err := c.temporalPrefix(decoded); err != nil {
 		return nil, err
 	}
 	if err := c.keying(decoded); err != nil {
@@ -377,84 +440,156 @@ func CompileWithSources(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Out
 	return c.finish()
 }
 
+// temporalOps are the op kinds of the temporal prefix (compiler.
+// temporalPrefix): the source head's delay, the alpha head's hoisted
+// unpremultiply, trim, speed and fps. CompileMatteInput applies exactly
+// these; they decide which source frames reach every later stage and are
+// the ops a matte's memo key is made of.
+var temporalOps = map[string]bool{
+	recipe.OpDelay: true, recipe.OpUnpremultiply: true,
+	recipe.OpTrim: true, recipe.OpSpeed: true, recipe.OpFPS: true,
+}
+
 // detectOps are the op kinds CompileDetect applies: everything the stage
-// order puts in front of the geometry (the source head's delay, the alpha
-// head's hoisted unpremultiply, the temporal stages, the keying and the
-// feather — a feather changes which alpha exceeds the autocrop threshold, so
-// the detection must see it exactly like the render does).
+// order puts in front of the geometry (the temporal prefix, the keying —
+// chromakey, colorkey and the matte (Phase 5b) —, the morph and the feather
+// — a morph or feather changes which alpha exceeds the autocrop threshold,
+// so the detection must see it exactly like the render does).
 var detectOps = map[string]bool{
 	recipe.OpDelay: true, recipe.OpUnpremultiply: true,
 	recipe.OpTrim: true, recipe.OpSpeed: true, recipe.OpFPS: true,
-	recipe.OpChromaKey: true, recipe.OpColorKey: true, recipe.OpFeather: true,
+	recipe.OpChromaKey: true, recipe.OpColorKey: true, recipe.OpMatte: true,
+	recipe.OpMorph: true, recipe.OpFeather: true,
 }
 
 // CompileDetect compiles the detection plan of the autocrop op: only the
 // stages that precede the geometry — the source head (image sequence /
 // separate alpha stream), the hoisted unpremultiply, trim / speed / fps and
-// the keying and feather ops — so the frames it yields are in SOURCE
-// coordinates, keyed and feathered exactly as the render keys them (both run
-// before any crop or scale, see CompileWithSources; a feather changes which
-// alpha exceeds the autocrop threshold). jobs runs it, with its own sampling
-// and bbox/cropdetect stages appended after "[out]", to find the content box
-// of a keyed clip; the box then becomes the op's Resolved crop.
+// the keying, matte, morph and feather ops — so the frames it yields are in
+// SOURCE coordinates, keyed, matted, cleaned and feathered exactly as the
+// render keys them (all run before any crop or scale, see
+// CompileWithSources; a morph or feather changes which alpha exceeds the
+// autocrop threshold). jobs runs it, with its own sampling and
+// bbox/cropdetect stages appended after "[out]", to find the content box of
+// a keyed clip; the box then becomes the op's Resolved crop.
 //
 // ops are the stack's detection-kind ops, wherever they sit relative to the
 // autocrop: the compiler hoists every kind in detectOps (delay,
-// unpremultiply, trim, speed, fps, chromakey, colorkey, feather) in front of
-// the geometry regardless of its position in the stack, so a key or feather
-// BEHIND the autocrop shapes the rendered picture too and must shape the
-// detected box — jobs' autocropDetectionOps collects them from the whole
-// stack. The detectOps kinds are applied in the usual stage order and
-// validated like Compile does (errors name the op by its index in ops);
-// every other kind — geometry, reverse, text, overlay, an autocrop itself,
-// even an unknown kind — is ignored, params unread. srcs is the recipe's source list (only srcs[0],
-// the main source, is read; the overlay sources are irrelevant without
-// overlay ops). There is no Output: the fps is the fps op's, else the
-// source's, capped at MaxFPS.
+// unpremultiply, trim, speed, fps, chromakey, colorkey, matte, morph,
+// feather) in front of the geometry regardless of its position in the
+// stack, so a key, matte, morph or feather BEHIND the autocrop shapes the
+// rendered picture too and must shape the detected box — jobs'
+// autocropDetectionOps collects them from the whole stack. The detectOps
+// kinds are applied in the usual stage order and validated like Compile
+// does (errors name the op by its index in ops); every other kind —
+// geometry, reverse, text, overlay, an autocrop itself, even an unknown
+// kind — is ignored, params unread. srcs is the recipe's source list (only
+// srcs[0], the main source, is read; the overlay sources are irrelevant
+// without overlay ops). There is no Output: the fps is the fps op's, else
+// the source's, capped at MaxFPS.
 //
 // The plan follows the Compile contract — InputArgs / InputPattern for the
 // main input, Filter ending in "[out]" at format=rgba, constant Plan.FPS,
 // TrimStart/TrimEnd/Speed/SourceFPS, Duration/Frames — with Width x Height
 // the source frame (the normalised canvas for a mixed-size sequence),
-// Plan.HasAlpha reporting whether those frames carry alpha (source alpha or
-// keying: that decides whether the box is read off the alpha plane), and
-// empty ExtraInputs/TextFiles, Reversed false. The frame-size limits of
-// Compile (MaxDim, MaxPixels) are not applied: the detection streams the
-// frames through -f null and never materialises a master, and a source
-// that only a later resize shrinks must still be croppable to its content.
-// (Frame counts are not capped by either entry point — that is jobs'
-// admission, which detection plans never reach; the pass is bounded by
-// jobs' autocropTimeout instead.)
+// Plan.HasAlpha reporting whether those frames carry alpha (source alpha,
+// keying or a matte: that decides whether the box is read off the alpha
+// plane), empty TextFiles, Reversed false, and ExtraInputs holding only the
+// matte inputs of the matte ops (Phase 5b: Source 0, Matte set, Path "" for
+// jobs to fill before the detection runs — never an overlay). The
+// frame-size limits of Compile (MaxDim, MaxPixels) are not applied: the
+// detection streams the frames through -f null and never materialises a
+// master, and a source that only a later resize shrinks must still be
+// croppable to its content. (Frame counts are not capped by either entry
+// point — that is jobs' admission, which detection plans never reach; the
+// pass is bounded by jobs' autocropTimeout instead.)
+//
+// CompileDetect is CompileDetectFor with an empty recipe.Output: the fps is
+// the fps op's, else the source's, capped at MaxFPS.
 func CompileDetect(srcs []recipe.ProbeInfo, ops []recipe.Op) (*Plan, error) {
-	if len(srcs) == 0 {
-		return nil, errorf("no sources")
-	}
-	src := srcs[0]
-	if src.Width <= 0 || src.Height <= 0 {
-		return nil, errorf("source has no usable frame size (%dx%d)", src.Width, src.Height)
-	}
-	var decoded []decodedOp
-	for i, op := range ops {
-		if !detectOps[op.Kind] {
-			continue
-		}
-		d, err := decodeOp(i, op)
-		if err != nil {
-			return nil, err
-		}
-		decoded = append(decoded, d)
-	}
-	c := newCompiler(srcs, recipe.Output{})
-	if err := c.source(decoded); err != nil {
-		return nil, err
-	}
-	if err := c.temporal(decoded); err != nil {
+	return CompileDetectFor(srcs, ops, recipe.Output{})
+}
+
+// CompileDetectFor (Phase 5b) is CompileDetect with the render's frame rate:
+// the detection plan's fps resolves exactly as CompileWithSources resolves
+// it for out — the fps op, else Output.FPS, else the source rate, snapped
+// with SnapFPS(out.Format, …) — so the frames a detection samples are the
+// render's output grid. That matters once a matte op is among the detection
+// ops: its matte sequence (Plan.ExtraInputs with a Matte entry, Path "" for
+// jobs to fill) was computed on that grid and is paired by timestamp, and
+// the input's "-framerate" / MatteInput.FPS carry that grid's rate. Only
+// out.Format and out.FPS are read; the rest of out (size, fit, …) is the
+// geometry's and never reaches a detection plan (validateOutput is not
+// applied either: the detection renders no output).
+func CompileDetectFor(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Output) (*Plan, error) {
+	c, decoded, err := prefixCompiler(srcs, ops, out, detectOps)
+	if err != nil {
 		return nil, err
 	}
 	if err := c.keying(decoded); err != nil {
 		return nil, err
 	}
 	return c.assemble()
+}
+
+// CompileMatteInput (Phase 5b) compiles the plan whose frames the matte
+// sidecar sees: the temporal prefix of the render only — the source head
+// (image sequence / separate alpha stream), the hoisted unpremultiply, trim /
+// delay / speed / fps — ending in "[out]" at format=rgba, Width x Height the
+// SOURCE frame (the normalised canvas of a mixed-size sequence), with
+// Plan.FPS resolved Output-aware exactly as CompileWithSources does for out
+// (fps op, Output.FPS, source rate, SnapFPS(out.Format, …)) and InputArgs
+// identical to the render's, so a matte computed from this plan pairs with
+// the render's master frame for frame. Only the temporalOps kinds of ops
+// are applied (validated like Compile does, errors naming the op by its
+// index in ops); every other kind — keys, matte, morph, feather, geometry,
+// reverse, bounce, text, overlay, an unknown kind — is ignored, params
+// unread (the model sees RGB only: those ops are not in the matte's memo
+// key, and jobs may pass the whole stack or just its temporal ops). So
+// ExtraInputs and TextFiles are empty and Reversed/Bounced false; like
+// CompileDetect it applies no frame-size limit and never refuses a plan for
+// its frame count. jobs streams it with enc.MatteSourceArgs. The three
+// entry points — this, CompileDetectFor and CompileWithSources — share one
+// temporal prefix (compiler.temporalPrefix): this plan's stages minus its
+// terminal format=rgba are the render plan's leading stages up to its first
+// keying stage, and its InputArgs are the render's.
+func CompileMatteInput(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Output) (*Plan, error) {
+	c, _, err := prefixCompiler(srcs, ops, out, temporalOps)
+	if err != nil {
+		return nil, err
+	}
+	return c.assemble()
+}
+
+// prefixCompiler is the shared front of CompileDetectFor and
+// CompileMatteInput: it checks the main source, decodes the ops whose kind
+// is in kinds (the others are skipped unread) and compiles the temporal
+// prefix on a fresh compiler for out, returning it with the decoded ops for
+// the stages the caller appends.
+func prefixCompiler(srcs []recipe.ProbeInfo, ops []recipe.Op, out recipe.Output, kinds map[string]bool) (*compiler, []decodedOp, error) {
+	if len(srcs) == 0 {
+		return nil, nil, errorf("no sources")
+	}
+	src := srcs[0]
+	if src.Width <= 0 || src.Height <= 0 {
+		return nil, nil, errorf("source has no usable frame size (%dx%d)", src.Width, src.Height)
+	}
+	var decoded []decodedOp
+	for i, op := range ops {
+		if !kinds[op.Kind] {
+			continue
+		}
+		d, err := decodeOp(i, op)
+		if err != nil {
+			return nil, nil, err
+		}
+		decoded = append(decoded, d)
+	}
+	c := newCompiler(srcs, out)
+	if err := c.temporalPrefix(decoded); err != nil {
+		return nil, nil, err
+	}
+	return c, decoded, nil
 }
 
 // BindTextFiles returns a copy of p whose Filter has every TextFile
@@ -580,6 +715,14 @@ func round3(v float64) float64 {
 func round6(v float64) float64 {
 	return math.Round(v*1e6) / 1e6
 }
+
+// FPSText (Phase 5b) is the text of a rate in filter/argv form — fnum(v):
+// what the plan's "fps=F:round=down" stage, a matte input's "-framerate"
+// and MatteInput.FPS carry (FPSText(Plan.FPS) == MatteInput.FPS on every
+// plan). jobs keys a matte memo under it (matte.ClipKeyParts.FPS), writes
+// it into the memo's manifest and compares the two string-exact, so the
+// one rule for the text lives here.
+func FPSText(v float64) string { return fnum(v) }
 
 // fnum renders v for filter/argv text: rounded to 3 decimals, minimal
 // digits, no exponent, no trailing zeros, no "-0" (1.5 → "1.5", 2 → "2",

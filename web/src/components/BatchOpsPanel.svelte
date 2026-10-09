@@ -1,10 +1,13 @@
 <script lang="ts">
   // Batch mode (Phase 4): only the geometry-independent global ops are
-  // editable — fps, speed (+ reverse / bounce), background keying and
-  // feather; unpremultiply is per row (auto from each probe). Trim / crop /
-  // auto-crop / resize / flip / rotate / overlays are per-source and stay
-  // out of every batch recipe (lib/batch batchOpsCfg) — "Open in editor" on
-  // a row seeds the normal single view for those.
+  // editable — fps, speed (+ reverse / bounce), background removal (AI /
+  // Colour / Screen — the AI matte is per source anyway: every row's render
+  // runs its own pass, one at a time through the sidecar, and its SSE shows
+  // the "AI matte" stage) and feather; unpremultiply is per row (auto from
+  // each probe). Trim / crop / auto-crop / resize / flip / rotate / overlays
+  // are per-source and stay out of every batch recipe (lib/batch
+  // batchOpsCfg) — "Open in editor" on a row seeds the normal single view
+  // for those.
   import { phase4OpsOffered } from '../lib/capabilities.svelte';
   import { fmtNum } from '../lib/format';
   import { app } from '../lib/state.svelte';
@@ -108,9 +111,13 @@
     {/if}
   </OpCard>
 
-  <BackgroundCard />
+  <!-- No preview in batch: the Background card's Colour mode takes typed hex only (no eyedropper); AI and Screen are as in the editor. -->
+  <BackgroundCard picker={false} />
   <FeatherCard />
-  <p class="hint eyedrop">In batch there is no preview to pick a colour from — type the hex value in the Background card instead.</p>
+  <p class="hint eyedrop">
+    In batch there is no preview to pick a colour from — type the hex values in the Background card’s Colour mode instead, or
+    use its AI mode (every row gets its own matte, computed one row at a time).
+  </p>
 </div>
 
 <style>

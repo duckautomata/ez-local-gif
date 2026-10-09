@@ -76,3 +76,36 @@ jobs:
 
             - name: Build Static Files
               run: npm run build
+
+    # Mirrored as `sidecar-test` in docker-image.yml — keep the steps identical in both files.
+    # The matte sidecar's pytest on the CPU runtime (no GPU on the runner; the
+    # tests use synthetic ONNX graphs and fixtures, no weight download).
+    sidecar:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+        defaults:
+            run:
+                working-directory: sidecar
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            - name: Setup Python
+              uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+              with:
+                  python-version: "3.12"
+                  cache: pip
+                  cache-dependency-path: sidecar/requirements-cpu.txt
+
+            # The same hashed pins the cpu image installs (sidecar/Dockerfile);
+            # pytest is a test-only extra, installed without the hash check.
+            - name: Install Dependencies
+              run: |
+                  python -m pip install --require-hashes -r requirements-cpu.txt
+                  python -m pip install pytest
+
+            - name: Run Tests
+              run: python -m pytest -q tests

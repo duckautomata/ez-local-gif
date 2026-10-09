@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // flight de-duplicates concurrent calls by key (a stdlib-only singleflight):
@@ -23,6 +24,13 @@ type flightCall[T any] struct {
 	done chan struct{}
 	val  T
 	err  error
+
+	// Abandon-aware runs (doDetachedAbandon) count their waiters: when the
+	// count stays at zero for the grace period the leader's ctx is
+	// cancelled. All three are guarded by flight.mu.
+	waiters int
+	cancel  context.CancelFunc
+	timer   *time.Timer
 }
 
 // do returns fn's result for key, sharing one run among concurrent callers.
@@ -109,6 +117,101 @@ func (g *flight[T]) once(ctx context.Context, key string, fn func(context.Contex
 		var zero T
 		return zero, ctx.Err()
 	}
+}
+
+// doDetachedAbandon is doDetached for a run nobody should pay for once
+// nobody wants it: fn runs in its own goroutine under a cancellable child
+// of context.WithoutCancel(ctx), every caller waits for its result or for
+// its own ctx to end, and when the call has had NO waiter for grace the
+// leader's ctx is cancelled (fn then returns a context error to no one; the
+// next caller starts a fresh run). A polling client that re-joins inside
+// the grace keeps the run alive. An AI matte pass runs this way (Phase 5b):
+// a 20-minute CPU pass that every waiter has abandoned must not run to the
+// end, while an autocrop detection (doDetached) must. Like do, a waiter
+// whose own ctx is still alive but sees the run end with a context error
+// (cancelled by the abandon timer a moment before it joined) runs fn
+// again rather than failing.
+func (g *flight[T]) doDetachedAbandon(ctx context.Context, key string, grace time.Duration, fn func(context.Context) (T, error)) (T, error) {
+	for {
+		val, err := g.abandonable(ctx, key, grace, fn)
+		if err != nil && isContextError(err) && ctx.Err() == nil {
+			continue
+		}
+		return val, err
+	}
+}
+
+// abandonable joins or starts the abandon-aware call for key and waits
+// once (see doDetachedAbandon).
+func (g *flight[T]) abandonable(ctx context.Context, key string, grace time.Duration, fn func(context.Context) (T, error)) (T, error) {
+	g.mu.Lock()
+	if g.calls == nil {
+		g.calls = map[string]*flightCall[T]{}
+	}
+	c, joined := g.calls[key]
+	if !joined {
+		runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		c = &flightCall[T]{done: make(chan struct{}), cancel: cancel}
+		g.calls[key] = c
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.err = fmt.Errorf("jobs: in-flight call panicked: %v", r)
+				}
+				g.mu.Lock()
+				delete(g.calls, key)
+				if c.timer != nil {
+					c.timer.Stop()
+					c.timer = nil
+				}
+				g.mu.Unlock()
+				cancel()
+				close(c.done)
+			}()
+			c.val, c.err = fn(runCtx)
+		}()
+	}
+	c.waiters++
+	if c.timer != nil {
+		// A waiter came back inside the grace: the run stays.
+		c.timer.Stop()
+		c.timer = nil
+	}
+	g.mu.Unlock()
+	defer g.leave(key, c, grace)
+	select {
+	case <-c.done:
+		return c.val, c.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+// leave drops one waiter of c and, when it was the last while the run is
+// still going, arms the abandon timer.
+func (g *flight[T]) leave(key string, c *flightCall[T], grace time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	c.waiters--
+	if c.waiters > 0 || g.calls[key] != c {
+		return
+	}
+	c.timer = time.AfterFunc(grace, func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if c.waiters == 0 && g.calls[key] == c {
+			c.cancel()
+		}
+	})
+}
+
+// inFlight reports whether a call for key is running right now.
+func (g *flight[T]) inFlight(key string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.calls[key]
+	return ok
 }
 
 // isContextError reports whether err is (or wraps) a cancellation or

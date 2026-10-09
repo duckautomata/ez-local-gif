@@ -1,7 +1,32 @@
 // Pure helpers for the Result card: grouping the manifest's files by kind and
 // describing them. Framework-free (unit-tested in result.test.ts).
 
-import type { ResultFile, Target } from './api';
+import type { Check, Report, ResultFile, Target } from './api';
+
+/** RULE_RENDER_MATTE is jobs' info check naming the AI matte a render used (Phase 5b). */
+export const RULE_RENDER_MATTE = 'render.matte';
+
+/**
+ * matteCheck finds the `render.matte` info check of a report — "AI matte:
+ * isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes" —
+ * so the Result card can say which model produced the file at a glance
+ * (the check also lists with the others). null without one.
+ */
+export function matteCheck(report: Report | null | undefined): Check | null {
+  return report?.checks?.find((c) => c.rule === RULE_RENDER_MATTE) ?? null;
+}
+
+/**
+ * matteSummary is the Result card's "AI matte:" line — the check's detail
+ * without a leading "AI matte:" of its own (jobs may word it either way),
+ * or null when the report has no render.matte check.
+ */
+export function matteSummary(report: Report | null | undefined): string | null {
+  const c = matteCheck(report);
+  if (!c) return null;
+  const text = c.detail.replace(/^\s*AI matte\s*:\s*/i, '').trim();
+  return text || 'see the Discord checks';
+}
 
 export interface FileGroups {
   /** the main output (kind "" / "output"); null for a frames-only result */

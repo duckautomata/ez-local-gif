@@ -3,11 +3,54 @@
 #   docker compose up -d --build        # build + run, then open http://localhost:8080
 #   docker compose logs -f app
 #   docker compose down                 # keeps the ezlg-data volume; add -v to wipe it
+#                                       # (-v also wipes ezlg-models: the AI weights)
+#
+# AI background removal (Phase 5b) is OFF unless you start the matte sidecar —
+# ONE of the two profiles (never both: they share the "matte" network alias):
+#   docker compose --profile matte up -d        # CPU sidecar  (duckautomata/ezlg-matte:<tag>)
+#   docker compose --profile matte-gpu up -d    # CUDA sidecar (…:<tag>-cuda; needs
+#                                               # nvidia-container-toolkit + host driver ≥ 580)
+#   # or once, in .env (see .env.example): COMPOSE_PROFILES=matte-gpu → plain `up -d` includes it
+#   docker compose pull matte-gpu && docker compose up -d   # update the sidecar (pull-only here;
+#                                               # the build: blocks live in compose.dev.yaml)
+#   docker compose run --rm matte download      # pre-fetch EVERY model of sidecar/models.json (air-gapped: copy the
+#                                               # volume; it serves matte and matte-gpu alike; name ids to narrow it)
 #
 # Dev loop (bind-mounted source, go run + vite dev inside the container):
 #   docker compose -f compose.yaml -f compose.dev.yaml up --build
 #
 # See docs/USAGE.md for WSL2 notes and docs/DESIGN.md §2.1 / §6 / §9.9 for sizing.
+
+# Shared base of the two matte sidecar variants (docs/background-removal-proposal.md §8).
+# YAML `<<` merges top-level keys only, so each service restates its full `environment`.
+x-matte: &matte
+  # The tag this release ships; pinned, never latest. It exists on Docker Hub only
+  # once the release is tagged: .github/workflows/docker-image.yml publishes
+  # :<tag> / :<tag>-cuda on a `v*` tag push (a plain master push publishes
+  # `latest` and the short SHA only) — the release procedure is `git tag -a v0.5.0
+  # && git push origin v0.5.0`, then `docker manifest inspect
+  # duckautomata/ezlg-matte:v0.5.0-cuda` to verify. Until then, or to run a
+  # master build, set EZLG_MATTE_TAG=<short sha> in .env (docs/USAGE.md).
+  image: duckautomata/ezlg-matte:${EZLG_MATTE_TAG:-v0.5.0}
+  pull_policy: missing
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  volumes: [ezlg-models:/models]              # weights + derived graphs + CUDA JIT cache; survives upgrades
+  networks: { default: { aliases: [matte] } } # the app talks to http://matte:9402 whichever variant runs
+  healthcheck:
+    # python:3.12-slim ships no curl; /v1/ping answers 503 while the device is unavailable (no CUDA EP).
+    test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9402/v1/ping',timeout=3).status==200 else 1)"]
+    interval: 30s
+    timeout: 5s
+    # A cold first start of the cuda image listens only after the CUDA session
+    # exists (context + PTX JIT; /models/.nv caches it from then on) and the
+    # preloaded weights (400 MB) are down: "health: starting" for minutes is
+    # normal then, "unhealthy" is not (docs/USAGE.md Troubleshooting).
+    start_period: 300s
+  # NO ports: — no auth; never publish it on the LAN. The app reaches it on the compose network only.
 
 services:
   app:
@@ -68,10 +111,18 @@ services:
       # EZLG_ADDR: ":8080"             # listen address (also change ports: and the healthcheck)
       # EZLG_INPUT: "/input"           # folder the /input picker lists (bind it read-only above)
       # EZLG_OUTPUT: "/output"         # folder "Save to /output" writes to
+      # AI background removal (Phase 5b): where the matte sidecar answers. Probed
+      # every 30 s; 3 misses = features.matte off (back on when it answers again);
+      # "" disables it. Nothing is reached until a matte profile is up — and there
+      # is deliberately no depends_on: the app must start without the sidecar.
+      EZLG_MATTE_URL: "http://matte:9402"
+      # EZLG_MATTE_MAX_SECONDS: "600"  # refuse a clip whose estimated AI pass exceeds this
+      # EZLG_MATTE_MAX_FRAMES: "3000"  # … or that would send more frames than this to the sidecar
       # NVIDIA_DRIVER_CAPABILITIES: compute,video,utility   # with the gpu block below
-    # -- GPU (not used in v1; see docs/DESIGN.md §6). Uncomment for NVDEC/NVENC/rembg later,
-    #    together with NVIDIA_DRIVER_CAPABILITIES above (needs nvidia-container-toolkit,
-    #    host driver >= 610 for the prebuilt FFmpeg 9 NVENC).
+    # -- GPU for the app itself (not used in v1; see docs/DESIGN.md §6). Uncomment for
+    #    NVDEC/NVENC later, together with NVIDIA_DRIVER_CAPABILITIES above (needs
+    #    nvidia-container-toolkit, host driver >= 610 for the prebuilt FFmpeg 9 NVENC).
+    #    AI matting does NOT need this: the matte-gpu service below carries its own reservation.
     # deploy:
     #   resources:
     #     reservations:
@@ -80,5 +131,42 @@ services:
     #           count: all
     #           capabilities: [gpu]
 
+  # ---- AI matte sidecar (docs/background-removal-proposal.md §7–§8, sidecar/README.md).
+  # Start ONE of the two; both answer as http://matte:9402 (the app warns when two
+  # instances alternate behind the alias). The service picks the device; MATTE_MODELS
+  # picks the models the UI offers (ids from sidecar/models.json: isnet-anime =
+  # "Anime (fast)", birefnet-lite = "General (precise)"); the UI preselects
+  # MATTE_DEFAULT_MODEL and lets the user choose any offered model per recipe.
+  matte:                                      # docker compose --profile matte up -d        (CPU)
+    <<: *matte
+    profiles: [matte]
+    environment:
+      MATTE_DEVICE: cpu
+      MATTE_MODELS: isnet-anime               # offered models (comma list); birefnet-lite on CPU needs ≥ 14 GiB RAM free
+      # MATTE_DEFAULT_MODEL: isnet-anime      # the model the UI preselects
+      # MATTE_PRELOAD: isnet-anime            # downloaded + self-tested at start (default = MATTE_MODELS)
+      MATTE_MODEL_TTL: "600"                  # seconds idle before a model is unloaded; 0 = never (dedicated box);
+                                              # 120 = hand a shared desktop its RAM back sooner
+      HOME: /tmp
+      # MATTE_THREADS: "0"                    # ONNX intra-op threads (0 = physical cores; lower it when renders share the cores)
+      # MATTE_MODELS_BASE_URL: ""             # mirror for the weights (air-gapped hosts)
+    # mem_limit: 16g                          # Precise on CPU needs ~13 GB RSS; the sidecar refuses it below 14 GiB available
+  matte-gpu:                                  # docker compose --profile matte-gpu up -d    (CUDA)
+    <<: *matte
+    image: duckautomata/ezlg-matte:${EZLG_MATTE_TAG:-v0.5.0}-cuda
+    profiles: [matte-gpu]
+    environment:
+      MATTE_DEVICE: cuda                      # stays up and reports device "unavailable" when the CUDA EP is missing
+      MATTE_MODELS: isnet-anime,birefnet-lite # offered models (comma list)
+      # MATTE_DEFAULT_MODEL: isnet-anime
+      # MATTE_PRELOAD: isnet-anime,birefnet-lite
+      MATTE_MODEL_TTL: "600"                  # 0 = never unload; 120 = hand a shared desktop its VRAM back sooner
+      MATTE_GPU_MEM_LIMIT_GIB: "6"            # lite's arena cap; lower values fail (§7.3) — raise it on larger cards only
+      CUDA_CACHE_PATH: /models/.nv            # the PTX JIT cache survives restarts
+      HOME: /tmp
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
 volumes:
   ezlg-data:
+  ezlg-models:                                # the sidecar's weights (~400 MB), derived graphs and JIT cache

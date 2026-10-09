@@ -41,11 +41,23 @@
 //	GET  /api/fonts                 Phase 3: {"fonts": [{"family","style","file"}, …]} — faces drawtext can use
 //	                                (fc-list inside the container; empty list when unavailable; always an
 //	                                array, never null; Cache-Control: no-cache)
+//	GET  /api/matte                 Phase 5b: the AI matte sidecar as of the app's last probe (a snapshot,
+//	                                jobs.Manager.MatteStatus; Cache-Control: no-cache — the SPA polls it):
+//	                                {"enabled": <features.matte>, "device": "cuda"|"cpu"|"unavailable"|"",
+//	                                "reason": "<why the feature or the device is off, when it is>",
+//	                                "gpu": {"name","totalGiB","freeGiB"} | absent,
+//	                                "defaultModel": "isnet-anime", "models": {id: {"label", "state":
+//	                                ready|loading|downloading|missing|unavailable, "percent", "msPerFrame",
+//	                                "reason", "licence", "sizes"}, …} (always an object, empty without a
+//	                                sidecar), "maxSeconds": N, "maxFrames": N (EZLG_MATTE_MAX_SECONDS /
+//	                                _MAX_FRAMES as applied)}. 200 on every install; "enabled" is false and
+//	                                "reason" says why on one without EZLG_MATTE_URL or with the sidecar down.
 //	POST /api/proxy                 Phase 3: {"sources": [hash, …], "ops": [...], "output": {...}, "maxW": 360,
 //	                                "maxSeconds": 10} → image/webp (animated, lossy, alpha): the Play preview.
 //	                                Same memo/cancel semantics as /api/still ("src" is accepted too; 0 = the
 //	                                defaults; negative maxW/maxSeconds → 400). 400 when a source is missing,
-//	                                409 when one is not probed yet, 504 after 60 s.
+//	                                409 when one is not probed yet, 504 after 60 s. Phase 5b: "eager": true
+//	                                and the 202 pending answer exactly as for /api/still (Play is eager).
 //	GET  /api/sources/{hash}        → recipe.Source
 //	                                Phase 3: overlay assets are ordinary uploads; a recipe lists them in
 //	                                "sources" after the main source and overlay ops reference them by index.
@@ -55,10 +67,22 @@
 //	                                Phase 3: "sources": [hash, …] (main source first) in place of — or
 //	                                agreeing with — "src" (jobs.Manager.StillSources); 404 for an
 //	                                unknown source, 409 for one not probed yet
+//	                                Phase 5b: a recipe with a matte op whose AI matte is not on disk yet
+//	                                answers 202 Accepted (Cache-Control: no-store) with
+//	                                {"pending": "matte", "state": running|deferred|loading|downloading,
+//	                                "done": N, "total": N, "percent": 0..100, "estimateMs": N, plus every
+//	                                field of the GET /api/matte object at the same level} — the pass runs
+//	                                (or waits on the model), the client keeps its picture and re-requests;
+//	                                "eager": true (Play, "Compute now") starts a pass a plain still would
+//	                                defer as too long ("deferred"); 503 naming the compose profile when no
+//	                                sidecar can produce the matte (jobs.ErrMatteUnavailable)
 //	POST /api/jobs                  recipe.Recipe → 202 jobs.Job (503 + Retry-After while shutting down;
 //	                                400 for an output.target outside the set /api/capabilities "targets"
 //	                                lists — the error names the valid ones; 400 for a source that is not
-//	                                uploaded, 409 for one not probed yet — every entry of "sources")
+//	                                uploaded, 409 for one not probed yet — every entry of "sources";
+//	                                Phase 5b: 400 for a recipe with a matte op while features.matte is
+//	                                false — the error carries the reason and names the compose profile
+//	                                "docker compose --profile matte-gpu up -d" — checked before sources)
 //	GET  /api/jobs/{id}             → jobs.Job
 //	DELETE /api/jobs/{id}           cancel → 204
 //	GET  /api/jobs/{id}/events      text/event-stream of jobs.Event ("event: progress|done|error",
@@ -90,9 +114,25 @@
 //	                                "fonts": <true iff /api/fonts lists at least one face>,
 //	                                "feather": true, "bounce": true (the Phase 4 op kinds, named so
 //	                                the SPA can gate those cards on older servers),
+//	                                "morph": true (the Phase 5a op kind, named for the same reason —
+//	                                an older server 400s the unknown kind: an op {"kind": "morph",
+//	                                "params": {"close": bool, "grow": 0..4}} cleans the alpha plane
+//	                                with 3x3 morphology, hoisted into the keying group like feather
+//	                                — "close" (dilation then erosion) fills pinholes of up to 1 px
+//	                                without growing the silhouette, "grow" adds that many extra
+//	                                dilations in SOURCE pixels; at least one of the two must be set
+//	                                or the recipe is a compile error; the colour planes are never
+//	                                touched and the op is skipped on frames without alpha —
+//	                                recipe.MorphParams; the SPA gates the Background card's Edge
+//	                                cleanup fold on it),
 //	                                "inputPick": <true iff the /input dir was readable at startup>,
 //	                                "outputSave": <true iff the /output dir was writable at startup>,
-//	                                "gifski": <true iff the gifski binary answered its version probe>}}
+//	                                "gifski": <true iff the gifski binary answered its version probe>,
+//	                                "matte": <true iff a matte sidecar is configured (EZLG_MATTE_URL) and
+//	                                answered its last probes — jobs.Manager.MatteEnabled; the Phase 5b
+//	                                op kind {"kind": "matte", "params": {"model": "<id>"}} (recipe.
+//	                                MatteParams) is refused with 400 by POST /api/jobs while it is false,
+//	                                and GET /api/matte carries the reason and the live sidecar state>}}
 //	GET  /healthz                   "ok"
 //	GET  /*                         embedded SPA: real files as-is; extension-less paths fall back
 //	                                to index.html (client routes); paths with a file extension or
@@ -297,6 +337,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /api/sources/{hash}", s.handleGetSource)
 	mux.HandleFunc("GET /api/input", s.handleListInput)
 	mux.HandleFunc("GET /api/fonts", s.handleFonts)
+	mux.HandleFunc("GET /api/matte", s.handleMatte)
 	mux.HandleFunc("POST /api/still", s.handleStill)
 	mux.HandleFunc("POST /api/proxy", s.handleProxy)
 	mux.HandleFunc("POST /api/jobs", s.handleCreateJob)

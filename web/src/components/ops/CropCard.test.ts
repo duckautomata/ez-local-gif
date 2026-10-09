@@ -87,13 +87,13 @@ describe('CropCard (SSR)', () => {
     expect(out).not.toContain('alpha threshold');
     expect(out).not.toContain('aria-label="Auto-crop alpha threshold"');
     // keyed content has alpha whatever the source: the threshold applies
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'green' };
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'screen' };
     app.ops.autocrop.threshold = 32;
     out = html(opaque, true);
     expect(out).toContain('alpha threshold 32');
     expect(out).toContain('aria-label="Auto-crop alpha threshold"');
-    // a Pick-a-colour mode with nothing picked yet emits no op: no fold
-    app.ops.background = { ...app.ops.background, mode: 'pick', pickColor: '' };
+    // a Colour mode with nothing picked yet emits no op: no fold
+    app.ops.background = { ...app.ops.background, mode: 'colour', colors: [''] };
     expect(html(opaque, true)).not.toContain('alpha threshold');
   });
 
@@ -114,13 +114,13 @@ describe('CropCard (SSR)', () => {
     expect(out).toContain('Non-black borders are trimmed; with a Background op on it crops to what is left after background removal');
     expect(out).not.toContain(keyedText);
     // keyed: greenscreen, or a picked colour
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'green' };
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'screen' };
     expect(html(opaque, true)).toContain(keyedText);
-    app.ops.background = { ...app.ops.background, mode: 'pick', pickColor: '00ff00' };
+    app.ops.background = { ...app.ops.background, mode: 'colour', colors: ['00ff00'] };
     expect(html(opaque, true)).toContain(keyedText);
     setSource(gifSrc);
     app.ops.autocrop = { enabled: true, padding: 0, threshold: 1 };
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'blue' };
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'screen', screen: 'blue', color: '0000ff' };
     out = html(gifInfo, true);
     expect(out).toContain(keyedText);
     expect(out).not.toContain('Non-black borders are trimmed');

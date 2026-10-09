@@ -818,9 +818,12 @@ func TestCropDetectArgs(t *testing.T) {
 }
 
 // Detection plans as graph.CompileDetect emits them: the ops in front of the
-// autocrop at the source frame size, ending in [out].
+// autocrop at the source frame size, ending in [out]. The keyed one carries
+// the Phase 5a chromakey text (an rgba pass, 4:4:4 pinned to BT.601 limited
+// range, the key as limited-range YUV with yuv=1, default similarity 0.1);
+// the builder embeds it verbatim.
 const (
-	keyedFilter   = "[0:v]fps=10:round=down,format=yuva444p,chromakey=color=0x00ff00:similarity=0.2:blend=0.05,despill=type=green:mix=0.6:expand=0.3,format=rgba[out]"
+	keyedFilter   = "[0:v]fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3,format=rgba[out]"
 	opaqueFilter  = "[0:v]fps=10:round=down,format=rgba[out]"
 	stillFilter0  = "[0:v]format=rgba[out]"
 	alphaDetector = ",format=rgba,alphaextract,lagfun=decay=1,bbox=min_val="

@@ -38,28 +38,31 @@ describe('feather op (review R4)', () => {
     expect(buildOps(ops)).toEqual([]);
   });
 
-  it('emits {kind:"feather", params:{radius}} after the keying op and before crop/autocrop', () => {
+  it('emits {kind:"feather", params:{radius}} after the keying op (and its Phase 5a morph) and before crop/autocrop', () => {
     const ops = defaultOps(gifInfo);
     ops.feather = { enabled: true, radius: 3 };
     expect(buildOps(ops)).toEqual([{ kind: 'feather', params: { radius: 3 } }]);
-    ops.background = { ...defaultBackground(), enabled: true };
+    ops.background = { ...defaultBackground(), enabled: true, mode: 'screen' };
     ops.crop = { enabled: true, x: 1, y: 2, w: 30, h: 40 };
     ops.resize = { enabled: true, width: 128, height: 0, fit: 'contain' };
     ops.flipRotate = { enabled: true, horizontal: true, vertical: false, degrees: 90 };
-    expect(buildOps(ops).map((o) => o.kind)).toEqual(['chromakey', 'feather', 'crop', 'resize', 'flip', 'rotate']);
+    expect(buildOps(ops).map((o) => o.kind)).toEqual(['chromakey', 'morph', 'feather', 'crop', 'resize', 'flip', 'rotate']);
     // after a colorkey too, and before autocrop
-    ops.background = { ...defaultBackground(), enabled: true, mode: 'pick', pickColor: '313338' };
+    ops.background = { ...defaultBackground(), enabled: true, colors: ['313338'] };
     ops.autocrop = { enabled: true, padding: 0, threshold: 1 };
+    expect(buildOps(ops).map((o) => o.kind)).toEqual(['colorkey', 'morph', 'feather', 'autocrop', 'resize', 'flip', 'rotate']);
+    // with the Edge cleanup off, right after the key
+    ops.background.morph = { close: false, grow: 0 };
     expect(buildOps(ops).map((o) => o.kind)).toEqual(['colorkey', 'feather', 'autocrop', 'resize', 'flip', 'rotate']);
   });
 
   it('is part of the crop preview (it precedes the geometry) and survives keyPreview', () => {
     const ops = defaultOps(gifInfo);
     ops.feather = { enabled: true, radius: 2.5 };
-    ops.background = { ...defaultBackground(), enabled: true };
+    ops.background = { ...defaultBackground(), enabled: true, mode: 'screen' };
     ops.crop = { enabled: true, x: 0, y: 0, w: 10, h: 10 };
-    expect(buildOps(ops, { cropPreview: true })).toEqual([{ kind: 'chromakey' }, { kind: 'feather', params: { radius: 2.5 } }]);
-    // the eyedropper preview drops only the key, not the feather
+    expect(buildOps(ops, { cropPreview: true })).toEqual([{ kind: 'chromakey' }, { kind: 'morph', params: { close: true } }, { kind: 'feather', params: { radius: 2.5 } }]);
+    // the eyedropper preview drops only the Background card's ops (key + morph), not the feather
     expect(buildOps(ops, { keyPreview: true }).map((o) => o.kind)).toEqual(['feather', 'crop']);
   });
 

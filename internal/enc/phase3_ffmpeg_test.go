@@ -763,6 +763,7 @@ func TestCropDetectPlanReal(t *testing.T) {
 		}
 	}
 	chroma := op(recipe.OpChromaKey, recipe.ChromaKeyParams{Color: "00ff00"})
+	chromaSoft := op(recipe.OpChromaKey, recipe.ChromaKeyParams{Color: "00ff00", Similarity: 0.15})
 	colorKey := op(recipe.OpColorKey, recipe.ColorKeyParams{Color: "00ff00", Similarity: 0.1})
 
 	t.Run("raw source path: opaque green is all content", func(t *testing.T) {
@@ -778,9 +779,11 @@ func TestCropDetectPlanReal(t *testing.T) {
 
 	// ring checks that got is want grown by exactly ring px on every side
 	// (clamped to the frame): chromakey judges each pixel by its 3x3
-	// neighbourhood, so the screen pixels touching the subject keep a little
-	// alpha, which the alpha > 0 default threshold counts as content — the
-	// render keeps those pixels too, so the crop must include them.
+	// neighbourhood, so the screen pixels on the subject's straight edges
+	// (three subject neighbours: a third of its chroma distance, ~0.17 for
+	// this red on green) score past the default similarity 0.1 + blend 0.05
+	// and are fully opaque — content at any threshold; the render keeps
+	// those pixels too, so the crop must include them.
 	ring := func(name string, got box, ok bool, want box, r int) {
 		t.Helper()
 		grown := box{min(want.w+2*r, 160-max(want.x-r, 0)), min(want.h+2*r, 120-max(want.y-r, 0)), max(want.x-r, 0), max(want.y-r, 0)}
@@ -799,10 +802,16 @@ func TestCropDetectPlanReal(t *testing.T) {
 		if !p.HasAlpha {
 			t.Fatalf("chromakey plan reports no alpha: %s", p.Filter)
 		}
-		ring("chromakey (3x3 neighbourhood): one soft pixel around", got, ok, want, 1)
-		// The soft ring is well below full alpha: a hard threshold drops it.
+		ring("chromakey (3x3 neighbourhood): one pixel around", got, ok, want, 1)
+		// At the default similarity the ring is opaque, so a hard threshold
+		// keeps it; at 0.15 (inside the blend band) the same pixels are
+		// partial — about alpha 100 — and threshold 255 drops them.
 		got, ok, _ = detectPlan(clip, info, []recipe.Op{chroma}, 255)
-		expect("chromakey, threshold 255", got, ok, want, true)
+		ring("chromakey, threshold 255: the ring is opaque at the default", got, ok, want, 1)
+		got, ok, _ = detectPlan(clip, info, []recipe.Op{chromaSoft}, 1)
+		ring("chromakey at similarity 0.15: a partial ring", got, ok, want, 1)
+		got, ok, _ = detectPlan(clip, info, []recipe.Op{chromaSoft}, 255)
+		expect("chromakey at similarity 0.15, threshold 255: the subject's box", got, ok, want, true)
 		// Trimmed to [1, 2) s: positions 60 and 80 only → x 60..119.
 		got, ok, _ = detectPlan(clip, info, []recipe.Op{op(recipe.OpTrim, recipe.TrimParams{Start: 1, End: 2}), colorKey}, 1)
 		expect("trimmed keyed clip", got, ok, box{60, 30, 60, 20}, true)

@@ -16,6 +16,14 @@ web/*.local
 /output/
 /output-dev/
 
+# Local compose settings (copy .env.example to .env)
+.env
+
+# Python (sidecar/)
+__pycache__/
+*.pyc
+.pytest_cache/
+
 # Editors / OS
 .DS_Store
 Thumbs.db

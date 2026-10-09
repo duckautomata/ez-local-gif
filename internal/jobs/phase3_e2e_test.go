@@ -257,11 +257,17 @@ const greenSteps = "color=c=0x00FF00:s=64x48:r=10:d=1[bg];color=c=0xDC1E1E:s=16x
 
 // Keying ops for the autocrop tests: colorkey judges each pixel on its own
 // (an exact box on hard edges); chromakey judges the 3x3 neighbourhood, so
-// the screen pixels touching the subject keep a little alpha and the
-// default threshold (alpha > 0) counts them — one extra pixel per side.
+// the screen pixels on the subject's straight edges (three subject
+// neighbours: a third of its chroma distance, ~0.17 for this red on green)
+// score past the default similarity 0.1 + blend 0.05 and come out fully
+// opaque — one extra pixel per side at any threshold. chromaKeySoft keys
+// at 0.15, inside the blend band, where the same pixels are partial (about
+// alpha 100): the default threshold (alpha > 0) counts them, a hard one
+// drops them.
 var (
 	colorKeyGreen  = recipe.Op{Kind: recipe.OpColorKey, Params: json.RawMessage(`{"color":"00ff00","similarity":0.1}`)}
 	chromaKeyGreen = recipe.Op{Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"00ff00"}`)}
+	chromaKeySoft  = recipe.Op{Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"00ff00","similarity":0.15}`)}
 )
 
 // TestRenderKeying: chromakey and colorkey turn the green background
@@ -741,8 +747,10 @@ func TestAutoCropDetection(t *testing.T) {
 		{"green-screen clip without keying: the full frame", steps, []recipe.Op{autocropOp(`{}`)}, full},
 		{"green-screen clip, colorkey then autocrop: the subject's box", steps, []recipe.Op{colorKeyGreen, autocropOp(`{}`)}, recipe.CropParams{X: 8, Y: 18, W: 26, H: 12}},
 		{"green-screen clip, colorkey, padding 2", steps, []recipe.Op{colorKeyGreen, pad2}, recipe.CropParams{X: 6, Y: 16, W: 30, H: 16}},
-		{"green-screen clip, chromakey then autocrop: the subject plus its soft edge", steps, []recipe.Op{chromaKeyGreen, autocropOp(`{}`)}, recipe.CropParams{X: 7, Y: 17, W: 28, H: 14}},
-		{"green-screen clip, chromakey, hard threshold: the subject's box", steps, []recipe.Op{chromaKeyGreen, autocropOp(`{"threshold":255}`)}, recipe.CropParams{X: 8, Y: 18, W: 26, H: 12}},
+		{"green-screen clip, chromakey then autocrop: the subject plus its 3x3 ring", steps, []recipe.Op{chromaKeyGreen, autocropOp(`{}`)}, recipe.CropParams{X: 7, Y: 17, W: 28, H: 14}},
+		{"green-screen clip, chromakey, hard threshold: the ring is opaque at the default similarity", steps, []recipe.Op{chromaKeyGreen, autocropOp(`{"threshold":255}`)}, recipe.CropParams{X: 7, Y: 17, W: 28, H: 14}},
+		{"green-screen clip, chromakey at similarity 0.15: a partial ring, counted at the default threshold", steps, []recipe.Op{chromaKeySoft, autocropOp(`{}`)}, recipe.CropParams{X: 7, Y: 17, W: 28, H: 14}},
+		{"green-screen clip, chromakey at similarity 0.15, hard threshold: the subject's box", steps, []recipe.Op{chromaKeySoft, autocropOp(`{"threshold":255}`)}, recipe.CropParams{X: 8, Y: 18, W: 26, H: 12}},
 		{"green-screen clip, trimmed and keyed: the second position only", steps, []recipe.Op{trim05, colorKeyGreen, autocropOp(`{}`)}, recipe.CropParams{X: 18, Y: 18, W: 16, H: 12}},
 		{"green-screen clip, keyed after unpremultiply and speed", steps, []recipe.Op{{Kind: recipe.OpUnpremultiply}, {Kind: recipe.OpSpeed, Params: json.RawMessage(`{"factor":2}`)}, colorKeyGreen, autocropOp(`{}`)}, recipe.CropParams{X: 8, Y: 18, W: 26, H: 12}},
 		{"green-screen still, keyed: no loop needed", greenStill, []recipe.Op{colorKeyGreen, autocropOp(`{}`)}, recipe.CropParams{X: 8, Y: 18, W: 16, H: 12}},
@@ -853,7 +861,7 @@ func TestAutoCropDetection(t *testing.T) {
 	if box := resolvedBox(t, got); box != (recipe.CropParams{X: 13, Y: 9, W: 30, H: 30}) {
 		t.Errorf("memoised box at padding 3 = %+v", box)
 	}
-	rawKey, _ := autocropKey(square.Hash, nil, 1)
+	rawKey, _ := autocropKey(square.Hash, nil, 1, "10", nil)
 	if raw, ok := readAutocropMemo(filepath.Join(e.st.Scratch, autocropDir, rawKey+".json"), square.Info); !ok || raw != (recipe.CropParams{X: 16, Y: 12, W: 24, H: 24}) {
 		t.Errorf("memo entry = %+v (%v), want the raw unpadded box", raw, ok)
 	}
@@ -956,7 +964,7 @@ func TestRenderAutoCropKeyed(t *testing.T) {
 		// 26x12 at (8,18) + 2 px: 30x16 at (6,16); the subject fills the
 		// middle, the padding ring is keyed screen.
 		{"colorkey + autocrop", []recipe.Op{colorKeyGreen, pad2}, 30, 16, image.Pt(15, 8), true},
-		// chromakey's soft ring adds a pixel per side.
+		// chromakey's 3x3 ring (opaque at the default similarity) adds a pixel per side.
 		{"chromakey + autocrop", []recipe.Op{chromaKeyGreen, pad2}, 32, 18, image.Pt(16, 9), true},
 		{"autocrop alone: the full frame", []recipe.Op{pad2}, 64, 48, image.Pt(12, 24), false},
 		// The keying op behind the autocrop: the compiler keys before the

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { ResultFile } from './api';
-import { chatSizes, descLine, groupFiles, isFramesResult, isImageFormat, sizeState } from './result';
+import type { Report, ResultFile } from './api';
+import { chatSizes, descLine, groupFiles, isFramesResult, isImageFormat, matteCheck, matteSummary, RULE_RENDER_MATTE, sizeState } from './result';
 
 function file(name: string, extra: Partial<ResultFile> = {}): ResultFile {
   return {
@@ -106,5 +106,25 @@ describe('sizeState / chatSizes / isImageFormat', () => {
     for (const f of ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg']) expect(isImageFormat(f), f).toBe(true);
     expect(isImageFormat('zip')).toBe(false);
     expect(isImageFormat('frames')).toBe(false);
+  });
+});
+
+// Phase 5b: the render.matte info check names the AI matte a render used.
+describe('matteCheck / matteSummary', () => {
+  const report = (checks: Report['checks']): Report => ({ rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 1, limit: 2, width: 1, height: 1, frames: 1, durationMs: 1, minDelayMs: 1, loopForever: true, hasAlpha: true, ok: true, checks });
+  const chk = (rule: string, detail: string) => ({ rule, level: 'info' as const, ok: true, fixed: false, detail });
+
+  it('finds the check and words the line without a doubled prefix', () => {
+    expect(RULE_RENDER_MATTE).toBe('render.matte');
+    const r = report([chk('render.alpha', 'alpha kept'), chk('render.matte', 'isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes')]);
+    expect(matteCheck(r)?.rule).toBe('render.matte');
+    expect(matteSummary(r)).toBe('isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes');
+    expect(matteSummary(report([chk('render.matte', 'AI matte: birefnet-lite fp32 1024²')]))).toBe('birefnet-lite fp32 1024²');
+    expect(matteSummary(report([chk('render.matte', '  ai MATTE :  x ')]))).toBe('x');
+    expect(matteSummary(report([chk('render.matte', '')]))).toBe('see the Discord checks');
+    expect(matteSummary(report([chk('render.alpha', 'alpha kept')]))).toBeNull();
+    expect(matteCheck(report(null))).toBeNull();
+    expect(matteSummary(null)).toBeNull();
+    expect(matteSummary(undefined)).toBeNull();
   });
 });

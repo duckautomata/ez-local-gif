@@ -61,6 +61,8 @@ const LABELS: Record<string, string> = {
   'static.format': 'Image summary',
   // render pipeline / fit engine (internal/jobs)
   'render.alpha': 'Transparency as rendered',
+  // Phase 5b: an info check naming the AI matte a render used (model, precision, size, weights, matte count, cleanup)
+  'render.matte': 'AI matte as rendered',
   'fit.target': 'Fit-to-size budget reached',
 };
 

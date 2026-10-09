@@ -166,6 +166,10 @@ func decodeOp(i int, op recipe.Op) (decodedOp, error) {
 		params = new(recipe.ColorKeyParams)
 	case recipe.OpFeather:
 		params = new(recipe.FeatherParams)
+	case recipe.OpMorph:
+		params = new(recipe.MorphParams)
+	case recipe.OpMatte:
+		params = new(recipe.MatteParams)
 	case recipe.OpAutoCrop:
 		params = new(recipe.AutoCropParams)
 	case recipe.OpText:
@@ -218,7 +222,9 @@ type compiler struct {
 	chains     []string
 	labels     int              // base labels handed out by closeChain ("[bN]")
 	extras     map[int]extraRef // overlay source index → its ExtraInput (dedupe)
+	matteRefs  map[matteKey]int // (model, size) of a matte op → its ExtraInput position (dedupe, see compiler.matte)
 	ovs        int              // overlay ops compiled so far (labels "[ovN]")
+	mattes     int              // matte merges emitted so far (labels "[mN…]", see mergeMatte)
 	keys       int              // alpha-keeping key wrappers emitted so far (labels "[kN…]", see keyKeepingAlpha)
 	layers     int              // translucent text layers emitted so far (labels "[tN]", see textLayers)
 	bounces    int              // bounce ops emitted so far (labels "[fN]"/"[rN]"/"[rrN]", see bounce); each doubles Duration and Frames in assemble
@@ -230,6 +236,13 @@ type compiler struct {
 type extraRef struct {
 	index    int  // position in Plan.ExtraInputs
 	infinite bool // the input never ends by construction (-loop 1 / -stream_loop -1)
+}
+
+// matteKey identifies the matte sequence a matte op reads: two matte ops
+// with the same resolved model and size share one ExtraInput (Phase 5b).
+type matteKey struct {
+	model string
+	size  int
 }
 
 // sequence holds the resolved facts of an image-sequence source.
@@ -256,8 +269,24 @@ func newCompiler(srcs []recipe.ProbeInfo, out recipe.Output) *compiler {
 		nativeYUVA: planarYUVAlpha(src),
 		input:      mainInput,
 		extras:     map[int]extraRef{},
+		matteRefs:  map[matteKey]int{},
 		plan:       Plan{OutLabel: outLabel, Speed: 1},
 	}
+}
+
+// temporalPrefix compiles the stages every entry point shares — the source
+// head (image sequence / separate alpha stream), the alpha head (hoisted
+// unpremultiply), trim, speed and fps — so CompileWithSources,
+// CompileDetectFor and CompileMatteInput yield the same leading stages and
+// the same InputArgs for the same source, ops and Output (Phase 5b: the
+// matte sidecar sees exactly the frames the render keys, the detection
+// samples the render's grid). ops is the stack the caller decoded (the
+// temporal kinds are picked out of it; the rest is ignored here).
+func (c *compiler) temporalPrefix(ops []decodedOp) error {
+	if err := c.source(ops); err != nil {
+		return err
+	}
+	return c.temporal(ops)
 }
 
 // planarYUVAlpha reports whether src decodes to a planar YUV format with an
@@ -1083,6 +1112,7 @@ func (c *compiler) assemble() (*Plan, error) {
 			p.Frames *= 2
 		}
 	}
+	p.Bounces = c.bounces
 	p.Bounced = c.bounces > 0
 	return p, nil
 }
