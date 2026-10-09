@@ -50,7 +50,8 @@ const (
 	// the limited-range YUV colour (yuv=1 after an rgba pass) and the
 	// chroma/colour default similarities changed (0.2 → 0.1 / 0.1 → 0.08),
 	// so the memoised proxies of keyed recipes show the off-range key and
-	// the old defaults.
+	// the old defaults. Phase 5c needs no bump (see stillMemoVersion): its
+	// matte params are new op text.
 	proxyMemoVersion = "2026-10-08.1"
 )
 
@@ -88,7 +89,12 @@ func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out
 	subset := stillOutput(out)
 	// Phase 5b: the stack's mattes are resolved inside compile (preview
 	// mode — a matte not on disk yet is *ErrMattePending, which the server
-	// maps to 202; Play sets the eager flag on ctx) and fold into the key.
+	// maps to 202) and fold into the key. Phase 5c: Play behaves like a
+	// still — with no memo, no pass in flight and no eager mark on ctx the
+	// state is MattePendingIdle and no pass starts (the SPA shows the "not
+	// computed — Compute" pill on the proxy too); the Compute matte button
+	// alone sends the eager mark that starts it. The error is handed up
+	// before any memo, slot or ffmpeg work.
 	plan, mattes, err := m.compile(ctx, s, ops, subset)
 	if err != nil {
 		return nil, err

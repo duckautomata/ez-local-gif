@@ -188,13 +188,46 @@ func (g *flight[T]) abandonable(ctx context.Context, key string, grace time.Dura
 	}
 }
 
+// join waits for the abandon-aware call for key that is ALREADY running —
+// counting as one of its waiters, so the run stays alive while the caller
+// waits and the abandon timer is armed again when the caller leaves — and
+// reports joined false at once, starting nothing, when no call for key is
+// in flight. It is the preview's way of following a matte pass that an
+// eager request or a render started (Phase 5c: a plain still or proxy
+// never starts a pass of its own, it only watches one that runs). Like
+// abandonable, a waiter whose own ctx ends returns its ctx.Err(); a run
+// that ends with a context error (the abandon timer fired) hands that
+// error to the joiner, who treats it as nothing in flight.
+func (g *flight[T]) join(ctx context.Context, key string, grace time.Duration) (val T, joined bool, err error) {
+	g.mu.Lock()
+	c, ok := g.calls[key]
+	if !ok {
+		g.mu.Unlock()
+		return val, false, nil
+	}
+	c.waiters++
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	g.mu.Unlock()
+	defer g.leave(key, c, grace)
+	select {
+	case <-c.done:
+		return c.val, true, c.err
+	case <-ctx.Done():
+		return val, true, ctx.Err()
+	}
+}
+
 // leave drops one waiter of c and, when it was the last while the run is
-// still going, arms the abandon timer.
+// still going, arms the abandon timer (a call started by do / doDetached
+// has no cancel and is never cancelled this way).
 func (g *flight[T]) leave(key string, c *flightCall[T], grace time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	c.waiters--
-	if c.waiters > 0 || g.calls[key] != c {
+	if c.waiters > 0 || g.calls[key] != c || c.cancel == nil {
 		return
 	}
 	c.timer = time.AfterFunc(grace, func() {

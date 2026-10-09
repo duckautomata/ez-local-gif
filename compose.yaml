@@ -5,11 +5,16 @@
 #   docker compose down                 # keeps the ezlg-data volume; add -v to wipe it
 #                                       # (-v also wipes ezlg-models: the AI weights)
 #
-# AI background removal (Phase 5b) is OFF unless you start the matte sidecar —
+# AI background removal (Phase 5b/5c) is OFF unless you start the matte sidecar —
 # ONE of the two profiles (never both: they share the "matte" network alias):
 #   docker compose --profile matte up -d        # CPU sidecar  (duckautomata/ezlg-matte:<tag>)
 #   docker compose --profile matte-gpu up -d    # CUDA sidecar (…:<tag>-cuda; needs
-#                                               # nvidia-container-toolkit + host driver ≥ 580)
+#                                               # nvidia-container-toolkit + host driver ≥ 580);
+#                                               # it offers GPU AND CPU — the user picks "Run on"
+#                                               # in the Background card (Phase 5c)
+#   # Nothing stays loaded (5c): every model is self-tested at start and released; a pass
+#   # loads what it needs and the sidecar drops it again after MATTE_MODEL_TTL idle or when
+#   # the user leaves the AI mode. Nothing runs until "Compute matte" or Render is pressed.
 #   # or once, in .env (see .env.example): COMPOSE_PROFILES=matte-gpu → plain `up -d` includes it
 #   docker compose pull matte-gpu && docker compose up -d   # update the sidecar (pull-only here;
 #                                               # the build: blocks live in compose.dev.yaml)
@@ -47,8 +52,10 @@ x-matte: &matte
     timeout: 5s
     # A cold first start of the cuda image listens only after the CUDA session
     # exists (context + PTX JIT; /models/.nv caches it from then on) and the
-    # preloaded weights (400 MB) are down: "health: starting" for minutes is
-    # normal then, "unhealthy" is not (docs/USAGE.md Troubleshooting).
+    # offered weights (~560 MB with the guided model) are down and self-tested
+    # on each device (then released — Phase 5c keeps nothing resident):
+    # "health: starting" for minutes is normal then, "unhealthy" is not
+    # (docs/USAGE.md Troubleshooting).
     start_period: 300s
   # NO ports: — no auth; never publish it on the LAN. The app reaches it on the compose network only.
 
@@ -118,6 +125,11 @@ services:
       EZLG_MATTE_URL: "http://matte:9402"
       # EZLG_MATTE_MAX_SECONDS: "600"  # refuse a clip whose estimated AI pass exceeds this
       # EZLG_MATTE_MAX_FRAMES: "3000"  # … or that would send more frames than this to the sidecar
+      # EZLG_MATTE_DEVICE: ""          # Phase 5c: the device AI passes run on when the sidecar offers
+      #                                 # several ("cuda" / "cpu"; "" = the sidecar's default). Only the
+      #                                 # STARTUP value: the card's "Run on" select (PUT /api/matte/settings)
+      #                                 # changes it at run time and persists it under /data/mattes/settings.json,
+      #                                 # which then wins. The device is never part of a recipe or a result.
       # NVIDIA_DRIVER_CAPABILITIES: compute,video,utility   # with the gpu block below
     # -- GPU for the app itself (not used in v1; see docs/DESIGN.md §6). Uncomment for
     #    NVDEC/NVENC later, together with NVIDIA_DRIVER_CAPABILITIES above (needs
@@ -133,35 +145,52 @@ services:
 
   # ---- AI matte sidecar (docs/background-removal-proposal.md §7–§8, sidecar/README.md).
   # Start ONE of the two; both answer as http://matte:9402 (the app warns when two
-  # instances alternate behind the alias). The service picks the device; MATTE_MODELS
-  # picks the models the UI offers (ids from sidecar/models.json: isnet-anime =
-  # "Anime (fast)", birefnet-lite = "General (precise)"); the UI preselects
-  # MATTE_DEFAULT_MODEL and lets the user choose any offered model per recipe.
+  # instances alternate behind the alias). MATTE_DEVICE is the sidecar's DEFAULT device;
+  # the cuda image offers cuda AND cpu (it carries both execution providers) and the
+  # user picks "Run on: GPU / CPU" in the Background card (Phase 5c). MATTE_MODELS picks
+  # the models the UI offers (ids from sidecar/models.json: isnet-anime = "Anime (fast)",
+  # birefnet-lite = "General (precise)", sam2-tiny = "Guided (click to select)" — the
+  # SAM 2 tracker behind the box / click prompts); the UI preselects the sidecar's
+  # default model FOR THE DEVICE IN USE (General on cuda, Anime on cpu —
+  # MATTE_DEFAULT_MODEL_CUDA / _CPU override one, MATTE_DEFAULT_MODEL both) and lets the
+  # user choose any offered model per recipe. Nothing stays resident: every offered model
+  # is downloaded and self-tested on each offered device at start (so an estimate exists
+  # before the first pass) and released at once; a pass loads what it needs, the sidecar
+  # drops it after MATTE_MODEL_TTL idle, and the app asks it to drop everything when the
+  # user leaves the AI mode (POST /api/matte/unload).
   matte:                                      # docker compose --profile matte up -d        (CPU)
     <<: *matte
     profiles: [matte]
     environment:
       MATTE_DEVICE: cpu
-      MATTE_MODELS: isnet-anime               # offered models (comma list); birefnet-lite on CPU needs ≥ 14 GiB RAM free
-      # MATTE_DEFAULT_MODEL: isnet-anime      # the model the UI preselects
-      # MATTE_PRELOAD: isnet-anime            # downloaded + self-tested at start (default = MATTE_MODELS)
-      MATTE_MODEL_TTL: "600"                  # seconds idle before a model is unloaded; 0 = never (dedicated box);
-                                              # 120 = hand a shared desktop its RAM back sooner
+      MATTE_MODELS: isnet-anime,sam2-tiny     # offered models (comma list); birefnet-lite on CPU needs ≥ 14 GiB RAM free;
+                                              # the guided tracker runs fp32 on CPU (slow — fine for short clips)
+      # MATTE_DEFAULT_MODEL_CPU: isnet-anime  # the model the UI preselects on cpu (MATTE_DEFAULT_MODEL: on every device)
+      # MATTE_PRELOAD: ""                     # "" (default) = every offered model is downloaded + self-tested at start,
+                                              # then RELEASED; a comma list keeps the named ones resident (dedicated box)
+      MATTE_MODEL_TTL: "300"                  # seconds idle before a model is unloaded; 0 = never (dedicated box);
+                                              # 120 = hand a shared desktop its RAM back sooner (isnet reloads in ~1 s)
+      # MATTE_MAX_TRACK_FRAMES: "3000"        # frames one guided (tracker) request may carry
       HOME: /tmp
       # MATTE_THREADS: "0"                    # ONNX intra-op threads (0 = physical cores; lower it when renders share the cores)
       # MATTE_MODELS_BASE_URL: ""             # mirror for the weights (air-gapped hosts)
     # mem_limit: 16g                          # Precise on CPU needs ~13 GB RSS; the sidecar refuses it below 14 GiB available
-  matte-gpu:                                  # docker compose --profile matte-gpu up -d    (CUDA)
+  matte-gpu:                                  # docker compose --profile matte-gpu up -d    (CUDA, offers cpu too)
     <<: *matte
     image: duckautomata/ezlg-matte:${EZLG_MATTE_TAG:-v0.5.0}-cuda
     profiles: [matte-gpu]
     environment:
-      MATTE_DEVICE: cuda                      # stays up and reports device "unavailable" when the CUDA EP is missing
-      MATTE_MODELS: isnet-anime,birefnet-lite # offered models (comma list)
-      # MATTE_DEFAULT_MODEL: isnet-anime
-      # MATTE_PRELOAD: isnet-anime,birefnet-lite
-      MATTE_MODEL_TTL: "600"                  # 0 = never unload; 120 = hand a shared desktop its VRAM back sooner
+      MATTE_DEVICE: cuda                      # the DEFAULT device; cpu is offered next to it ("Run on" in the card).
+                                              # Stays up and reports device "unavailable" when the CUDA EP is missing
+      MATTE_MODELS: isnet-anime,birefnet-lite,sam2-tiny   # offered models (comma list), on both devices
+      # MATTE_DEFAULT_MODEL_CUDA: birefnet-lite   # the UI's preselection on cuda (General: precise AND stable on video)
+      # MATTE_DEFAULT_MODEL_CPU: isnet-anime      # … and on cpu (lite on CPU is gated by the 14 GiB RAM check)
+      # MATTE_PRELOAD: ""                     # "" = self-test every model on both devices at start, then release;
+                                              # a comma list keeps those resident (e.g. birefnet-lite: 2–20 s to reload)
+      MATTE_MODEL_TTL: "300"                  # 0 = never unload; 120 = hand a shared desktop its VRAM back sooner
       MATTE_GPU_MEM_LIMIT_GIB: "6"            # lite's arena cap; lower values fail (§7.3) — raise it on larger cards only
+      # MATTE_MAX_TRACK_FRAMES: "3000"        # frames one guided (tracker) request may carry (~1.2 GB VRAM per 45 frames at 720²)
+      # MATTE_TRACK_OFFLOAD_FRAMES: "300"     # longer tracks keep SAM 2's memory bank in host RAM (~1.2× slower, no OOM on long clips)
       CUDA_CACHE_PATH: /models/.nv            # the PTX JIT cache survives restarts
       HOME: /tmp
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -169,4 +198,4 @@ services:
 
 volumes:
   ezlg-data:
-  ezlg-models:                                # the sidecar's weights (~400 MB), derived graphs and JIT cache
+  ezlg-models:                                # the sidecar's weights (~560 MB: isnet 176, lite 224, sam2-tiny 156), derived graphs and JIT cache

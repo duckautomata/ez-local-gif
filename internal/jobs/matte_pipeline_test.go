@@ -7,8 +7,9 @@ package jobs
 // pass-level tests (matte_test.go) and the memo-fixture tests
 // (matte_integration_test.go) leave to the whole pipeline — ten concurrent
 // stills sharing one pass and answering pending after the preview wait,
-// a loading sidecar or a stopped one serving a memo, Play's eager flag
-// starting a deferred pass, a render job that waits a loading model out
+// a loading sidecar or a stopped one serving a memo, a plain Play answering
+// idle and the eager flag (the Compute matte button) starting the pass
+// (Phase 5c), a render job that waits a loading model out
 // with StageMatte progress, the job error naming a stopped sidecar, a
 // cancelled job abandoning its pass, Concurrency = 1 with an AI render not
 // blocking a plain one, the frames store serving an fps-upsampled clip at
@@ -147,7 +148,7 @@ func TestProbeIgnoresCallerCancellation(t *testing.T) {
 	// expired, so it pings): a cancelled ctx is the caller's context error,
 	// not "sidecar unreachable".
 	expireMattePing(m)
-	if _, _, err := m.waitMatteReady(cctx, "k", recipe.MatteModelISNetAnime); !errors.Is(err, context.Canceled) || errors.Is(err, ErrMatteUnavailable) {
+	if _, _, _, err := m.waitMatteReady(cctx, "k", recipe.MatteModelISNetAnime, matte.DeviceCPU); !errors.Is(err, context.Canceled) || errors.Is(err, ErrMatteUnavailable) {
 		t.Errorf("waitMatteReady under a cancelled ctx: %v", err)
 	}
 	if !m.MatteEnabled() {
@@ -185,12 +186,13 @@ func TestStillsShareOneMattePass(t *testing.T) {
 	}
 	answers := make([]answer, 10)
 	var wg sync.WaitGroup
+	eager := WithMatteEager(e.ctx, true) // the Compute matte button (Phase 5c: a plain still never starts a pass)
 	for i := range answers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			start := time.Now()
-			_, err := e.m.StillSources(e.ctx, []string{clip.Hash}, ops, out, 0.35, 0)
+			_, err := e.m.StillSources(eager, []string{clip.Hash}, ops, out, 0.35, 0)
 			answers[i] = answer{err: err, took: time.Since(start)}
 		}(i)
 	}
@@ -273,7 +275,13 @@ func TestStillsShareOneMattePass(t *testing.T) {
 	if _, err := m2.probeMatte(e.ctx); err != nil {
 		t.Fatal(err)
 	}
-	data, err := m2.StillSources(e.ctx, []string{clip.Hash}, ops, out, 0.35, 0)
+	// A plain still is idle under the new identity (never served from the
+	// old weights' memo); the eager one runs the new pass.
+	var idle *ErrMattePending
+	if _, err := m2.StillSources(e.ctx, []string{clip.Hash}, ops, out, 0.35, 0); !errors.As(err, &idle) || idle.State != MattePendingIdle {
+		t.Fatalf("plain still under the new weights: %v, want idle", err)
+	}
+	data, err := m2.StillSources(WithMatteEager(e.ctx, true), []string{clip.Hash}, ops, out, 0.35, 0)
 	if err != nil {
 		t.Fatalf("still under the new weights: %v", err)
 	}
@@ -288,23 +296,23 @@ func TestStillsShareOneMattePass(t *testing.T) {
 	}
 }
 
-// TestProxyMatteEagerViaSidecar: a proxy whose pass estimate is over the
-// eager bound is deferred (no POST) unless the request is eager — Play sets
-// the flag — which starts the pass and, once it is done, plays the clip;
-// the memo then serves a plain request.
+// TestProxyMatteEagerViaSidecar: a plain proxy (Play) with no memo and no
+// pass in flight answers idle (no POST, Phase 5c) whatever the estimate;
+// an eager request — the Compute matte button — starts the pass and, once
+// it is done, plays the clip; the memo then serves a plain request.
 func TestProxyMatteEagerViaSidecar(t *testing.T) {
-	e := newMatteRig(t, 10_000, Options{}) // 10 s per frame → 200 s estimate > the 90 s eager bound
+	e := newMatteRig(t, 10_000, Options{}) // 10 s per frame → 200 s estimate: idle is not about the cost
 	clip := e.clipDistinct()
 	ops := []recipe.Op{matteOp("")}
 	out := recipe.Output{Format: "gif", FPS: 10}
 
 	_, err := e.m.Proxy(e.ctx, []string{clip.Hash}, ops, out, 360, 10)
 	var pending *ErrMattePending
-	if !errors.As(err, &pending) || pending.State != MattePendingDeferred || pending.Total != 20 || pending.EstimateMS != 20*10_002 {
-		t.Fatalf("plain Play: %v (%+v), want deferred", err, pending)
+	if !errors.As(err, &pending) || pending.State != MattePendingIdle || pending.Total != 20 || pending.EstimateMS != 20*10_002 {
+		t.Fatalf("plain Play: %v (%+v), want idle", err, pending)
 	}
 	if posts, _ := e.f.stats(); posts != 0 {
-		t.Errorf("a deferred proxy posted %d batches", posts)
+		t.Errorf("an idle proxy posted %d batches", posts)
 	}
 	eager := WithMatteEager(e.ctx, true)
 	data, err := e.m.Proxy(eager, []string{clip.Hash}, ops, out, 360, 10)
@@ -772,7 +780,13 @@ func TestAutoCropMatteSubjectViaSidecar(t *testing.T) {
 	}
 	out := recipe.Output{Format: "gif", FPS: 10}
 	ops := []recipe.Op{matteOp(""), autocropOp(`{}`)}
-	got, err := e.m.ResolveAutoCropFor(e.ctx, clip.Hash, ops, out)
+	// A plain request is idle (nothing on disk, no pass); the eager one
+	// runs the pass the detection then reads.
+	var pending *ErrMattePending
+	if _, err := e.m.ResolveAutoCropFor(e.ctx, clip.Hash, ops, out); !errors.As(err, &pending) || pending.State != MattePendingIdle {
+		t.Fatalf("plain ResolveAutoCropFor: %v, want idle", err)
+	}
+	got, err := e.m.ResolveAutoCropFor(WithMatteEager(e.ctx, true), clip.Hash, ops, out)
 	if err != nil {
 		t.Fatalf("ResolveAutoCropFor: %v", err)
 	}

@@ -104,20 +104,30 @@ def test_all_urls_failing_raises_after_the_attempts(tmp_path, server, monkeypatc
 def test_base_url_override_replaces_the_url_list(tmp_path):
     reg = matte.load_registry(os.path.join(matte.HERE, "models.json"))
     cfg = matte.Config({"MATTE_MODELS_DIR": str(tmp_path), "MATTE_MODELS_BASE_URL": "https://mirror.example/models/"})
-    m = matte.Model("isnet-anime", reg["isnet-anime"], cfg, "cpu")
+    m = matte.Model("isnet-anime", reg["isnet-anime"], cfg)
     assert m.urls == ["https://mirror.example/models/isnet-anime.onnx"]
-    m2 = matte.Model("isnet-anime", reg["isnet-anime"], matte.Config({"MATTE_MODELS_DIR": str(tmp_path)}), "cpu")
+    m2 = matte.Model("isnet-anime", reg["isnet-anime"], matte.Config({"MATTE_MODELS_DIR": str(tmp_path)}))
     assert m2.urls[0].startswith("https://github.com/danielgatis/rembg/releases/download/v0.0.0/") and len(m2.urls) == 2
 
 
 def test_models_json_facts():
     reg = matte.load_registry(os.path.join(matte.HERE, "models.json"))
-    assert set(reg) == {"isnet-anime", "birefnet-lite"}
+    assert set(reg) == {"isnet-anime", "birefnet-lite", "sam2-tiny"}
     for mid, s in reg.items():
         assert len(s["sha256"]) == 64 and s["bytes"] > 0 and s["urls"] and s["licence"] in ("Apache-2.0", "MIT")
         assert os.path.isfile(os.path.join(matte.HERE, s["licence_file"]))
+        assert set(s["offer"]) <= {"cuda", "cpu"} and set(s.get("defaultFor", [])) <= set(s["offer"])
+        if s.get("kind") == "tracker":
+            assert s["config"].endswith(".yaml") and s["image_size"] == 1024 and s["precision"] == {"cuda": "bf16", "cpu": "fp32"}
+            continue
         assert s["output"]["activation"] in ("sigmoid", "logits")
         assert s["default_size"]["cuda"] in s["sizes"] and s["default_size"]["cpu"] in s["sizes"]
     assert reg["isnet-anime"]["sha256"] == "f15622d853e8260172812b657053460e20806f04b9e05147d49af7bed31a6e99"
     assert reg["birefnet-lite"]["sha256"] == "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333"
+    assert reg["sam2-tiny"]["sha256"] == "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69" and reg["sam2-tiny"]["bytes"] == 156008466
     assert reg["isnet-anime"]["input"]["std"] == [1.0, 1.0, 1.0]  # rembg dis_anime.py, not the ImageNet std
+    # Phase 5c defaults: General on the GPU, Anime on the CPU, the tracker on both and never a default
+    assert reg["birefnet-lite"]["defaultFor"] == ["cuda"] and reg["isnet-anime"]["defaultFor"] == ["cpu"] and "defaultFor" not in reg["sam2-tiny"]
+    assert reg["isnet-anime"]["label"] == "Anime (fast)" and reg["birefnet-lite"]["label"] == "General (precise)" and reg["sam2-tiny"]["label"] == "Guided (click to select)"
+    assert reg["sam2-tiny"]["kind"] == "tracker" and reg["sam2-tiny"]["offer"] == ["cuda", "cpu"]
+    assert reg["birefnet-lite"]["offer"] == ["cuda", "cpu"] and reg["birefnet-lite"]["ram"] == {"min_available_gib": 14}  # on the cpu too, gated by RAM

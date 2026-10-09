@@ -287,6 +287,15 @@ type Options struct {
 	// frames streamed. 0 = DefaultMatteMaxFrames (3000). Wire to
 	// EZLG_MATTE_MAX_FRAMES.
 	MatteMaxFrames int
+
+	// MatteDevice (Phase 5c) is the device matte passes run on when the
+	// sidecar offers several ("cuda" / "cpu"; "" = the sidecar's default):
+	// the startup default of the server-side preference that
+	// SetMatteDevice / PUT /api/matte/settings changes at run time and
+	// persists under /data/mattes/settings.json (the persisted value wins
+	// over this option once set). The device never enters a recipe or a
+	// memo key. Wire to EZLG_MATTE_DEVICE.
+	MatteDevice string
 }
 
 // Memo bounds.
@@ -608,7 +617,15 @@ const supportedFormatList = "gif, webp, apng, avif, png, jpeg, frames, mp4, webm
 // sidecar's identity (MatteParams.Resolved, filled by jobs). One bump per
 // shipped phase, the project's habit; the matte memo itself never sees
 // this version (matte.KeyVersion keys it).
-const PipelineVersion = "2026-10-08.2"
+// 2026-10-09.1: Phase 5c — the matte op's Keep colours are a union of
+// colorkey wrappers behind the merge (new filter text), its Stabilise /
+// Edge / Prompts make the matte input read a derived sequence (the
+// stabilised memo, the tracker's gated memo) instead of the raw one, and
+// MatteParams.Resolved carries the tracker / edge identities, so matte
+// recipes render to other bytes; the SPA sends stabilise "light" on every
+// AI recipe by default. The matte memos and their derived dirs are keyed
+// by matte.KeyVersion (unchanged) and survive this bump.
+const PipelineVersion = "2026-10-09.1"
 
 // ResultKey is the on-disk / URL identity of a recipe's rendered result:
 // sha256(recipe hash, PipelineVersion, discordlint.RulesVersion). It is what
@@ -625,9 +642,14 @@ func ResultKey(r recipe.Recipe) string {
 // matte op's Resolved identity (Phase 5b) is likewise dropped and then
 // FILLED from the persisted sidecar facts (fillMatteResolved) before
 // hashing: the weights / processing version / size / precision the render
-// will use are part of the recipe hash and so of the result key, so a new
-// sidecar image never serves a cached result made with the old weights —
-// no facts yet is ErrMatteUnavailable, an unoffered model ErrInvalidRecipe.
+// will use — and, for the guided model (Phase 5c), the tracker weights and
+// the edge model's id / weights / processing version — are part of the
+// recipe hash and so of the result key, so a new sidecar image never
+// serves a cached result made with the old weights — no facts yet is
+// ErrMatteUnavailable, an unoffered model ErrInvalidRecipe. The device a
+// pass runs on is not a recipe param and never reaches the hash: it is the
+// server-side preference (Options.MatteDevice / SetMatteDevice), and a
+// matte made on the CPU serves a GPU render of the same recipe.
 func (m *Manager) Submit(r recipe.Recipe) (Job, error) {
 	if err := r.Validate(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)

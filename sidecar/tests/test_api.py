@@ -22,7 +22,13 @@ def test_ping_shape(sidecar):
     assert p["version"] == "test" and len(p["instance"]) == 16
     assert p["device"] == "cpu" and p["reason"] == "" and p["busy"] == 0
     assert p["defaultModel"] == "synthetic"
+    # Phase 5c: the devices the process offers, the default device and its default model, per-device states
+    assert p["devices"] == ["cpu"] and p["defaultDevice"] == "cpu" and p["defaultModels"] == {"cpu": "synthetic"}
     m = p["models"]["synthetic"]
+    assert m["kind"] == "segmenter" and set(m["devices"]) == {"cpu"}
+    d = m["devices"]["cpu"]
+    assert d["state"] == "ready" and d["reason"] == "" and d["precision"] == "fp32" and d["size"] == SIZE and d["sizes"] == [SIZE, 2 * SIZE]
+    assert d["resident"] is True and d["msPerFrame"] == m["msPerFrame"] and d["graphDigest"] == m["graphDigest"]
     assert m["state"] == "ready" and m["reason"] == "" and m["lastError"] == ""
     assert m["weights"] == matte.sha256_file(str(sidecar.models_dir / "synthetic.onnx"))
     assert m["graphDigest"] == m["weights"]  # fp32 at the graph size = the source file
@@ -151,9 +157,9 @@ def test_unload_then_warm(sidecar):
     status, body, _ = sidecar.post("/v1/warm?model=synthetic")
     assert status == 200 and json.loads(body)["model"] == "synthetic"
     t0 = time.time()
-    while time.time() - t0 < 20 and not sidecar.app.models["synthetic"].sessions:
+    while time.time() - t0 < 20 and not sidecar.rt().sessions:
         time.sleep(0.02)
-    assert sidecar.app.models["synthetic"].sessions
+    assert sidecar.rt().sessions
     assert sidecar.post("/v1/unload?model=synthetic")[0] == 200
     # a request on a released model recreates the session by itself
     status, body, _ = sidecar.matte(frames(1))
@@ -166,11 +172,11 @@ def test_ttl_releases_idle_sessions(tmp_path, synthetic_file, monkeypatch):
     sc = Sidecar(tmp_path, synthetic_file, env={"MATTE_MODEL_TTL": "0.4"})
     try:
         sc.wait()
-        assert sc.app.models["synthetic"].sessions
+        assert sc.rt().sessions
         t0 = time.time()
-        while time.time() - t0 < 10 and sc.app.models["synthetic"].sessions:
+        while time.time() - t0 < 10 and sc.rt().sessions:
             time.sleep(0.05)
-        assert not sc.app.models["synthetic"].sessions
+        assert not sc.rt().sessions
         status, body, _ = sc.matte(frames(1))
         assert status == 200 and len(matte.parse_records(body)) == 1
     finally:
@@ -287,7 +293,7 @@ def test_oom_that_released_another_model_is_503_retry(tmp_path, synthetic_file):
     try:
         sc.wait("synthetic")
         sc.wait("other")
-        assert sc.app.models["other"].sessions
+        assert sc.rt("other").sessions
         status, body, _ = sc.matte(frames(1))
         assert status == 503, body
         j = json.loads(body)
@@ -312,9 +318,9 @@ def test_loading_model_answers_503_with_retry_after(tmp_path, synthetic_file):
             gate.wait(30)
         return ort.InferenceSession(path, so, providers=providers)
 
-    sc = Sidecar(tmp_path, synthetic_file, env={"MATTE_PRELOAD": ""}, session_factory=slow_create)
+    sc = Sidecar(tmp_path, synthetic_file, env={"MATTE_PRELOAD": "", "MATTE_SELFTEST": "0"}, session_factory=slow_create)
     try:
-        assert sc.app.models["synthetic"].state == "loading" and not sc.app.models["synthetic"].queued
+        assert sc.rt().state == "loading" and not sc.rt().queued
         status, body, _ = sc.matte(frames(1))  # not preloaded: this request starts the load and is told to retry
         assert status == 503, body
         j = json.loads(body)
@@ -332,11 +338,11 @@ def test_loading_model_answers_503_with_retry_after(tmp_path, synthetic_file):
 
 def test_missing_file_is_downloaded_on_demand_and_reports_a_failed_download(tmp_path, synthetic_file, monkeypatch):
     monkeypatch.setattr(matte, "DOWNLOAD_ATTEMPTS", 1)
-    sc = Sidecar(tmp_path, synthetic_file, env={"MATTE_PRELOAD": ""})
+    sc = Sidecar(tmp_path, synthetic_file, env={"MATTE_PRELOAD": "", "MATTE_SELFTEST": "0"})
     try:
         os.remove(sc.models_dir / "synthetic.onnx")
-        m = sc.app.models["synthetic"]
-        m.state = "missing"  # as Model() reports it when the file is absent at start
+        m = sc.app.runtime("synthetic", "cpu")
+        m.state = "missing"  # as Runtime() reports it when the file is absent at start
         m.urls = ["http://127.0.0.1:9/nothing.onnx"]  # nothing listens on port 9: the download fails at once
         assert json.loads(sc.get("/v1/ping")[1])["models"]["synthetic"]["state"] == "missing"
         status, body, _ = sc.matte(frames(1))
@@ -348,7 +354,7 @@ def test_missing_file_is_downloaded_on_demand_and_reports_a_failed_download(tmp_
             time.sleep(0.05)
         p = json.loads(sc.get("/v1/ping")[1])["models"]["synthetic"]
         assert p["state"] == "missing" and p["reason"].startswith("download failed") and p["lastError"]
-        assert p["weights"] == m.weights  # the static pin is reported in every state
+        assert p["weights"] == m.model.weights  # the static pin is reported in every state
     finally:
         sc.close()
 
@@ -405,16 +411,16 @@ def test_gpu_query_feeds_ping_and_the_vram_precheck(tmp_path, synthetic_file):
     try:
         sc.wait()
         assert json.loads(sc.get("/v1/ping")[1])["gpu"] == gpu
-        m = sc.app.models["synthetic"]
-        m.spec = dict(m.spec, vram={"cap": True, "min_limit_gib": 6, "min_free_gib": 7})
-        sc.app.device = "cuda"  # the pre-check reads the device and the last GPU sample
-        why = sc.app._precheck(m)
+        rt = sc.rt()
+        rt.model.spec = dict(rt.model.spec, vram={"cap": True, "min_limit_gib": 6, "min_free_gib": 7})
+        rt.device = "cuda"  # the pre-check reads the runtime's device and the last GPU sample
+        why = sc.app._precheck(rt)
         assert why == "needs about 7 GB of free GPU memory, 5.5 GB free"
         sc.app.cfg.gpu_mem_limit_gib = 4
-        assert sc.app._precheck(m).startswith("MATTE_GPU_MEM_LIMIT_GIB=4 is below the 6 GiB")
-        sc.app.device = "cpu"
-        m.spec = dict(m.spec, ram={"min_available_gib": 100000})
-        why = sc.app._precheck(m)
+        assert sc.app._precheck(rt).startswith("MATTE_GPU_MEM_LIMIT_GIB=4 is below the 6 GiB")
+        rt.device = "cpu"
+        rt.model.spec = dict(rt.model.spec, ram={"min_available_gib": 100000})
+        why = sc.app._precheck(rt)
         assert why is None or why.startswith("cpu: 100000 GiB of RAM needed")
     finally:
         sc.close()

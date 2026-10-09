@@ -222,9 +222,10 @@ type compiler struct {
 	chains     []string
 	labels     int              // base labels handed out by closeChain ("[bN]")
 	extras     map[int]extraRef // overlay source index → its ExtraInput (dedupe)
-	matteRefs  map[matteKey]int // (model, size) of a matte op → its ExtraInput position (dedupe, see compiler.matte)
+	matteRefs  map[matteKey]int // (model, size, stabilise, prompts, edge) of a matte op → its ExtraInput position (dedupe, see compiler.matte)
 	ovs        int              // overlay ops compiled so far (labels "[ovN]")
 	mattes     int              // matte merges emitted so far (labels "[mN…]", see mergeMatte)
+	keeps      int              // keep-colour union wrappers emitted so far (labels "[uN…]", see keepColour)
 	keys       int              // alpha-keeping key wrappers emitted so far (labels "[kN…]", see keyKeepingAlpha)
 	layers     int              // translucent text layers emitted so far (labels "[tN]", see textLayers)
 	bounces    int              // bounce ops emitted so far (labels "[fN]"/"[rN]"/"[rrN]", see bounce); each doubles Duration and Frames in assemble
@@ -239,10 +240,15 @@ type extraRef struct {
 }
 
 // matteKey identifies the matte sequence a matte op reads: two matte ops
-// with the same resolved model and size share one ExtraInput (Phase 5b).
+// with the same resolved model and size share one ExtraInput (Phase 5b)
+// — and, Phase 5c, the same stabilise mode, canonical prompts and edge
+// model, since each of those names another derived sequence on disk.
 type matteKey struct {
-	model string
-	size  int
+	model     string
+	size      int
+	stabilise string
+	prompts   string
+	edge      string
 }
 
 // sequence holds the resolved facts of an image-sequence source.

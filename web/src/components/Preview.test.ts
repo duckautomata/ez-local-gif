@@ -9,7 +9,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ProbeInfo, Source } from '../lib/api';
 import { resetFeatures, setFeatures } from '../lib/capabilities.svelte';
 import { defaultOutput, presetById } from '../lib/presets';
-import { app, defaultOps, setSource, stillRequest } from '../lib/state.svelte';
+import { app, defaultAi, defaultOps, setSource, stillRequest } from '../lib/state.svelte';
 import Preview from './Preview.svelte';
 
 const gifInfo: ProbeInfo = {
@@ -284,5 +284,56 @@ describe('Preview (SSR)', () => {
     expect(stillRequest(src30, ops, noFps, { cropMode: true, picking: false, t: 0.5, maxW: 8192 })?.output).toEqual({ format: 'gif' });
     // no source, no request
     expect(stillRequest(null, ops, out, { cropMode: false, picking: false, t: 0, maxW: 480 })).toBeNull();
+  });
+
+  it('prompt mode (Phase 5c): the guided model with its panel open shows the source frame as a prompt canvas — Play off, the meta line says how; crop mode and the eyedropper win', () => {
+    setSource(gifSrc);
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'sam2-tiny', modelChosen: true } };
+    const play = (out: string) => out.match(/<button[^>]*aria-label="Play an animated preview"[^>]*>/)?.[0] ?? '';
+    // the panel closed: an ordinary preview
+    let out = html();
+    expect(out).not.toContain('Select subject:');
+    expect(play(out)).not.toContain('disabled');
+    app.ui.promptOpen = true;
+    out = html();
+    expect(out).toContain('Select subject: drag a box around it, click to keep (+)');
+    expect(out).toContain('click a marker to');
+    expect(out).toContain('0 prompted frames');
+    expect(play(out)).toContain('disabled');
+    expect(out).not.toContain('Crop mode:');
+    app.ops.background.ai.prompts = [{ frame: 0, box: [0, 0, 1, 1], points: [] }];
+    expect(html()).toContain('1 prompted frame');
+    // a per-frame model: no prompt mode even with the flag on
+    app.ops.background.ai.model = 'birefnet-lite';
+    out = html();
+    expect(out).not.toContain('Select subject:');
+    expect(play(out)).not.toContain('disabled');
+    app.ops.background.ai.model = 'sam2-tiny';
+    // crop mode wins over the panel; the armed eyedropper too
+    app.ui.cropOpen = true;
+    out = html();
+    expect(out).toContain('Crop mode: full frame shown');
+    expect(out).not.toContain('Select subject:');
+    app.ui.cropOpen = false;
+    app.ui.pickColor = true;
+    app.ui.pickTarget = 'keep';
+    app.ui.pickRow = 0;
+    out = html();
+    expect(out).toContain('Eyedropper:');
+    expect(out).not.toContain('Select subject:');
+    app.ui.pickColor = false;
+    app.ui.promptOpen = false;
+    // the still request of prompt mode: the source frame unkeyed, the main source alone, format + fps only
+    const out1 = defaultOutput();
+    out1.preset = 'emote';
+    presetById('emote').apply(out1);
+    const ops = defaultOps(gifInfo);
+    ops.background = { ...ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1], points: [] }] } };
+    ops.crop = { enabled: true, x: 10, y: 20, w: 100, h: 50 };
+    const r = stillRequest(gifSrc, ops, out1, { cropMode: false, picking: false, promptMode: true, t: 0.02, maxW: 480 });
+    expect(r?.ops).toEqual([]);
+    expect(r?.sources).toEqual([gifSrc.hash]);
+    expect(r?.output).toEqual({ format: 'gif', fps: 25 });
+    expect(stillRequest(gifSrc, ops, out1, { cropMode: false, picking: false, t: 0.02, maxW: 480 })?.ops.map((o) => o.kind)).toEqual(['matte', 'morph', 'crop']);
   });
 });

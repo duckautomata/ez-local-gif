@@ -10,8 +10,10 @@ import { render } from 'svelte/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { MatteStatus, ProbeInfo, Source } from '../../lib/api';
 import { resetFeatures, setFeatures } from '../../lib/capabilities.svelte';
-import { matte, resetMatte, setMatteStatus } from '../../lib/matte.svelte';
-import { app, armEyedropper, setBackgroundMode, setSource } from '../../lib/state.svelte';
+import { LOOSE_BOX_WARNING } from '../../lib/maskguard';
+import { matteMemoKey } from '../../lib/matte';
+import { matte, noteMatteMemo, resetMatte, setMatteStatus } from '../../lib/matte.svelte';
+import { app, armEyedropper, defaultAi, matteClipKey, setBackgroundMode, setSource } from '../../lib/state.svelte';
 import BackgroundCard from './BackgroundCard.svelte';
 
 const gifInfo: ProbeInfo = {
@@ -84,6 +86,31 @@ function addButton(out: string): string {
 /** the Edge cleanup <details> element ('' when absent) */
 function edgeFold(out: string): string {
   return out.match(/<details[^>]*><summary[^>]*><span[^>]*>Edge cleanup<\/span>[\s\S]*?<\/details>/)?.[0] ?? '';
+}
+/** a <select aria-label="…"> ('' when absent) and its <option> tags */
+function selectFor(out: string, label: string): string {
+  return out.match(new RegExp(`<select[^>]*aria-label="${label}"[^>]*>[\\s\\S]*?</select>`))?.[0] ?? '';
+}
+function optionsOf(sel: string): string[] {
+  return sel.match(/<option[^>]*>[^<]*<\/option>/g) ?? [];
+}
+/** the Compute matte button tag ('' when absent) with its text */
+function computeButton(out: string): string {
+  return out.match(/<button[^>]*aria-label="Compute matte"[^>]*>[\s\S]*?<\/button>/)?.[0] ?? '';
+}
+/** a 5c status: both devices offered, lite the GPU default, isnet the CPU default, the tracker on the GPU */
+function bothStatus(over: Partial<MatteStatus> = {}): MatteStatus {
+  return gpuStatus({
+    devices: ['cuda', 'cpu'],
+    defaultModel: 'birefnet-lite',
+    defaultModels: { cuda: 'birefnet-lite', cpu: 'isnet-anime' },
+    models: {
+      'isnet-anime': { label: 'Anime (fast)', state: 'ready', msPerFrame: 18, devices: { cuda: { state: 'ready', msPerFrame: 18 }, cpu: { state: 'ready', msPerFrame: 136 } } },
+      'birefnet-lite': { label: 'General (precise)', state: 'ready', msPerFrame: 170, devices: { cuda: { state: 'ready', msPerFrame: 170 }, cpu: { state: 'unavailable', reason: 'cpu: 14 GiB of RAM needed, 9 GiB available' } } },
+      'sam2-tiny': { label: 'Guided (click to select)', kind: 'tracker', state: 'ready', msPerFrame: 60, devices: { cuda: { state: 'ready', msPerFrame: 60 } } },
+    },
+    ...over,
+  });
 }
 
 describe('BackgroundCard (SSR)', () => {
@@ -458,5 +485,282 @@ describe('BackgroundCard (SSR)', () => {
     app.source = null;
     expect(statusText(html(true, false))).toBe('ready · GPU');
     expect(html(false, false)).toContain('>AI · fill pinholes</span>');
+  });
+
+  // ---- Phase 5c: device choice, Compute matte, Stabilise, Keep colours, the guided model
+  it('AI (5c): "Run on" only when the sidecar offers both devices (the effective one selected); Stabilise defaults to Light; the Compute button follows the compute state', () => {
+    setFeatures({ features: all5a });
+    setMatteStatus(bothStatus());
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai' };
+    let out = html();
+    const run = selectFor(out, 'Run on');
+    expect(run).toBeTruthy();
+    expect(optionsOf(run)).toHaveLength(2);
+    expect(optionsOf(run)[0]).toMatch(/<option value="cuda"[^>]*selected[^>]*>GPU<\/option>/);
+    expect(optionsOf(run)[1]).toMatch(/<option value="cpu"[^>]*>CPU<\/option>/);
+    expect(optionsOf(run)[1]).not.toContain('selected');
+    expect(run).not.toContain('disabled');
+    // Run on precedes Model: the model default follows the device
+    expect(out.indexOf('aria-label="Run on"')).toBeGreaterThan(0);
+    expect(out.indexOf('aria-label="Run on"')).toBeLessThan(out.indexOf('aria-label="Model"'));
+    expect(out).not.toContain('Guided needs the editor');
+    // the model options follow the effective device, the tracker last
+    expect(options(out).map((o) => o.match(/value="([^"]+)"/)?.[1])).toEqual(['isnet-anime', 'birefnet-lite', 'sam2-tiny']);
+    expect(options(out)[2]).toContain('Guided (click to select)');
+    expect(options(out)[2]).not.toContain('disabled');
+    // Stabilise: Off · Light · Strong, Light selected
+    const stab = selectFor(out, 'Stabilise');
+    expect(optionsOf(stab).map((o) => o.replace(/<[^>]*>/g, ''))).toEqual(['Off', 'Light', 'Strong']);
+    expect(optionsOf(stab)[1]).toContain('selected');
+    expect(optionsOf(stab)[2]).toContain('title="The median, then a short hold');
+    // the Compute button: nothing on the stage yet → disabled; idle → enabled; running → progress; computed → "computed"
+    expect(computeButton(out)).toContain('disabled');
+    expect(computeButton(out)).toContain('Compute matte');
+    matte.compute = { state: 'idle', done: 0, total: 50, device: 'GPU', pending: 'idle' };
+    out = html();
+    expect(computeButton(out)).not.toContain('disabled');
+    expect(computeButton(out)).toContain('class="primary"');
+    expect(out).toContain('not computed for this clip, model and device yet');
+    matte.compute = { state: 'running', done: 24, total: 50, device: 'GPU', pending: 'running' };
+    out = html();
+    expect(computeButton(out)).toContain('computing… 24/50');
+    expect(computeButton(out)).toContain('disabled');
+    expect(out).toContain('24 of 50 frames');
+    matte.compute = { state: 'computed', done: 0, total: 0, device: '', pending: '' };
+    out = html();
+    expect(computeButton(out)).toContain('>computed<');
+    expect(out).toContain('cached — trim, speed and fps changes re-use it');
+    // the CPU as the effective device: the states are the CPU's, the GPU-only tracker is disabled with the reason
+    setMatteStatus(bothStatus({ device: 'cpu', defaultModel: 'isnet-anime' }));
+    out = html();
+    expect(optionsOf(selectFor(out, 'Run on'))[1]).toContain('selected');
+    expect(options(out)[1]).toMatch(/disabled[^>]*>General \(precise\) — unavailable</);
+    expect(options(out)[2]).toMatch(/disabled[^>]*>Guided \(click to select\) — unavailable</);
+    expect(options(out)[2]).toContain('title="not offered on CPU"');
+    expect(statusText(out)).toBe('ready · CPU · up to ~7 s for this clip'); // 50 × (136 + 2) ms
+    // a single device: no Run on
+    setMatteStatus(gpuStatus());
+    expect(selectFor(html(), 'Run on')).toBe('');
+    setMatteStatus(bothStatus({ devices: ['cuda'] }));
+    expect(selectFor(html(), 'Run on')).toBe('');
+    // a PUT in flight disables the select
+    setMatteStatus(bothStatus());
+    matte.settingDevice = true;
+    expect(selectFor(html(), 'Run on')).toContain('disabled');
+    matte.settingDevice = false;
+  });
+
+  it('AI (5c): the help text names the models, Keep / Grow and Stabilise; the summary shows what deviates from the defaults', () => {
+    setFeatures({ features: all5a });
+    setMatteStatus(bothStatus());
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'birefnet-lite' } };
+    const out = html();
+    expect(out).toContain('General (precise) keeps thin strands');
+    expect(out).toContain('Anime (fast) is for anime-style characters only.');
+    expect(out).toContain('If parts of the subject drop out, add a');
+    expect(out).toContain('Keep colour or raise Grow; if edges flicker, set Stabilise');
+    expect(out).toContain('Computed once per frame and cached');
+    expect(html(false)).toContain('>AI · General (precise) · fill pinholes</span>'); // light is the default: unsaid
+    app.ops.background.ai.stabilise = '';
+    expect(html(false)).toContain('>AI · General (precise) · stabilise off · fill pinholes</span>');
+    app.ops.background.ai.stabilise = 'strong';
+    app.ops.background.ai.keep = ['ff0000', '', 'ff0000', '00ff00'];
+    expect(html(false)).toContain('>AI · General (precise) · stabilise strong · keep 2 colours · fill pinholes</span>');
+  });
+
+  it('AI (5c): the Advanced fold holds the Keep colours rows (eyedropper in the editor, typed hex in batch) and the keep similarity at 0.08', () => {
+    setFeatures({ features: all5a });
+    setMatteStatus(bothStatus());
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai' };
+    let out = html();
+    expect(out).toContain('>Advanced</span>');
+    expect(out).toContain('· keep none');
+    expect(out).toContain('Keep similarity (0.01–1) — <b>0.08</b>');
+    expect(out).toMatch(/<input[^>]*type="range"[^>]*aria-label="Keep similarity"/);
+    expect(out).not.toContain('aria-label="Keep colour 1 (hex)"'); // no rows yet
+    expect(out).toMatch(/<button[^>]*title="Force another colour opaque — up to 6"[^>]*>\+ add colour<\/button>/);
+    expect(out).toContain('pick a colour the model drops');
+    app.ops.background.ai.keep = ['ff0000', ''];
+    app.ops.background.ai.keepSimilarity = 0.2;
+    app.ui.pickColor = true;
+    app.ui.pickTarget = 'keep';
+    app.ui.pickRow = 1;
+    out = html();
+    expect(out).toContain('aria-label="Keep colour 1 (hex)"');
+    expect(out).toContain('aria-label="Keep colour 2 (hex)"');
+    expect(out).toContain('aria-label="Remove keep colour 1"');
+    expect(out).toMatch(/class="swatch[^"]*"[^>]*background: #ff0000/);
+    expect(out).toContain('Keep similarity (0.01–1) — <b>0.20</b>');
+    expect(out).toContain('· keep 1 colour · similarity 0.20');
+    const picks = pickButtons(out);
+    expect(picks).toHaveLength(2);
+    expect(picks[0]).toContain('Pick again');
+    expect(picks[1]).toContain('Click the preview…');
+    expect(picks[1]).toContain('aria-pressed="true"');
+    // a Keep eyedropper does not light the Colour rows (and vice versa)
+    app.ui.pickTarget = 'colour';
+    expect(pickButtons(html())[1]).toContain('Pick from preview');
+    app.ui.pickColor = false;
+    // batch: typed hex only
+    out = html(true, false);
+    expect(pickButtons(out)).toHaveLength(0);
+    expect(out).toContain('aria-label="Keep colour 1 (hex)"');
+    expect(out).not.toContain('type a hex value'); // a colour is picked already
+    app.ops.background.ai.keep = [''];
+    expect(html(true, false)).toContain('type a hex value');
+  });
+
+  it('AI (5c) guided: picking the tracker shows the Select subject panel, the Edge select on the device default, the keyframe strip and Clear; no matte until the subject is selected', () => {
+    setFeatures({ features: all5a });
+    setMatteStatus(bothStatus());
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'sam2-tiny', modelChosen: true } };
+    app.ui.promptOpen = true;
+    let out = html();
+    expect(options(out)[2]).toContain('selected');
+    const select = out.match(/<button[^>]*aria-pressed="(true|false)"[^>]*>\s*(Select subject|Done selecting)\s*<\/button>/);
+    expect(select?.[1]).toBe('true');
+    expect(select?.[2]).toBe('Done selecting');
+    const edge = selectFor(out, 'Edge');
+    expect(optionsOf(edge).map((o) => o.match(/value="([^"]+)"/)?.[1])).toEqual(['isnet-anime', 'birefnet-lite', 'none']);
+    expect(optionsOf(edge)[1]).toContain('selected'); // the GPU default
+    expect(optionsOf(edge)[2]).toContain('None — tracker mask only');
+    expect(out).toContain('No subject selected yet — open Select subject and draw a box around it on the preview; no matte is applied until then.');
+    expect(out).toContain(
+      'Scrub to a frame where General got it right and press Use this frame’s matte — the most reliable start; refine with − clicks. Otherwise draw a box around the character — a single click usually selects only a part (skin, a sleeve) or floods the frame when it',
+    );
+    expect(out).toContain('so click it 2–3 times if you click — add a − click on anything that stays; then Compute.');
+    expect(out).toContain('another frame where it drifts and Compute again.');
+    expect(out).toMatch(/<button[^>]*disabled[^>]*>Clear<\/button>/);
+    expect(computeButton(out)).toContain('disabled'); // nothing to compute without prompts
+    expect(out).toContain('select the subject first');
+    expect(html(false)).toContain('>AI · Guided (click to select) · select the subject · fill pinholes</span>');
+    // the CPU default is the anime model; an explicit edge shows as chosen; None words the hint
+    setMatteStatus(bothStatus({ device: 'cpu', defaultModel: 'isnet-anime' }));
+    expect(optionsOf(selectFor(html(), 'Edge'))[0]).toContain('selected');
+    app.ops.background.ai.edge = 'none';
+    out = html();
+    expect(optionsOf(selectFor(out, 'Edge'))[2]).toContain('selected');
+    expect(out).toContain('Edge None uses the tracker’s mask alone');
+    // prompts: the keyframe strip with jump / delete, Clear enabled, the summary counts
+    setMatteStatus(bothStatus());
+    app.ops.background.ai.prompts = [
+      { frame: 12, box: null, points: [{ x: 0.5, y: 0.5, label: 1 }] },
+      { frame: 0, box: [0.1, 0.2, 0.6, 0.9], points: [{ x: 0.7, y: 0.4, label: 0 }, { x: 0.3, y: 0.6, label: 1 }] },
+    ];
+    out = html();
+    expect(out).toContain('aria-label="Prompted frames"');
+    const jumps = out.match(/<button[^>]*aria-label="Go to prompted frame \d+"[^>]*>[\s\S]*?<\/button>/g) ?? [];
+    expect(jumps).toHaveLength(2);
+    expect((jumps[0] ?? '').replace(/<[^>]*>|<!---->/g, '').replace(/\s+/g, ' ').trim()).toBe('f 1 ▭ +1 −1');
+    expect((jumps[1] ?? '').replace(/<[^>]*>|<!---->/g, '').replace(/\s+/g, ' ').trim()).toBe('f 13 +1');
+    expect(out).toContain('aria-label="Delete the prompts of frame 1"');
+    expect(out).toContain('aria-label="Delete the prompts of frame 13"');
+    expect(out).not.toMatch(/<button[^>]*disabled[^>]*>Clear<\/button>/);
+    expect(out).not.toContain('No subject selected yet');
+    // the panel open with a subject selected: Compute is enabled although the stage shows the unkeyed frame (it closes the panel and runs the keyed still eagerly)
+    expect(computeButton(out)).not.toContain('disabled');
+    expect(computeButton(out)).toContain('Close the subject panel and run the guided matte');
+    expect(out).toContain('closes the panel and runs the track (and the edge pass)');
+    expect(html(false)).toContain('>AI · Guided (click to select) · 2 frames · 1 box · 3 points · fill pinholes</span>');
+    // the panel closed: "Select subject" unpressed
+    app.ui.promptOpen = false;
+    expect(html()).toMatch(/<button[^>]*aria-pressed="false"[^>]*>\s*Select subject\s*<\/button>/);
+    // a per-frame model hides the panel
+    app.ops.background.ai.model = 'birefnet-lite';
+    expect(selectFor(html(), 'Edge')).toBe('');
+    app.ui.promptOpen = false;
+  });
+
+  it('AI (5c) in batch (picker off): the same controls minus Compute; the tracker is disabled (no preview to prompt on)', () => {
+    setFeatures({ features: all5a });
+    setMatteStatus(bothStatus());
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai' };
+    const out = html(true, false);
+    expect(computeButton(out)).toBe('');
+    expect(selectFor(out, 'Run on')).toBeTruthy();
+    expect(selectFor(out, 'Stabilise')).toBeTruthy();
+    expect(options(out)[2]).toMatch(/disabled[^>]*title="The guided model needs the editor’s preview to select the subject"/);
+    expect(out).toContain('>Advanced</span>');
+    // the tracker chosen anyway (an editor session carried over): the panel's button is disabled, no prompts hint,
+    // and the note says the rows key with the device's default per-frame model instead (batchOpsCfg)
+    app.ops.background.ai.model = 'sam2-tiny';
+    const g = html(true, false);
+    expect(g).toMatch(/<button[^>]*disabled[^>]*>\s*Select subject\s*<\/button>/);
+    expect(g).toContain('No subject selected yet; no matte is applied until then.');
+    expect(g).toContain('Guided needs the editor’s preview to select the subject — batch rows key with General (precise) instead (no prompts, no edge model).');
+    setMatteStatus(bothStatus({ device: 'cpu', defaultModel: 'isnet-anime' }));
+    expect(html(true, false)).toContain('batch rows key with Anime (fast) instead');
+  });
+
+  it('AI (5d) guided: "Use this frame’s matte" follows what the server said about the edge model’s matte of this clip; the strip shows ▣; the guard’s warning sits under the panel; Edge None disables it', () => {
+    setFeatures({ features: all5a });
+    setMatteStatus(bothStatus());
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'sam2-tiny', modelChosen: true } };
+    app.ui.promptOpen = true;
+    app.ui.scrubFrame = 2;
+    const btn = (out: string) => out.match(/<button[^>]*>\s*(Use|Drop) this frame’s matte\s*<\/button>/)?.[0] ?? '';
+    // nothing known yet: enabled, the title hedges (the overlay's answer says)
+    let out = html();
+    expect(btn(out)).not.toContain('disabled');
+    expect(btn(out)).toContain('Start the track from General’s matte of frame 3');
+    expect(btn(out)).toContain('if that matte is computed for this clip');
+    expect(out).toContain('Scrub to a frame where General got it right and press Use this frame’s matte — the most reliable start; refine with − clicks.');
+    // the server said idle for General on this clip: disabled, with the way out
+    const key = matteMemoKey(matteClipKey(app.source, app.ops, app.output), 'birefnet-lite', 'cuda');
+    expect(key).not.toBe('');
+    noteMatteMemo(key, 'idle');
+    out = html();
+    expect(btn(out)).toContain('disabled');
+    expect(btn(out)).toContain('General matte not computed for this clip: switch the Model to General (precise), press Compute, then come back');
+    // computed: enabled without the hedge
+    noteMatteMemo(key, 'computed');
+    out = html();
+    expect(btn(out)).not.toContain('disabled');
+    expect(btn(out)).not.toContain('if that matte is computed');
+    // the frame carries the mask: the button takes it off; the strip shows ▣; the summary counts the frame matte; Compute is enabled
+    app.ops.background.ai.prompts = [
+      { frame: 2, box: null, points: [{ x: 0.5, y: 0.5, label: 0 }], maskFrom: 'edge' },
+      { frame: 0, box: [0, 0, 0.5, 0.5], points: [] },
+    ];
+    out = html();
+    expect(btn(out)).toContain('Drop this frame’s matte');
+    expect(btn(out)).not.toContain('disabled');
+    expect(btn(out)).toContain('Take the matte prompt off this frame (its box and clicks stay)');
+    const jumps = out.match(/<button[^>]*aria-label="Go to prompted frame \d+"[^>]*>[\s\S]*?<\/button>/g) ?? [];
+    expect(jumps.map((j) => j.replace(/<[^>]*>|<!---->/g, '').replace(/\s+/g, ' ').trim())).toEqual(['f 1 ▭', 'f 3 ▣ −1']);
+    expect(html(false)).toContain('>AI · Guided (click to select) · 2 frames · frame matte · 1 box · 1 point · fill pinholes</span>');
+    expect(computeButton(out)).not.toContain('disabled');
+    // another frame on the scrubber: the button offers that frame
+    app.ui.scrubFrame = 0;
+    out = html();
+    expect(btn(out)).toContain('Start the track from General’s matte of frame 1');
+    expect(btn(out)).toContain('replaces the box and clicks on it');
+    app.ui.scrubFrame = 2;
+    // the guard's warning under the panel (set by the overlay)
+    expect(out).not.toContain('role="alert"');
+    app.ui.promptWarning = LOOSE_BOX_WARNING;
+    out = html();
+    expect(out).toMatch(new RegExp(`<p class="warn[^"]*" role="alert">${LOOSE_BOX_WARNING.replace(/[+]/g, '\\$&')}</p>`));
+    app.ui.promptWarning = '';
+    // Edge None: no edge model to take the matte from — disabled, and the help text leads with the box
+    app.ops.background.ai.prompts = [];
+    app.ops.background.ai.edge = 'none';
+    out = html();
+    expect(btn(out)).toContain('disabled');
+    expect(btn(out)).toContain('Needs an edge model: Edge is None — tracker mask only');
+    expect(out).toContain('Draw a box around the character — a single click');
+    expect(out).not.toContain('Scrub to a frame where');
+    expect(out).toContain('None uses the tracker’s mask alone (and offers no frame matte to start from)');
+    // on the CPU the Anime model is the edge default: the words follow
+    app.ops.background.ai.edge = '';
+    setMatteStatus(bothStatus({ device: 'cpu', defaultModel: 'isnet-anime' }));
+    out = html();
+    expect(btn(out)).toContain('Start the track from Anime’s matte of frame 3');
+    expect(out).toContain('Scrub to a frame where Anime got it right');
+    // batch (no preview): disabled
+    expect(btn(html(true, false))).toContain('disabled');
+    expect(btn(html(true, false))).toContain('Needs the editor’s preview');
+    app.ui.promptOpen = false;
+    app.ui.scrubFrame = 0;
   });
 });

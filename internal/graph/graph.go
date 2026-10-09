@@ -94,7 +94,14 @@
 //     W x H is the current (source) frame, format=rgba only when the chain
 //     does not already end in one, and alphamerge gets no shortest /
 //     eof_action: the sequence has the main's frame count by construction
-//     and jobs checks it after the master; see compiler.matte / mergeMatte)
+//     and jobs checks it after the master; see compiler.matte / mergeMatte);
+//     a matte op's keep colours (Phase 5c, recipe.MatteParams.Keep) follow
+//     its merge as one union wrapper each — "…,split=3[uN][uNm][uNe];[uNm]
+//     colorkey=color=0xRRGGBB:similarity=S:blend=0,alphaextract,negate
+//     [uNk];[uNe]alphaextract[uNa];[uNa][uNk]blend=all_mode=lighten[uNx];
+//     [uN][uNx]alphamerge,…" (alpha = max(merged alpha, 255 where the
+//     colour is within S): the colour's pixels come back opaque whatever
+//     the matte, nothing else changes; see keepColour)
 //     → the geometry ops in the order given (crop — including a resolved
 //     autocrop —, premultiplied lanczos scale, canvas pad, flip/rotate; each
 //     sees the frame size produced by the previous one) → output fit
@@ -381,6 +388,22 @@ type MatteInput struct {
 	// unknown; the compiler leaves it 0). enc clamps a forward still's
 	// matte slot to Frames-1 when it is known.
 	Frames int
+
+	// Phase 5c. Stabilise is the op's validated recipe.MatteParams.Stabilise
+	// ("" | light | strong): the filter text does not change, but jobs
+	// fills Path with the DERIVED sequence "<clipdir>/stab-<mode>/%06d.png"
+	// (enc.MatteStabiliseArgs) instead of the raw memo, so stills, proxies
+	// and renders all read the stabilised mattes.
+	Stabilise string
+	// Prompts is the canonical text of the op's guided prompts
+	// (recipe.MatteParams.Prompts; "" when there are none): sorted by
+	// frame, fixed decimals — see CanonicalMattePrompts. jobs keys the
+	// tracker's clip memo under it.
+	Prompts string
+	// Edge is the op's recipe.MatteParams.Edge as given ("" = the device's
+	// default per-frame model, recipe.MatteEdgeNone, or a segmenter id);
+	// jobs names the gated derived dir "<clipdir>/gated-<edge>-<edgeKey>-r3/" with it.
+	Edge string
 }
 
 // TextFile is one drawtext body the compiler deferred to a file.

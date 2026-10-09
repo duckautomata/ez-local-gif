@@ -1,19 +1,23 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from 'svelte';
-  import { fetchProxy, fetchStill, type ProxyRequest } from '../lib/api';
+  import { fetchProxy, fetchStill, hasMatteOp, MATTE_EDGE_NONE, matteModelOf, matteParamsOf, type Op, type ProxyRequest } from '../lib/api';
   import { caps } from '../lib/capabilities.svelte';
   import { displayToPixel, readPixel, rgbToHex } from '../lib/eyedropper';
   import { clamp, fmtNum, fmtSeconds, fmtTimecode, frameStart, stillTime } from '../lib/format';
-  import { mattePendingPill } from '../lib/matte';
-  import { notePending, pollWhilePending } from '../lib/matte.svelte';
+  import { computeFromPending, edgeModelFor, effectiveDevice, isIdleState, isTracker, matteMemoKey, mattePendingPill, NO_COMPUTE } from '../lib/matte';
+  import { matte, noteMatteMemo, notePending, pollWhilePending, registerMatteCompute, setMatteCompute } from '../lib/matte.svelte';
   import { ProxyPlayer, type ProxyView } from '../lib/proxy';
+  import { keyframes } from '../lib/prompts';
   import {
+    aiActive,
     app,
     applyPickedColor,
     buildOutput,
     effectiveOps,
     forwardFrame,
     hasOverlays,
+    isGuided,
+    matteClipKey,
     opsApply,
     planFPS,
     planFrames,
@@ -28,6 +32,7 @@
   import BackdropToggle from './BackdropToggle.svelte';
   import CropOverlay from './CropOverlay.svelte';
   import OverlayLayer from './OverlayLayer.svelte';
+  import PromptOverlay from './PromptOverlay.svelte';
 
   /** Proxy (Play) limits: DESIGN §7 — first 10 s, ≤ 360 px wide. */
   const PROXY_MAXW = 360;
@@ -61,8 +66,13 @@
   const cropMode = $derived(app.ui.cropOpen && withOps && !app.ops.autocrop.enabled);
   // Eyedropper: the Background card armed it; the still is requested unkeyed.
   const picking = $derived(app.ui.pickColor && withOps && !cropMode);
+  // Prompt mode (Phase 5c): the guided model's Select subject panel is open
+  // — the still is the SOURCE frame (crop mode's mechanism) unkeyed, with
+  // the prompt canvas and the live mask over it. The eyedropper wins while
+  // it is armed (a Keep colour pick needs the same unkeyed still).
+  const promptMode = $derived(app.ui.promptOpen && withOps && !cropMode && aiActive(ops) && isGuided(ops.background));
   // Overlay placement: drag boxes over the still at output-canvas size.
-  const overlayMode = $derived(withOps && !cropMode && hasOverlays(ops));
+  const overlayMode = $derived(withOps && !cropMode && !promptMode && hasOverlays(ops));
 
   // The scrubber is a frame index on the plan's grid (planFPS / planFrames
   // mirror graph.Plan.FPS / Plan.Frames): i ∈ [0, total − 1], one notch per
@@ -137,9 +147,11 @@
   // back first (forwardFrame, WEB-5) — otherwise the mirrored half of a
   // bounced clip clamps to the clip end and the crop rectangle is drawn on
   // the wrong frame.
-  const stillT = $derived(cropMode && info ? stillTime(forwardFrame(info, app.ops, app.output, i), fps) : t);
+  /** the scrubber slot on the forward grid: what crop / prompt mode's truncated stack must ask for, and the prompted frame's index */
+  const fwdFrame = $derived(info ? forwardFrame(info, app.ops, app.output, i) : 0);
+  const stillT = $derived((cropMode || promptMode) && info ? stillTime(fwdFrame, fps) : t);
   const req = $derived(
-    stillRequest(app.source, app.ops, app.output, { cropMode, picking, t: stillT, maxW: stillMaxW({ overlay: overlayMode, zoomed, wide }) }),
+    stillRequest(app.source, app.ops, app.output, { cropMode, picking, promptMode, t: stillT, maxW: stillMaxW({ overlay: overlayMode, zoomed, wide }) }),
   );
 
   // The still on screen (url), the in-flight flag and the last error live in a
@@ -202,27 +214,30 @@
     const r = proxyReq;
     untrack(() => player.update(r));
   });
-  // Crop / eyedropper modes need the still on the stage.
+  // Crop / eyedropper / prompt modes need the still on the stage.
   $effect(() => {
-    if (cropMode || picking) untrack(() => player.stop());
+    if (cropMode || picking || promptMode) untrack(() => player.stop());
   });
   // An older server has no POST /api/proxy (features.proxy off): Play stays
   // visible but disabled, its tooltip saying why.
   const proxyOn = $derived(caps.features.proxy);
-  const canPlay = $derived(proxyOn && !!info && !cropMode && !picking && (total > 1 || hasOverlays(ops)));
+  const canPlay = $derived(proxyOn && !!info && !cropMode && !picking && !promptMode && (total > 1 || hasOverlays(ops)));
   const playing = $derived(proxy.playing && !!proxy.url);
   /** Play is on its way: a fetch in flight, or its matte pending (Stop cancels either) */
   const playBusy = $derived(proxy.loading || proxy.pending !== null);
 
-  // ---- Phase 5b: the AI matte pending pill. A still / proxy whose answer
-  // was 202 keeps the picture on the stage and shows what the sidecar is
-  // doing (lib/matte.mattePendingPill: "AI matte 24/45 · GPU", "loading
-  // model… (12 s)", "downloading weights 43 %"); a DEFERRED still (the
-  // estimate is over the server's eager bound) offers "Compute now", which
-  // re-requests it with `eager` and starts the pass — Play and Render start
-  // it anyway. The schedulers re-request by themselves (still.ts /
-  // proxy.ts); while anything is pending /api/matte is polled too, so the
-  // Background card's states follow.
+  // ---- Phase 5b / 5c: the AI matte pending pill. A still / proxy whose
+  // answer was 202 keeps the picture on the stage and shows what the
+  // sidecar is doing (lib/matte.mattePendingPill: "AI matte 24/45 · GPU",
+  // "loading model… (12 s)", "downloading weights 43 %"); an IDLE matte
+  // (nothing on disk, nothing running — a preview never starts a pass by
+  // itself) reads "AI matte not computed" with a Compute button, which
+  // re-requests the still (or the pending proxy) with `eager` and starts
+  // the pass — the Background card's Compute matte button does the same
+  // through registerMatteCompute; Render starts it anyway. The schedulers
+  // re-request by themselves (still.ts / proxy.ts); while anything is
+  // pending /api/matte is polled too, so the Background card's states
+  // follow.
   const pendingView = $derived(proxy.pending ?? (playing ? null : view.pending));
   let now = $state(Date.now());
   $effect(() => {
@@ -236,7 +251,85 @@
   // (lib/matte.svelte pollWhilePending).
   pollWhilePending(() => view.pending !== null || proxy.pending !== null);
   const pillText = $derived(pendingView ? mattePendingPill(pendingView, now) : '');
-  const canComputeNow = $derived(!!view.pending && view.pending.state === 'deferred' && !proxy.pending && !playing);
+  const canComputeNow = $derived(!!pendingView && isIdleState(pendingView.state) && !playing);
+  /**
+   * the Compute button: in prompt mode the panel closes and the keyed still
+   * that follows starts the pass (still.computeNext); otherwise the pending
+   * proxy's re-request when Play is waiting, else the still's
+   */
+  function computeNow() {
+    if (promptMode) {
+      still.computeNext();
+      app.ui.promptOpen = false;
+      return;
+    }
+    if (proxy.pending) player.computeNow();
+    else still.computeNow();
+  }
+  // The compute state the Background card's Compute matte button shows
+  // (lib/matte.svelte): 'none' without a matte op on the stage, 'idle' /
+  // 'running' from the 202, 'computed' once the still of the CURRENT state
+  // is on screen (displayedKey = the request's key), 'unknown' meanwhile.
+  const stageMatte = $derived(!!req && hasMatteOp(req.ops));
+  $effect(() => {
+    const r = req;
+    const p = proxy.pending ?? view.pending;
+    const loading = view.loading;
+    const url = view.url;
+    if (!stageMatte) {
+      setMatteCompute(NO_COMPUTE);
+      return;
+    }
+    const shown = url !== null && !loading && p === null && untrack(() => still.displayedKey) === StillScheduler.key(r);
+    const c = computeFromPending(p, shown);
+    setMatteCompute(c);
+    // Phase 5d: what the answer said about the server's memos (lib/
+    // matte.svelte matteMemo — "Use this frame's matte" reads the edge
+    // model's entry); the device and the clip key are read untracked so
+    // the effect keeps the still's dependencies alone.
+    if (r && (c.state === 'computed' || c.state === 'idle')) {
+      const state = c.state;
+      untrack(() => noteStageMemo(r.ops, state));
+    }
+  });
+  /**
+   * noteStageMemo records the stage's matte memo as computed / idle, and
+   * — for a guided op that computed — its edge model's memo as computed
+   * too: the gated matte is derived from the edge model's pass over the
+   * same clip, so that pass ran (or was already on disk).
+   */
+  function noteStageMemo(ops: Op[], state: 'computed' | 'idle') {
+    const clip = matteClipKey(app.source, app.ops, app.output);
+    const device = effectiveDevice(matte.status);
+    const model = matteModelOf(ops);
+    noteMatteMemo(matteMemoKey(clip, model, device), state);
+    if (state !== 'computed' || !isTracker(matte.status, model)) return;
+    const edge = edgeModelFor(matteParamsOf(ops)?.edge, matte.status, device);
+    if (edge !== MATTE_EDGE_NONE) noteMatteMemo(matteMemoKey(clip, edge, device), 'computed');
+  }
+  onMount(() => {
+    registerMatteCompute(computeNow);
+    return () => {
+      registerMatteCompute(null);
+      setMatteCompute(NO_COMPUTE);
+    };
+  });
+  // The device preference changed (the card's Run on select, or the
+  // sidecar's answer): the still on screen was made for the old device, so
+  // the current state is asked again — a memo hit or an idle 202 says
+  // where the new device stands. The first known device never retries.
+  let lastDevice = '';
+  $effect(() => {
+    const d = effectiveDevice(matte.status);
+    untrack(() => {
+      if (d === lastDevice) return;
+      const known = lastDevice !== '';
+      lastDevice = d;
+      if (known && d !== '' && stageMatte) still.retry();
+    });
+  });
+  /** the keyframe strip's count for the prompt-mode meta line */
+  const promptedFrames = $derived(promptMode ? keyframes(app.ops.background.ai.prompts).length : 0);
   // While the proxy plays the still <img> is unmounted: pause the still
   // scheduler so scrubbing / editing renders no stills (full-resolution ones
   // in overlay mode) that nothing shows, and release the URLs it parked for
@@ -337,7 +430,7 @@
        role, so it must not wrap interactive descendants (the error overlay's
        Retry button, the crop canvas). The frame slider lives on the position
        readout in the scrub row below instead. -->
-  <div class="stage backdrop-{app.ui.backdrop}" class:cropping={cropMode} class:picking>
+  <div class="stage backdrop-{app.ui.backdrop}" class:cropping={cropMode || promptMode} class:picking>
     {#if playing}
       <div class="img-wrap">
         <img src={proxy.url} alt="Animated preview (first {PROXY_SECONDS} s, low resolution)" class="proxy" style={zoomStyle} draggable="false" onerror={() => player.imageFailed()} />
@@ -375,6 +468,9 @@
         {#if cropMode && imgEl && info}
           <CropOverlay img={imgEl} srcW={info.width} srcH={info.height} />
         {/if}
+        {#if promptMode && !picking && imgEl && info}
+          <PromptOverlay img={imgEl} srcW={info.width} srcH={info.height} frame={fwdFrame} />
+        {/if}
         {#if overlayMode && !picking && imgEl && natural.w > 0}
           <OverlayLayer img={imgEl} canvasW={natural.w} canvasH={natural.h} t={shown} />
         {/if}
@@ -387,7 +483,9 @@
       <div class="pill" role="status">
         <span>{pillText}</span>
         {#if canComputeNow}
-          <button type="button" class="sm" onclick={() => still.computeNow()} title="Start the AI matte pass now (Play and Render start it anyway)">Compute now</button>
+          <button type="button" class="sm" onclick={computeNow} title="Start the AI matte pass for this clip now (Render starts it anyway)">
+            {pendingView.state === 'deferred' ? 'Compute now' : 'Compute'}
+          </button>
         {/if}
       </div>
     {/if}
@@ -465,6 +563,13 @@
         </span>
       {:else if cropMode}
         <span class="warn">Crop mode: full frame shown, drag to set the rectangle</span>
+      {:else if promptMode}
+        <span class="warn">
+          Select subject: drag a box around it, click to keep (+), <kbd>Shift</kbd>-click or right-click to remove (−), click a marker to
+          delete it · the source frame is shown unkeyed with the tracker's mask in green · {promptedFrames} prompted {promptedFrames === 1
+            ? 'frame'
+            : 'frames'}
+        </span>
       {:else if info && !withOps}
         <span>Optimize: the source GIF as-is (ops are not applied)</span>
       {:else if overlayMode}

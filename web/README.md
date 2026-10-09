@@ -56,7 +56,13 @@ into the Go binary by `web/embed.go`.
     src/lib/matte.ts             Phase 5b pure helpers: model options / labels, the clip estimate and caps
                                  verdict (jobs' up-front refusal), status line, pending pill, retry cadence
     src/lib/matte.svelte.ts      the live GET /api/matte object: reference-counted 5 s polling while the AI
-                                 mode is visible or a preview is pending; a 202 installs its status too
+                                 mode is visible or a preview is pending; a 202 installs its status too;
+                                 Phase 5c: the preview's compute state + the Compute matte hook, the device
+                                 preference (PUT /api/matte/settings), the debounced unload on leaving AI
+    src/lib/prompts.ts           Phase 5c guided model: the prompt maths (boxes / ± points normalised to the
+                                 source frame, per-frame edits, keyframes, the wire / recipe shapes)
+    src/lib/promptmask.ts        PromptMaskScheduler: the live mask of the Select subject panel
+                                 (POST /api/matte/prompt, debounce / abort / 202 retry, unit-tested)
     src/lib/stages.ts            job stage labels (incl. "AI matte") for the Render panel and batch rows
     src/lib/render.svelte.ts     job submission / progress / result state
     src/lib/format.ts            formatting helpers, snapFPS/gifDelays, fitSize, fmtTimecode, frame grid
@@ -72,9 +78,11 @@ into the Go binary by `web/embed.go`.
     src/lib/editsource.ts        "edit as source": open tab → POST /api/sources/from-result → navigate
     src/lib/toast.svelte.ts      toasts
     src/components/…             UploadZone (+ /input picker, mixed-drop choice), ProbeBadge, Preview
-                                 (+ CropOverlay, OverlayLayer drag boxes, eyedropper layer, Play/Stop),
+                                 (+ CropOverlay, PromptOverlay — the guided model's prompt canvas —,
+                                 OverlayLayer drag boxes, eyedropper layer, Play/Stop),
                                  AnchorGrid, ops/* (Trim, Crop + auto-crop, Resize, Fps, Speed + reverse
-                                 + bounce, Background, FlipRotate, Delay, OverlaysPanel →
+                                 + bounce, Background + ColourRows (the colour rows shared by the Colour
+                                 mode and the AI mode's Keep colours), FlipRotate, Delay, OverlaysPanel →
                                  TextOverlayCard / ImageOverlayCard + TimeRangeFields), OutputCard,
                                  RenderPanel, ResultCard (+ InChat, Save to /output), DiscordChecks,
                                  BatchPanel / BatchOpsPanel / BatchRenderPanel, ShortcutsOverlay,
@@ -184,12 +192,53 @@ into the Go binary by `web/embed.go`.
   a matte recipe may answer **202** while the pass runs: `fetchStill` /
   `fetchProxy` throw `MattePending`, the schedulers keep the picture on
   stage, show the pill ("AI matte 24/45 · GPU", "loading model… (12 s)",
-  "~3 min on CPU" + **Compute now** for a deferred pass) and re-request
-  after 500 ms (5 s while deferred); Play and "Compute now" send `eager`.
+  "AI matte not computed" + **Compute** while idle) and re-request
+  after 500 ms (5 s while idle); only the Compute button sends `eager`.
   The Render panel appends "· up to ~N s AI matte (GPU|CPU)" to its
   estimate line and shows the server's refusal note over
   `EZLG_MATTE_MAX_FRAMES` / `_MAX_SECONDS`; the Result card shows the
-  `render.matte` info check as an "AI matte:" line. Screen (Green / Blue sub-choice, `screen`) emits `chromakey` (key
+  `render.matte` info check as an "AI matte:" line (plus what the recipe's
+  matte op asked for — guided + edge, stabilise, keep — when the detail
+  lacks it, `lib/result.matteLine`).
+  **Phase 5c** (on demand, device choice, stabilise, keep, guided): nothing
+  in the AI mode starts a pass — a preview of an uncomputed matte answers
+  202 `idle` and shows the last picture with the pill; the card's **Compute
+  matte** button (`lib/matte.svelte` `registerMatteCompute` → the Preview's
+  `still.computeNow()` / `player.computeNow()`, `eager: true`) or Render
+  starts it, and the button reads "computing… 24/45" / "computed" from the
+  compute state the Preview publishes (`setMatteCompute`, derived from its
+  still's 202 / picture). Play behaves like a still (no `eager`). **Run on**
+  (GPU / CPU, only when `MatteStatus.devices` lists both) is a server-side
+  preference — `PUT /api/matte/settings {device}`, reflected in
+  `MatteStatus.device` (the effective device), never a recipe param; the
+  model states, estimate and the Model select's default follow that device
+  (`defaultModels`), a user-picked model stays (`ai.modelChosen`), an
+  auto-filled one follows. Leaving the AI mode (or the card going away)
+  `POST /api/matte/unload`s after a 1.5 s debounce (`aiModeChanged`).
+  **Stabilise** (`ai.stabilise`: Off / Light (default) / Strong → the op's
+  `stabilise`, sent whenever set since the recipe zero value is off) is
+  derived server-side from the cached matte — no model run, so it shows
+  without Compute. **Keep colours** (Advanced fold, `ai.keep` /
+  `ai.keepSimilarity` → `keep` / `keepSimilarity`, up to 6, the same
+  `ColourRows` as the Colour mode; the eyedropper lands in a keep row when
+  `app.ui.pickTarget` is `'keep'` and the card stays in AI) force picked
+  colours opaque in-graph. **Guided (click to select)** (`sam2-tiny`, kind
+  `tracker`, listed last; disabled in batch): picking it opens the Select
+  subject panel (`app.ui.promptOpen`) — the preview shows the SOURCE-frame
+  still like crop mode but unkeyed (`stillRequest({promptMode})`) under
+  `PromptOverlay` (drag = the frame's box with the crop rectangle's
+  handles, click = + point, Shift/right-click = − point, click a marker to
+  remove it; the mask of that frame under that frame's prompts is fetched
+  from `POST /api/matte/prompt` after every change — `lib/promptmask` —
+  and painted at 50 % green); prompts live in `ai.prompts`
+  (`lib/prompts.FramePrompts`, 0..1 of the source frame, keyed by the
+  forward-grid frame `forwardFrame`), the keyframe strip jumps
+  (`scrubFrameFor`) / deletes per frame, Clear forgets all, Edge picks the
+  per-frame model that refines the tracker's band ('' = the device's
+  default). The op carries `prompts` (rounded to 4 decimals, frame-sorted)
+  and `edge`; with nothing that selects (no box, no + click) **no matte op
+  is emitted** (like a Colour row without a pick) and the Render panel says
+  so. Screen (Green / Blue sub-choice, `screen`) emits `chromakey` (key
   colour — preset `00ff00` / `0000ff` or custom —, similarity default 0.1,
   blend, despill on/off + mix/expand under Advanced); recipe zero values are
   left out of the params, and because the Go zero value of blend *is* the

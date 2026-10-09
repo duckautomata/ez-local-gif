@@ -1,5 +1,5 @@
 {
-  "_about": "Models the matte sidecar can offer (matte.py reads this file; MATTE_MODELS picks ids from it). Every file is a plain ONNX graph executed by onnxruntime — no remote code. `urls` are tried in order (the pinned rembg GitHub release v0.0.0 asset first, then a mirror holding the byte-identical file); the download is verified against `sha256` before the file is used, and that sha256 is the `weights` the app folds into its memo keys. The facts come from docs/reviews/background-removal-bench/models.json (research run 2026-10-08).",
+  "_about": "Models the matte sidecar can offer (matte.py reads this file; MATTE_MODELS picks ids from it). Segmenters (kind absent or \"segmenter\") are plain ONNX graphs executed by onnxruntime; the tracker (kind \"tracker\") is a SAM 2.1 checkpoint run by the pinned sam2 package on torch — no remote code either way. `urls` are tried in order (the pinned release asset first, then a mirror holding the byte-identical file); the download is verified against `sha256` before the file is used, and that sha256 is the `weights` the app folds into its memo keys. `offer` lists the devices a model is offered on by default (MATTE_MODELS can name a model for every device); `defaultFor` marks the device(s) whose default model it is (MATTE_DEFAULT_MODEL* override). The facts come from docs/reviews/background-removal-bench/models.json (research run 2026-10-08) and the SAM 2 prototype (2026-10-09).",
   "v": 1,
   "models": {
     "isnet-anime": {
@@ -15,6 +15,7 @@
       "licence": "Apache-2.0",
       "licence_file": "LICENSES/isnet-anime.Apache-2.0.txt",
       "offer": ["cuda", "cpu"],
+      "defaultFor": ["cpu"],
       "graph_size": 1024,
       "sizes": [1024, 512],
       "default_size": {"cuda": 1024, "cpu": 512},
@@ -22,7 +23,7 @@
       "rescalable": true,
       "input": {"name": "img", "mean": [0.485, 0.456, 0.406], "std": [1.0, 1.0, 1.0]},
       "output": {"name": "mask", "activation": "sigmoid"},
-      "notes": "opset 11, input float32 [1,3,1024,1024], output [1,1,1024,1024] with the sigmoid in the graph; /255 then minus mean, std 1 (rembg dis_anime.py — NOT the ImageNet std). The 34 Resize nodes carry absolute sizes, so other input sizes are derived with tools/rescale_graph.py; fp16 on CUDA with tools/to_fp16.py (MAE 0.00005 vs fp32)."
+      "notes": "opset 11, input float32 [1,3,1024,1024], output [1,1,1024,1024] with the sigmoid in the graph; /255 then minus mean, std 1 (rembg dis_anime.py — NOT the ImageNet std). The 34 Resize nodes carry absolute sizes, so other input sizes are derived with tools/rescale_graph.py; fp16 on CUDA with tools/to_fp16.py (MAE 0.00005 vs fp32). Anime-style characters only: it detects nothing on photographic content. The CPU default (~130 ms/frame at 512² on 8 cores)."
     },
     "birefnet-lite": {
       "label": "General (precise)",
@@ -35,7 +36,8 @@
       "upstream": "ZhengPeng7/BiRefNet, BiRefNet_lite (general-use training set, swin_v1_tiny backbone, epoch 232); rembg's ONNX export — no mirror with the same sha256 is known",
       "licence": "MIT",
       "licence_file": "LICENSES/birefnet.MIT.txt",
-      "offer": ["cuda"],
+      "offer": ["cuda", "cpu"],
+      "defaultFor": ["cuda"],
       "graph_size": 1024,
       "sizes": [1024],
       "default_size": {"cuda": 1024, "cpu": 1024},
@@ -45,7 +47,26 @@
       "output": {"name": null, "activation": "logits"},
       "vram": {"cap": true, "min_limit_gib": 6, "min_free_gib": 7},
       "ram": {"min_available_gib": 14},
-      "notes": "fixed batch 1, float32 [1,3,1024,1024] input, [1,1,1024,1024] LOGITS output (the sidecar applies the sigmoid); ImageNet mean/std. ORT's CUDA arena grows to 14.5 GB uncapped: it runs under gpu_mem_limit = MATTE_GPU_MEM_LIMIT_GIB (6.3 GB footprint at 6 GiB; 5/4/3 GiB caps FAIL). Session create 10–20 s on an RTX 5080, ~170 ms/frame; on CPU 3.7–10 s/frame at 12.6 GB RSS."
+      "notes": "fixed batch 1, float32 [1,3,1024,1024] input, [1,1,1024,1024] LOGITS output (the sidecar applies the sigmoid); ImageNet mean/std. ORT's CUDA arena grows to 14.5 GB uncapped: it runs under gpu_mem_limit = MATTE_GPU_MEM_LIMIT_GIB (6.3 GB footprint at 6 GiB; 5/4/3 GiB caps FAIL). Session create 10–20 s on an RTX 5080, ~170 ms/frame; stable on a moving subject (IoU 0.96–0.99 every frame): the GPU default. Offered on the CPU too (fp32 1024², 3.7–10 s/frame at 12.6 GB RSS) but gated by 14 GiB of available RAM: below that it is listed unavailable with the figure, never silently absent."
+    },
+    "sam2-tiny": {
+      "label": "Guided (click to select)",
+      "kind": "tracker",
+      "file": "sam2.1_hiera_tiny.pt",
+      "bytes": 156008466,
+      "sha256": "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69",
+      "urls": [
+        "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
+      ],
+      "upstream": "facebookresearch/sam2, SAM 2.1 hiera-tiny checkpoint (release 092824); run by the sam2 package pinned at commit 2b90b9f5ceec907a1c18123530e92e794ad901a4 (requirements-sam2.txt) with its own config configs/sam2.1/sam2.1_hiera_t.yaml",
+      "licence": "Apache-2.0",
+      "licence_file": "LICENSES/sam2.Apache-2.0.txt",
+      "offer": ["cuda", "cpu"],
+      "config": "configs/sam2.1/sam2.1_hiera_t.yaml",
+      "image_size": 1024,
+      "precision": {"cuda": "bf16", "cpu": "fp32"},
+      "vram": {"min_free_gib": 2},
+      "notes": "A video object tracker, not a per-frame segmenter: POST /v1/track takes the whole clip (rgb24 at the tracking size, long side <= 1024) plus prompts (a box and/or clicks on one or more frames, or a mask — one 8-bit gray PNG record after the frames, Phase 5d: the per-frame model's matte of one good frame is the most reliable prompt, applied with add_new_mask; the frame's clicks refine it) and answers one binary mask per frame; POST /v1/track/frame answers one prompted frame's mask for the live overlay. Frames are resized to 1024² inside (image_size), bf16 autocast on CUDA (~35 ms/frame propagation + ~30 ms frame prep at 720², ~1.2 GB VRAM), fp32 on CPU (~1.5 s/frame). Built with add_all_frames_to_correct_as_cond=true so corrections on later frames stick; the CUDA connected-components extension is not built (SAM2_BUILD_CUDA=0) — hole filling (fill_hole_area=8) runs through scipy instead. The app gates a per-frame model's matte with this mask for the edges (DESIGN.md §4.3)."
     }
   }
 }

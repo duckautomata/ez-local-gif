@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { Report, ResultFile } from './api';
-import { chatSizes, descLine, groupFiles, isFramesResult, isImageFormat, matteCheck, matteSummary, RULE_RENDER_MATTE, sizeState } from './result';
+import type { Recipe, Report, ResultFile } from './api';
+import { chatSizes, descLine, groupFiles, isFramesResult, isImageFormat, matteCheck, matteLine, matteRecipeNotes, matteSummary, RULE_RENDER_MATTE, sizeState } from './result';
 
 function file(name: string, extra: Partial<ResultFile> = {}): ResultFile {
   return {
@@ -126,5 +126,38 @@ describe('matteCheck / matteSummary', () => {
     expect(matteCheck(report(null))).toBeNull();
     expect(matteSummary(null)).toBeNull();
     expect(matteSummary(undefined)).toBeNull();
+  });
+});
+
+// Phase 5c: what the recipe's matte op asked for beyond the model joins the
+// line when the server's detail does not already say it.
+describe('matteRecipeNotes / matteLine', () => {
+  const report = (detail: string): Report => ({ rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 1, limit: 2, width: 1, height: 1, frames: 1, durationMs: 1, minDelayMs: 1, loopForever: true, hasAlpha: true, ok: true, checks: [{ rule: 'render.matte', level: 'info', ok: true, fixed: false, detail }] });
+  const recipe = (params: object | undefined): Pick<Recipe, 'ops'> => ({ ops: [{ kind: 'trim', params: { start: 1 } }, params ? { kind: 'matte', params } : { kind: 'matte' }] });
+
+  it('words stabilise, keep colours and the guided model with its edge', () => {
+    expect(matteRecipeNotes(recipe(undefined))).toEqual([]);
+    expect(matteRecipeNotes(recipe({ model: 'birefnet-lite' }))).toEqual([]);
+    expect(matteRecipeNotes(recipe({ stabilise: 'light' }))).toEqual(['stabilise light']);
+    expect(matteRecipeNotes(recipe({ keep: ['ff0000', '00ff00'], keepSimilarity: 0.2 }))).toEqual(['2 keep colours']);
+    expect(matteRecipeNotes(recipe({ keep: ['ff0000'] }))).toEqual(['1 keep colour']);
+    expect(matteRecipeNotes(recipe({ model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1] }], edge: 'none', stabilise: 'strong' }))).toEqual(['guided (sam2-tiny) + no edge model · 1 prompted frame', 'stabilise strong']);
+    expect(matteRecipeNotes(recipe({ model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1] }, { frame: 4, points: [[0.5, 0.5, 1]] }], resolved: { weights: 'w', proc: '1', size: 0, precision: 'fp16', edge: 'birefnet-lite' } }))).toEqual([
+      'guided (sam2-tiny) + edge birefnet-lite · 2 prompted frames',
+    ]);
+    expect(matteRecipeNotes(recipe({ model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1] }], edge: 'isnet-anime' }))).toEqual(['guided (sam2-tiny) + edge isnet-anime · 1 prompted frame']);
+    expect(matteRecipeNotes({ ops: [{ kind: 'colorkey', params: { color: '313338' } }] })).toEqual([]);
+    expect(matteRecipeNotes(null)).toEqual([]);
+  });
+
+  it('matteLine appends only what the detail lacks, and stands alone without a check', () => {
+    const r = recipe({ stabilise: 'light', keep: ['ff0000'] });
+    expect(matteLine(report('isnet-anime fp16 1024², 45 mattes'), r)).toBe('isnet-anime fp16 1024², 45 mattes · stabilise light · 1 keep colour');
+    expect(matteLine(report('AI matte: isnet-anime · cuda · stabilise light · 1 keep colour'), r)).toBe('isnet-anime · cuda · stabilise light · 1 keep colour');
+    expect(matteLine(report('isnet-anime · Stabilise: light'), r)).toBe('isnet-anime · Stabilise: light · 1 keep colour');
+    expect(matteLine(null, r)).toBe('stabilise light · 1 keep colour');
+    expect(matteLine(null, recipe({ model: 'birefnet-lite' }))).toBeNull();
+    expect(matteLine(report(''), recipe({ model: 'birefnet-lite' }))).toBe('see the Discord checks');
+    expect(matteLine(null, { ops: [] })).toBeNull();
   });
 });

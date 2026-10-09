@@ -26,7 +26,8 @@ func FrameKey(rgb []byte) string {
 
 // ClipKeyParts are the inputs of ClipKey (spec §4.2). Weights and Proc come
 // from the persisted facts (Facts), never from a live digest; the device is
-// deliberately absent (CPU and GPU mattes of one graph are equivalent).
+// deliberately absent (CPU and GPU mattes of one graph are equivalent —
+// Size and Precision, which differ per device, are what keys them).
 type ClipKeyParts struct {
 	Src         string           // the source blob hash
 	Temporal    []recipe.Op      // the stack's temporal ops in stack order (TemporalOps)
@@ -34,10 +35,18 @@ type ClipKeyParts struct {
 	InfoVersion int              // the store.InfoVersion the probe facts were stored under
 	FPS         string           // the compiled plan's effective rate as filter text (graph's fnum(Plan.FPS))
 	Model       string           // model id
-	Size        int              // the effective input square
+	Size        int              // the effective input square (a segmenter); 0 for a tracker, whose size is TrackW×TrackH
 	Precision   string           // fp16 / fp32 of the graph the sidecar runs
-	Weights     string           // sha256 of the pinned source ONNX
+	Weights     string           // sha256 of the pinned source weights
 	Proc        string           // the sidecar's processingVersion
+
+	// Tracker requests only (Phase 5c Part B, a model of KindTracker): the
+	// canonical prompts (TrackPrompts.Canonical) and the tracking size the
+	// clip was sent at. All zero for a segmenter, whose key text is then
+	// exactly the pre-5c one (no KeyVersion bump: existing memos stay valid).
+	Prompts string // TrackPrompts.Canonical()
+	TrackW  int    // the frames' width on the wire (enc's trackSize)
+	TrackH  int    // the frames' height on the wire
 }
 
 // TemporalOps returns the ops of a stack that shape the frames the model
@@ -87,13 +96,15 @@ type seqFacts struct {
 //	sha256("matte|" + KeyVersion + "\n" + canonical(Recipe{Sources: [Src], Ops: Temporal})
 //	       + "\nprobe=" + json(probe facts) + "|info=" + InfoVersion
 //	       + "\nfps=" + FPS + "|model=" + Model + "|size=" + Size + "|prec=" + Precision
-//	       + "|weights=" + Weights + "|proc=" + Proc)
+//	       + "|weights=" + Weights + "|proc=" + Proc
+//	       [+ "\ntrack=" + TrackW + "x" + TrackH + "|prompts=" + Prompts])
 //
 // as lowercase hex, the probe facts being Kind, IsStill, Width, Height,
 // FPS, Duration, ColorStream, AlphaStream, Premultiplied and Sequence
-// {Pattern, Count, DelayMS, Mixed} (probeFacts). Like recipe.Hash it panics
-// only when a temporal op's params are not valid JSON — the compiler has
-// validated them by the time a key is made.
+// {Pattern, Count, DelayMS, Mixed} (probeFacts); the track line exists only
+// when Prompts / TrackW / TrackH are set (a tracker matte). Like
+// recipe.Hash it panics only when a temporal op's params are not valid
+// JSON — the compiler has validated them by the time a key is made.
 func ClipKey(parts ClipKeyParts) string {
 	sum := sha256.Sum256([]byte(clipKeyText(parts)))
 	return hex.EncodeToString(sum[:])
@@ -123,10 +134,14 @@ func clipKeyText(p ClipKeyParts) string {
 	if err != nil {
 		panic(err) // a struct of scalars cannot fail to marshal
 	}
-	return "matte|" + KeyVersion + "\n" + string(canon) +
+	s := "matte|" + KeyVersion + "\n" + string(canon) +
 		"\nprobe=" + string(fj) + "|info=" + itoa(p.InfoVersion) +
 		"\nfps=" + p.FPS + "|model=" + p.Model + "|size=" + itoa(p.Size) + "|prec=" + p.Precision +
 		"|weights=" + p.Weights + "|proc=" + p.Proc
+	if p.Prompts != "" || p.TrackW != 0 || p.TrackH != 0 {
+		s += "\ntrack=" + itoa(p.TrackW) + "x" + itoa(p.TrackH) + "|prompts=" + p.Prompts
+	}
+	return s
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }

@@ -191,15 +191,15 @@ func TestProtect(t *testing.T) {
 	}
 	r1 := st.Protect(dir)
 	r2 := st.Protect(dir + string(filepath.Separator)) // cleans to the same dir
-	for _, p := range []string{dir, child} {
+	// The dir, what is under it, and (Phase 5c) what it is under — removing
+	// the parent would remove the held dir.
+	for _, p := range []string{dir, child, parent} {
 		if !st.isProtected(p) {
 			t.Errorf("%s not protected", p)
 		}
 	}
-	for _, p := range []string{sibling, parent} {
-		if st.isProtected(p) {
-			t.Errorf("%s protected although outside the dir", p)
-		}
+	if st.isProtected(sibling) {
+		t.Errorf("%s protected although outside the dir", sibling)
 	}
 	r1()
 	r1() // idempotent: must not release the second hold
@@ -207,8 +207,10 @@ func TestProtect(t *testing.T) {
 		t.Fatal("the second hold was released by the first release")
 	}
 	r2()
-	if st.isProtected(dir) {
-		t.Fatal("still protected after every hold was released")
+	for _, p := range []string{dir, child, parent} {
+		if st.isProtected(p) {
+			t.Fatalf("%s still protected after every hold was released", p)
+		}
 	}
 	r2() // over-release is harmless
 	if len(st.protected) != 0 {

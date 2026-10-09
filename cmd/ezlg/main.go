@@ -48,6 +48,10 @@
 //	                     (default 3000; <= 0 keeps the default), applied up-front from the
 //	                     plan and at run time from the frames streamed
 //	                     (jobs.Options.MatteMaxFrames)
+//	EZLG_MATTE_DEVICE    the device AI matte passes run on when the sidecar offers several
+//	                     ("cuda" / "cpu"; default "" = the sidecar's default) — the startup
+//	                     value of the preference PUT /api/matte/settings changes at run time
+//	                     (jobs.Options.MatteDevice, Phase 5c)
 //	EZLG_FFMPEG etc.     override tool paths (see ffrun.LookupTools; EZLG_FC_LIST for the
 //	                     fontconfig fc-list behind GET /api/fonts)
 //
@@ -154,7 +158,10 @@ type serveConfig struct {
 	matteURL        string
 	matteMaxSeconds int
 	matteMaxFrames  int
-	drain           time.Duration
+	// matteDevice is jobs.Options.MatteDevice (EZLG_MATTE_DEVICE, Phase 5c);
+	// "" = the sidecar's default device.
+	matteDevice string
+	drain       time.Duration
 }
 
 func serveConfigFromEnv() serveConfig {
@@ -174,6 +181,7 @@ func serveConfigFromEnv() serveConfig {
 		matteURL:        os.Getenv("EZLG_MATTE_URL"),
 		matteMaxSeconds: int(envInt("EZLG_MATTE_MAX_SECONDS", jobs.DefaultMatteMaxSeconds)),
 		matteMaxFrames:  int(envInt("EZLG_MATTE_MAX_FRAMES", jobs.DefaultMatteMaxFrames)),
+		matteDevice:     os.Getenv("EZLG_MATTE_DEVICE"),
 		drain:           drainTimeout,
 	}
 }
@@ -232,6 +240,7 @@ func runServer(ctx context.Context, cfg serveConfig, ln net.Listener) error {
 		MatteURL:        cfg.matteURL,
 		MatteMaxSeconds: cfg.matteMaxSeconds,
 		MatteMaxFrames:  cfg.matteMaxFrames,
+		MatteDevice:     cfg.matteDevice,
 	})
 	log.Printf("phase 4 file exchange: save to %s = %v (EZLG_OUTPUT), pick from %s = %v (EZLG_INPUT)",
 		cfg.outputDir, jm.OutputSaveEnabled(), cfg.inputDir, jm.InputPickEnabled())

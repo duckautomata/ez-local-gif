@@ -4,8 +4,28 @@
 // preview answer carries.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MattePending, type MatteStatus } from './api';
-import { MATTE_POLL_MS } from './matte';
-import { holdMattePolling, matte, mattePolling, notePending, pendingHold, refreshMatte, resetMatte, setMatteStatus } from './matte.svelte';
+import { MATTE_POLL_MS, MATTE_UNLOAD_DEBOUNCE_MS, NO_COMPUTE } from './matte';
+import { ApiError } from './api';
+import {
+  aiModeChanged,
+  cancelMatteUnload,
+  computeMatte,
+  holdMattePolling,
+  matte,
+  matteMemo,
+  matteMemoState,
+  mattePolling,
+  matteUnloadScheduled,
+  noteMatteMemo,
+  notePending,
+  pendingHold,
+  refreshMatte,
+  registerMatteCompute,
+  resetMatte,
+  setMatteCompute,
+  setMatteDevice,
+  setMatteStatus,
+} from './matte.svelte';
 
 function status(over: Partial<MatteStatus> = {}): MatteStatus {
   return { enabled: true, device: 'cuda', defaultModel: 'isnet-anime', models: { 'isnet-anime': { label: 'Anime (fast)', state: 'ready', msPerFrame: 18 } }, maxSeconds: 600, maxFrames: 3000, ...over };
@@ -23,14 +43,15 @@ describe('matte store', () => {
   });
 
   it('starts unknown; setMatteStatus installs an answer and clears the error; null forgets it', () => {
-    expect(matte).toEqual({ loaded: false, status: null, error: '' });
+    const idle = { loaded: false, status: null, error: '', compute: { state: 'none', done: 0, total: 0, device: '', pending: '' }, settingDevice: false };
+    expect(matte).toEqual(idle);
     matte.error = 'HTTP 502';
     setMatteStatus(status());
     expect(matte.loaded).toBe(true);
     expect(matte.status?.device).toBe('cuda');
     expect(matte.error).toBe('');
     setMatteStatus(null);
-    expect(matte).toEqual({ loaded: false, status: null, error: '' });
+    expect(matte).toEqual(idle);
   });
 
   it('pendingHold: three consecutive 202s (an update per new pending object) are ONE hold and one fetch; false releases; release is idempotent', async () => {
@@ -180,5 +201,106 @@ describe('matte store', () => {
       maxSeconds: 600,
       maxFrames: 3000,
     });
+  });
+
+  // ---- Phase 5c
+  it('setMatteDevice stores the preference through the setter and installs its answer; a failure keeps the status and returns the message', async () => {
+    setMatteStatus(status({ device: 'cuda', devices: ['cuda', 'cpu'] }));
+    const calls: string[] = [];
+    const ok = async (device: string) => {
+      calls.push(device);
+      return status({ device: device || 'cuda', devices: ['cuda', 'cpu'], defaultModel: device === 'cpu' ? 'isnet-anime' : 'birefnet-lite' });
+    };
+    const p = setMatteDevice('cpu', ok);
+    expect(matte.settingDevice).toBe(true);
+    expect(await p).toBe('');
+    expect(matte.settingDevice).toBe(false);
+    expect(calls).toEqual(['cpu']);
+    expect(matte.status).toMatchObject({ device: 'cpu', defaultModel: 'isnet-anime' });
+    expect(await setMatteDevice('', ok)).toBe(''); // back to the default
+    expect(matte.status?.device).toBe('cuda');
+    const err = await setMatteDevice('tpu', async () => {
+      throw new ApiError('device tpu not offered', 400);
+    });
+    expect(err).toBe('device tpu not offered');
+    expect(matte.status?.device).toBe('cuda'); // kept
+    expect(matte.settingDevice).toBe(false);
+  });
+
+  it('aiModeChanged: leaving the AI mode unloads after the debounce, coming back in time cancels, repeats are idempotent, errors are ignored', async () => {
+    let n = 0;
+    let fail = false;
+    const unload = async () => {
+      n++;
+      if (fail) throw new Error('HTTP 502');
+    };
+    aiModeChanged(false, { unload }); // never on: nothing to release
+    await vi.advanceTimersByTimeAsync(MATTE_UNLOAD_DEBOUNCE_MS * 2);
+    expect(n).toBe(0);
+    expect(MATTE_UNLOAD_DEBOUNCE_MS).toBe(1500);
+    aiModeChanged(true);
+    aiModeChanged(true);
+    expect(matteUnloadScheduled()).toBe(false);
+    aiModeChanged(false);
+    expect(matteUnloadScheduled()).toBe(true);
+    aiModeChanged(false); // still one timer
+    await vi.advanceTimersByTimeAsync(MATTE_UNLOAD_DEBOUNCE_MS - 1);
+    expect(n).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(n).toBe(1);
+    expect(matteUnloadScheduled()).toBe(false);
+    // back and out again before the debounce: cancelled
+    aiModeChanged(true);
+    aiModeChanged(false);
+    await vi.advanceTimersByTimeAsync(500);
+    aiModeChanged(true);
+    expect(matteUnloadScheduled()).toBe(false);
+    await vi.advanceTimersByTimeAsync(MATTE_UNLOAD_DEBOUNCE_MS * 2);
+    expect(n).toBe(1);
+    // a failing unload is swallowed; cancelMatteUnload drops a pending one
+    fail = true;
+    aiModeChanged(false);
+    await vi.advanceTimersByTimeAsync(MATTE_UNLOAD_DEBOUNCE_MS);
+    expect(n).toBe(2);
+    aiModeChanged(true);
+    aiModeChanged(false, { delayMs: 10 });
+    cancelMatteUnload();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(n).toBe(2);
+  });
+
+  it('the Compute matte button reaches the registered preview; setMatteCompute publishes a state only when it changed', () => {
+    expect(computeMatte()).toBe(false);
+    let pressed = 0;
+    registerMatteCompute(() => pressed++);
+    expect(computeMatte()).toBe(true);
+    expect(pressed).toBe(1);
+    registerMatteCompute(null);
+    expect(computeMatte()).toBe(false);
+    const before = matte.compute;
+    setMatteCompute({ ...NO_COMPUTE });
+    expect(matte.compute).toBe(before); // same values: the object is kept (no spurious updates)
+    setMatteCompute({ state: 'running', done: 24, total: 45, device: 'GPU', pending: 'running' });
+    expect(matte.compute).toEqual({ state: 'running', done: 24, total: 45, device: 'GPU', pending: 'running' });
+    setMatteCompute({ state: 'computed', done: 0, total: 0, device: '', pending: '' });
+    expect(matte.compute.state).toBe('computed');
+  });
+
+  it('matteMemo (5d) records what the server said about a memo per key; an empty key is ignored; resetMatte forgets it; the matte store is untouched', () => {
+    expect(matteMemoState('k')).toBe('unknown');
+    expect(matteMemoState('')).toBe('unknown');
+    noteMatteMemo('', 'computed');
+    expect(matteMemo.known).toEqual({});
+    noteMatteMemo('k', 'idle');
+    expect(matteMemoState('k')).toBe('idle');
+    noteMatteMemo('k', 'computed');
+    expect(matteMemoState('k')).toBe('computed');
+    noteMatteMemo('j', 'idle');
+    expect(matteMemo.known).toEqual({ k: 'computed', j: 'idle' });
+    expect(matte.compute.state).toBe('none');
+    expect(matte.loaded).toBe(false);
+    resetMatte();
+    expect(matteMemo.known).toEqual({});
+    expect(matteMemoState('k')).toBe('unknown');
   });
 });

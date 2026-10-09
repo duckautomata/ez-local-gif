@@ -111,12 +111,15 @@
     {/if}
   </OpCard>
 
-  <!-- No preview in batch: the Background card's Colour mode takes typed hex only (no eyedropper); AI and Screen are as in the editor. -->
+  <!-- No preview in batch: the Background card's Colour mode (and the AI mode's Keep colours) take typed hex only (no eyedropper);
+       the AI controls are as in the editor minus Compute matte (every row's render runs its pass) and the guided model (it needs
+       the preview to select the subject); Screen is unchanged. -->
   <BackgroundCard picker={false} />
   <FeatherCard />
   <p class="hint eyedrop">
     In batch there is no preview to pick a colour from — type the hex values in the Background card’s Colour mode instead, or
-    use its AI mode (every row gets its own matte, computed one row at a time).
+    use its AI mode (every row gets its own matte, computed one row at a time when it renders; the guided model needs the
+    editor).
   </p>
 </div>
 

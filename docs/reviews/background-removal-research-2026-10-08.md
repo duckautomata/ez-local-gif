@@ -7,6 +7,8 @@ workstation (Windows 11, Ryzen 7 7800X3D 8C/16T, RTX 5080 16 GB, driver 616.92, 
 9.0.1, Python 3.12, onnxruntime-gpu 1.30.0) on 2026-10-08, or read from primary sources (filter source files, model
 cards, LICENSE files, release pages). The scripts are in [`background-removal-bench/`](background-removal-bench/README.md).
 
+> Continued in [background-removal-stabilise-and-guided-2026-10-09.md](background-removal-stabilise-and-guided-2026-10-09.md): frame-pairing check, temporal stabilisation of matte sequences, and the SAM 2.1 guided-segmentation prototype behind Phase 5c.
+
 ## 1. Verdict in five lines
 
 1. **AI matting works on this content.** On a ground-truth corpus made from the user's own illustrated character,

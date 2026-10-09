@@ -28,11 +28,17 @@ package store
 //     older than the grace is pruned;
 //   - the size pass evicts mattes last (results, then blobs, then mattes,
 //     oldest first): a matte is kilobytes to a few MB and the most expensive
-//     thing on the disk to regenerate.
+//     thing on the disk to regenerate;
+//   - (Phase 5c, matte_5c.go) a derived sequence under a clip dir
+//     (stab-<mode>/, gated-<edge>-<edgeKey>-r<r>/) is part of the clip: counted,
+//     swept and protected with it; a derive's <name>.tmp sibling is in
+//     progress while young (and so is the clip) and junk after
+//     inProgressGrace, removed on its own.
 //
 // Protect is what keeps a dir a render or preview is reading out of the
 // sweeper's hands meanwhile: every delete path of Sweep — results and blobs
-// included — skips a protected path or anything under one.
+// included — skips a protected path, anything under one, and anything a
+// protected path lies under (removing the parent would remove it).
 
 import (
 	"context"
@@ -133,12 +139,13 @@ func (s *Store) TouchMatteFrame(path string) error {
 }
 
 // Protect marks dir (an absolute path under Root, e.g. a MatteDir) as in use:
-// the sweeper never deletes a protected dir or anything under it until the
-// returned release func has been called as many times as Protect was for
-// that dir (a render protects its matte dir from the master render to the
-// end of the job, a preview for the duration of its ffmpeg run). release is
-// idempotent. The set is in-memory only — a restart clears it, which is
-// fine: nothing is reading then.
+// the sweeper never deletes a protected dir, anything under it, or any dir
+// above it (which would take it along — a Protect of a derived dir keeps
+// its clip dir) until the returned release func has been called as many
+// times as Protect was for that dir (a render protects its matte dir from
+// the master render to the end of the job, a preview for the duration of
+// its ffmpeg run). release is idempotent. The set is in-memory only — a
+// restart clears it, which is fine: nothing is reading then.
 //
 // Protect before reading what the dir holds (the manifest, a result's
 // files): the sweeper checks the set right before each delete, so a dir
@@ -166,16 +173,19 @@ func (s *Store) Protect(dir string) (release func()) {
 	}
 }
 
-// isProtected reports whether path, or any directory above it, is currently
-// protected (Protect). Every delete path of Sweep consults it right before
-// removing something. Both sides are cleaned absolute paths, so a plain
-// prefix test (with the separator) is the containment check.
+// isProtected reports whether removing path would remove something held by
+// Protect: path itself, a directory above it, or (Phase 5c) a protected
+// path under it — a derived dir's hold keeps its clip dir. Every delete
+// path of Sweep consults it right before removing something. Both sides
+// are cleaned absolute paths, so a plain prefix test (with the separator)
+// is the containment check either way.
 func (s *Store) isProtected(path string) bool {
 	path = filepath.Clean(path)
+	sep := string(filepath.Separator)
 	s.protectMu.Lock()
 	defer s.protectMu.Unlock()
 	for p := range s.protected {
-		if path == p || strings.HasPrefix(path, p+string(filepath.Separator)) {
+		if path == p || strings.HasPrefix(path, p+sep) || strings.HasPrefix(p, path+sep) {
 			return true
 		}
 	}
@@ -197,9 +207,10 @@ func (s *Store) anyProtected(paths []string) bool {
 type matteKind uint8
 
 const (
-	matteClip  matteKind = iota // <mattes>/<key>/: a memoised clip sequence
-	matteTmp                    // <mattes>/.tmp-*: a pass in progress, or abandoned
-	matteFrame                  // <mattes>/frames/…/<sha>.png: one frames-store file (or a temp beside one)
+	matteClip       matteKind = iota // <mattes>/<key>/: a memoised clip sequence (its derived dirs included)
+	matteTmp                         // <mattes>/.tmp-*: a pass in progress, or abandoned
+	matteFrame                       // <mattes>/frames/…/<sha>.png: one frames-store file (or a temp beside one)
+	matteDerivedTmp                  // <mattes>/<key>/<name>.tmp: a derive in progress, or abandoned (Phase 5c)
 )
 
 // matteEntry is one sweepable item of the mattes class.
@@ -209,7 +220,7 @@ type matteEntry struct {
 	mtime      time.Time
 	size       int64
 	src        string // clip: the manifest's source blob hash ("" when unreadable)
-	inProgress bool   // younger than inProgressGrace: a tmp dir, a clip without a readable manifest, a frames temp
+	inProgress bool   // younger than inProgressGrace: a tmp dir, a clip without a readable manifest, a frames temp, a derive temp (and its clip)
 	junk       bool   // the same kinds, older than inProgressGrace: removed whatever the TTL says
 }
 
@@ -248,6 +259,8 @@ func (s *Store) listMattes(now time.Time) ([]matteEntry, error) {
 			continue
 		}
 		m := matteEntry{path: dir}
+		var derivedTmps []matteEntry
+		sized := false
 		if strings.HasPrefix(name, matteTmpPrefix) {
 			m.kind = matteTmp
 			// A running pass keeps adding PNGs: age by the newest entry.
@@ -262,6 +275,13 @@ func (s *Store) listMattes(now time.Time) ([]matteEntry, error) {
 				if mst, err := os.Stat(manifestPath); err == nil && mst.ModTime().After(m.mtime) {
 					m.mtime = mst.ModTime()
 				}
+				// Phase 5c: a derive's temp dirs are entries of their own
+				// (their size off the clip's); a live one makes the clip
+				// in progress, so neither pass pulls the memo from under
+				// the derive.
+				var tmpBytes int64
+				derivedTmps, tmpBytes, m.inProgress = s.listMatteDerivedTmps(dir, now)
+				m.size, sized = dirSize(dir)-tmpBytes, true
 			} else {
 				// Never a memo (jobs renames a complete dir into place and
 				// drops one whose manifest it cannot read): the results
@@ -270,8 +290,11 @@ func (s *Store) listMattes(now time.Time) ([]matteEntry, error) {
 				m.flagProgress(now)
 			}
 		}
-		m.size = dirSize(dir)
+		if !sized {
+			m.size = dirSize(dir)
+		}
 		out = append(out, m)
+		out = append(out, derivedTmps...)
 	}
 	return out, nil
 }
@@ -342,16 +365,17 @@ func (s *Store) sweepMattesAge(ctx context.Context, now time.Time, ttl time.Dura
 
 // sweepMattesSize is the size pass of the mattes class, run after the
 // results and blobs passes. Clips whose source blob the blob pass just
-// evicted go first whatever the cap says (dead weight, as in the age pass);
-// then, while still over the cap, the oldest sweepable entry goes. total is
-// kept current.
+// evicted go first whatever the cap says (dead weight, as in the age pass —
+// and as there, not while a derive is in progress under the clip); then,
+// while still over the cap, the oldest sweepable entry goes. total is kept
+// current.
 func (s *Store) sweepMattesSize(ctx context.Context, mattes []matteEntry, total *int64, maxBytes int64, evictedBlobs map[string]bool, note func(error)) error {
 	var live []matteEntry
 	for _, m := range mattes {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if m.kind == matteClip && evictedBlobs[m.src] && !s.isProtected(m.path) {
+		if m.kind == matteClip && evictedBlobs[m.src] && !m.inProgress && !s.isProtected(m.path) {
 			note(removeMatte(m))
 			*total -= m.size
 			continue

@@ -21,13 +21,18 @@ package jobs
 //     compiler's dedupe), compiles the matte input plan
 //     (graph.CompileMatteInput: its FPSText keys the memo), keys the memo
 //     (matteClipKey), serves a hit, else refuses up-front from the frame
-//     count and the persisted msPerFrame, defers a still over the eager
-//     bound, and otherwise runs or joins the PASS under
+//     count and the persisted msPerFrame of the EFFECTIVE device (Phase
+//     5c: the preference, matte_5c.go), and otherwise — only for an eager
+//     preview or a render; a plain preview answers MattePendingIdle, or
+//     follows a pass somebody else started — runs or joins the PASS under
 //     m.mt.flight.doDetachedAbandon (one per clip key; cancelled when
 //     nobody has waited for matteAbandonGrace). A preview waits
 //     mattePreviewWait and then answers *ErrMattePending from the pass's
 //     progress; a render waits under the job ctx, mirroring the progress
-//     into the ctx's withMatteProgress listener;
+//     into the ctx's withMatteProgress listener. A tracker request
+//     (the guided model) runs runTrackPass instead, the edge model's own
+//     pass after it, and the gate / stabilise derives follow either
+//     (resolvedMatte.SeqDir);
 //   - runMattePass: waits for the model (loading / downloading are pending
 //     states, missing / unavailable refuse with the sidecar's reason), then
 //     streams enc.MatteSourceArgs (ffrun.RunFrom: read at the consumer's
@@ -99,10 +104,6 @@ const (
 	// matteBatchFrames is the number of distinct frames per POST /v1/matte
 	// (8 × 3 MB rgb24 at 1024², 8 × 786 KB at 512²: one batch in flight).
 	matteBatchFrames = 8
-	// matteEagerSeconds is the estimate above which a STILL does not start
-	// a pass (it answers MattePendingDeferred instead); Play, "Compute now"
-	// and Render (MatteEager / render mode) always start it.
-	matteEagerSeconds = 90.0
 	// matteLoadTimeout bounds how long a pass waits for a model that is
 	// downloading or loading before it fails.
 	matteLoadTimeout = 300 * time.Second
@@ -156,13 +157,11 @@ var (
 )
 
 // Matte pending states (ErrMattePending.State / the 202 body's "state").
+// MattePendingIdle (matte_5c.go) is the fourth: nothing started.
 const (
 	// MattePendingRunning: the pass is streaming frames to the sidecar
 	// (Done / Total / Percent are live).
 	MattePendingRunning = "running"
-	// MattePendingDeferred: the estimate exceeds the eager bound for a still,
-	// so no pass was started; Play, "Compute now" or Render starts it.
-	MattePendingDeferred = "deferred"
 	// MattePendingLoading: the sidecar is creating the model's session.
 	MattePendingLoading = "loading"
 	// MattePendingDownloading: the sidecar is fetching the model's weights
@@ -172,41 +171,65 @@ const (
 
 // ErrMattePending is returned (as *ErrMattePending; use errors.As) by the
 // still and proxy renderers when a recipe's matte is not on disk yet and the
-// pass did not finish within the preview wait: the pass runs (State
-// "running"), was deferred to an explicit request ("deferred"), or waits on
-// the sidecar loading or downloading the model. The server maps it to 202
-// Accepted with these fields; the SPA keeps the picture on stage and
-// re-requests. Renders never see it — they wait under the job ctx with
+// pass did not finish within the preview wait: nothing was started because
+// the request was not eager (State MattePendingIdle — the Compute matte
+// button or Render starts the pass), the pass runs ("running"), or it
+// waits on the sidecar loading or downloading the model. The server maps
+// it to 202 Accepted with these fields; the SPA keeps the picture on stage
+// and re-requests. Renders never see it — they wait under the job ctx with
 // StageMatte progress instead.
 type ErrMattePending struct {
 	State      string // one of the MattePending* constants
+	Phase      string // "" (a per-frame pass) or MattePhaseTracking: the guided model's one-POST track, worded "tracking N frames" while it runs
 	Done       int    // frames matted so far (running)
 	Total      int    // frames the pass will matte (0 = unknown)
 	Percent    int    // 0..100: the pass's progress, or the download's
-	Device     string // "cuda" / "cpu" — the sidecar's device, for the pill text
+	Device     string // "cuda" / "cpu" — the effective device, for the pill text
 	EstimateMS int64  // the pass's estimated total wall time in ms (0 = unknown)
+	Reason     string // idle only (Phase 5d): why nothing can start from here, for the SPA — a mask prompt whose edge matte is not computed ("compute the General matte first …"); "" for the plain idle
 }
 
+// MattePhaseTracking is the ErrMattePending.Phase / matteProgress.Phase of
+// a tracker (guided) pass: the whole clip goes to the sidecar in ONE POST
+// and the masks come back together at its end, so the frame count cannot
+// tick meanwhile — the progress reads "tracking N frames" instead of
+// "0/N" for the length of the request (the 202 body's "phase", the
+// render's StageMatte line and the SPA's pill / Compute button).
+const MattePhaseTracking = "tracking"
+
 // Error renders the pending state the way the SPA's pill does ("AI matte
-// 24/45 · GPU", "AI matte: loading model", …).
+// 24/45 · GPU", "AI matte: tracking 45 frames · GPU", "AI matte: loading
+// model", "AI matte not computed", …).
 func (e *ErrMattePending) Error() string {
 	dev := matteDeviceLabel(e.Device)
 	switch e.State {
-	case MattePendingDeferred:
-		if e.EstimateMS > 0 {
-			return fmt.Sprintf("jobs: AI matte pending: ~%s on %s — compute it with Play or Render", humanSeconds(e.EstimateMS), dev)
+	case MattePendingIdle:
+		if e.Reason != "" {
+			return "jobs: AI matte not computed — " + e.Reason
 		}
-		return fmt.Sprintf("jobs: AI matte pending: deferred on %s — compute it with Play or Render", dev)
+		if e.EstimateMS > 0 {
+			return fmt.Sprintf("jobs: AI matte not computed (~%s on %s) — press Compute matte or Render", humanSeconds(e.EstimateMS), dev)
+		}
+		return fmt.Sprintf("jobs: AI matte not computed on %s — press Compute matte or Render", dev)
 	case MattePendingLoading:
 		return "jobs: AI matte pending: loading model"
 	case MattePendingDownloading:
 		return fmt.Sprintf("jobs: AI matte pending: downloading weights %d %%", e.Percent)
 	default:
+		if e.tracking() {
+			return fmt.Sprintf("jobs: AI matte pending: tracking %d frames · %s", e.Total, dev)
+		}
 		if e.Total > 0 {
 			return fmt.Sprintf("jobs: AI matte pending: %d/%d · %s", e.Done, e.Total, dev)
 		}
 		return fmt.Sprintf("jobs: AI matte pending: %d frames · %s", e.Done, dev)
 	}
+}
+
+// tracking reports a running tracker pass whose masks have not started to
+// arrive (the whole clip is in the one POST): worded "tracking N frames".
+func (e *ErrMattePending) tracking() bool {
+	return e.Phase == MattePhaseTracking && e.Total > 0 && e.Done < e.Total
 }
 
 // matteDeviceLabel is the UI word for a sidecar device ("cuda" → "GPU").
@@ -244,25 +267,33 @@ var ErrMatteUnavailable = errors.New("jobs: the matte service is not available")
 // the 202 pending body carries. Enabled is MatteEnabled(); with the feature
 // off only Enabled, Reason (why), MaxSeconds and MaxFrames are meaningful.
 type MatteStatus struct {
-	Enabled      bool                        `json:"enabled"`
-	Device       string                      `json:"device"`           // "cuda" / "cpu" / "unavailable" / "" (never probed)
-	Reason       string                      `json:"reason,omitempty"` // why the feature or the device is off, for the UI
-	GPU          *matte.GPUInfo              `json:"gpu,omitempty"`
-	DefaultModel string                      `json:"defaultModel"` // the id the UI preselects (the sidecar's MATTE_DEFAULT_MODEL)
-	Models       map[string]MatteModelStatus `json:"models"`       // the models the sidecar offers, by id
-	MaxSeconds   int                         `json:"maxSeconds"`   // Options.MatteMaxSeconds as applied
-	MaxFrames    int                         `json:"maxFrames"`    // Options.MatteMaxFrames as applied
+	Enabled       bool                        `json:"enabled"`
+	Device        string                      `json:"device"`                  // the EFFECTIVE device passes run on (Phase 5c: the preference, else the sidecar's default) — "cuda" / "cpu" / "unavailable" / "" (never probed)
+	Devices       []string                    `json:"devices,omitempty"`       // Phase 5c: every device the sidecar offers ("cuda", "cpu"); the "Run on" select shows only when there are several
+	DefaultDevice string                      `json:"defaultDevice,omitempty"` // Phase 5c: the device a request without a preference runs on (so a client can tell "preference = default" from "no preference")
+	Reason        string                      `json:"reason,omitempty"`        // why the feature or the device is off, for the UI
+	GPU           *matte.GPUInfo              `json:"gpu,omitempty"`
+	DefaultModel  string                      `json:"defaultModel"`            // the id the UI preselects (the sidecar's default for the effective device)
+	DefaultModels map[string]string           `json:"defaultModels,omitempty"` // Phase 5c: the sidecar's default model per device ("cuda" → birefnet-lite, "cpu" → isnet-anime)
+	Models        map[string]MatteModelStatus `json:"models"`                  // the models the sidecar offers, by id
+	MaxSeconds    int                         `json:"maxSeconds"`              // Options.MatteMaxSeconds as applied
+	MaxFrames     int                         `json:"maxFrames"`               // Options.MatteMaxFrames as applied
 }
 
 // MatteModelStatus is one offered model's live state in MatteStatus.Models.
+// The top-level fields mirror the sidecar's DEFAULT device; Devices
+// (Phase 5c) carries each offered device's own state and estimate.
 type MatteModelStatus struct {
-	Label      string  `json:"label"`                // the UI label ("Anime (fast)", "General (precise)")
-	State      string  `json:"state"`                // ready / loading / downloading / missing / unavailable
-	Percent    int     `json:"percent,omitempty"`    // download / load progress for the transient states
-	MsPerFrame float64 `json:"msPerFrame,omitempty"` // the sidecar's measured ms per frame at its default size (0 = unknown)
-	Reason     string  `json:"reason,omitempty"`     // why the model is missing / unavailable
-	Licence    string  `json:"licence,omitempty"`
-	Sizes      []int   `json:"sizes,omitempty"` // the input squares the sidecar accepts for it
+	Label      string                            `json:"label"`                // the UI label ("Anime (fast)", "General (precise)", "Guided (click to select)")
+	Kind       string                            `json:"kind,omitempty"`       // Phase 5c: "segmenter" (per-frame matte) or "tracker" (the guided model); "" = segmenter
+	State      string                            `json:"state"`                // ready / loading / downloading / missing / unavailable
+	Percent    int                               `json:"percent,omitempty"`    // download / load progress for the transient states
+	MsPerFrame float64                           `json:"msPerFrame,omitempty"` // the sidecar's measured ms per frame at its default size (0 = unknown)
+	Reason     string                            `json:"reason,omitempty"`     // why the model is missing / unavailable
+	Licence    string                            `json:"licence,omitempty"`
+	Sizes      []int                             `json:"sizes,omitempty"`   // the input squares the sidecar accepts for it
+	Resident   bool                              `json:"resident"`          // a session is loaded on the default device right now (Phase 5c: "ready" alone means downloaded and self-tested — the first pass adds the model load)
+	Devices    map[string]MatteModelDeviceStatus `json:"devices,omitempty"` // Phase 5c: per offered device (matte_5c.go)
 }
 
 // RuleRenderMatte is the info-level check jobs appends to the primary
@@ -303,12 +334,21 @@ type matteState struct {
 	// body / the render's StageMatte line.
 	progress map[string]matteProgress
 	flight   flight[matte.Manifest]
+
+	// Phase 5c: the device preference (loadMatteSettings / SetMatteDevice;
+	// prefSet tells a persisted "" reset from "never set", when
+	// Options.MatteDevice applies) and the derives in flight, by derived
+	// dir (deriveSequence).
+	pref    string
+	prefSet bool
+	derives flight[string]
 }
 
 // matteProgress is one running pass's state for ErrMattePending and the
 // render job's StageMatte message.
 type matteProgress struct {
-	State      string // MattePending* (never "deferred" here)
+	State      string // MattePending* (never "idle" here)
+	Phase      string // "" or MattePhaseTracking (a tracker pass)
 	Done       int    // frames filed into the clip dir so far
 	Total      int    // frames the pass will produce (0 = unknown)
 	Percent    int    // 0..100 of the pass, or of the download
@@ -319,7 +359,7 @@ type matteProgress struct {
 
 // pending is the progress as the pending error / progress listener sees it.
 func (p matteProgress) pending() ErrMattePending {
-	return ErrMattePending{State: p.State, Done: p.Done, Total: p.Total, Percent: p.Percent, Device: p.Device, EstimateMS: p.EstimateMS}
+	return ErrMattePending{State: p.State, Phase: p.Phase, Done: p.Done, Total: p.Total, Percent: p.Percent, Device: p.Device, EstimateMS: p.EstimateMS}
 }
 
 // initMatte wires the sidecar client and seeds the facts bookkeeping
@@ -354,6 +394,7 @@ func (m *Manager) initMatte() {
 	default:
 		log.Printf("jobs: matte: facts file %s unreadable (%v); the next probe rewrites it", matteFactsPath(m.st), err)
 	}
+	m.loadMatteSettings()
 }
 
 // matteURL is the configured sidecar base URL ("" when none).
@@ -418,10 +459,24 @@ func (m *Manager) MatteStatus() MatteStatus {
 		return st
 	}
 	if p := s.live; p != nil {
-		st.Device = p.Device
 		st.GPU = p.GPU
-		if p.DefaultModel != "" {
-			st.DefaultModel = p.DefaultModel
+		st.Devices = offeredDevices(p)
+		if p.Device == matte.DeviceUnavailable {
+			st.Device = matte.DeviceUnavailable
+		} else {
+			st.DefaultDevice = p.EffectiveDevice("")
+			st.Device = effectiveDevice(p, s.prefLocked(m.opts))
+		}
+		if len(p.DefaultModels) > 0 {
+			st.DefaultModels = make(map[string]string, len(p.DefaultModels))
+			for dev, id := range p.DefaultModels {
+				st.DefaultModels[dev] = id
+			}
+		} else if p.DefaultModel != "" && len(st.Devices) > 0 {
+			st.DefaultModels = map[string]string{st.Devices[0]: p.DefaultModel}
+		}
+		if dm := p.DefaultModelFor(st.Device); dm != "" {
+			st.DefaultModel = dm
 		}
 		for id, ms := range p.Models {
 			st.Models[id] = matteModelStatus(id, ms)
@@ -487,12 +542,29 @@ func matteModelStatus(id string, ms matte.ModelState) MatteModelStatus {
 		Reason:     ms.Reason,
 		Licence:    ms.Licence,
 		Sizes:      ms.Sizes,
+		Resident:   ms.Resident,
 	}
 	if st.Label == "" {
 		st.Label = matteModelLabel(id)
 	}
 	if st.Reason == "" && ms.LastError != "" && (ms.State == matte.StateMissing || ms.State == matte.StateUnavailable) {
 		st.Reason = ms.LastError
+	}
+	// Phase 5c: the kind and the per-device states (a pre-5c sidecar
+	// reports neither; the SPA then reads the top-level fields).
+	st.Kind = ms.Kind
+	if st.Kind == "" && id == recipe.MatteModelSAM2Tiny {
+		st.Kind = matte.KindTracker
+	}
+	if len(ms.Devices) > 0 {
+		st.Devices = make(map[string]MatteModelDeviceStatus, len(ms.Devices))
+		for dev, d := range ms.Devices {
+			ds := MatteModelDeviceStatus{State: d.State, Reason: d.Reason, Precision: d.Precision, Percent: d.Percent, Size: d.Size, MsPerFrame: d.MsPerFrameAt(0), Resident: d.Resident}
+			if ds.Reason == "" && ms.LastError != "" && (d.State == matte.StateMissing || d.State == matte.StateUnavailable) {
+				ds.Reason = ms.LastError
+			}
+			st.Devices[dev] = ds
+		}
 	}
 	return st
 }
@@ -505,6 +577,8 @@ func matteModelLabel(id string) string {
 		return "Anime (fast)"
 	case recipe.MatteModelBiRefNetLite:
 		return "General (precise)"
+	case recipe.MatteModelSAM2Tiny:
+		return "Guided (click to select)"
 	}
 	return id
 }
@@ -791,7 +865,8 @@ func matteProgressFn(ctx context.Context) func(ErrMattePending) {
 }
 
 // matteProgressMessage is the StageMatte message of a progress report: the
-// SPA shows it after the stage label ("AI matte · 24/45 · GPU").
+// SPA shows it after the stage label ("AI matte · 24/45 · GPU"; a tracker
+// pass "AI matte · tracking 45 frames · GPU" until its masks arrive).
 func matteProgressMessage(p ErrMattePending) string {
 	dev := matteDeviceLabel(p.Device)
 	switch p.State {
@@ -799,8 +874,11 @@ func matteProgressMessage(p ErrMattePending) string {
 		return "loading model"
 	case MattePendingDownloading:
 		return fmt.Sprintf("downloading weights %d %%", p.Percent)
-	case MattePendingDeferred:
-		return "starting"
+	case MattePendingIdle:
+		return "not computed"
+	}
+	if p.tracking() {
+		return fmt.Sprintf("tracking %d frames · %s", p.Total, dev)
 	}
 	if p.Total > 0 {
 		return fmt.Sprintf("%d/%d · %s", p.Done, p.Total, dev)
@@ -830,8 +908,8 @@ type matteMode int
 const (
 	// matteModePreview: a still / proxy — wait mattePreviewWait for a running
 	// pass, then answer *ErrMattePending (the server's 202); without
-	// MatteEager(ctx) a pass whose estimate exceeds matteEagerSeconds is not
-	// started (deferred).
+	// MatteEager(ctx) no pass is ever started (Phase 5c: MattePendingIdle
+	// at once, unless one is in flight to follow).
 	matteModePreview matteMode = iota
 	// matteModeRender: a render's pre-stage — wait under the job ctx (the
 	// model's load states bounded by matteLoadTimeout), mirroring the
@@ -844,50 +922,121 @@ const (
 // identity (Model, Size, Precision + the manifest's Weights/Proc). ReqSize
 // is the op's Size as written (0 = the server's default), which the plan's
 // MatteInput.Size repeats: findMatte pairs a plan's matte inputs with their
-// resolution by (Model, ReqSize).
+// resolution by (Model, ReqSize) — and, Phase 5c, findMatteInput by the
+// op's Stabilise / Prompts / Edge as well (the compiler's dedupe key).
+// SeqDir is the directory the plan reads: Dir itself, or a derived
+// sequence under it ("<Dir>/stab-<mode>/", "<Dir>/gated-<edge>-<edgeKey>-r3/",
+// "<Dir>/gated-<edge>-<edgeKey>-r3/stab-<mode>/") when the op asks for one (seqDir).
 type resolvedMatte struct {
 	Model     string // the resolved model id
-	Size      int    // the effective input square
+	Size      int    // the effective input square (0 for a tracker: the manifest's TrackW x TrackH)
 	ReqSize   int    // the op's requested size (0 = the server's default); see findMatte
-	Precision string // fp16 / fp32
+	Precision string // fp16 / fp32 / bf16
 	Dir       string // the memo dir holding %06d.png + matte.json
 	Manifest  *matte.Manifest
 	ClipKey   string // matte.ClipKey — what still/proxy/autocrop keys fold in
+
+	// Phase 5c.
+	Stabilise string // the op's stabilise mode ("" = off): the derived sequence SeqDir names
+	Prompts   string // graph.CanonicalMattePrompts of the op's prompts ("" without): the MatteInput identity
+	ReqEdge   string // the op's Edge as written ("" / "none" / a model id): the MatteInput identity
+	Edge      string // the RESOLVED edge model id of a tracker matte ("" = none, or a segmenter)
+	SeqDir    string // the directory the plan reads ("" = Dir); see seqDir
+	Device    string // the effective device the pass ran / would run on
+	Keep      int    // keep colours of the op (the most of the ops sharing this request), for the info line
+
+	edge *resolvedMatte // the edge model's own resolution (its memo), when Edge is set
+	id   matteIdentity  // the identity resolved from the facts (zero for a literal built by hand)
 }
 
 // identity is the resolved matte's identity (the fields the memo key and
-// MatteParams.Resolved are made of).
+// MatteParams.Resolved are made of): the one resolveMatte recorded, with
+// the manifest's weights / proc, or — for a resolvedMatte built without
+// one — the plain fields.
 func (r *resolvedMatte) identity() matteIdentity {
-	id := matteIdentity{Model: r.Model, Size: r.Size, Precision: r.Precision}
+	id := r.id
+	if id.Model == "" {
+		id = matteIdentity{Model: r.Model, Size: r.Size, Precision: r.Precision}
+	}
 	if r.Manifest != nil {
 		id.Weights, id.Proc = r.Manifest.Weights, r.Manifest.Proc
 	}
 	return id
 }
 
-// matteRequest is one distinct (model, size) a stack asks a matte for.
-// Model is the resolved id (recipe.MatteModelDefault for ""); Size is the
-// op's request (0 = the server's default for its device).
+// seqDir is the directory holding the sequence the plan reads.
+func (r *resolvedMatte) seqDir() string {
+	if r.SeqDir != "" {
+		return r.SeqDir
+	}
+	return r.Dir
+}
+
+// matteRequest is one distinct request a stack asks a matte for — the
+// compiler's dedupe key (model, size, stabilise, canonical prompts, edge as
+// written; graph's matteKey) plus what the pass needs of the op. Model is
+// the resolved id (recipe.MatteModelDefault for ""); Size is the op's
+// request (0 = the server's default for its device).
 type matteRequest struct {
-	Model string
-	Size  int
+	Model     string
+	Size      int
+	Stabilise string // "" / light / strong
+	Prompts   string // graph.CanonicalMattePrompts (the MatteInput identity text)
+	Edge      string // the op's Edge as written
+
+	prompts []recipe.MattePrompt // the op's prompts (a tracker)
+	keep    int                  // keep colours (the info line only; the picture is the graph's)
+}
+
+// same reports whether two requests are one input of the plan (the
+// compiler's dedupe).
+func (r matteRequest) same(o matteRequest) bool {
+	return r.Model == o.Model && r.Size == o.Size && r.Stabilise == o.Stabilise && r.Prompts == o.Prompts && r.Edge == o.Edge
+}
+
+// matteRequestOf is the request of one decoded matte op.
+func matteRequestOf(p recipe.MatteParams) matteRequest {
+	return matteRequest{Model: p.Model, Size: p.Size, Stabilise: p.Stabilise, Prompts: graph.CanonicalMattePrompts(p.Prompts), Edge: p.Edge, prompts: p.Prompts, keep: len(p.Keep)}
 }
 
 // matteIdentity is what the persisted facts say a (model, size) renders
-// with — the fields of recipe.MatteResolved plus the model id and the facts
-// the memo key needs. It is made from /data/mattes/models.json only, never
-// from a live answer, so a memo hit needs no running sidecar.
+// with on the effective device — the fields of recipe.MatteResolved plus
+// the model id and the facts the memo key needs. It is made from
+// /data/mattes/models.json only, never from a live answer, so a memo hit
+// needs no running sidecar. Phase 5c: Device is where the pass runs (never
+// part of a key — Size / Precision, which differ per device, are), Kind
+// tells a tracker, whose identity adds the tracking size and the canonical
+// prompts (matte.TrackPrompts.Canonical) and, with an edge, the edge
+// model's own identity.
 type matteIdentity struct {
-	Model     string
-	Size      int // the effective input square
-	Precision string
-	Weights   string
-	Proc      string
+	Model      string
+	Size       int // the effective input square (0 for a tracker)
+	Precision  string
+	Weights    string
+	Proc       string
+	Kind       string  // matte.KindSegmenter ("" too) / matte.KindTracker
+	Device     string  // the effective device
+	MsPerFrame float64 // the device's measured rate at Size (0 = unknown)
+
+	// Tracker only.
+	TrackW, TrackH int            // enc.TrackSize of the plan's frame (set once the plan is known)
+	Prompts        string         // matte.TrackPrompts.Canonical() of the op's prompts
+	Edge           *matteIdentity // the edge model (nil = none)
 }
+
+// tracker reports whether the identity is a tracker's (the guided model).
+func (id matteIdentity) tracker() bool { return id.Kind == matte.KindTracker }
 
 // resolved is the recipe.MatteResolved form of the identity.
 func (id matteIdentity) resolved() recipe.MatteResolved {
-	return recipe.MatteResolved{Weights: id.Weights, Proc: id.Proc, Size: id.Size, Precision: id.Precision}
+	r := recipe.MatteResolved{Weights: id.Weights, Proc: id.Proc, Size: id.Size, Precision: id.Precision}
+	if id.tracker() {
+		r.Tracker = id.Weights
+		if id.Edge != nil {
+			r.Edge, r.EdgeWeights, r.EdgeProc = id.Edge.Model, id.Edge.Weights, id.Edge.Proc
+		}
+	}
+	return r
 }
 
 // hasMatteOp reports whether ops hold a matte op.
@@ -916,9 +1065,10 @@ func decodeMatteOp(idx int, op recipe.Op) (recipe.MatteParams, error) {
 	return p, nil
 }
 
-// matteRequests returns the distinct (model, size) requests of ops in order
-// of first use — the same dedupe the compiler applies (one ExtraInput per
-// distinct model/size); nil when the stack has no matte op.
+// matteRequests returns the distinct requests of ops in order of first use
+// — the same dedupe the compiler applies (one ExtraInput per distinct
+// model / size / stabilise / prompts / edge; matteRequest.same); nil when
+// the stack has no matte op. Ops sharing a request pool their keep count.
 func matteRequests(ops []recipe.Op) ([]matteRequest, error) {
 	var reqs []matteRequest
 	for i, op := range ops {
@@ -929,44 +1079,149 @@ func matteRequests(ops []recipe.Op) ([]matteRequest, error) {
 		if err != nil {
 			return nil, err
 		}
-		r := matteRequest{Model: p.Model, Size: p.Size}
-		if !slices.Contains(reqs, r) {
-			reqs = append(reqs, r)
+		r := matteRequestOf(p)
+		if j := slices.IndexFunc(reqs, func(q matteRequest) bool { return q.same(r) }); j >= 0 {
+			reqs[j].keep = max(reqs[j].keep, r.keep)
+			continue
 		}
+		reqs = append(reqs, r)
 	}
 	return reqs, nil
 }
 
-// identityFor resolves one request against the facts: the model must be
-// one the sidecar offers (ErrInvalidRecipe otherwise), a requested size one
-// it accepts, and the facts must carry the weights digest, the processing
-// version and a default size (an answer without them is ErrMatteUnavailable
-// — nothing can be keyed from it).
-func identityFor(f *matte.Facts, req matteRequest) (matteIdentity, error) {
+// identityFor resolves one request against the facts on device (the
+// effective device): the model must be one the sidecar offers
+// (ErrInvalidRecipe otherwise) and offers ON that device, a requested size
+// one the device accepts, and the facts must carry the weights digest, the
+// processing version and a default size (an answer without them is
+// ErrMatteUnavailable — nothing can be keyed from it). Size, Precision and
+// MsPerFrame are the device's own (matte.ModelState.On: a pre-5c sidecar
+// reports its one device's through the mirrored fields). A tracker
+// (matte.KindTracker, or the guided model id) takes no size — its Size is
+// 0 and the tracking size joins the identity once the plan is known.
+func identityFor(f *matte.Facts, req matteRequest, device string) (matteIdentity, error) {
 	ms, ok := f.Model(req.Model)
 	if !ok {
 		return matteIdentity{}, fmt.Errorf("%w: the matte service does not offer model %q (offered: %s)", ErrInvalidRecipe, req.Model, offeredModels(&f.Ping))
 	}
-	if req.Size != 0 && !ms.HasSize(req.Size) {
-		return matteIdentity{}, fmt.Errorf("%w: model %s does not accept input size %d (sizes: %v)", ErrInvalidRecipe, req.Model, req.Size, ms.Sizes)
-	}
-	size := ms.EffectiveSize(req.Size)
-	if size <= 0 {
-		return matteIdentity{}, fmt.Errorf("%w: its last answer reports no input size for model %s", ErrMatteUnavailable, req.Model)
+	d, ok := ms.On(device)
+	if !ok {
+		return matteIdentity{}, fmt.Errorf("%w: the matte service does not offer model %s on %s (offered on: %s) — pick another model or device", ErrInvalidRecipe, req.Model, matteDeviceLabel(device), modelDevices(ms))
 	}
 	if ms.Weights == "" || f.ProcessingVersion == "" {
 		return matteIdentity{}, fmt.Errorf("%w: its last answer carries no weights digest or processing version for model %s", ErrMatteUnavailable, req.Model)
 	}
-	return matteIdentity{Model: req.Model, Size: size, Precision: ms.Precision, Weights: ms.Weights, Proc: f.ProcessingVersion}, nil
+	id := matteIdentity{Model: req.Model, Precision: d.Precision, Weights: ms.Weights, Proc: f.ProcessingVersion, Kind: ms.Kind, Device: device}
+	if ms.IsTracker() || req.Model == recipe.MatteModelSAM2Tiny {
+		id.Kind = matte.KindTracker
+		if req.Size != 0 {
+			return matteIdentity{}, fmt.Errorf("%w: the guided model %s takes no input size (got %d): it tracks the clip at its own size", ErrInvalidRecipe, req.Model, req.Size)
+		}
+		id.MsPerFrame = d.MsPerFrameAt(0)
+		return id, nil
+	}
+	if req.Size != 0 && !d.HasSize(req.Size) {
+		return matteIdentity{}, fmt.Errorf("%w: model %s does not accept input size %d on %s (sizes: %v)", ErrInvalidRecipe, req.Model, req.Size, matteDeviceLabel(device), d.Sizes)
+	}
+	size := d.EffectiveSize(req.Size)
+	if size <= 0 {
+		return matteIdentity{}, fmt.Errorf("%w: its last answer reports no input size for model %s on %s", ErrMatteUnavailable, req.Model, matteDeviceLabel(device))
+	}
+	id.Size, id.MsPerFrame = size, d.MsPerFrameAt(size)
+	return id, nil
+}
+
+// modelDevices lists the devices a model's facts report it on ("its one
+// device" for a pre-5c answer).
+func modelDevices(ms matte.ModelState) string {
+	if len(ms.Devices) == 0 {
+		return "its one device"
+	}
+	devs := make([]string, 0, len(ms.Devices))
+	for dev := range ms.Devices {
+		devs = append(devs, dev)
+	}
+	sort.Strings(devs)
+	return strings.Join(devs, ", ")
+}
+
+// identityOf is identityFor plus the Phase 5c guided-model resolution: a
+// tracker's identity carries the canonical prompts and the edge model's
+// identity (edgeIdentityFor), and must have prompts; prompts or an edge on
+// a per-frame model are the client's mistake (the compiler refuses them
+// too — this is the check before any pass, which runs before compile).
+func identityOf(f *matte.Facts, device string, req matteRequest) (matteIdentity, error) {
+	id, err := identityFor(f, req, device)
+	if err != nil {
+		return id, err
+	}
+	if !id.tracker() {
+		if req.Edge != "" || len(req.prompts) > 0 {
+			return id, fmt.Errorf("%w: prompts and edge need the guided model %q (got model %q)", ErrInvalidRecipe, recipe.MatteModelSAM2Tiny, req.Model)
+		}
+		return id, nil
+	}
+	if len(req.prompts) == 0 {
+		return id, fmt.Errorf("%w: the guided model %q needs at least one prompt (a box or a positive point)", ErrInvalidRecipe, req.Model)
+	}
+	tp := trackPromptsOf(req.prompts)
+	if err := tp.Validate(); err != nil {
+		return id, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
+	}
+	id.Prompts = tp.Canonical()
+	edge, err := edgeIdentityFor(f, device, req.Edge)
+	if err != nil {
+		return id, err
+	}
+	if _, masked := maskPromptFrame(req.prompts); masked && edge == nil {
+		// Phase 5d: the mask is the edge model's matte — no edge, no mask.
+		return id, errMaskPromptNoEdge()
+	}
+	id.Edge = edge
+	return id, nil
+}
+
+// edgeIdentityFor resolves a tracker op's Edge on device: nil for
+// recipe.MatteEdgeNone; else the named per-frame model, or — for "" — the
+// sidecar's default model of the device (Ping.DefaultModelFor; the
+// recipe's default when that is unknown or is itself a tracker), as a
+// plain segmenter identity at its default size. A tracker named as the
+// edge is the client's mistake.
+func edgeIdentityFor(f *matte.Facts, device, edge string) (*matteIdentity, error) {
+	if edge == recipe.MatteEdgeNone {
+		return nil, nil
+	}
+	model := edge
+	if model == "" {
+		model = f.DefaultModelFor(device)
+		if ms, ok := f.Model(model); model == "" || !ok || ms.IsTracker() || model == recipe.MatteModelSAM2Tiny {
+			model = recipe.MatteModelDefault
+		}
+	}
+	ms, ok := f.Model(model)
+	if !ok {
+		return nil, fmt.Errorf("%w: the matte service does not offer edge model %q (offered: %s)", ErrInvalidRecipe, model, offeredModels(&f.Ping))
+	}
+	if ms.IsTracker() || model == recipe.MatteModelSAM2Tiny {
+		return nil, fmt.Errorf("%w: the edge model must be a per-frame model or %q, not the tracker %q", ErrInvalidRecipe, recipe.MatteEdgeNone, model)
+	}
+	id, err := identityFor(f, matteRequest{Model: model}, device)
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 
 // matteClipKey is the memo key of src's matte for the temporal ops of ops at
 // the plan rate fps (graph.FPSText(Plan.FPS)) under identity id (spec §4.2):
 // matte.ClipKey over the stack's temporal ops, the probe facts the prefix
 // compiles from under the current store.InfoVersion, the rate and the
-// identity. Neither the device nor PipelineVersion is part of it.
+// identity — for a tracker the canonical prompts and the tracking size as
+// well (the key's track line). Neither the device nor PipelineVersion is
+// part of it; nor is the edge model (its memo has a key of its own, the
+// gated sequence is a derived dir under this one).
 func matteClipKey(src *store.Blob, ops []recipe.Op, fps string, id matteIdentity) string {
-	return matte.ClipKey(matte.ClipKeyParts{
+	parts := matte.ClipKeyParts{
 		Src:         src.Hash,
 		Temporal:    matte.TemporalOps(ops),
 		Probe:       *src.Info,
@@ -977,7 +1232,11 @@ func matteClipKey(src *store.Blob, ops []recipe.Op, fps string, id matteIdentity
 		Precision:   id.Precision,
 		Weights:     id.Weights,
 		Proc:        id.Proc,
-	})
+	}
+	if id.tracker() {
+		parts.Prompts, parts.TrackW, parts.TrackH = id.Prompts, id.TrackW, id.TrackH
+	}
+	return matte.ClipKey(parts)
 }
 
 // readMatteMemo reads the memo of key under Protect (so the sweeper cannot
@@ -1030,26 +1289,32 @@ var errMatteRekey = errors.New("jobs: matte: the sidecar's identity changed; re-
 // resolveMattes resolves every matte op of ops for the main source src at
 // the rate the plan for out runs at: nil, nil when ops hold no matte op (no
 // facts read, no file touched); otherwise one resolvedMatte per distinct
-// (model, size) request in order of first use (the compiler's dedupe), each
-// pointing at a COMPLETE memo on disk. Memo hits are served from the
-// persisted facts alone (no live sidecar) and touched; a miss runs the
-// pass: mode mattePreview waits mattePreviewWait and then returns
-// *ErrMattePending (State running / loading / downloading, or deferred
-// when a still's estimate exceeds matteEagerSeconds and MatteEager(ctx) is
-// not set — Play / "Compute now" set it); mode matteRender waits under
-// ctx and reports progress through matteProgressFn(ctx) when the render
-// installed a listener. out is the recipe's Output (previews pass their
-// stillOutput subset: the plan's fps follows Output.Format / Output.FPS
-// exactly as the render's).
+// request (model, size, stabilise, prompts, edge) in order of first use
+// (the compiler's dedupe), each pointing at a COMPLETE memo on disk — and,
+// Phase 5c, at the derived sequence the op asks for (SeqDir: stabilised
+// and / or gated with the edge model, derived here on any request, eager
+// or not — a cheap ffmpeg pass, no model run). Memo hits are served from
+// the persisted facts alone (no live sidecar) and touched; a miss in mode
+// mattePreview WITHOUT MatteEager(ctx) starts nothing and returns
+// *ErrMattePending State idle at once — unless a pass for the clip is in
+// flight (an eager preview's or a render's), which it follows for
+// mattePreviewWait and then reports (running / loading / downloading); an
+// eager preview (the Compute matte button) runs or joins the pass the
+// same way; mode matteRender waits under ctx and reports progress through
+// matteProgressFn(ctx) when the render installed a listener. out is the
+// recipe's Output (previews pass their stillOutput subset: the plan's fps
+// follows Output.Format / Output.FPS exactly as the render's).
 //
 // Errors: ErrInvalidRecipe for a malformed matte op, a model or size the
-// facts do not cover and the up-front refusal over Options.MatteMaxFrames /
-// MatteMaxSeconds (frames × (msPerFrame + 2 ms); floats and comparisons
-// only — nothing allocates from Plan.Frames); an error wrapping
-// ErrMatteUnavailable when no facts exist yet or no sidecar can run the
-// pass; the pass's own plain error when it fails; ctx.Err() when the
-// caller's ctx ends. Callers that run ffmpeg over the result protect the
-// dirs meanwhile (protectMattes).
+// facts do not cover (on the effective device), prompts / an edge on a
+// per-frame model, a prompt on a frame past the clip, and the up-front
+// refusal over Options.MatteMaxFrames / MatteMaxSeconds (frames ×
+// (msPerFrame + 2 ms), a tracker's with matteTrackEstimateFactor on top)
+// or the tracker's body cap (floats and comparisons only — nothing
+// allocates from Plan.Frames); an error wrapping ErrMatteUnavailable when
+// no facts exist yet or no sidecar can run the pass; the pass's own plain
+// error when it fails; ctx.Err() when the caller's ctx ends. Callers that
+// run ffmpeg over the result protect the dirs meanwhile (protectMattes).
 func (m *Manager) resolveMattes(ctx context.Context, src *store.Blob, ops []recipe.Op, out recipe.Output, mode matteMode) ([]resolvedMatte, error) {
 	reqs, err := matteRequests(ops)
 	if err != nil || len(reqs) == 0 {
@@ -1090,39 +1355,150 @@ func (m *Manager) resolveMattes(ctx context.Context, src *store.Blob, ops []reci
 	return nil, fmt.Errorf("%w: the matte service changed its weights twice during one request", ErrMatteUnavailable)
 }
 
-// resolveMatte resolves one request (see resolveMattes).
+// resolveMatte resolves one request (see resolveMattes): the identity on
+// the effective device, the memo hit or the pass (matteMiss), then — Phase
+// 5c — for a tracker with an edge the edge model's own resolution (a plain
+// segmenter request on the same clip: its memo, or its pass under the same
+// policy) and the gate derive, and for any op with a stabilise mode the
+// stabilise derive on top; SeqDir names what the plan reads. Phase 5d: a
+// tracker request with a MASK prompt (recipe.MattePrompt.MaskFrom) resolves
+// the edge FIRST — the mask is the edge memo's matte of that frame scaled
+// to the tracking size (resolveMaskPrompt) and its digest is part of the
+// tracker's key — and the gate reuses that resolution.
 func (m *Manager) resolveMatte(ctx context.Context, src *store.Blob, ops []recipe.Op, plan *graph.Plan, fps string, req matteRequest, facts *matte.Facts, mode matteMode) (resolvedMatte, error) {
-	id, err := identityFor(facts, req)
+	device := m.matteEffectiveDevice(&facts.Ping)
+	id, err := identityOf(facts, device, req)
 	if err != nil {
 		return resolvedMatte{}, err
 	}
+	var (
+		edge *resolvedMatte // the edge model's resolution, once made (the mask prompt, then the gate)
+		mask []byte         // the mask prompt's PNG at the tracking size (nil without one)
+	)
+	if id.tracker() {
+		id.TrackW, id.TrackH = enc.TrackSize(plan.Width, plan.Height)
+		if id.TrackW < 1 || id.TrackH < 1 {
+			return resolvedMatte{}, fmt.Errorf("%w: the source has no frame size", ErrInvalidRecipe)
+		}
+		if frame, has := maskPromptFrame(req.prompts); has {
+			if edge, mask, err = m.resolveMaskPrompt(ctx, src, ops, plan, fps, id, frame, req.prompts, facts, mode); err != nil {
+				return resolvedMatte{}, err
+			}
+			id.Prompts = withMaskDigest(trackPromptsOf(req.prompts), maskDigestOf(mask)).Canonical()
+		}
+	}
 	key := matteClipKey(src, ops, fps, id)
-	rm := resolvedMatte{Model: id.Model, Size: id.Size, ReqSize: req.Size, Precision: id.Precision, Dir: m.st.MatteDir(key), ClipKey: key}
-	if man, ok := m.matteMemoHit(key, fps); ok {
-		rm.Manifest = man
-		return rm, nil
+	rm := resolvedMatte{
+		Model: id.Model, Size: id.Size, ReqSize: req.Size, Precision: id.Precision, Dir: m.st.MatteDir(key), ClipKey: key,
+		Stabilise: req.Stabilise, Prompts: req.Prompts, ReqEdge: req.Edge, Device: device, Keep: req.keep, id: id,
 	}
-	if m.mt.client == nil {
-		return resolvedMatte{}, fmt.Errorf("%w: no AI matte on disk for this clip and AI mattes are off on this server (EZLG_MATTE_URL is empty)", ErrMatteUnavailable)
+	if id.Edge != nil {
+		rm.Edge = id.Edge.Model
 	}
-	ms, _ := facts.Model(id.Model)
-	w := matteWork{
-		src: src, plan: plan, fps: fps, id: id, dir: rm.Dir,
-		frames: plan.Frames, device: facts.Device,
+	man, ok := m.matteMemoHit(key, fps)
+	if !ok {
+		if man, err = m.matteMiss(ctx, src, plan, fps, id, key, req.prompts, mask, mode); err != nil {
+			return resolvedMatte{}, err
+		}
 	}
-	w.estMS = matteEstimateMS(w.frames, ms.MsPerFrameAt(id.Size))
-	if err := m.matteRefusal(w.frames, w.estMS, w.device, id.Model); err != nil {
+	rm.Manifest = man
+	// The memo stays protected from here through the derives (the hit's own
+	// Protect ended with the manifest read): a sweep in between would turn a
+	// derive into an opaque ffmpeg failure instead of a "retry".
+	release := m.st.Protect(rm.Dir)
+	defer release()
+	if err := matteSequenceGone(rm.Dir); err != nil {
 		return resolvedMatte{}, err
 	}
-	if mode == matteModePreview && !MatteEager(ctx) && float64(w.estMS)/1000 > matteEagerSeconds && !m.mt.flight.inFlight(key) {
-		return resolvedMatte{}, &ErrMattePending{State: MattePendingDeferred, Total: w.frames, Device: w.device, EstimateMS: w.estMS}
+	seq := rm.Dir
+	if id.Edge != nil {
+		if edge == nil {
+			e, err := m.resolveMatte(ctx, src, ops, plan, fps, matteRequest{Model: id.Edge.Model}, facts, mode)
+			if err != nil {
+				return resolvedMatte{}, err
+			}
+			edge = &e
+		}
+		if edge.Manifest.Frames != man.Frames {
+			return resolvedMatte{}, fmt.Errorf("AI matte: the edge model's memo has %d frames, the tracker's %d — report this with the source", edge.Manifest.Frames, man.Frames)
+		}
+		rm.edge = edge
+		if seq, err = m.deriveGated(ctx, rm.Dir, edge.Dir, id.Edge.Model, edge.ClipKey, man.Frames); err != nil {
+			return resolvedMatte{}, err
+		}
+	}
+	if req.Stabilise != "" {
+		if seq, err = m.deriveStabilised(ctx, seq, req.Stabilise, man.Frames, rm.Dir); err != nil {
+			return resolvedMatte{}, err
+		}
+	}
+	rm.SeqDir = seq
+	return rm, nil
+}
+
+// matteMiss handles a request whose memo is not on disk: the work's
+// estimate and the up-front refusals (the caps; a tracker's body cap and
+// prompt frames too), then the Phase 5c start policy — a plain preview
+// (mode matteModePreview without MatteEager) follows a pass in flight
+// (joinMatteFlight) or answers MattePendingIdle, never starting one; an
+// eager preview or a render runs or joins the pass (runMatteFlight). mask
+// is a tracker's mask prompt PNG at the tracking size (Phase 5d; nil
+// without one — resolveMatte derived it and keyed id.Prompts with its
+// digest).
+func (m *Manager) matteMiss(ctx context.Context, src *store.Blob, plan *graph.Plan, fps string, id matteIdentity, key string, prompts []recipe.MattePrompt, mask []byte, mode matteMode) (*matte.Manifest, error) {
+	if m.mt.client == nil {
+		return nil, fmt.Errorf("%w: no AI matte on disk for this clip and AI mattes are off on this server (EZLG_MATTE_URL is empty)", ErrMatteUnavailable)
+	}
+	w := matteWork{src: src, plan: plan, fps: fps, id: id, dir: m.st.MatteDir(key), frames: plan.Frames, device: id.Device, prompts: prompts, mask: mask}
+	if id.tracker() {
+		w.estMS = matteTrackEstimateMS(w.frames, id.MsPerFrame)
+		// The belt: a mask-prompted request ran these before its edge pass
+		// (resolveMaskPrompt), every other tracker request runs them here.
+		if err := m.trackRefusals(w.frames, id, prompts); err != nil {
+			return nil, err
+		}
+	} else {
+		w.estMS = matteEstimateMS(w.frames, id.MsPerFrame)
+		if err := m.matteRefusal(w.frames, w.estMS, w.device, id.Model); err != nil {
+			return nil, err
+		}
+	}
+	if mode == matteModePreview && !MatteEager(ctx) {
+		man, joined, err := m.joinMatteFlight(ctx, key, w)
+		if !joined {
+			return nil, &ErrMattePending{State: MattePendingIdle, Total: w.frames, Device: w.device, EstimateMS: w.estMS}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &man, nil
 	}
 	man, err := m.runMatteFlight(ctx, mode, key, w)
 	if err != nil {
-		return resolvedMatte{}, err
+		return nil, err
 	}
-	rm.Manifest = &man
-	return rm, nil
+	return &man, nil
+}
+
+// joinMatteFlight is a plain preview's way of following a pass: it joins
+// the pass for key when one is in flight (flight.join: a waiter for
+// mattePreviewWait, then *ErrMattePending from the pass's progress, like
+// runMatteFlight's preview wait) and reports joined false — nothing to
+// follow, nothing started — otherwise, including when the run it joined
+// ended cancelled by the abandon timer.
+func (m *Manager) joinMatteFlight(ctx context.Context, key string, w matteWork) (man matte.Manifest, joined bool, err error) {
+	wctx, cancel := context.WithTimeout(ctx, mattePreviewWait)
+	defer cancel()
+	man, joined, err = m.mt.flight.join(wctx, key, matteAbandonGrace)
+	switch {
+	case !joined, err == nil:
+		return man, joined, err
+	case wctx.Err() != nil && ctx.Err() == nil:
+		return matte.Manifest{}, true, m.mattePendingFor(key, w)
+	case isContextError(err) && ctx.Err() == nil:
+		return matte.Manifest{}, false, nil
+	}
+	return matte.Manifest{}, true, err
 }
 
 // matteEstimateMS is the pass's estimated wall time: frames × (msPerFrame +
@@ -1195,6 +1571,9 @@ func (m *Manager) runMatteFlight(ctx context.Context, mode matteMode, key string
 		if got, ok := m.matteMemoHit(key, w.fps); ok {
 			return *got, nil // a previous leader finished while we waited
 		}
+		if w.id.tracker() {
+			return m.runTrackPass(pctx, key, w)
+		}
 		return m.runMattePass(pctx, key, w)
 	})
 	if err != nil && mode == matteModePreview && wctx.Err() != nil && ctx.Err() == nil {
@@ -1218,14 +1597,16 @@ func (m *Manager) mattePendingFor(key string, w matteWork) *ErrMattePending {
 
 // matteWork is what one pass needs.
 type matteWork struct {
-	src    *store.Blob
-	plan   *graph.Plan // the matte input plan (graph.CompileMatteInput)
-	fps    string      // graph.FPSText(plan.FPS): the key's and the manifest's rate text
-	id     matteIdentity
-	dir    string // the memo dir to rename into
-	frames int    // the plan's pre-bounce frame count (0 = unknown)
-	estMS  int64  // the estimate (0 = unknown)
-	device string // the facts' device (the live ping's wins once known)
+	src     *store.Blob
+	plan    *graph.Plan // the matte input plan (graph.CompileMatteInput)
+	fps     string      // graph.FPSText(plan.FPS): the key's and the manifest's rate text
+	id      matteIdentity
+	dir     string               // the memo dir to rename into
+	frames  int                  // the plan's pre-bounce frame count (0 = unknown)
+	estMS   int64                // the estimate (0 = unknown)
+	device  string               // the effective device the pass runs on (id.Device)
+	prompts []recipe.MattePrompt // a tracker's prompts
+	mask    []byte               // Phase 5d: a tracker's mask prompt PNG at the tracking size (nil without one); its digest is in id.Prompts
 }
 
 // runMattePass produces the clip's matte sequence (spec §4.1 steps 5–9)
@@ -1244,18 +1625,21 @@ func (m *Manager) runMattePass(ctx context.Context, key string, w matteWork) (ma
 	defer m.clearMatteProgress(key)
 	started := time.Now()
 
-	ping, ms, err := m.waitMatteReady(ctx, key, w.id.Model)
+	ping, ms, d, err := m.waitMatteReady(ctx, key, w.id.Model, w.device)
 	if err != nil {
 		return man, err
 	}
 	if ms.Weights != w.id.Weights || ping.ProcessingVersion != w.id.Proc {
 		return man, errMatteRekey
 	}
-	if !ms.HasSize(w.id.Size) {
-		return man, fmt.Errorf("%w: model %s does not accept input size %d (sizes: %v)", ErrInvalidRecipe, w.id.Model, w.id.Size, ms.Sizes)
+	if ms.IsTracker() {
+		return man, fmt.Errorf("%w: model %s is a tracker (the guided model): it needs prompts", ErrInvalidRecipe, w.id.Model)
 	}
-	device := ping.Device
-	msPerFrame := ms.MsPerFrameAt(w.id.Size)
+	if !d.HasSize(w.id.Size) {
+		return man, fmt.Errorf("%w: model %s does not accept input size %d on %s (sizes: %v)", ErrInvalidRecipe, w.id.Model, w.id.Size, matteDeviceLabel(w.device), d.Sizes)
+	}
+	device := w.device
+	msPerFrame := d.MsPerFrameAt(w.id.Size)
 	m.setMatteProgress(key, func(p *matteProgress) {
 		p.State, p.Device = MattePendingRunning, device
 		if p.EstimateMS == 0 {
@@ -1287,7 +1671,7 @@ func (m *Manager) runMattePass(ctx context.Context, key string, w matteWork) (ma
 	defer pcancel()
 	pass := &mattePass{
 		m: m, key: key, w: w, tmp: tmp, frameDir: frameDir,
-		pctx: pctx, msPerFrame: msPerFrame, busy: ping.Busy,
+		pctx: pctx, msPerFrame: msPerFrame, busy: ping.Busy, device: wireDevice(ping, device),
 		pending: map[string][]int{}, filed: map[string]bool{},
 	}
 	bw := newBatchWriter(w.id.Size*w.id.Size*3, m.opts.MatteMaxFrames, pass.onFrame, pcancel)
@@ -1378,93 +1762,124 @@ func matteBatchTimeout(frames int, msPerFrame float64, busy int) time.Duration {
 }
 
 // waitMatteReady pings the sidecar (reusing an answer up to
-// mattePingMaxAge old) and returns once model is ready to run. Loading and
-// downloading are pending states: the pass's progress shows them (a preview
-// answers 202 with them), /v1/warm is posted once so the load is under way,
-// and the state is re-polled every matteLoadPoll for up to
+// mattePingMaxAge old) and returns once model is ready to run on device
+// (matteReadiness classifies the state). Loading and downloading are
+// pending states: the pass's progress shows them (a preview answers 202
+// with them), /v1/warm is posted once for that device so the load is under
+// way, and the state is re-polled every matteLoadPoll for up to
 // matteLoadTimeout; a model "missing" with no reason (its download not
 // started yet — queued behind another model's load at startup) is pending
 // the same way. A device or model that is unavailable, a model missing
 // AFTER a failed download (reason / lastError set), an unreachable sidecar
 // or another protocol refuse with ErrMatteUnavailable and the sidecar's
 // own reason.
-func (m *Manager) waitMatteReady(ctx context.Context, key, model string) (*matte.Ping, matte.ModelState, error) {
+func (m *Manager) waitMatteReady(ctx context.Context, key, model, device string) (*matte.Ping, matte.ModelState, matte.DeviceState, error) {
 	deadline := time.Now().Add(matteLoadTimeout)
 	warmed := false
 	maxAge := mattePingMaxAge
 	for {
-		p, err := m.pingMatte(ctx, maxAge)
+		p, ms, d, pending, err := m.matteReadinessAged(ctx, model, device, maxAge)
 		maxAge = 0
 		if err != nil {
-			var se *matte.StatusError
-			switch {
-			case ctx.Err() != nil:
-				// The pass was abandoned / the job cancelled mid-ping: a
-				// context error, which the flight knows not to hand to a
-				// waiter whose own ctx is alive (it re-runs the pass).
-				return nil, matte.ModelState{}, ctx.Err()
-			case errors.Is(err, ErrMatteUnavailable):
-				return nil, matte.ModelState{}, err
-			case errors.As(err, &se):
-				// The sidecar answered (a 503 with device "unavailable"
-				// carries its reason as the message).
-				return nil, matte.ModelState{}, fmt.Errorf("%w: the matte service at %s is not usable: %s", ErrMatteUnavailable, m.matteURL(), se.Message)
-			}
-			return nil, matte.ModelState{}, fmt.Errorf("%w: AI matte failed: sidecar unreachable at %s — is the matte profile up? (%v)", ErrMatteUnavailable, m.matteURL(), err)
+			return nil, ms, d, err
 		}
-		if p.Device == matte.DeviceUnavailable {
-			return nil, matte.ModelState{}, fmt.Errorf("%w: the matte service's device is unavailable: %s", ErrMatteUnavailable, p.Reason)
-		}
-		ms, ok := p.Model(model)
-		if !ok {
-			return nil, matte.ModelState{}, fmt.Errorf("%w: the matte service does not offer model %q (offered: %s)", ErrInvalidRecipe, model, offeredModels(p))
-		}
-		state := ms.State
-		switch state {
-		case matte.StateReady:
-			return p, ms, nil
-		case matte.StateUnavailable:
-			return nil, ms, fmt.Errorf("%w: matte model %s is unavailable: %s", ErrMatteUnavailable, model, firstNonEmpty(ms.Reason, ms.LastError, "see the matte service's log"))
-		case matte.StateMissing:
-			// "missing" with a reason or a lastError is a FAILED download
-			// (the sidecar retries it every 10 min on its own) and refuses
-			// with that text. A bare "missing" is a download that has not
-			// started yet — the sidecar has one sequential loader thread,
-			// so at startup the second MATTE_PRELOAD model stays "missing"
-			// with no reason for the whole time the first one downloads,
-			// derives and self-tests, and /v1/warm is a no-op while it is
-			// queued — and that is pending (the sidecar's own gate answers
-			// 503 "model loading" with state downloading for it), bounded
-			// by matteLoadTimeout like loading / downloading, however many
-			// polls it takes.
-			if ms.Reason != "" || ms.LastError != "" {
-				return nil, ms, fmt.Errorf("%w: matte model %s is missing: %s", ErrMatteUnavailable, model, firstNonEmpty(ms.Reason, ms.LastError, "its weights were not downloaded"))
-			}
-			state = MattePendingDownloading
-		case matte.StateLoading, matte.StateDownloading:
-		default:
-			return nil, ms, fmt.Errorf("%w: matte model %s is in an unknown state %q — update the matte service", ErrMatteUnavailable, model, ms.State)
+		if pending == "" {
+			return p, ms, d, nil
 		}
 		if !warmed {
 			warmed = true
 			wctx, cancel := context.WithTimeout(ctx, matteProbeTimeout)
-			if err := m.mt.client.Warm(wctx, model); err != nil {
+			if err := m.mt.client.Warm(wctx, model, wireDevice(p, device)); err != nil {
 				log.Printf("jobs: matte: warm %s: %v", model, err)
 			}
 			cancel()
 		}
 		m.setMatteProgress(key, func(pr *matteProgress) {
-			pr.State, pr.Percent, pr.Device = state, ms.Percent, p.Device
+			pr.State, pr.Percent, pr.Device = pending, d.Percent, device
 		})
 		if time.Now().After(deadline) {
-			return nil, ms, fmt.Errorf("AI matte failed: the matte service did not finish loading model %s within %s (state %s)", model, matteLoadTimeout, ms.State)
+			return nil, ms, d, fmt.Errorf("AI matte failed: the matte service did not finish loading model %s within %s (state %s)", model, matteLoadTimeout, d.State)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ms, ctx.Err()
+			return nil, ms, d, ctx.Err()
 		case <-time.After(matteLoadPoll):
 		}
 	}
+}
+
+// matteReadiness is matteReadinessAged with the pass's reuse window
+// (mattePingMaxAge).
+func (m *Manager) matteReadiness(ctx context.Context, model, device string) (*matte.Ping, matte.ModelState, matte.DeviceState, string, error) {
+	return m.matteReadinessAged(ctx, model, device, mattePingMaxAge)
+}
+
+// matteReadinessAged pings the sidecar (an answer up to maxAge old reused)
+// and classifies model's state ON device: pending is "" when the model is
+// ready there, else the MattePending* state to wait in (loading,
+// downloading — a bare "missing", a download not started yet, counts as
+// downloading); err refuses. A sidecar that no longer offers device — the
+// facts the device was chosen from are stale and the ping just persisted
+// the new ones — is errMatteRekey, so resolveMattes resolves again.
+//
+// "missing" with a reason or a lastError is a FAILED download (the sidecar
+// retries it every 10 min on its own) and refuses with that text. A bare
+// "missing" is a download that has not started yet — the sidecar has one
+// sequential loader thread, so at startup the second model stays "missing"
+// with no reason for the whole time the first one downloads, derives and
+// self-tests, and /v1/warm is a no-op while it is queued — and that is
+// pending (the sidecar's own gate answers 503 "model loading" with state
+// downloading for it), bounded by matteLoadTimeout like loading /
+// downloading, however many polls it takes.
+func (m *Manager) matteReadinessAged(ctx context.Context, model, device string, maxAge time.Duration) (p *matte.Ping, ms matte.ModelState, d matte.DeviceState, pending string, err error) {
+	p, err = m.pingMatte(ctx, maxAge)
+	if err != nil {
+		var se *matte.StatusError
+		switch {
+		case ctx.Err() != nil:
+			// The pass was abandoned / the job cancelled mid-ping: a
+			// context error, which the flight knows not to hand to a
+			// waiter whose own ctx is alive (it re-runs the pass).
+			return nil, ms, d, "", ctx.Err()
+		case errors.Is(err, ErrMatteUnavailable):
+			return nil, ms, d, "", err
+		case errors.As(err, &se):
+			// The sidecar answered (a 503 with device "unavailable"
+			// carries its reason as the message).
+			return nil, ms, d, "", fmt.Errorf("%w: the matte service at %s is not usable: %s", ErrMatteUnavailable, m.matteURL(), se.Message)
+		}
+		return nil, ms, d, "", fmt.Errorf("%w: AI matte failed: sidecar unreachable at %s — is the matte profile up? (%v)", ErrMatteUnavailable, m.matteURL(), err)
+	}
+	if p.Device == matte.DeviceUnavailable {
+		return nil, ms, d, "", fmt.Errorf("%w: the matte service's device is unavailable: %s", ErrMatteUnavailable, p.Reason)
+	}
+	if !p.Offers(device) {
+		return nil, ms, d, "", errMatteRekey
+	}
+	ms, ok := p.Model(model)
+	if !ok {
+		return nil, ms, d, "", fmt.Errorf("%w: the matte service does not offer model %q (offered: %s)", ErrInvalidRecipe, model, offeredModels(p))
+	}
+	d, ok = ms.On(device)
+	if !ok {
+		return nil, ms, d, "", fmt.Errorf("%w: the matte service does not offer model %s on %s (offered on: %s)", ErrInvalidRecipe, model, matteDeviceLabel(device), modelDevices(ms))
+	}
+	switch d.State {
+	case matte.StateReady:
+		return p, ms, d, "", nil
+	case matte.StateUnavailable:
+		return nil, ms, d, "", fmt.Errorf("%w: matte model %s is unavailable on %s: %s", ErrMatteUnavailable, model, matteDeviceLabel(device), firstNonEmpty(d.Reason, ms.LastError, "see the matte service's log"))
+	case matte.StateMissing:
+		if d.Reason != "" || ms.LastError != "" {
+			return nil, ms, d, "", fmt.Errorf("%w: matte model %s is missing: %s", ErrMatteUnavailable, model, firstNonEmpty(d.Reason, ms.LastError, "its weights were not downloaded"))
+		}
+		return p, ms, d, MattePendingDownloading, nil
+	case matte.StateLoading:
+		return p, ms, d, MattePendingLoading, nil
+	case matte.StateDownloading:
+		return p, ms, d, MattePendingDownloading, nil
+	}
+	return nil, ms, d, "", fmt.Errorf("%w: matte model %s is in an unknown state %q — update the matte service", ErrMatteUnavailable, model, d.State)
 }
 
 func firstNonEmpty(v ...string) string {
@@ -1487,6 +1902,7 @@ type mattePass struct {
 	pctx       context.Context
 	msPerFrame float64
 	busy       int
+	device     string // the device= of every POST (wireDevice: "" for a pre-5c sidecar)
 
 	done    int              // frames filed into tmp so far
 	posted  int              // frames POSTed so far
@@ -1548,7 +1964,7 @@ func (p *mattePass) post() error {
 	for {
 		bctx, cancel := context.WithTimeout(p.pctx, timeout)
 		i := 0
-		err := p.m.mt.client.Matte(bctx, p.w.id.Model, p.w.id.Size, frames, p.body(), func(png []byte) error {
+		err := p.m.mt.client.Matte(bctx, p.w.id.Model, p.device, p.w.id.Size, frames, p.body(), func(png []byte) error {
 			if i >= frames {
 				return fmt.Errorf("%w: more records than frames", matte.ErrMissingTerminator)
 			}
@@ -1814,6 +2230,7 @@ func (m *Manager) fillMatteResolved(ops []recipe.Op) ([]recipe.Op, error) {
 	if err != nil {
 		return nil, err
 	}
+	device := m.matteEffectiveDevice(&facts.Ping)
 	out := slices.Clone(ops)
 	for i, op := range out {
 		if op.Kind != recipe.OpMatte {
@@ -1823,7 +2240,7 @@ func (m *Manager) fillMatteResolved(ops []recipe.Op) ([]recipe.Op, error) {
 		if err != nil {
 			return nil, err
 		}
-		id, err := identityFor(facts, matteRequest{Model: p.Model, Size: p.Size})
+		id, err := identityOf(facts, device, matteRequestOf(p))
 		if err != nil {
 			return nil, err
 		}
@@ -1847,7 +2264,10 @@ func (m *Manager) fillMatteResolved(ops []recipe.Op) ([]recipe.Op, error) {
 // the two (a probe rewrote models.json with a new sidecar's weights), and a
 // result filed under the submitted hash must not be made with another
 // identity — the job fails asking for a fresh submit. Ops without a
-// Resolved identity are not checked.
+// Resolved identity are not checked. Each op is paired with its own
+// resolution the way the plan's inputs are (findMatteFor: model, size and
+// the Phase 5c params — two guided ops of one model with different edge
+// models resolve two identities that differ in the edge fields).
 func checkMatteResolved(ops []recipe.Op, mattes []resolvedMatte) error {
 	for i, op := range ops {
 		if op.Kind != recipe.OpMatte {
@@ -1860,7 +2280,7 @@ func checkMatteResolved(ops []recipe.Op, mattes []resolvedMatte) error {
 		if p.Model == "" {
 			p.Model = recipe.MatteModelDefault
 		}
-		rm := findMatte(mattes, p.Model, p.Size)
+		rm := findMatteFor(mattes, matteRequestOf(p))
 		if rm == nil {
 			return fmt.Errorf("%w: op %d (matte): no resolved AI matte for model %s", ErrInvalidRecipe, i, p.Model)
 		}
@@ -1935,14 +2355,14 @@ func fillMatteInputs(p *graph.Plan, mattes []resolvedMatte) error {
 		if in.Matte == nil {
 			continue
 		}
-		rm := findMatte(mattes, in.Matte.Model, in.Matte.Size)
+		rm := findMatteInput(mattes, in.Matte) // by model, size and the op's 5c params (matte_recipe.go)
 		if rm == nil || rm.Manifest == nil {
 			return fmt.Errorf("%w: no resolved AI matte for model %s (size %d)", ErrInvalidRecipe, in.Matte.Model, in.Matte.Size)
 		}
 		if rm.Manifest.FPS != in.Matte.FPS {
 			return fmt.Errorf("%w: the AI matte of model %s was produced at %s fps, the plan runs at %s — stale resolution", ErrInvalidRecipe, in.Matte.Model, rm.Manifest.FPS, in.Matte.FPS)
 		}
-		in.Path = filepath.Join(rm.Dir, matte.FramePattern)
+		in.Path = filepath.Join(matteInputDir(rm, in.Matte), matte.FramePattern) // the raw memo, or the derived sequence the op asks for (Phase 5c)
 		in.Matte.Frames = rm.Manifest.Frames
 	}
 	return nil
@@ -2004,18 +2424,44 @@ func protectMattes(st *store.Store, mattes []resolvedMatte) (release func(), err
 // applyMatteInfo appends the render.matte info check to rep (nil-safe):
 // the identity and provenance of every matte the render merged ("AI matte:
 // isnet-anime 1024 px fp16 · weights f15622d8… · proc 1 · graph 3a1b… · 45
-// frames · cuda 18.4 ms/frame").
+// frames · cuda 18.4 ms/frame"; a guided matte reads "guided (sam2-tiny) +
+// edge birefnet-lite · 1024x576 bf16 · weights … · proc 1 · 45 frames ·
+// cuda 48.0 ms/frame · edge weights … · 2 prompted frames", or "guided
+// (sam2-tiny), tracker mask only · …" without an edge — the "guided (…) +
+// edge <model>" form the SPA's Result card and the recipe notes use). What
+// the op asked beyond the identity — stabilise, keep colours — is worded
+// from the recipe by applyMatteRecipeNotes (matte_recipe.go), which the
+// render applies right after this; the integration test greps "stabilise
+// light", "keep" and the tracker id out of the finished line.
 func applyMatteInfo(rep *discordlint.Report, mattes []resolvedMatte) {
 	if rep == nil || len(mattes) == 0 {
 		return
 	}
 	parts := make([]string, 0, len(mattes))
 	for _, rm := range mattes {
-		s := fmt.Sprintf("%s %d px", rm.Model, rm.Size)
+		man := rm.Manifest
+		guided := rm.id.tracker() || (man != nil && man.TrackW > 0)
+		var s string
+		if guided {
+			s = fmt.Sprintf("guided (%s)", rm.Model)
+			switch {
+			case rm.edge != nil:
+				s += " + edge " + rm.edge.Model
+			case rm.Edge != "":
+				s += " + edge " + rm.Edge
+			default:
+				s += ", tracker mask only"
+			}
+			if man != nil && man.TrackW > 0 {
+				s += fmt.Sprintf(" · %dx%d", man.TrackW, man.TrackH)
+			}
+		} else {
+			s = fmt.Sprintf("%s %d px", rm.Model, rm.Size)
+		}
 		if rm.Precision != "" {
 			s += " " + rm.Precision
 		}
-		if man := rm.Manifest; man != nil {
+		if man != nil {
 			s += " · weights " + short(man.Weights) + " · proc " + man.Proc
 			if man.GraphDigest != "" {
 				s += " · graph " + short(man.GraphDigest)
@@ -2027,6 +2473,17 @@ func applyMatteInfo(rep *discordlint.Report, mattes []resolvedMatte) {
 					s += " " + strconv.FormatFloat(man.MsPerFrame, 'f', 1, 64) + " ms/frame"
 				}
 			}
+		}
+		if rm.edge != nil && rm.edge.Manifest != nil {
+			s += " · edge weights " + short(rm.edge.Manifest.Weights)
+		}
+		if guided && man != nil && man.Prompts != "" {
+			if n := strings.Count(man.Prompts, "|f="); n == 1 {
+				s += " · 1 prompted frame"
+			} else if n > 1 {
+				s += fmt.Sprintf(" · %d prompted frames", n)
+			}
+			s += maskPromptNote(man.Prompts)
 		}
 		parts = append(parts, s)
 	}

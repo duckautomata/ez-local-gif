@@ -9,38 +9,103 @@
   // despill). The Edge cleanup fold (op "morph": fill pinholes / grow the
   // matte) follows whichever key is on. Sliders re-render the still. The AI
   // mode is disabled with the reason on a server without features.matte (a
-  // plain install without the compose profile) and never starts a GPU pass
-  // by itself: the preview's next still does.
-  import { MATTE_MODEL_DEFAULT } from '../../lib/api';
+  // plain install without the compose profile).
+  //
+  // Phase 5c: nothing in the AI mode starts a pass — selecting AI, a model
+  // or a device shows the last picture with a "not computed" pill; the
+  // Compute matte button (or Render) starts it, and leaving the AI mode
+  // releases the sidecar's models (lib/matte.svelte trackAiMode). "Run on"
+  // picks the device server-side (PUT /api/matte/settings; shown only when
+  // the sidecar offers several), the Model select defaults to that device's
+  // default, Stabilise (light by default) post-processes the matte sequence
+  // on the server from the cached matte (no model run), and the Advanced
+  // fold's Keep colours force picked colours opaque (in-graph, instant).
+  // The guided model (Part B) adds the Select subject panel: the preview
+  // becomes a prompt canvas (box drag, +/− clicks, live mask), a keyframe
+  // strip lists the prompted frames, Edge picks the per-frame model that
+  // refines the tracker's edge band.
+  //
+  // Phase 5d: "Use this frame's matte" makes the scrubber's frame a MASK
+  // prompt — the edge model's per-frame matte of it starts the track (the
+  // prototype's most reliable prompt: IoU 0.997, no drawing). It is
+  // enabled when that matte is known to exist for this clip (the Preview /
+  // the overlay note what the server answered, lib/matte.svelte matteMemo)
+  // or nothing is known yet (the overlay's answer then says), disabled
+  // when the server said it is not computed or Edge is None (no edge
+  // model to take it from). The loose-box guard's warning (set by the
+  // overlay, lib/maskguard) shows under the panel.
+  import { untrack } from 'svelte';
+  import { MATTE_EDGE_NONE, MATTE_MODEL_DEFAULT, MAX_MATTE_KEEP } from '../../lib/api';
   import { caps } from '../../lib/capabilities.svelte';
   import { normalizeHex } from '../../lib/format';
-  import { matteEstimate, matteModel, matteModelFor, matteModelOptions, matteStatusLine, MATTE_PROFILE_HINT, modelLabel } from '../../lib/matte';
-  import { holdMattePolling, matte, refreshMatte } from '../../lib/matte.svelte';
   import {
+    computeButtonText,
+    defaultEdgeFor,
+    deviceLabel,
+    edgeOptions,
+    effectiveDevice,
+    matteDevices,
+    matteEstimate,
+    matteMemoKey,
+    matteModel,
+    matteModelFor,
+    matteModelOptions,
+    matteStatusLine,
+    MATTE_PROFILE_HINT,
+    modelLabel,
+    shortModelLabel,
+    STABILISE_OPTIONS,
+    stabiliseLabel,
+  } from '../../lib/matte';
+  import { computeMatte, holdMattePolling, matte, matteMemoState, refreshMatte, setMatteDevice, trackAiMode } from '../../lib/matte.svelte';
+  import { canPromptFrame, framePrompts, hasMask, keyframes, MAX_PROMPT_FRAMES, promptSummary } from '../../lib/prompts';
+  import {
+    addKeepColor,
     addKeyColor,
     app,
     armEyedropper,
+    armKeepEyedropper,
     CHROMA_BLUE,
     CHROMA_GREEN,
+    clearFramePrompts,
+    clearMattePrompts,
     disarmEyedropper,
+    edgeIsNone,
     effectiveOps,
+    fillMatteDefault,
+    forwardFrame,
+    guidedNeedsPrompts,
+    isGuided,
+    keepColors,
+    matteClipKey,
     MAX_KEY_COLORS,
     MORPH_MAX_GROW,
     planFrames,
+    promptGridKey,
+    prunePrompts,
+    removeKeepColor,
     removeKeyColor,
+    scrubFrameFor,
     setBackgroundMode,
+    setFrameMaskPrompt,
+    setKeepColor,
     setKeyColor,
+    setMatteEdge,
     setMatteModel,
+    setMatteStabilise,
+    STABILISE_DEFAULT,
     type BackgroundMode,
     type ScreenColor,
   } from '../../lib/state.svelte';
+  import { toast } from '../../lib/toast.svelte';
   import NumField from '../NumField.svelte';
   import OpCard from '../OpCard.svelte';
+  import ColourRows from './ColourRows.svelte';
 
   interface Props {
     /** start expanded (tests render the body server-side) */
     initialOpen?: boolean;
-    /** offer the preview eyedropper; false in batch (no preview to pick from — Colour takes typed hex only) */
+    /** offer the preview eyedropper / the prompt canvas / the Compute button; false in batch (no preview — rows render) */
     picker?: boolean;
   }
   let { initialOpen = false, picker = true }: Props = $props();
@@ -63,6 +128,7 @@
   const colour = $derived(bg.enabled && bg.mode === 'colour');
   const picking = $derived(app.ui.pickColor);
   const pickRow = $derived(app.ui.pickRow);
+  const pickTarget = $derived(app.ui.pickTarget);
   /** the rows that carry a colour (the ones that emit an op) */
   const picked = $derived(bg.colors.filter((c) => c !== ''));
   /** the Screen sub-choice's preset colour; anything else in the key colour field is custom */
@@ -101,17 +167,26 @@
   $effect(() => {
     if (open && caps.loaded && !caps.features.matte && !matte.loaded) void refreshMatte();
   });
+  // Leaving the AI mode (or switching the card off) releases the sidecar's
+  // resident models after a short debounce (Phase 5c: nothing stays loaded
+  // while AI is not in use); the card going away counts as leaving.
+  trackAiMode(() => ai);
   /** the model the select shows and the op names: the choice, else the server's default, else the recipe default */
   const model = $derived(matteModelFor(bg.ai.model, matte.status));
-  // As soon as the server's default is known it becomes the explicit choice,
-  // so what the select shows is what the op sends (state.AiCfg).
+  // As soon as the server's default (for the effective device) is known it
+  // becomes the explicit choice, so what the select shows is what the op
+  // sends (state.AiCfg); a model the user picked stays across a device
+  // change, an auto-filled one follows the new device's default.
   $effect(() => {
     const d = matte.status?.defaultModel?.trim();
-    if (d && !app.ops.background.ai.model) app.ops.background.ai.model = d;
+    if (d) fillMatteDefault(d);
   });
-  const options = $derived(matteModelOptions(matte.status));
+  const device = $derived(effectiveDevice(matte.status));
+  const devices = $derived(matteDevices(matte.status));
+  const options = $derived(matteModelOptions(matte.status, device));
   /** the chosen model is not among the offered ones (the server will refuse it): shown as an extra, flagged option */
   const unlisted = $derived(!options.some((o) => o.id === model));
+  const guided = $derived(ai && isGuided(bg));
   /** the forward frame count of the clip (the matte pass runs on the temporal prefix, before a bounce doubles it) */
   const aiFrames = $derived.by(() => {
     const src = app.source;
@@ -121,12 +196,129 @@
     return ops.bounce && !src.info.isStill && n >= 2 ? n / 2 : n;
   });
   const aiEstimate = $derived(ai ? matteEstimate(matte.status, model, aiFrames) : null);
+  // The guided model's prompts are OUTPUT frame indices on the matte
+  // plan's forward grid: a change of the source, the trim start, the
+  // delay, the speed or the plan fps moves every frame under them (the box
+  // drawn on old frame 0 would condition old frame 10), and a shorter clip
+  // leaves the frames past its end with nothing to prompt — so they are
+  // dropped, with a toast, rather than tracking the wrong pictures in
+  // silence. The trim end, crop, reverse and bounce leave the grid alone.
+  let promptGrid: string | undefined;
+  $effect(() => {
+    const key = promptGridKey(app.source, app.ops, app.output);
+    const frames = aiFrames;
+    untrack(() => {
+      const moved = promptGrid !== undefined && key !== promptGrid;
+      promptGrid = key;
+      const dropped = prunePrompts(moved, frames);
+      if (dropped > 0 && guided) {
+        toast.info(
+          moved
+            ? 'Guided prompts cleared: the trim, speed or fps change moved the frames they were drawn on — select the subject again'
+            : `${dropped} guided ${dropped === 1 ? 'prompt' : 'prompts'} past the clip’s end dropped`,
+        );
+      }
+    });
+  });
+  /** in batch: the per-frame model the rows key with when the editor's choice was the guided model (batchOpsCfg) */
+  const batchFallback = $derived.by(() => {
+    const id = matteModelFor('', matte.status);
+    return modelLabel(id, matteModel(matte.status, id));
+  });
   const statusLine = $derived.by(() => {
     if (matte.status) return matteStatusLine(matte.status, model, aiEstimate?.ms ?? 0);
     if (matte.error) return `matte status unavailable — ${matte.error}`;
     return matteStatusLine(null, model);
   });
   const aiLabel = $derived(modelLabel(model, matteModel(matte.status, model)));
+  // The Compute matte button reflects the preview's compute state
+  // (lib/matte.svelte: the Preview publishes idle / running / computed for
+  // the still on its stage); in batch there is no preview and rows render.
+  const compute = $derived(computeButtonText(matte.compute));
+  const needsPrompts = $derived(ai && guidedNeedsPrompts(app.ops));
+  /** the guided panel is open with a subject selected: the stage shows the unkeyed frame, so Compute closes the panel and runs the keyed still eagerly */
+  const promptReady = $derived(ai && picker && isGuided(bg) && app.ui.promptOpen && !needsPrompts);
+  const computeDisabled = $derived(needsPrompts || (compute.disabled && !promptReady));
+  const computeHint = $derived.by(() => {
+    if (needsPrompts) return 'select the subject first';
+    if (promptReady) return 'closes the panel and runs the track (and the edge pass)';
+    switch (matte.compute.state) {
+      case 'idle':
+        return 'not computed for this clip, model and device yet — previews show the last picture until then';
+      case 'running':
+        return matte.compute.total > 0 ? `${matte.compute.done} of ${matte.compute.total} frames` : 'the pass is running';
+      case 'computed':
+        return 'cached — trim, speed and fps changes re-use it';
+      default:
+        return '';
+    }
+  });
+  const stabilise = $derived(bg.ai.stabilise);
+  const keepRows = $derived(bg.ai.keep);
+  const keepCount = $derived(keepColors(bg).length);
+  const keepArmed = $derived(picking && pickTarget === 'keep' ? pickRow : -1);
+  const colourArmed = $derived(picking && pickTarget === 'colour' ? pickRow : -1);
+  // ---- guided model (Part B)
+  const prompts = $derived(bg.ai.prompts);
+  const promptFrames = $derived(keyframes(prompts));
+  /** the prompted frame the scrubber is on (the forward grid index) */
+  const currentFrame = $derived(app.source ? forwardFrame(app.source.info, app.ops, app.output, app.ui.scrubFrame) : 0);
+  const edgeOpts = $derived(edgeOptions(matte.status, device));
+  /** what the Edge select shows: the explicit choice, else the device's default per-frame model */
+  const edgeValue = $derived(bg.ai.edge || defaultEdgeFor(matte.status, device));
+  // ---- "Use this frame's matte" (Phase 5d)
+  const edgeNone = $derived(edgeIsNone(edgeValue));
+  const edgeLabel = $derived(edgeNone ? '' : modelLabel(edgeValue, matteModel(matte.status, edgeValue)));
+  /** "General" / "Anime": the edge model's label without its qualifier, for the help text and the hints */
+  const edgeShort = $derived(shortModelLabel(edgeLabel));
+  /** the scrubber's frame is the set's mask prompt already (the button then takes it off) */
+  const currentHasMask = $derived(hasMask(framePrompts(prompts, currentFrame)));
+  /** what the server was seen to say about the edge model's matte of this clip */
+  const edgeMemo = $derived(edgeNone ? 'unknown' : matteMemoState(matteMemoKey(matteClipKey(app.source, app.ops, app.output), edgeValue, device)));
+  const useMatte = $derived.by(() => {
+    if (currentHasMask) return { text: 'Drop this frame’s matte', disabled: !picker, title: 'Take the matte prompt off this frame (its box and clicks stay)' };
+    const text = 'Use this frame’s matte';
+    if (!picker || !app.source) return { text, disabled: true, title: 'Needs the editor’s preview' };
+    if (edgeNone) return { text, disabled: true, title: 'Needs an edge model: Edge is None — tracker mask only' };
+    if (!canPromptFrame(prompts, currentFrame)) return { text, disabled: true, title: `At most ${MAX_PROMPT_FRAMES} prompted frames` };
+    if (edgeMemo === 'idle') {
+      return { text, disabled: true, title: `${edgeShort} matte not computed for this clip: switch the Model to ${edgeLabel}, press Compute, then come back` };
+    }
+    const known = edgeMemo === 'computed' ? '' : ' (if that matte is computed for this clip — the overlay says otherwise)';
+    return { text, disabled: false, title: `Start the track from ${edgeShort}’s matte of frame ${currentFrame + 1} — the most reliable start; replaces the box and clicks on it${known}` };
+  });
+  function useFrameMatte() {
+    setFrameMaskPrompt(currentFrame, !currentHasMask);
+  }
+  function onEdge(id: string) {
+    if (setMatteEdge(id)) toast.info('Edge None uses the tracker’s mask alone — the frame-matte prompt was dropped (its box and clicks stay)');
+  }
+  /** the help text's lead-in: the frame matte first (the most reliable start) when an edge model can provide one */
+  const drawHint = $derived(
+    edgeNone ? 'Draw' : `Scrub to a frame where ${edgeShort} got it right and press Use this frame’s matte — the most reliable start; refine with − clicks. Otherwise draw`,
+  );
+
+  async function onDevice(e: Event & { currentTarget: HTMLSelectElement }) {
+    const select = e.currentTarget;
+    const err = await setMatteDevice(select.value);
+    if (err) {
+      // The server refused (the sidecar no longer offers it): the control
+      // goes back to the effective device, which did not change, instead
+      // of claiming the one the server refused.
+      select.value = device;
+      toast.error(`Run on: ${err}`);
+    }
+  }
+  function togglePrompt() {
+    app.ui.promptOpen = !app.ui.promptOpen;
+    if (app.ui.promptOpen) disarmEyedropper();
+  }
+  function jumpTo(frame: number) {
+    const src = app.source;
+    if (!src) return;
+    app.ui.scrubFrame = scrubFrameFor(src.info, app.ops, app.output, frame);
+    app.ui.promptOpen = true;
+  }
 
   const morphSummary = $derived.by(() => {
     const parts: string[] = [];
@@ -139,7 +331,12 @@
     const tail = morphSummary ? ` · ${morphSummary}` : '';
     if (bg.mode === 'ai') {
       const which = model !== MATTE_MODEL_DEFAULT ? ` · ${aiLabel}` : '';
-      return `AI${which}${aiSupported ? '' : ' — not available on this server'}${tail}`;
+      const extras: string[] = [];
+      if (isGuided(bg)) extras.push(promptSummary(bg.ai.prompts));
+      if (stabilise !== STABILISE_DEFAULT) extras.push(stabilise ? `stabilise ${stabiliseLabel(stabilise).toLowerCase()}` : 'stabilise off');
+      if (keepCount) extras.push(`keep ${keepCount} ${keepCount === 1 ? 'colour' : 'colours'}`);
+      const more = extras.length ? ` · ${extras.join(' · ')}` : '';
+      return `AI${which}${aiSupported ? '' : ' — not available on this server'}${more}${tail}`;
     }
     if (bg.mode === 'colour') {
       if (!picked.length) return picker ? 'pick a colour on the preview' : 'type a colour to remove';
@@ -162,26 +359,32 @@
     app.ops.background.color = s === 'blue' ? CHROMA_BLUE : CHROMA_GREEN;
   }
 
-  // The eyedropper only makes sense while the card is in Colour mode.
+  // The eyedropper only makes sense while the card is in Colour mode (a
+  // Colour row) or in AI mode (a Keep colours row).
   $effect(() => {
-    if (app.ui.pickColor && !(bg.enabled && bg.mode === 'colour')) disarmEyedropper();
+    const ok = app.ui.pickTarget === 'keep' ? bg.enabled && bg.mode === 'ai' : bg.enabled && bg.mode === 'colour';
+    if (app.ui.pickColor && !ok) disarmEyedropper();
   });
 
   function setChromaColor(hex: string) {
     const n = normalizeHex(hex);
     if (n) app.ops.background.color = n;
   }
-  /** a typed row hex: stored when valid, else the field is put back to what the row holds */
-  function onHex(i: number, e: Event & { currentTarget: HTMLInputElement }) {
-    if (!setKeyColor(i, e.currentTarget.value)) e.currentTarget.value = bg.colors[i] ? '#' + bg.colors[i] : '';
-  }
   function toggleEyedropper(i: number) {
-    if (picking && pickRow === i) disarmEyedropper();
+    if (picking && pickTarget === 'colour' && pickRow === i) disarmEyedropper();
     else armEyedropper(i);
   }
   function addColour() {
     const i = addKeyColor();
     if (i >= 0 && picker) armEyedropper(i);
+  }
+  function toggleKeepEyedropper(i: number) {
+    if (picking && pickTarget === 'keep' && pickRow === i) disarmEyedropper();
+    else armKeepEyedropper(i);
+  }
+  function addKeep() {
+    const i = addKeepColor();
+    if (i >= 0 && picker) armKeepEyedropper(i);
   }
 </script>
 
@@ -222,15 +425,36 @@
       <p class="note">{aiReason} — the matte op will be rejected at render.</p>
     {/if}
     <div class="row">
+      <!-- Run on comes first: the Model default follows the device (an unchosen model moves to the new device's default), so the dependency reads left to right -->
+      {#if devices.length > 1}
+        <label class="field">
+          <span>Run on</span>
+          <select aria-label="Run on" value={device} disabled={matte.settingDevice} onchange={onDevice} title="Which device the sidecar runs the pass on — a server-side setting, not part of the recipe; the Model default follows it">
+            {#each devices as d (d)}
+              <option value={d} selected={d === device}>{deviceLabel(d)}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
       <label class="field">
         <span>Model</span>
         <select class="model" aria-label="Model" value={model} onchange={(e) => setMatteModel(e.currentTarget.value)}>
           {#each options as o (o.id)}
-            <option value={o.id} selected={o.id === model} disabled={o.disabled} title={o.reason || undefined}>{o.text}</option>
+            <option value={o.id} selected={o.id === model} disabled={o.disabled || (o.tracker && !picker)} title={o.tracker && !picker ? 'The guided model needs the editor’s preview to select the subject' : o.reason || undefined}>
+              {o.text}
+            </option>
           {/each}
           {#if unlisted}
             <option value={model} selected>{model}{options.length ? ' — not offered by this server' : ''}</option>
           {/if}
+        </select>
+      </label>
+      <label class="field">
+        <span>Stabilise</span>
+        <select aria-label="Stabilise" value={stabilise} onchange={(e) => setMatteStabilise(e.currentTarget.value)} title="Temporal smoothing of the matte sequence, derived on the server from the cached matte (no model run)">
+          {#each STABILISE_OPTIONS as o (o.id)}
+            <option value={o.id} selected={o.id === stabilise} title={o.hint}>{o.label}</option>
+          {/each}
         </select>
       </label>
       <span class="field status-field">
@@ -238,11 +462,116 @@
         <span class="status" class:bad={!aiSupported || matte.status?.device === 'unavailable'} role="status">{statusLine}</span>
       </span>
     </div>
+    {#if !picker && isGuided(bg)}
+      <p class="note">Guided needs the editor’s preview to select the subject — batch rows key with {batchFallback} instead (no prompts, no edge model).</p>
+    {/if}
+    {#if picker}
+      <div class="row compute">
+        <button
+          type="button"
+          class:primary={!computeDisabled}
+          disabled={computeDisabled}
+          onclick={() => computeMatte()}
+          title={promptReady ? 'Close the subject panel and run the guided matte for this clip now — Render runs it anyway' : compute.title}
+          aria-label="Compute matte"
+        >
+          {promptReady ? 'Compute matte' : compute.text}
+        </button>
+        {#if computeHint}<span class="hint">{computeHint}</span>{/if}
+      </div>
+    {/if}
+
+    {#if guided}
+      <div class="guided">
+        <div class="row">
+          <button
+            type="button"
+            class="sm"
+            class:primary={app.ui.promptOpen}
+            aria-pressed={app.ui.promptOpen}
+            disabled={!picker}
+            onclick={togglePrompt}
+            title={picker ? 'Draw the box and the +/− clicks on the preview' : 'Needs the editor’s preview'}
+          >
+            {app.ui.promptOpen ? 'Done selecting' : 'Select subject'}
+          </button>
+          <button type="button" class="sm" class:ghost={currentHasMask} disabled={useMatte.disabled} onclick={useFrameMatte} title={useMatte.title}>
+            {useMatte.text}
+          </button>
+          <label class="field">
+            <span>Edge</span>
+            <select aria-label="Edge" value={edgeValue} onchange={(e) => onEdge(e.currentTarget.value)} title="The per-frame model that refines the tracker's edge band (the tracker is coarse at edges)">
+              {#each edgeOpts as o (o.id)}
+                <option value={o.id} selected={o.id === edgeValue} disabled={o.disabled} title={o.reason || undefined}>{o.text}</option>
+              {/each}
+            </select>
+          </label>
+          <button type="button" class="sm ghost" onclick={clearMattePrompts} disabled={!prompts.length} title="Forget every box and click">Clear</button>
+        </div>
+        {#if promptFrames.length}
+          <div class="keyframes" role="list" aria-label="Prompted frames">
+            {#each promptFrames as k (k.frame)}
+              <span class="keyframe" role="listitem" class:current={k.frame === currentFrame}>
+                <button type="button" class="sm" onclick={() => jumpTo(k.frame)} title="Show this frame on the preview" aria-label="Go to prompted frame {k.frame + 1}">
+                  f {k.frame + 1}{k.mask ? ' ▣' : ''}{k.box ? ' ▭' : ''}{k.positive ? ` +${k.positive}` : ''}{k.negative ? ` −${k.negative}` : ''}
+                </button>
+                <button type="button" class="sm ghost" onclick={() => clearFramePrompts(k.frame)} aria-label="Delete the prompts of frame {k.frame + 1}" title="Delete this frame's prompts">×</button>
+              </span>
+            {/each}
+          </div>
+        {:else}
+          <p class="hint">No subject selected yet{picker ? ' — open Select subject and draw a box around it on the preview' : ''}; no matte is applied until then.</p>
+        {/if}
+        {#if app.ui.promptWarning}
+          <p class="warn" role="alert">{app.ui.promptWarning}</p>
+        {/if}
+        <p class="hint">
+          {drawHint} a box around the character — a single click usually selects only a part (skin, a sleeve) or floods the frame when it
+          lands beside the subject, so click it 2–3 times if you click — add a − click on anything that stays; then Compute. Click on
+          another frame where it drifts and Compute again. Edge {edgeValue === MATTE_EDGE_NONE ? 'None uses the tracker’s mask alone (and offers no frame matte to start from)' : 'refines the band around the tracked outline with the per-frame model'}.
+        </p>
+      </div>
+    {/if}
+
+    <details class="adv" bind:open={advOpen}>
+      <summary>
+        <span class="sum">Advanced</span>{#if !advOpen}<span class="muted small">· keep {keepCount ? `${keepCount} ${keepCount === 1 ? 'colour' : 'colours'} · similarity ${bg.ai.keepSimilarity.toFixed(2)}` : 'none'}</span>{/if}
+      </summary>
+      <div class="row">
+        <ColourRows
+          colors={keepRows}
+          {picker}
+          armedRow={keepArmed}
+          max={MAX_MATTE_KEEP}
+          caption={keepRows.length > 1 ? 'Keep colours' : 'Keep colour'}
+          hexLabel={'Keep colour {i} (hex)'}
+          removeLabel={'Remove keep colour {i}'}
+          addTitle="Force another colour opaque — up to {MAX_MATTE_KEEP}"
+          emptyHint={picker ? 'pick a colour the model drops' : 'type a hex value'}
+          onPick={toggleKeepEyedropper}
+          onHex={setKeepColor}
+          onRemove={removeKeepColor}
+          onAdd={addKeep}
+        />
+        <label class="field slider">
+          <span>Keep similarity (0.01–1) — <b>{bg.ai.keepSimilarity.toFixed(2)}</b></span>
+          <span class="row tight">
+            <input type="range" min="0.01" max="1" step="0.01" bind:value={app.ops.background.ai.keepSimilarity} aria-label="Keep similarity" />
+            <NumField bind:value={app.ops.background.ai.keepSimilarity} min={0.01} max={1} step={0.01} small />
+          </span>
+        </label>
+      </div>
+      <p class="hint">
+        Keep colours force every pixel of that colour (within the similarity) opaque, on top of the matte — for a prop or a
+        flat-coloured part the model drops. Applied in the graph: it shows at once, no pass needed.
+      </p>
+    </details>
     <p class="hint">
-      Computed once per frame and cached; trim, speed and fps changes re-use what is cached. On frames that already carry
-      transparency the matte is intersected with it, never substituted. Anime (fast) is crisp and quick; General (precise) keeps
-      hair strands and rejects stream UI at about 10× the time. Soft edges need WebP / AVIF / APNG output — GIF cuts them to
-      1-bit alpha.
+      Computed once per frame and cached; trim, speed and fps changes re-use what is cached. General (precise) keeps thin strands
+      and props and is stable on video; Anime (fast) is for anime-style characters only. If parts of the subject drop out, add a
+      Keep colour or raise Grow; if edges flicker, set Stabilise (Light removes single-frame pops, Strong keeps parts that drop
+      out for a frame at the cost of a short trail on fast motion). On frames that already carry transparency the matte is
+      intersected with it, never substituted. Soft edges need WebP / AVIF / APNG output — GIF cuts them to 1-bit alpha.
     </p>
   {:else if screen}
     <div class="row">
@@ -293,43 +622,22 @@
     </p>
   {:else if colour}
     <div class="row">
-      <span class="field colours">
-        <span>{bg.colors.length > 1 ? 'Colours to remove' : 'Colour to remove'}</span>
-        {#each bg.colors as c, i (i)}
-          <span class="row tight colour-row">
-            {#if picker}
-              <button
-                type="button"
-                class="sm"
-                class:primary={picking && pickRow === i}
-                aria-pressed={picking && pickRow === i}
-                onclick={() => toggleEyedropper(i)}
-                title="Then click the colour on the preview"
-              >
-                {picking && pickRow === i ? 'Click the preview…' : c ? 'Pick again' : 'Pick from preview'}
-              </button>
-            {/if}
-            <span class="swatch" class:empty={!c} style:background={c ? '#' + c : undefined} aria-hidden="true"></span>
-            <input
-              type="text"
-              class="hex mono"
-              value={c ? '#' + c : ''}
-              placeholder="#rrggbb"
-              onchange={(e) => onHex(i, e)}
-              maxlength="7"
-              spellcheck="false"
-              aria-label="Colour {i + 1} to remove (hex)"
-            />
-            {#if bg.colors.length > 1 || c}
-              <button type="button" class="sm ghost" onclick={() => removeKeyColor(i)} aria-label="Remove colour {i + 1}" title={bg.colors.length > 1 ? 'Remove this colour' : 'Clear this colour'}>×</button>
-            {/if}
-          </span>
-        {/each}
-        <span class="row tight">
-          <button type="button" class="sm" onclick={addColour} disabled={bg.colors.length >= MAX_KEY_COLORS} title="Key another colour (a 2-colour ramp, a second flat tone) — up to {MAX_KEY_COLORS}">+ add colour</button>
-          {#if !picked.length}<span class="hint">{picker ? 'nothing picked yet' : 'type a hex value'}</span>{/if}
-        </span>
-      </span>
+      <ColourRows
+        colors={bg.colors}
+        {picker}
+        armedRow={colourArmed}
+        max={MAX_KEY_COLORS}
+        caption={bg.colors.length > 1 ? 'Colours to remove' : 'Colour to remove'}
+        hexLabel={'Colour {i} to remove (hex)'}
+        removeLabel={'Remove colour {i}'}
+        addTitle="Key another colour (a 2-colour ramp, a second flat tone) — up to {MAX_KEY_COLORS}"
+        emptyHint={picker ? 'nothing picked yet' : 'type a hex value'}
+        clearOnly
+        onPick={toggleEyedropper}
+        onHex={setKeyColor}
+        onRemove={removeKeyColor}
+        onAdd={addColour}
+      />
       <label class="field slider">
         <span>Similarity (0.01–1) — <b>{bg.pickSimilarity.toFixed(2)}</b></span>
         <span class="row tight">
@@ -393,26 +701,8 @@
   .field.slider > span:first-child {
     white-space: normal;
   }
-  .field.colours {
-    gap: 6px;
-  }
-  .field.colours > .row + .row {
-    margin-top: 0;
-  }
   .hex {
     width: 84px;
-  }
-  .swatch {
-    display: inline-block;
-    width: 24px;
-    height: 24px;
-    border-radius: 4px;
-    border: 1px solid var(--border-strong);
-    flex: none;
-  }
-  .swatch.empty {
-    border-style: dashed;
-    background: transparent;
   }
   select.model {
     min-width: 180px;
@@ -428,12 +718,44 @@
   .status.bad {
     color: var(--amber);
   }
+  .row.compute {
+    gap: 8px 10px;
+  }
+  .guided {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+  }
+  .keyframes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+  }
+  .keyframe {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+  }
+  .keyframe.current > button:first-child {
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .warn {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--amber);
+  }
   .adv {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     padding: 0 10px;
   }
-  .hint + .adv {
+  .hint + .adv,
+  .guided + .adv,
+  .row + .adv {
     margin-top: 8px;
   }
   .adv > summary {

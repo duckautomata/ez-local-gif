@@ -1,7 +1,7 @@
 // Pure helpers for the Result card: grouping the manifest's files by kind and
 // describing them. Framework-free (unit-tested in result.test.ts).
 
-import type { Check, Report, ResultFile, Target } from './api';
+import { matteParamsOf, MATTE_EDGE_NONE, type Check, type Recipe, type Report, type ResultFile, type Target } from './api';
 
 /** RULE_RENDER_MATTE is jobs' info check naming the AI matte a render used (Phase 5b). */
 export const RULE_RENDER_MATTE = 'render.matte';
@@ -26,6 +26,48 @@ export function matteSummary(report: Report | null | undefined): string | null {
   if (!c) return null;
   const text = c.detail.replace(/^\s*AI matte\s*:\s*/i, '').trim();
   return text || 'see the Discord checks';
+}
+
+/**
+ * matteRecipeNotes words what the recipe's matte op asked for beyond the
+ * model (Phase 5c) — "guided (sam2-tiny) + edge birefnet-lite · 3
+ * prompted frames", "stabilise light", "2 keep colours" — so the Result
+ * card's line names them even when a server's render.matte detail does
+ * not. Empty without a matte op or with nothing to add.
+ */
+export function matteRecipeNotes(recipe: Pick<Recipe, 'ops'> | null | undefined): string[] {
+  const p = matteParamsOf(recipe?.ops);
+  if (!p) return [];
+  const out: string[] = [];
+  const prompts = Array.isArray(p.prompts) ? p.prompts : [];
+  if (prompts.length) {
+    const edge = typeof p.edge === 'string' ? p.edge.trim() : '';
+    const resolvedEdge = p.resolved?.edge?.trim() ?? '';
+    const edgeText = edge === MATTE_EDGE_NONE ? 'no edge model' : `edge ${resolvedEdge || edge || 'default'}`;
+    out.push(`guided (${p.model || 'sam2-tiny'}) + ${edgeText} · ${prompts.length} prompted ${prompts.length === 1 ? 'frame' : 'frames'}`);
+  }
+  if (typeof p.stabilise === 'string' && p.stabilise.trim()) out.push(`stabilise ${p.stabilise.trim()}`);
+  const keep = Array.isArray(p.keep) ? p.keep.filter((k) => typeof k === 'string' && k !== '') : [];
+  if (keep.length) out.push(`${keep.length} keep ${keep.length === 1 ? 'colour' : 'colours'}`);
+  return out;
+}
+
+/**
+ * matteLine is the Result card's whole "AI matte:" line: the render.matte
+ * detail, followed by the recipe notes the detail does not already mention
+ * (a word-wise check: "stabilise", "keep", "guided"). null without a
+ * render.matte check AND without a matte op.
+ */
+export function matteLine(report: Report | null | undefined, recipe: Pick<Recipe, 'ops'> | null | undefined): string | null {
+  const summary = matteSummary(report);
+  const notes = matteRecipeNotes(recipe);
+  if (summary === null && !notes.length) return null;
+  const have = (summary ?? '').toLowerCase();
+  const extra = notes.filter((n) => {
+    const word = n.startsWith('guided') ? 'guided' : n.startsWith('stabilise') ? 'stabilise' : 'keep';
+    return !have.includes(word);
+  });
+  return [summary ?? '', ...extra].filter((s) => s !== '').join(' · ');
 }
 
 export interface FileGroups {

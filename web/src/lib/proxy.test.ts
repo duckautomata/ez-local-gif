@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MattePending, type MattePendingBody, type MattePendingState, type ProxyRequest } from './api';
-import { MATTE_RETRY_MS } from './matte';
+import { MATTE_IDLE_RETRY_MS, MATTE_RETRY_MS } from './matte';
 import { ProxyPlayer, type ProxyView } from './proxy';
 
 interface Call {
@@ -179,20 +179,23 @@ describe('ProxyPlayer', () => {
   });
 });
 
-// Phase 5b: Play always starts a deferred matte pass (`eager`), and a 202
-// answer keeps the still on the stage with the pending state until the
-// proxy arrives — re-requested every MATTE_RETRY_MS — or Stop / a recipe
+// Phase 5b / 5c: Play behaves like a still — it never starts a matte pass
+// by itself (no `eager`; the server answers 202 "idle" until the Compute
+// button or a render ran the pass) — and a 202 answer keeps the still on
+// the stage with the pending state until the proxy arrives — re-requested
+// every MATTE_RETRY_MS (the slow cadence while idle) — or Stop / a recipe
 // change ends it. Without a matte op nothing changes on the wire.
-describe('ProxyPlayer — AI matte pending (Phase 5b)', () => {
+describe('ProxyPlayer — AI matte pending (Phase 5b / 5c)', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
   const M = req([{ kind: 'matte' }, { kind: 'morph', params: { close: true } }]);
 
-  it('Play with a matte op sends eager; a 202 sets pending (not playing), hands the status over and re-requests until the proxy arrives', async () => {
+  it('Play with a matte op sends NO eager; a 202 sets pending (not playing), hands the status over and re-requests until the proxy arrives', async () => {
     const h = harness();
     h.player.update(M);
     const p = h.player.play();
-    expect(h.calls[0].req).toEqual({ ...M, eager: true });
+    expect(h.calls[0].req).toEqual(M);
+    expect(h.calls[0].req).not.toHaveProperty('eager');
     h.calls[0].reject(pendingErr('running', { done: 10, total: 45 }));
     await p;
     expect(h.view).toMatchObject({ url: null, playing: false, loading: false, error: '' });
@@ -202,7 +205,7 @@ describe('ProxyPlayer — AI matte pending (Phase 5b)', () => {
     expect(h.calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(h.calls).toHaveLength(2);
-    expect(h.calls[1].req).toEqual({ ...M, eager: true });
+    expect(h.calls[1].req).toEqual(M);
     expect(h.view.loading).toBe(true);
     h.calls[1].resolve();
     await vi.advanceTimersByTimeAsync(0);
@@ -247,5 +250,52 @@ describe('ProxyPlayer — AI matte pending (Phase 5b)', () => {
     expect(h.view.error).toBe('AI matte failed: sidecar unreachable');
     await vi.advanceTimersByTimeAsync(5000);
     expect(h.calls).toHaveLength(4);
+  });
+
+  it('an idle 202 (Phase 5c) re-requests at the poll cadence; computeNow re-plays at once with eager and keeps it on the retries until the proxy', async () => {
+    const h = harness();
+    h.player.update(M);
+    let p = h.player.play();
+    h.calls[0].reject(pendingErr('idle', { total: 45 }));
+    await p;
+    expect(h.view.pending).toMatchObject({ state: 'idle', total: 45 });
+    expect(h.view.playing).toBe(false);
+    await vi.advanceTimersByTimeAsync(MATTE_IDLE_RETRY_MS - 1);
+    expect(h.calls).toHaveLength(1); // not every 500 ms: nothing changes by itself
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1].req).toEqual(M);
+    h.calls[1].reject(pendingErr('idle', { total: 45 }));
+    await vi.advanceTimersByTimeAsync(0);
+    // the Compute button: at once, with eager
+    h.player.computeNow();
+    expect(h.calls).toHaveLength(3);
+    expect(h.calls[2].req).toEqual({ ...M, eager: true });
+    h.calls[2].reject(pendingErr('running', { done: 3, total: 45 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.view.pending?.state).toBe('running');
+    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
+    expect(h.calls).toHaveLength(4);
+    expect(h.calls[3].req).toEqual({ ...M, eager: true }); // the retries keep it
+    h.calls[3].resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.view).toMatchObject({ playing: true, pending: null });
+    // Play again later is plain
+    h.player.stop();
+    p = h.player.play();
+    expect(h.calls[4].req).toEqual(M);
+    h.calls[4].resolve();
+    await p;
+    // a recipe change drops a pressed Compute: the new recipe plays plain
+    h.player.stop();
+    h.player.computeNow();
+    expect(h.calls[5].req).toEqual({ ...M, eager: true });
+    h.calls[5].reject(pendingErr('running', { done: 1, total: 45 }));
+    await vi.advanceTimersByTimeAsync(0);
+    h.player.update(B);
+    p = h.player.play();
+    expect(h.calls[6].req).toEqual(B);
+    h.calls[6].resolve();
+    await p;
   });
 });

@@ -10,6 +10,7 @@ import {
   armEyedropper,
   backgroundOps,
   buildOps,
+  defaultAi,
   defaultBackground,
   defaultOps,
   recipeOps,
@@ -41,21 +42,22 @@ const src: Source = { hash: 'a'.repeat(64), name: 'x.gif', size: 1, info: gifInf
 
 describe('AI mode ops (Phase 5b)', () => {
   it('a new session has no model chosen (the card fills the server default in); AI is one of the modes', () => {
-    expect(defaultBackground().ai).toEqual({ model: '' });
+    expect(defaultBackground().ai).toMatchObject({ model: '', modelChosen: false, stabilise: 'light', keep: [], prompts: [], edge: '' }); // 5c: stabilise light by default
     expect(defaultBackground().mode).toBe('colour'); // enabling still lands on Colour: AI never starts a pass silently
     expect(MATTE_MODEL_DEFAULT).toBe('isnet-anime');
   });
 
   it('backgroundOps: a bare matte op for the recipe default / no choice, the model otherwise, then the morph', () => {
     const b: BackgroundCfg = { ...defaultBackground(), enabled: true, mode: 'ai' };
+    b.ai.stabilise = ''; // the 5b shape: with the 5c default (light) the op carries `stabilise` — state.phase5c.test.ts
     expect(backgroundOps(b)).toEqual([{ kind: 'matte' }, { kind: 'morph', params: { close: true } }]);
     b.morph = { close: false, grow: 0 };
     expect(backgroundOps(b)).toEqual([{ kind: 'matte' }]);
-    b.ai = { model: 'isnet-anime' }; // the explicit default: still bare (the Go zero value resolves to it)
+    b.ai = { ...b.ai, model: 'isnet-anime' }; // the explicit default: still bare (the Go zero value resolves to it)
     expect(backgroundOps(b)).toEqual([{ kind: 'matte' }]);
-    b.ai = { model: 'birefnet-lite' };
+    b.ai = { ...b.ai, model: 'birefnet-lite' };
     expect(backgroundOps(b)).toEqual([{ kind: 'matte', params: { model: 'birefnet-lite' } }]);
-    b.ai = { model: '  birefnet-lite ' };
+    b.ai = { ...b.ai, model: '  birefnet-lite ' };
     expect(backgroundOps(b)).toEqual([{ kind: 'matte', params: { model: 'birefnet-lite' } }]);
     b.morph = { close: true, grow: 2 };
     expect(backgroundOps(b)).toEqual([{ kind: 'matte', params: { model: 'birefnet-lite' } }, { kind: 'morph', params: { close: true, grow: 2 } }]);
@@ -74,7 +76,7 @@ describe('AI mode ops (Phase 5b)', () => {
     const ops = defaultOps(gifInfo);
     ops.trim = { enabled: true, start: 0.5, end: 0 };
     ops.fps = { enabled: true, fps: 20 };
-    ops.background = { ...defaultBackground(), enabled: true, mode: 'ai', ai: { model: 'birefnet-lite' }, morph: { close: true, grow: 1 } };
+    ops.background = { ...defaultBackground(), enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'birefnet-lite', stabilise: '' }, morph: { close: true, grow: 1 } };
     ops.feather = { enabled: true, radius: 2 };
     ops.crop = { enabled: true, x: 0, y: 0, w: 10, h: 10 };
     ops.bounce = true;
@@ -97,6 +99,7 @@ describe('AI mode ops (Phase 5b)', () => {
 
   it('setBackgroundMode("ai") enables the card in AI mode and disarms the eyedropper; setMatteModel picks the model', () => {
     setSource(src);
+    app.ops.background.ai.stabilise = '';
     armEyedropper(0);
     setBackgroundMode('ai', { picker: true });
     expect(app.ops.background).toMatchObject({ enabled: true, mode: 'ai' });
@@ -118,7 +121,7 @@ describe('AI mode ops (Phase 5b)', () => {
     expect(app.ui.pickColor).toBe(true);
     // a new source resets the choice
     setSource({ ...src, hash: 'b'.repeat(64) });
-    expect(app.ops.background.ai).toEqual({ model: '' });
+    expect(app.ops.background.ai).toMatchObject({ model: '', modelChosen: false, stabilise: 'light' });
     resetApp();
   });
 
@@ -128,6 +131,7 @@ describe('AI mode ops (Phase 5b)', () => {
     presetById('emote').apply(out);
     const ops = defaultOps(gifInfo);
     ops.background = { ...defaultBackground(), enabled: true, mode: 'ai' };
+    ops.background.ai.stabilise = '';
     ops.crop = { enabled: true, x: 0, y: 0, w: 10, h: 10 };
     const normal = stillRequest(src, ops, out, { cropMode: false, picking: false, t: 0.5, maxW: 480 });
     const crop = stillRequest(src, ops, out, { cropMode: true, picking: false, t: 0.5, maxW: 8192 });

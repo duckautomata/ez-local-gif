@@ -14,7 +14,12 @@ import {
   type FitMode,
   type FlipParams,
   type FPSParams,
+  hasMatteOp,
+  MATTE_EDGE_NONE,
   MATTE_MODEL_DEFAULT,
+  MATTE_MODEL_SAM2_TINY,
+  MATTE_STABILISE_LIGHT,
+  MAX_MATTE_KEEP,
   type MatteParams,
   type MorphParams,
   type Op,
@@ -22,6 +27,7 @@ import {
   type OverlayParams,
   type PresetId,
   type ProbeInfo,
+  type PromptMaskRequest,
   type ResizeParams,
   type RotateParams,
   type Source,
@@ -44,6 +50,8 @@ import {
   type TextOverlayCfg,
 } from './overlay';
 import { defaultOutput, fitsFormat, gifskiAllowed, isSequence, limitKiB, presetAvailable, presetById, videoCRF, type OutputCfg } from './presets';
+import { isStabiliseMode } from './matte';
+import { clearFrame, MASK_FROM_EDGE, maskFrame, setFrameMask, toMattePrompts, wireForFrame, type FramePrompts } from './prompts';
 
 // isSequence lives in presets.ts (isGifSource needs it there); re-exported so
 // components keep importing it from the state module.
@@ -128,9 +136,36 @@ export type ScreenColor = 'green' | 'blue';
  * select shows is always what the op names — the recipe default of a
  * `matte` op WITHOUT a model is the fixed MATTE_MODEL_DEFAULT, not the
  * sidecar's, which an operator may set to another id).
+ *
+ * Phase 5c: `modelChosen` says the user picked the model (the card then
+ * keeps it across a device change; an auto-filled default follows the
+ * device's default instead). `stabilise` is the Stabilise select ('' off,
+ * 'light' the default, 'strong'); `keep` the Keep colours rows (RRGGBB,
+ * '' = a row waiting for its pick, at most MAX_MATTE_KEEP) with
+ * `keepSimilarity`; `prompts` the guided model's prompted frames (lib/
+ * prompts, normalised to the source frame) and `edge` its edge model ('' =
+ * the device's default per-frame model, MATTE_EDGE_NONE, or a segmenter
+ * id). The device a pass runs on is a server-side preference (lib/
+ * matte.svelte setMatteDevice), never part of the ops.
  */
 export interface AiCfg {
   model: string;
+  modelChosen: boolean;
+  stabilise: string;
+  keep: string[];
+  keepSimilarity: number;
+  prompts: FramePrompts[];
+  edge: string;
+}
+
+/** KEEP_DEFAULTS mirrors recipe.MatteParams' Keep zero values (Phase 5c: keepSimilarity 0 = 0.08); same rule as CHROMA_DEFAULTS. */
+export const KEEP_DEFAULTS = { similarity: 0.08 };
+/** STABILISE_DEFAULT: every new session stabilises lightly (the experiment's recommendation for every model). */
+export const STABILISE_DEFAULT = MATTE_STABILISE_LIGHT;
+
+/** defaultAi is AiCfg for a new source. */
+export function defaultAi(): AiCfg {
+  return { model: '', modelChosen: false, stabilise: STABILISE_DEFAULT, keep: [], keepSimilarity: KEEP_DEFAULTS.similarity, prompts: [], edge: '' };
 }
 
 /** MorphCfg: the Edge cleanup fold (op "morph", emitted after the keys and before feather). */
@@ -248,9 +283,32 @@ export interface UiState {
    * applyPickedColor; an index past the rows appends (eyedropper.landPick).
    */
   pickRow: number;
+  /**
+   * Phase 5c: where an armed pick lands — a Colour mode row ('colour',
+   * switches the card to Colour) or a Keep colours row of the AI mode
+   * ('keep', the card stays in AI).
+   */
+  pickTarget: PickTarget;
+  /**
+   * Phase 5c: the guided model's Select subject panel is open — the
+   * preview shows the SOURCE-frame still (the crop-mode mechanism: the
+   * temporal prefix only, no geometry, no keys) as a prompt canvas with
+   * the live mask overlay. Opened when the guided model is picked; "Done"
+   * closes it to see the keyed preview.
+   */
+  promptOpen: boolean;
+  /**
+   * Phase 5d: the loose-box guard's warning (lib/maskguard) — set by the
+   * prompt overlay from the live mask of a BOX prompt that looks like the
+   * background, shown by the Background card under the Select subject
+   * panel, '' when nothing is wrong (or no box / no mask on screen).
+   */
+  promptWarning: string;
   /** id of the overlay whose drag box is highlighted (0 = none) */
   selectedOverlay: number;
 }
+
+export type PickTarget = 'colour' | 'keep';
 
 /** DEFAULT_DELAY_MS is the sequence frame delay the server assumes when the client sends none. */
 export const DEFAULT_DELAY_MS = 100;
@@ -265,7 +323,7 @@ export function defaultBackground(): BackgroundCfg {
   return {
     enabled: false,
     mode: 'colour',
-    ai: { model: '' },
+    ai: defaultAi(),
     screen: 'green',
     color: CHROMA_GREEN,
     similarity: CHROMA_DEFAULTS.similarity,
@@ -307,7 +365,7 @@ export function defaultOps(info?: ProbeInfo | null): OpsCfg {
 export const FEATHER_DEFAULT = 3;
 
 function defaultUi(): UiState {
-  return { backdrop: 'checker', resultBackdrop: 'dark', cropRatio: 0, scrubFrame: 0, cropOpen: false, pickColor: false, pickRow: 0, selectedOverlay: 0 };
+  return { backdrop: 'checker', resultBackdrop: 'dark', cropRatio: 0, scrubFrame: 0, cropOpen: false, pickColor: false, pickRow: 0, pickTarget: 'colour', promptOpen: false, promptWarning: '', selectedOverlay: 0 };
 }
 
 export const app = $state({
@@ -324,6 +382,9 @@ function resetUi(): void {
   app.ui.cropRatio = 0;
   app.ui.pickColor = false;
   app.ui.pickRow = 0;
+  app.ui.pickTarget = 'colour';
+  app.ui.promptOpen = false;
+  app.ui.promptWarning = '';
   app.ui.selectedOverlay = 0;
 }
 
@@ -485,19 +546,59 @@ function morphOp(m: MorphCfg): Op | null {
   return { kind: 'morph', params: p };
 }
 
+/** matteModelId is the model the AI mode names ('' = not chosen / the recipe default). */
+function matteModelId(b: BackgroundCfg): string {
+  return b.ai.model.trim();
+}
+
+/** isGuided: the AI mode's model is the guided tracker (sam2-tiny: prompts and the edge model apply). */
+export function isGuided(b: Pick<BackgroundCfg, 'ai'>): boolean {
+  return b.ai.model.trim() === MATTE_MODEL_SAM2_TINY;
+}
+
+/** keepColors is the Keep colours rows that carry a colour, deduplicated, at most MAX_MATTE_KEEP (what the op sends). */
+export function keepColors(b: Pick<BackgroundCfg, 'ai'>): string[] {
+  const out: string[] = [];
+  for (const c of b.ai.keep) {
+    if (!c || out.includes(c)) continue;
+    out.push(c);
+    if (out.length >= MAX_MATTE_KEEP) break;
+  }
+  return out;
+}
+
 /**
- * matteOp serialises the AI mode (Phase 5b): a `matte` op naming the
- * model, left out when it is the recipe default (MATTE_MODEL_DEFAULT —
- * the Go zero value resolves to it) or not chosen yet (''; the card fills
- * the server's default in as soon as /api/matte answers). `size` is never
- * sent (API-only; the server picks its device's default) and `resolved`
- * is the server's.
+ * matteOp serialises the AI mode (Phase 5b / 5c): a `matte` op naming the
+ * model (left out when it is the recipe default, MATTE_MODEL_DEFAULT — the
+ * Go zero value resolves to it — or not chosen yet: the card fills the
+ * server's default in as soon as /api/matte answers), the stabilise mode
+ * (sent whenever set: the recipe's zero value is OFF while the card
+ * defaults to light), the Keep colours with their similarity (the default
+ * 0.08 left out), and — for the guided model only — the prompts (lib/
+ * prompts.toMattePrompts: rounded, frame-sorted) and the edge model when
+ * chosen. `size` is never sent (API-only) and `resolved` is the server's.
+ * null for a guided model whose prompts cannot select anything yet: the
+ * server would refuse the op, so the card emits none (like a Colour row
+ * without a pick) until the subject is selected.
  */
-function matteOp(b: BackgroundCfg): Op {
-  const model = b.ai.model.trim();
-  if (!model || model === MATTE_MODEL_DEFAULT) return { kind: 'matte' };
-  const p: MatteParams = { model };
-  return { kind: 'matte', params: p };
+function matteOp(b: BackgroundCfg): Op | null {
+  const model = matteModelId(b);
+  const p: MatteParams = {};
+  if (model && model !== MATTE_MODEL_DEFAULT) p.model = model;
+  if (b.ai.stabilise && isStabiliseMode(b.ai.stabilise)) p.stabilise = b.ai.stabilise;
+  const keep = keepColors(b);
+  if (keep.length) {
+    p.keep = keep;
+    if (b.ai.keepSimilarity > 0 && b.ai.keepSimilarity !== KEEP_DEFAULTS.similarity) p.keepSimilarity = round(clamp(b.ai.keepSimilarity, 0.01, 1));
+  }
+  if (isGuided(b)) {
+    const prompts = toMattePrompts(b.ai.prompts);
+    if (!prompts.length) return null;
+    p.prompts = prompts;
+    const edge = b.ai.edge.trim();
+    if (edge) p.edge = edge;
+  }
+  return Object.keys(p).length ? { kind: 'matte', params: p } : { kind: 'matte' };
 }
 
 /**
@@ -506,26 +607,224 @@ function matteOp(b: BackgroundCfg): Op {
  * chromakey — and then, only when a key was emitted, the morph op of the
  * Edge cleanup (the morph cleans the key's or matte's alpha; with nothing
  * keyed there is nothing to clean, and a source's own alpha is not the
- * card's business). Empty when the card is off or no colour was picked
- * yet. Feather is not part of it: buildOps places it right after.
+ * card's business). Empty when the card is off, no colour was picked yet,
+ * or the guided model has no subject selected yet. Feather is not part of
+ * it: buildOps places it right after.
  */
 export function backgroundOps(b: BackgroundCfg): Op[] {
   if (!b.enabled) return [];
-  const ops = b.mode === 'ai' ? [matteOp(b)] : b.mode === 'colour' ? colorKeyOps(b) : [chromaKeyOp(b)];
+  let ops: Op[];
+  if (b.mode === 'ai') {
+    const m = matteOp(b);
+    ops = m ? [m] : [];
+  } else ops = b.mode === 'colour' ? colorKeyOps(b) : [chromaKeyOp(b)];
   if (!ops.length) return ops;
   const m = morphOp(b.morph);
   if (m) ops.push(m);
   return ops;
 }
 
-/** aiActive: the Background card keys with the AI matte (the recipe carries a matte op). */
+/** aiActive: the Background card keys with the AI matte (the recipe carries a matte op, or would once the subject is selected). */
 export function aiActive(c: Pick<OpsCfg, 'background'>): boolean {
   return c.background.enabled && c.background.mode === 'ai';
 }
 
-/** setMatteModel picks the AI mode's model (the card's select; '' = the server's default). */
+/** guidedNeedsPrompts: the AI mode is guided but nothing selects the subject yet (no matte op is emitted). */
+export function guidedNeedsPrompts(c: Pick<OpsCfg, 'background'>): boolean {
+  return aiActive(c) && isGuided(c.background) && toMattePrompts(c.background.ai.prompts).length === 0;
+}
+
+/**
+ * setMatteModel picks the AI mode's model (the card's select; '' = the
+ * server's default — unchosen, so the auto-fill follows the device's
+ * default again). Picking the guided model opens the Select subject panel
+ * (app.ui.promptOpen); leaving it closes the panel and disarms a Keep
+ * eyedropper is left alone (the rows are shared by every model).
+ */
 export function setMatteModel(id: string): void {
-  app.ops.background.ai.model = id.trim();
+  const ai = app.ops.background.ai;
+  const m = id.trim();
+  ai.model = m;
+  ai.modelChosen = m !== '';
+  app.ui.promptOpen = m === MATTE_MODEL_SAM2_TINY;
+}
+
+/**
+ * fillMatteDefault installs the server's default model while the user has
+ * not chosen one (the card's effect on every /api/matte answer): the
+ * select then shows what the op names, and a device change moves an
+ * unchosen model to the new device's default. A chosen model stays.
+ */
+export function fillMatteDefault(id: string): void {
+  const ai = app.ops.background.ai;
+  const d = id.trim();
+  if (!d || ai.modelChosen || ai.model === d) return;
+  ai.model = d;
+  if (d !== MATTE_MODEL_SAM2_TINY) app.ui.promptOpen = false;
+}
+
+/** setMatteStabilise sets the Stabilise select ('' / light / strong; anything else is ignored). */
+export function setMatteStabilise(mode: string): void {
+  const m = mode.trim();
+  if (isStabiliseMode(m)) app.ops.background.ai.stabilise = m;
+}
+
+/**
+ * setMatteEdge sets the guided model's edge model ('' = the device's
+ * default, MATTE_EDGE_NONE, or a segmenter id). Phase 5d: None offers no
+ * frame matte to start the track from (the graph refuses a mask prompt
+ * with edge none), so a mask prompt is taken off its frame — the frame's
+ * box and clicks stay, a mask-only frame goes — and true says so, for the
+ * card to tell the user.
+ */
+export function setMatteEdge(id: string): boolean {
+  const ai = app.ops.background.ai;
+  ai.edge = id.trim();
+  if (!edgeIsNone(ai.edge)) return false;
+  const mf = maskFrame(ai.prompts);
+  if (mf < 0) return false;
+  ai.prompts = setFrameMask(ai.prompts, mf, null);
+  return true;
+}
+
+/** edgeIsNone: the guided matte uses the tracker's mask alone. */
+export function edgeIsNone(edge: string): boolean {
+  return edge.trim() === MATTE_EDGE_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Keep colours rows (Phase 5c): the same row model as the Colour mode, on
+// the AI mode's matte op (recipe.MatteParams.Keep).
+
+/** addKeepColor appends an empty Keep row and returns its index; −1 at the cap (MAX_MATTE_KEEP). */
+export function addKeepColor(): number {
+  const keep = app.ops.background.ai.keep;
+  if (keep.length >= MAX_MATTE_KEEP) return -1;
+  keep.push('');
+  return keep.length - 1;
+}
+
+/** removeKeepColor drops Keep row i (an eyedropper armed for it is disarmed; one armed for a later row follows its row down). */
+export function removeKeepColor(i: number): void {
+  const keep = app.ops.background.ai.keep;
+  if (i < 0 || i >= keep.length) return;
+  keep.splice(i, 1);
+  if (app.ui.pickTarget === 'keep') {
+    if (app.ui.pickRow === i) app.ui.pickColor = false;
+    else if (app.ui.pickRow > i) app.ui.pickRow--;
+  }
+}
+
+/** setKeepColor stores a typed hex in Keep row i ('' clears it; a malformed value is ignored and false returned). */
+export function setKeepColor(i: number, hex: string): boolean {
+  const keep = app.ops.background.ai.keep;
+  if (i < 0 || i >= keep.length) return false;
+  const t = hex.trim();
+  if (t === '' || t === '#') {
+    keep[i] = '';
+    return true;
+  }
+  const n = normalizeHex(t);
+  if (!n) return false;
+  keep[i] = n;
+  if (app.ui.pickColor && app.ui.pickTarget === 'keep' && app.ui.pickRow === i) app.ui.pickColor = false;
+  return true;
+}
+
+/** armKeepEyedropper arms the preview eyedropper for Keep row `row` (the next click lands there, the card stays in AI). */
+export function armKeepEyedropper(row: number): void {
+  app.ui.pickRow = Math.max(0, Math.floor(row));
+  app.ui.pickTarget = 'keep';
+  app.ui.pickColor = true;
+}
+
+/** clearMattePrompts forgets every prompt of the guided model. */
+export function clearMattePrompts(): void {
+  app.ops.background.ai.prompts = [];
+}
+
+/** clearFramePrompts drops the prompts of one frame (the keyframe strip's delete). */
+export function clearFramePrompts(frame: number): void {
+  app.ops.background.ai.prompts = clearFrame(app.ops.background.ai.prompts, frame);
+}
+
+/** setMattePrompts replaces the guided model's prompts (the overlay's edits go through lib/prompts' pure helpers). */
+export function setMattePrompts(prompts: FramePrompts[]): void {
+  app.ops.background.ai.prompts = prompts;
+}
+
+/**
+ * setFrameMaskPrompt is "Use this frame's matte" (Phase 5d): `on` makes
+ * `frame` the set's mask prompt — the edge model's matte of it starts the
+ * track; its box and clicks are replaced, any other frame's mask is taken
+ * off (one per op) — and opens the Select subject panel so the overlay
+ * shows the mask; `off` takes the mask off that frame (lib/prompts
+ * setFrameMask). Any pending loose-box warning is cleared: it judged a box.
+ */
+export function setFrameMaskPrompt(frame: number, on: boolean): void {
+  const ai = app.ops.background.ai;
+  ai.prompts = setFrameMask(ai.prompts, frame, on ? MASK_FROM_EDGE : null);
+  app.ui.promptWarning = '';
+  if (on) app.ui.promptOpen = true;
+}
+
+/**
+ * promptGridKey names the forward frame grid the guided model's prompts
+ * are keyed on (FramePrompts.frame is an OUTPUT frame index of the matte
+ * plan): the source, the trim start, the delay op, the speed and the plan
+ * fps (effective ops, the Output card's rate / format snap included). A
+ * change of any of them moves every frame under the prompts — the box
+ * drawn on old frame 0 would condition old frame 10 after a 10-frame trim
+ * — so the card drops them (prunePrompts) instead of mis-tracking in
+ * silence. The trim END keeps earlier frames where they are (prompts past
+ * it are pruned by count), and crop, reverse, bounce, the keys and the
+ * overlays never touch the grid. '' without a source.
+ */
+export function promptGridKey(src: Source | null | undefined, c: OpsCfg, out: OutputCfg): string {
+  if (!src) return '';
+  const ops = effectiveOps(c, out);
+  const { start } = trimRange(src.info, ops);
+  const delay = ops.delay.enabled ? ops.delay.ms : 0;
+  return JSON.stringify([src.hash, start, delay, speedFactor(ops), planFPS(src.info, ops, out)]);
+}
+
+/** the op kinds that shape the frames a matte model sees in time (Go: matte.TemporalOps — delay, unpremultiply, trim, speed, fps) */
+const MATTE_TEMPORAL_KINDS: ReadonlySet<string> = new Set(['delay', 'unpremultiply', 'trim', 'speed', 'fps']);
+
+/**
+ * matteClipKey names the clip a matte memo is of, the way the server's
+ * clip key does (matte.ClipKeyParts: the source, the stack's temporal ops
+ * in stack order, the plan's fps — never the geometry, the keys or the
+ * overlays): the SPA keys what it learnt about the server's memos on it
+ * (lib/matte.matteMemoKey, lib/matte.svelte matteMemo), so "Use this
+ * frame's matte" knows whether the edge model's matte of THIS clip exists.
+ * '' without a source.
+ */
+export function matteClipKey(src: Source | null | undefined, c: OpsCfg, out: OutputCfg): string {
+  if (!src) return '';
+  const temporal = recipeOps(c, out).filter((o) => MATTE_TEMPORAL_KINDS.has(o.kind));
+  return JSON.stringify([src.hash, temporal, planFPS(src.info, c, out)]);
+}
+
+/**
+ * prunePrompts drops the guided model's prompts that no longer name the
+ * picture they were drawn on: every one when `moved` (the grid key changed
+ * under them), else those at or past `frames` (the clip's forward frame
+ * count; 0 = unknown, nothing dropped). Returns how many were dropped.
+ */
+export function prunePrompts(moved: boolean, frames: number): number {
+  const ai = app.ops.background.ai;
+  const before = ai.prompts.length;
+  if (!before) return 0;
+  if (moved) {
+    ai.prompts = [];
+    return before;
+  }
+  if (!(frames > 0)) return 0;
+  const kept = ai.prompts.filter((p) => p.frame < frames);
+  if (kept.length === before) return 0;
+  ai.prompts = kept;
+  return before - kept.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +884,7 @@ export function setKeyColor(i: number, hex: string): boolean {
 /** armEyedropper arms the preview eyedropper for Colour mode row `row` (the next click lands there). */
 export function armEyedropper(row: number): void {
   app.ui.pickRow = Math.max(0, Math.floor(row));
+  app.ui.pickTarget = 'colour';
   app.ui.pickColor = true;
 }
 
@@ -620,15 +920,22 @@ export function setBackgroundMode(m: BackgroundMode | 'none', opts: { picker: bo
 
 /**
  * applyPickedColor lands a sampled colour (RRGGBB) in the armed row
- * (app.ui.pickRow; eyedropper.landPick appends when the row is gone),
- * switches the card to Colour, enables it and disarms the eyedropper. A
- * malformed hex changes nothing.
+ * (app.ui.pickRow; eyedropper.landPick appends when the row is gone):
+ * a Colour mode row switches the card to Colour and enables it; a Keep
+ * colours row (app.ui.pickTarget 'keep', Phase 5c) lands in the AI mode's
+ * keep list and keeps the card in AI. Either way the eyedropper is
+ * disarmed. A malformed hex changes nothing.
  */
 export function applyPickedColor(hex: string): void {
   if (!normalizeHex(hex)) return;
   const b = app.ops.background;
-  b.colors = landPick(b.colors, app.ui.pickRow, hex, MAX_KEY_COLORS);
-  b.mode = 'colour';
+  if (app.ui.pickTarget === 'keep') {
+    b.ai.keep = landPick(b.ai.keep, app.ui.pickRow, hex, MAX_MATTE_KEEP);
+    b.mode = 'ai';
+  } else {
+    b.colors = landPick(b.colors, app.ui.pickRow, hex, MAX_KEY_COLORS);
+    b.mode = 'colour';
+  }
   b.enabled = true;
   app.ui.pickColor = false;
 }
@@ -706,9 +1013,9 @@ export function opsApply(out: Pick<OutputCfg, 'preset'>): boolean {
 }
 
 export interface BuildOpsOptions {
-  /** stop before crop: the still shows the full frame in source pixels for the drag rectangle */
+  /** stop before crop: the still shows the full frame in source pixels for the drag rectangle (and the guided model's prompt canvas) */
   cropPreview?: boolean;
-  /** leave the Background card's ops (keys and their morph) out: the eyedropper needs the original colours */
+  /** leave the Background card's ops (keys and their morph) out: the eyedropper needs the original colours, the prompt canvas the whole picture */
   keyPreview?: boolean;
 }
 
@@ -976,7 +1283,14 @@ export interface StillRequestOptions {
   cropMode: boolean;
   /** the eyedropper is armed: the Background card's ops (keys and their morph) are left out */
   picking: boolean;
-  /** the still's time in seconds (mid-frame; on the forward timeline in crop mode) */
+  /**
+   * Phase 5c: the guided model's Select subject panel is open — the still
+   * is the SOURCE frame like crop mode's (no geometry, the temporal prefix
+   * only) AND unkeyed like the eyedropper's (the whole picture to click
+   * on; the live mask overlay shows the tracker's answer)
+   */
+  promptMode?: boolean;
+  /** the still's time in seconds (mid-frame; on the forward timeline in crop / prompt mode) */
   t: number;
   /** the width cap (lib/still.stillMaxW) */
   maxW: number;
@@ -984,24 +1298,50 @@ export interface StillRequestOptions {
 
 /**
  * stillRequest is the body of POST /api/still for the current state — the
- * pure part of Preview.svelte's request, so the two shapes are testable:
- * the normal still carries recipeOps / recipeSources and previewOutput; in
+ * pure part of Preview.svelte's request, so the shapes are testable: the
+ * normal still carries recipeOps / recipeSources and previewOutput; in
  * crop mode the stack is cut before crop (buildOps cropPreview), the
  * sources are the main one alone (an overlay op never survives the cut) and
  * the output is cropPreviewOutput — the format and the fps, never the
  * geometry, so the crop still resolves to the same frame grid as the normal
- * one (spec §6.1). Null without a source.
+ * one (spec §6.1); prompt mode (Phase 5c) is crop mode's frame without the
+ * keys. Null without a source.
  */
 export function stillRequest(src: Source | null, c: OpsCfg, out: OutputCfg, o: StillRequestOptions): StillRequest | null {
   if (!src) return null;
   const output = buildOutput(out);
+  const full = o.cropMode || o.promptMode === true;
   return {
     src: src.hash,
-    sources: o.cropMode ? [src.hash] : recipeSources(src.hash, c, out),
-    ops: recipeOps(c, out, { cropPreview: o.cropMode, keyPreview: o.picking }),
-    output: o.cropMode ? cropPreviewOutput(output) : previewOutput(output),
+    sources: full ? [src.hash] : recipeSources(src.hash, c, out),
+    ops: recipeOps(c, out, { cropPreview: full, keyPreview: o.picking || o.promptMode === true }),
+    output: full ? cropPreviewOutput(output) : previewOutput(output),
     t: o.t,
     maxW: o.maxW,
+  };
+}
+
+/**
+ * promptMaskRequest is the body of POST /api/matte/prompt for the current
+ * state (Phase 5c): the recipe's sources / ops / output (the ops carry the
+ * guided matte op — null while the prompts cannot select anything, or
+ * when the AI mode is not guided: there is nothing to ask), the prompted
+ * frame (the forward grid index) and that frame's prompts alone. Null
+ * without a source.
+ */
+export function promptMaskRequest(src: Source | null, c: OpsCfg, out: OutputCfg, frame: number): PromptMaskRequest | null {
+  if (!src || !aiActive(c) || !isGuided(c.background)) return null;
+  const prompts = wireForFrame(c.background.ai.prompts, frame);
+  if (!prompts) return null;
+  const ops = recipeOps(c, out);
+  if (!hasMatteOp(ops)) return null;
+  return {
+    src: src.hash,
+    sources: recipeSources(src.hash, c, out),
+    ops,
+    output: previewOutput(buildOutput(out)),
+    frame,
+    prompts,
   };
 }
 
@@ -1393,6 +1733,23 @@ export function forwardFrame(info: ProbeInfo, c: OpsCfg, out: OutputCfg, i: numb
   }
   if (ops.reverse) idx = fwdTotal - 1 - idx;
   return idx;
+}
+
+/**
+ * scrubFrameFor is forwardFrame's inverse for the keyframe strip (Phase
+ * 5c): the scrubber slot that shows forward-grid frame `fwd` — the slot
+ * itself on a plain plan, the mirrored slot under a reverse op, and on a
+ * bounced plan the forward half's slot (its mirror shows the same frame).
+ * Clamped to the forward grid.
+ */
+export function scrubFrameFor(info: ProbeInfo, c: OpsCfg, out: OutputCfg, fwd: number): number {
+  const ops = effectiveOps(c, out);
+  const total = planFrames(info, ops, out);
+  if (total <= 0) return 0;
+  let fwdTotal = total;
+  if (ops.bounce && !info.isStill && total >= 2 && total % 2 === 0) fwdTotal = total / 2;
+  const idx = clamp(Math.round(fwd), 0, fwdTotal - 1);
+  return ops.reverse ? fwdTotal - 1 - idx : idx;
 }
 
 // ---------------------------------------------------------------------------

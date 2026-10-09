@@ -39,6 +39,13 @@ type Manifest struct {
 	Device      string    `json:"device"`      // cuda / cpu
 	MsPerFrame  float64   `json:"msPerFrame"`  // the sidecar's figure at the time
 	Created     time.Time `json:"created"`
+
+	// Tracker mattes only (Phase 5c Part B): the key's canonical prompts
+	// and tracking size (ClipKeyParts.Prompts / TrackW / TrackH); absent
+	// from a segmenter's manifest.
+	Prompts string `json:"prompts,omitempty"`
+	TrackW  int    `json:"trackW,omitempty"`
+	TrackH  int    `json:"trackH,omitempty"`
 }
 
 // ErrManifestVersion is returned by ReadManifest for a file written under

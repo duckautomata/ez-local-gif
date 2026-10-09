@@ -40,20 +40,11 @@ func MatteSourceArgs(srcPath string, p *graph.Plan, size int) []string {
 		return nil
 	}
 	n := strconv.Itoa(size)
-	args := make([]string, 0, len(p.InputArgs)+14)
-	args = append(args, p.InputArgs...)
-	args = append(args,
-		"-i", inputPath(srcPath, p),
-		"-filter_complex", p.Filter+";"+outLabel(p)+"format=rgb24,scale="+n+":"+n+":flags=bicubic"+matteSourceOutLabel,
-		"-map", matteSourceOutLabel,
-		"-an", "-sn", "-dn",
-		"-f", "rawvideo", "-pix_fmt", "rgb24",
-		"pipe:1",
-	)
-	return args
+	return matteStreamArgs(srcPath, p, n+":"+n)
 }
 
-// matteSourceOutLabel is the output pad of MatteSourceArgs' stretch chain.
+// matteSourceOutLabel is the output pad of the rgb24 matte streams'
+// stretch chain (MatteSourceArgs, MatteTrackSourceArgs, MatteTrackFrameArgs).
 const matteSourceOutLabel = "[mi]"
 
 // matteArgs selects the form a builder gives a matte input (ExtraInput.Matte)

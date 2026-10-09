@@ -5,7 +5,7 @@
   import { holdMattePolling, matte } from '../lib/matte.svelte';
   import { cancelRender, render, startRender } from '../lib/render.svelte';
   import { stageLabel } from '../lib/stages';
-  import { aiActive, app, effectiveOps, masterVerdict, MAX_EXTRACT_FRAMES, planFrames, planMaster } from '../lib/state.svelte';
+  import { aiActive, app, effectiveOps, guidedNeedsPrompts, masterVerdict, MAX_EXTRACT_FRAMES, planFrames, planMaster } from '../lib/state.svelte';
   import ResultCard from './ResultCard.svelte';
 
   const job = $derived(render.job);
@@ -32,6 +32,10 @@
     return ops.bounce && !src.info.isStill && n >= 2 ? n / 2 : n;
   });
   const aiVerdict = $derived(ai ? matteVerdict(matte.status, aiModel, aiFrames) : null);
+  // Phase 5c: the guided model without a subject selected emits no matte
+  // op at all (the server would refuse one without prompts), so a render
+  // would quietly keep the background — say so next to the button.
+  const needsPrompts = $derived(ai && guidedNeedsPrompts(effectiveOps(app.ops, app.output)));
 
   // The live frame-master estimate (state.planMaster mirrors jobs'
   // admission) and its verdict against the caps the server published.
@@ -121,6 +125,9 @@
     {/if}
     {#if aiVerdict?.over}
       <p class="note error estimate matte">{aiVerdict.note}</p>
+    {/if}
+    {#if needsPrompts}
+      <p class="note estimate matte">The guided AI matte has no subject selected yet — the render keeps the background. Open Select subject in the Background card and draw a box around it.</p>
     {/if}
   {/if}
 

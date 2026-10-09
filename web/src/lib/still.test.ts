@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MattePending, type MattePendingBody, type MattePendingState, type StillRequest } from './api';
-import { MATTE_DEFERRED_RETRY_MS, MATTE_RETRY_MS } from './matte';
+import { MATTE_DEFERRED_RETRY_MS, MATTE_IDLE_RETRY_MS, MATTE_RETRY_MS } from './matte';
 import { CANVAS_STILL_MAXW, DECODE_ERROR, FIT_STILL_MAXW, FIT_STILL_MAXW_WIDE, StillScheduler, stillMaxW, type StillView } from './still';
 
 describe('stillMaxW', () => {
@@ -497,5 +497,87 @@ describe('StillScheduler — AI matte pending (Phase 5b)', () => {
     expect(h.view.pending).toBeNull();
     await vi.advanceTimersByTimeAsync(5000);
     expect(h.calls).toHaveLength(5);
+  });
+});
+
+// Phase 5c: a preview never starts a pass — the server answers 202 "idle"
+// until the Compute matte button (computeNow: `eager`) or a render ran
+// it. Like 5b's deferred state it is re-requested at the poll cadence only.
+describe('StillScheduler — idle matte (Phase 5c)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('an idle 202 keeps the still, retries slowly, and the Compute button re-requests at once with eager until the picture', async () => {
+    const h = harness();
+    await display(h, 0);
+    h.still.request(B);
+    await vi.advanceTimersByTimeAsync(150);
+    h.calls[1].reject(pendingErr('idle', { total: 45, device: 'cuda' }));
+    await flush();
+    expect(h.view.url).toBe('blob:3');
+    expect(h.view.pending).toMatchObject({ state: 'idle', total: 45, device: 'cuda' });
+    expect(MATTE_IDLE_RETRY_MS).toBe(5000);
+    await vi.advanceTimersByTimeAsync(MATTE_IDLE_RETRY_MS - 1);
+    expect(h.calls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.calls).toHaveLength(3);
+    expect(h.calls[2].req).toEqual(B); // plain: the preview never starts the pass
+    h.calls[2].reject(pendingErr('idle', { total: 45 }));
+    await flush();
+    h.still.computeNow();
+    expect(h.calls).toHaveLength(4);
+    expect(h.calls[3].req).toEqual({ ...B, eager: true });
+    h.calls[3].reject(pendingErr('running', { done: 1, total: 45 }));
+    await flush();
+    expect(h.view.pending?.state).toBe('running');
+    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
+    expect(h.calls[4].req).toEqual({ ...B, eager: true });
+    h.calls[4].resolve();
+    await flush();
+    expect(h.view).toEqual({ url: 'blob:5', loading: false, error: '', pending: null });
+    expect(h.still.displayedKey).toBe(StillScheduler.key(B));
+    // a render started the pass meanwhile: the slow retry of another idle state sees it running, no eager needed
+    h.still.request(req(0.75));
+    await vi.advanceTimersByTimeAsync(150);
+    h.calls[5].reject(pendingErr('idle'));
+    await flush();
+    await vi.advanceTimersByTimeAsync(MATTE_IDLE_RETRY_MS);
+    expect(h.calls[6].req).toEqual(req(0.75));
+    h.calls[6].reject(pendingErr('running', { done: 10, total: 45 }));
+    await flush();
+    expect(h.view.pending?.state).toBe('running');
+    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
+    expect(h.calls).toHaveLength(8);
+  });
+
+  it('computeNext (the guided panel): the NEXT different request is loaded with eager, the same state and later ones are plain', async () => {
+    const h = harness();
+    await display(h, 0); // the prompt-mode still (no matte op) is on screen
+    h.still.computeNext();
+    h.still.request(A); // the same state: nothing to do
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.calls).toHaveLength(1);
+    h.still.request(B); // the panel closed: the keyed still
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1].req).toEqual({ ...B, eager: true });
+    h.calls[1].reject(pendingErr('running', { done: 1, total: 45 }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
+    expect(h.calls[2].req).toEqual({ ...B, eager: true }); // its retries too
+    h.calls[2].resolve();
+    await flush();
+    expect(h.view.pending).toBeNull();
+    h.still.request(req(0.75));
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.calls[3].req).toEqual(req(0.75)); // plain again
+    // pressed and then superseded twice: only the first different state is eager
+    h.still.computeNext();
+    h.still.request(A);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.calls[4].req).toEqual({ ...A, eager: true });
+    h.still.request(req(0.9)); // (B is the still on screen: nothing to fetch for it)
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.calls[5].req).toEqual(req(0.9));
   });
 });

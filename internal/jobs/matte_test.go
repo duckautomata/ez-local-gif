@@ -21,6 +21,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -299,6 +301,11 @@ func TestFlightAbandon(t *testing.T) {
 // fakeSidecar is an httptest matte sidecar: /v1/ping answers its ping
 // (status pingStatus), /v1/matte answers 255 − luma gray PNGs for every
 // frame (after delay, or failStatus instead), /v1/warm records the model.
+// Phase 5c: /v1/unload records its query, /v1/track answers one binary
+// mask per frame — 255 inside the first prompt's box (fakeTrackMask) —
+// and /v1/track/frame the same mask as image/png (after trackDelay, or
+// trackFail instead; retryTrack503 503s first); every model request's
+// device= is recorded (devices).
 type fakeSidecar struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -314,9 +321,65 @@ type fakeSidecar struct {
 	pings      int
 	warms      []string
 	batches    [][][]byte // the rgb frames of every POST, in order
+
+	// Phase 5c.
+	devices       []string // the device= of every /v1/matte, /v1/warm, /v1/track and /v1/track/frame ("" when absent)
+	unloads       []string // the raw query of every /v1/unload
+	tracks        int      // /v1/track calls served
+	trackFrames   int      // /v1/track/frame calls served
+	trackPrompts  []string // the X-Matte-Prompts header of every track / track-frame request
+	trackBodies   [][]byte // the rgb24 body of every /v1/track
+	trackSizes    [][2]int // w, h of every track / track-frame request
+	trackMasks    []string // Phase 5d: matte.MaskDigestOf the mask record of every track / track-frame request ("" when none)
+	trackDelay    time.Duration
+	trackFail     int // HTTP status to answer /v1/track and /v1/track/frame with (0 = serve)
+	retryTrack503 int // track requests still to answer 503 "model loading" before serving
 }
 
 const fakeMatteSize = 16
+
+// trackerWeights is the fake's sam2-tiny weights digest.
+const trackerWeights = "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69"
+
+// newFakeSidecar5c is a Phase 5c-shaped fake: two devices (cuda the
+// default, cpu), isnet-anime on both (fp16 on cuda, fp32 on cpu, 16 px —
+// a different identity per device), birefnet-lite on cuda only (the cuda
+// default model) and the tracker sam2-tiny on both (bf16 / fp32 at 1024).
+func newFakeSidecar5c(t *testing.T, msPerFrame float64) *fakeSidecar {
+	t.Helper()
+	f := newFakeSidecar(t, testWeights, msPerFrame)
+	f.set(func(f *fakeSidecar) {
+		p := &f.ping
+		p.Device, p.DefaultDevice = matte.DeviceCUDA, matte.DeviceCUDA
+		p.Devices = []string{matte.DeviceCUDA, matte.DeviceCPU}
+		p.DefaultModel = recipe.MatteModelBiRefNetLite
+		p.DefaultModels = map[string]string{matte.DeviceCUDA: recipe.MatteModelBiRefNetLite, matte.DeviceCPU: recipe.MatteModelISNetAnime}
+		ms := map[string]float64{strconv.Itoa(fakeMatteSize): msPerFrame}
+		isnet := p.Models[recipe.MatteModelISNetAnime]
+		isnet.Precision, isnet.Kind = "fp16", matte.KindSegmenter
+		isnet.Devices = map[string]matte.DeviceState{
+			matte.DeviceCUDA: {State: matte.StateReady, Precision: "fp16", Size: fakeMatteSize, Sizes: []int{fakeMatteSize}, MsPerFrame: ms},
+			matte.DeviceCPU:  {State: matte.StateReady, Precision: "fp32", Size: fakeMatteSize, Sizes: []int{fakeMatteSize}, MsPerFrame: map[string]float64{strconv.Itoa(fakeMatteSize): msPerFrame * 10}},
+		}
+		p.Models[recipe.MatteModelISNetAnime] = isnet
+		p.Models[recipe.MatteModelBiRefNetLite] = matte.ModelState{
+			State: matte.StateReady, Weights: otherWeights, GraphDigest: "g-" + otherWeights, Precision: "fp32",
+			Sizes: []int{fakeMatteSize}, DefaultSize: fakeMatteSize, MsPerFrame: ms, Licence: "MIT", Label: "General (precise)", Kind: matte.KindSegmenter,
+			Devices: map[string]matte.DeviceState{
+				matte.DeviceCUDA: {State: matte.StateReady, Precision: "fp32", Size: fakeMatteSize, Sizes: []int{fakeMatteSize}, MsPerFrame: ms},
+			},
+		}
+		p.Models[recipe.MatteModelSAM2Tiny] = matte.ModelState{
+			State: matte.StateReady, Weights: trackerWeights, GraphDigest: "g-" + trackerWeights, Precision: "bf16", Resident: true,
+			Sizes: []int{1024}, DefaultSize: 1024, MsPerFrame: map[string]float64{"1024": msPerFrame}, Licence: "Apache-2.0", Label: "Guided (click to select)", Kind: matte.KindTracker,
+			Devices: map[string]matte.DeviceState{
+				matte.DeviceCUDA: {State: matte.StateReady, Precision: "bf16", Size: 1024, Sizes: []int{1024}, MsPerFrame: map[string]float64{"1024": msPerFrame}, Resident: true},
+				matte.DeviceCPU:  {State: matte.StateReady, Precision: "fp32", Size: 1024, Sizes: []int{1024}, MsPerFrame: map[string]float64{"1024": msPerFrame * 20}},
+			},
+		}
+	})
+	return f
+}
 
 func newFakeSidecar(t *testing.T, weights string, msPerFrame float64) *fakeSidecar {
 	t.Helper()
@@ -358,13 +421,201 @@ func (f *fakeSidecar) handle(w http.ResponseWriter, r *http.Request) {
 	case "/v1/warm":
 		f.mu.Lock()
 		f.warms = append(f.warms, r.URL.Query().Get("model"))
+		f.devices = append(f.devices, r.URL.Query().Get("device"))
 		f.mu.Unlock()
 		w.Write([]byte(`{"model":"x","state":"loading"}`))
 	case "/v1/matte":
 		f.matte(w, r)
+	case "/v1/unload":
+		f.mu.Lock()
+		f.unloads = append(f.unloads, r.URL.RawQuery)
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"unloaded":[],"sessions":[]}`))
+	case "/v1/track":
+		f.track(w, r, false)
+	case "/v1/track/frame":
+		f.track(w, r, true)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
+}
+
+// fakeTrackHeader is the X-Matte-Prompts JSON as the fake parses it: the
+// 5c prompts plus the Phase 5d top-level "mask":{"frame":N} naming the
+// frame the body's trailing mask record belongs to.
+type fakeTrackHeader struct {
+	Obj     int                 `json:"obj"`
+	Prompts []matte.FramePrompt `json:"prompts"`
+	Mask    *struct {
+		Frame int `json:"frame"`
+	} `json:"mask"`
+}
+
+// track serves /v1/track (the record stream of frames masks) and
+// /v1/track/frame (one mask as image/png): the body must be exactly
+// frames × w × h × 3 bytes and the prompts header a TrackPrompts with at
+// least one prompt. Phase 5d: with a "mask" key in the header the body
+// carries ONE record [uint32 BE len][w×h gray PNG] after the frames (the
+// sidecar's contract: the mask frame must be < frames and listed in the
+// prompts, which then needs no box or points; the record's digest is kept
+// in trackMasks, "" for a request without one), and the answer for a
+// frame without a box or positive point is the received mask thresholded
+// at 128 (the mask is applied first, clicks refine it).
+func (f *fakeSidecar) track(w http.ResponseWriter, r *http.Request, single bool) {
+	q := r.URL.Query()
+	wd, hd := atoiOr(q.Get("w"), 0), atoiOr(q.Get("h"), 0)
+	frames := 1
+	if !single {
+		frames = atoiOr(q.Get("frames"), 0)
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil || wd <= 0 || hd <= 0 || frames <= 0 {
+		http.Error(w, `{"error":"bad body"}`, http.StatusBadRequest)
+		return
+	}
+	var th fakeTrackHeader
+	hdr := r.Header.Get(matte.PromptsHeader)
+	if err := json.Unmarshal([]byte(hdr), &th); err != nil || len(th.Prompts) == 0 {
+		http.Error(w, `{"error":"bad prompts"}`, http.StatusBadRequest)
+		return
+	}
+	tp := matte.TrackPrompts{Obj: th.Obj, Prompts: th.Prompts}
+	want := matte.TrackBodyLength(frames, wd, hd)
+	var maskPNG []byte
+	if th.Mask != nil {
+		if int64(len(body)) < want+4 {
+			http.Error(w, `{"error":"mask record missing"}`, http.StatusBadRequest)
+			return
+		}
+		n := int64(binary.BigEndian.Uint32(body[want:]))
+		if int64(len(body)) != want+4+n {
+			http.Error(w, `{"error":"mask record length"}`, http.StatusBadRequest)
+			return
+		}
+		maskPNG = bytes.Clone(body[want+4:])
+		img, err := png.Decode(bytes.NewReader(maskPNG))
+		if err != nil || img.Bounds().Dx() != wd || img.Bounds().Dy() != hd {
+			http.Error(w, `{"error":"the mask is not a w x h PNG"}`, http.StatusBadRequest)
+			return
+		}
+		// /v1/track/frame carries the clip's frame index in the header (the
+		// one frame of the body is that frame), so only the whole-clip
+		// track bounds it by frames.
+		if th.Mask.Frame < 0 || (!single && th.Mask.Frame >= frames) || !slices.ContainsFunc(th.Prompts, func(p matte.FramePrompt) bool { return p.Frame == th.Mask.Frame }) {
+			http.Error(w, `{"error":"mask frame out of range or not prompted"}`, http.StatusBadRequest)
+			return
+		}
+		body = body[:want]
+	} else if int64(len(body)) != want {
+		http.Error(w, `{"error":"bad body"}`, http.StatusBadRequest)
+		return
+	}
+	for _, p := range th.Prompts {
+		if p.Box == nil && len(p.Points) == 0 && (th.Mask == nil || p.Frame != th.Mask.Frame) {
+			http.Error(w, `{"error":"a prompt needs a box or points"}`, http.StatusBadRequest)
+			return
+		}
+	}
+	f.mu.Lock()
+	f.devices = append(f.devices, q.Get("device"))
+	f.trackPrompts = append(f.trackPrompts, hdr)
+	f.trackSizes = append(f.trackSizes, [2]int{wd, hd})
+	digest := ""
+	if maskPNG != nil {
+		digest = matte.MaskDigestOf(maskPNG)
+	}
+	f.trackMasks = append(f.trackMasks, digest)
+	if single {
+		f.trackFrames++
+	} else {
+		f.tracks++
+		f.trackBodies = append(f.trackBodies, bytes.Clone(body))
+	}
+	delay, fail, retry := f.trackDelay, f.trackFail, f.retryTrack503 > 0
+	if retry {
+		f.retryTrack503--
+	}
+	f.mu.Unlock()
+	if fail != 0 {
+		http.Error(w, `{"error":"fake track failure"}`, fail)
+		return
+	}
+	if retry {
+		http.Error(w, `{"error":"model loading","retryAfterMs":200,"state":"loading","percent":100}`, http.StatusServiceUnavailable)
+		return
+	}
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+	}
+	mask := fakeTrackMaskWith(tp, wd, hd, maskPNG)
+	if single {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(mask)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ezlg-mattes")
+	var out bytes.Buffer
+	var hdr4 [4]byte
+	for i := 0; i < frames; i++ {
+		binary.BigEndian.PutUint32(hdr4[:], uint32(len(mask)))
+		out.Write(hdr4[:])
+		out.Write(mask)
+	}
+	binary.BigEndian.PutUint32(hdr4[:], 0)
+	out.Write(hdr4[:])
+	w.Write(out.Bytes())
+}
+
+// fakeTrackMask is the fake tracker's mask of a w x h frame: 255 inside
+// the first prompt's box (x in [x0 w, x1 w), y in [y0 h, y1 h)), else 0 —
+// or, without a box, a 3x3 square around the first positive point.
+func fakeTrackMask(tp matte.TrackPrompts, w, h int) []byte {
+	return fakeTrackMaskWith(tp, w, h, nil)
+}
+
+// fakeTrackMaskWith is fakeTrackMask with the request's mask record (Phase
+// 5d; nil without one): a box or a positive point wins as before, else the
+// mask thresholded at 128 is the answer (every pixel >= 128 → 255).
+func fakeTrackMaskWith(tp matte.TrackPrompts, w, h int, maskPNG []byte) []byte {
+	img := image.NewGray(image.Rect(0, 0, w, h))
+	inside := func(x, y int) bool { return false }
+	if maskPNG != nil {
+		if src, err := png.Decode(bytes.NewReader(maskPNG)); err == nil {
+			inside = func(x, y int) bool {
+				r, _, _, _ := src.At(x, y).RGBA()
+				return r>>8 >= 128
+			}
+		}
+	}
+	for _, p := range tp.Prompts {
+		if b := p.Box; b != nil {
+			x0, y0, x1, y1 := int(b[0]*float64(w)), int(b[1]*float64(h)), int(b[2]*float64(w)), int(b[3]*float64(h))
+			inside = func(x, y int) bool { return x >= x0 && x < x1 && y >= y0 && y < y1 }
+			break
+		}
+		for _, pt := range p.Points {
+			if pt[2] == 1 {
+				cx, cy := int(pt[0]*float64(w)), int(pt[1]*float64(h))
+				inside = func(x, y int) bool { return x >= cx-1 && x <= cx+1 && y >= cy-1 && y <= cy+1 }
+				break
+			}
+		}
+	}
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if inside(x, y) {
+				img.Pix[y*img.Stride+x] = 255
+			}
+		}
+	}
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
 }
 
 func (f *fakeSidecar) matte(w http.ResponseWriter, r *http.Request) {
@@ -376,6 +627,7 @@ func (f *fakeSidecar) matte(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
+	f.devices = append(f.devices, q.Get("device"))
 	f.posts++
 	f.frames += frames
 	fb := size * size * 3
@@ -440,11 +692,37 @@ func (f *fakeSidecar) stats() (posts, frames int) {
 }
 
 func (f *fakeSidecar) setModel(mutate func(ms *matte.ModelState)) {
+	f.setModelOf(recipe.MatteModelISNetAnime, mutate)
+}
+
+// setModelOf mutates one model's ping entry — its top-level fields and, on
+// a 5c-shaped fake, every device's state the same way (State / Reason /
+// Percent follow the top level).
+func (f *fakeSidecar) setModelOf(id string, mutate func(ms *matte.ModelState)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ms := f.ping.Models[recipe.MatteModelISNetAnime]
+	ms := f.ping.Models[id]
 	mutate(&ms)
-	f.ping.Models[recipe.MatteModelISNetAnime] = ms
+	for dev, d := range ms.Devices {
+		d.State, d.Reason, d.Percent = ms.State, ms.Reason, ms.Percent
+		ms.Devices[dev] = d
+	}
+	f.ping.Models[id] = ms
+}
+
+// trackStats returns the /v1/track and /v1/track/frame calls served.
+func (f *fakeSidecar) trackStats() (tracks, frames int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tracks, f.trackFrames
+}
+
+// seenDevices returns the device= values the fake saw on its model
+// requests so far.
+func (f *fakeSidecar) seenDevices() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.devices...)
 }
 
 func (f *fakeSidecar) set(mutate func(f *fakeSidecar)) {
@@ -646,10 +924,11 @@ func TestMatteSubmitRefusesWithoutFacts(t *testing.T) {
 	}
 }
 
-// TestMatteDeferredAndRefusedWithoutFFmpeg: a still over the eager bound is
-// deferred before anything runs (no sidecar call, no pass), an eager one
-// would start the pass, and the caps refuse before the deferral.
-func TestMatteDeferredAndRefusedWithoutFFmpeg(t *testing.T) {
+// TestMatteIdleAndRefusedWithoutFFmpeg (Phase 5c): a plain still — however
+// cheap the pass would be — answers MattePendingIdle before anything runs
+// (no sidecar call, no pass, no warm-up), an eager one starts the pass,
+// and the caps refuse before either.
+func TestMatteIdleAndRefusedWithoutFFmpeg(t *testing.T) {
 	st := newTestStore(t)
 	srcHash := putSource(t, st, true) // 25 fps, 2 s → 50 frames
 	src, _ := st.GetBlob(srcHash)
@@ -661,22 +940,39 @@ func TestMatteDeferredAndRefusedWithoutFFmpeg(t *testing.T) {
 
 	_, err := m.resolveMattes(context.Background(), src, ops, out, matteModePreview)
 	var pending *ErrMattePending
-	if !errors.As(err, &pending) || pending.State != MattePendingDeferred || pending.Total != 50 || pending.Device != matte.DeviceCPU || pending.EstimateMS != 50*10_002 {
-		t.Fatalf("deferred still: %v (%+v)", err, pending)
+	if !errors.As(err, &pending) || pending.State != MattePendingIdle || pending.Total != 50 || pending.Device != matte.DeviceCPU || pending.EstimateMS != 50*10_002 {
+		t.Fatalf("plain still: %v (%+v), want idle", err, pending)
 	}
 	if posts, _ := f.stats(); posts != 0 {
-		t.Errorf("a deferred still posted %d batches", posts)
+		t.Errorf("an idle still posted %d batches", posts)
 	}
-	if !strings.Contains(err.Error(), "Play or Render") {
-		t.Errorf("deferred message: %v", err)
+	f.mu.Lock()
+	warms, pings := len(f.warms), f.pings
+	f.mu.Unlock()
+	if warms != 0 || pings != 0 {
+		t.Errorf("an idle still reached the sidecar (%d warms, %d pings)", warms, pings)
+	}
+	if !strings.Contains(err.Error(), "not computed") || !strings.Contains(err.Error(), "Compute matte") {
+		t.Errorf("idle message: %v", err)
+	}
+	// A cheap pass is idle too: there is no eager bound any more.
+	cheap := newFakeSidecar(t, testWeights, 1)
+	mc := NewManager(newTestStore(t), fakeTools, Options{MatteURL: cheap.srv.URL})
+	writeMatteFacts(t, mc.st, &cheap.ping)
+	if _, err := mc.resolveMattes(context.Background(), src, ops, out, matteModePreview); !errors.As(err, &pending) || pending.State != MattePendingIdle {
+		t.Errorf("a cheap plain still: %v, want idle", err)
 	}
 	// Eager: the pass starts (and fails here for want of ffmpeg — a plain
-	// error, never a context error).
+	// error, never a context error, never idle).
 	eager := WithMatteEager(context.Background(), true)
 	if _, err := m.resolveMattes(eager, src, ops, out, matteModePreview); err == nil || errors.As(err, &pending) || isContextError(err) {
 		t.Errorf("eager still: %v", err)
 	}
-	// Over the caps: refused up-front, before the deferral.
+	// A render always runs it.
+	if _, err := m.resolveMattes(context.Background(), src, ops, out, matteModeRender); err == nil || errors.As(err, &pending) || isContextError(err) {
+		t.Errorf("render: %v", err)
+	}
+	// Over the caps: refused up-front, before the idle answer.
 	tight := NewManager(st, fakeTools, Options{MatteURL: f.srv.URL, MatteMaxSeconds: 100})
 	if _, err := tight.resolveMattes(context.Background(), src, ops, out, matteModePreview); !errors.Is(err, ErrInvalidRecipe) || !strings.Contains(err.Error(), "EZLG_MATTE_MAX_SECONDS") {
 		t.Errorf("over the seconds cap: %v", err)
@@ -897,10 +1193,12 @@ func TestMattePassMemoAndFramesStore(t *testing.T) {
 	}
 }
 
-// TestMattePreviewPendingAndSingleFlight: ten concurrent previews of one
-// recipe share ONE pass; past the preview wait each answers
+// TestMattePreviewPendingAndSingleFlight: ten concurrent EAGER previews of
+// one recipe share ONE pass; past the preview wait each answers
 // *ErrMattePending running with the pass's progress, and the pass goes on
-// to completion while the SPA keeps re-joining.
+// to completion while the SPA keeps re-joining with PLAIN previews (Phase
+// 5c: a plain preview follows the pass in flight instead of answering
+// idle, and starts none of its own).
 func TestMattePreviewPendingAndSingleFlight(t *testing.T) {
 	shortMatteWaits(t, 150*time.Millisecond, 2*time.Second, 50*time.Millisecond)
 	e := newMatteRig(t, 1, Options{})
@@ -908,6 +1206,7 @@ func TestMattePreviewPendingAndSingleFlight(t *testing.T) {
 	clip := e.clipDistinct()
 	ops := []recipe.Op{matteOp("")}
 	out := recipe.Output{Format: "webp"}
+	eager := WithMatteEager(e.ctx, true)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 10)
@@ -915,7 +1214,7 @@ func TestMattePreviewPendingAndSingleFlight(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = e.m.resolveMattes(e.ctx, clip, ops, out, matteModePreview)
+			_, errs[i] = e.m.resolveMattes(eager, clip, ops, out, matteModePreview)
 		}(i)
 	}
 	wg.Wait()
@@ -936,7 +1235,8 @@ func TestMattePreviewPendingAndSingleFlight(t *testing.T) {
 	if pendings == 0 {
 		t.Error("no preview answered pending after the wait")
 	}
-	// Keep re-joining like the SPA until the memo is there.
+	// Keep re-joining like the SPA — plain previews — until the memo is
+	// there: they follow the running pass (never idle while it runs).
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		got, err := e.m.resolveMattes(e.ctx, clip, ops, out, matteModePreview)
@@ -949,6 +1249,9 @@ func TestMattePreviewPendingAndSingleFlight(t *testing.T) {
 		var pending *ErrMattePending
 		if !errors.As(err, &pending) {
 			t.Fatalf("re-join: %v", err)
+		}
+		if pending.State == MattePendingIdle {
+			t.Fatalf("a plain preview answered idle while the pass was in flight: %+v", pending)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("the pass never finished: %+v", pending)
@@ -970,8 +1273,9 @@ func TestMatteLoadingThenReady(t *testing.T) {
 	clip := e.clipDistinct()
 	ops := []recipe.Op{matteOp("")}
 	out := recipe.Output{Format: "webp"}
+	eager := WithMatteEager(e.ctx, true)
 
-	_, err := e.m.resolveMattes(e.ctx, clip, ops, out, matteModePreview)
+	_, err := e.m.resolveMattes(eager, clip, ops, out, matteModePreview)
 	var pending *ErrMattePending
 	if !errors.As(err, &pending) || pending.State != MattePendingLoading {
 		t.Fatalf("preview while loading: %v", err)
@@ -982,7 +1286,7 @@ func TestMatteLoadingThenReady(t *testing.T) {
 	if warms == 0 {
 		t.Error("no /v1/warm while the model loads")
 	}
-	// Downloading shows its percentage.
+	// Downloading shows its percentage (a plain preview follows the pass).
 	e.f.setModel(func(ms *matte.ModelState) { ms.State = matte.StateDownloading; ms.Percent = 43 })
 	time.Sleep(100 * time.Millisecond)
 	if _, err := e.m.resolveMattes(e.ctx, clip, ops, out, matteModePreview); !errors.As(err, &pending) || pending.State != MattePendingDownloading || pending.Percent != 43 {
@@ -1056,7 +1360,7 @@ func TestMatteMissingWhileQueuedIsPending(t *testing.T) {
 	ops := []recipe.Op{matteOp("")}
 	out := recipe.Output{Format: "webp"}
 
-	_, err := e.m.resolveMattes(e.ctx, clip, ops, out, matteModePreview)
+	_, err := e.m.resolveMattes(WithMatteEager(e.ctx, true), clip, ops, out, matteModePreview)
 	var pending *ErrMattePending
 	if !errors.As(err, &pending) || pending.State != MattePendingDownloading {
 		t.Fatalf("preview while missing (queued): %v", err)
@@ -1192,7 +1496,7 @@ func TestMatteAbandonCancelsPass(t *testing.T) {
 	ops := []recipe.Op{matteOp("")}
 	out := recipe.Output{Format: "webp"}
 
-	_, err := e.m.resolveMattes(e.ctx, clip, ops, out, matteModePreview)
+	_, err := e.m.resolveMattes(WithMatteEager(e.ctx, true), clip, ops, out, matteModePreview)
 	var pending *ErrMattePending
 	if !errors.As(err, &pending) {
 		t.Fatalf("preview: %v", err)

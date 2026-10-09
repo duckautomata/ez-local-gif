@@ -150,6 +150,29 @@ describe('batchOpsCfg / rowRecipe (global ops only)', () => {
       'bounce',
     ]);
   });
+
+  it('the guided model never reaches a batch row: its prompts are one clip’s, so rows key with the server’s default per-frame model', () => {
+    const c = defaultOps(info());
+    c.background = {
+      ...c.background,
+      enabled: true,
+      mode: 'ai',
+      ai: { ...c.background.ai, model: 'sam2-tiny', modelChosen: true, edge: 'birefnet-lite', prompts: [{ frame: 0, box: [0.1, 0.1, 0.5, 0.5], points: [{ x: 0.3, y: 0.3, label: 1 }] }] },
+    };
+    const b = batchOpsCfg(c, false);
+    expect(b.background.ai).toMatchObject({ model: '', modelChosen: false, prompts: [], edge: '' });
+    expect(b.background.ai.stabilise).toBe(c.background.ai.stabilise);
+    expect(c.background.ai.model).toBe('sam2-tiny'); // the editor's choice is untouched
+    const ops = rowRecipe({ source: src('a'), unpremultiply: false }, c, defaultOutput())?.ops ?? [];
+    const matteOp = ops.find((o) => o.kind === 'matte');
+    expect(matteOp).toBeDefined();
+    expect(JSON.stringify(matteOp)).not.toContain('sam2');
+    expect(JSON.stringify(matteOp)).not.toContain('prompts');
+    expect(JSON.stringify(matteOp)).not.toContain('edge');
+    // a per-frame model carries over as it is
+    c.background.ai = { ...c.background.ai, model: 'birefnet-lite', prompts: [] };
+    expect(batchOpsCfg(c, false).background.ai.model).toBe('birefnet-lite');
+  });
 });
 
 describe('render orchestration', () => {

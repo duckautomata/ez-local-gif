@@ -71,7 +71,11 @@ const (
 	// snapped per format) and the key carries that rate ("|fps=") and, with
 	// a matte op in the stack, the resolved mattes' clip keys (weights and
 	// processing version included), so a re-pinned sidecar never serves a
-	// stale box; matte joined detectionOps.
+	// stale box; matte joined detectionOps. Phase 5c needs no bump: the
+	// matte op's canonical form gained its stabilise / keep / prompts /
+	// edge params (canonicalMatteOp), which are omitted when unset, so the
+	// key text of every op without them — every box memoised so far — is
+	// unchanged, and a stack with them never shared a box with one without.
 	autocropKeyVersion = "5"
 	// autocropTimeout bounds one detection pass. The pass runs detached
 	// from the request that started it (flight.doDetached): a superseded
@@ -106,7 +110,10 @@ var geometryOps = map[string]bool{
 // The AI matte (Phase 5b) is the headline case: its memoised matte becomes
 // (or multiplies into) the alpha, so a clip with Background removal set to
 // AI crops to the subject the model found — the detection plan carries the
-// matte input (CompileDetectFor), which the resolved mattes fill.
+// matte input (CompileDetectFor), which the resolved mattes fill: the
+// derived sequence (stabilised / gated, Phase 5c) when the op asks for one,
+// exactly as the render reads it, and the keep colours' union wrappers the
+// detection plan emits like the render does.
 // Every other kind is either refused in front of the autocrop (geometryOps)
 // or invisible to the crop (reverse only reorders frames; text and overlays
 // are drawn on the output canvas after it) and is left out of the detection
@@ -234,16 +241,22 @@ func decodeAutoCrop(idx int, op recipe.Op) (recipe.AutoCropParams, error) {
 // feathered one). Geometry ops behind the autocrop are fine (the crop is
 // applied first). ops is the full stack, idx the autocrop's index.
 //
-// A matte op is rewritten to its decoded params (decodeMatteOp: the model,
-// "" resolved to the default, and the size — never Resolved): the previews
-// strip the Resolved identity before compiling while the render's ops
-// carry the one Submit filled in, and a client may spell the same op as
-// no params, {} or {"model": …}; the detection — and so autocropKey, which
+// A matte op is rewritten to its canonical decoded params
+// (canonicalMatteOp: the model, "" resolved to the default, the size and
+// the Phase 5c params — stabilise, keep (normalised hex), keepSimilarity,
+// prompts (sorted by frame) and edge — never Resolved): the previews strip
+// the Resolved identity before compiling while the render's ops carry the
+// one Submit filled in, and a client may spell the same op as no params,
+// {} or {"model": …}; the detection — and so autocropKey, which
 // canonicalises these ops — is the same for all of them (the compiler
 // ignores Resolved, and the clip keys the key also carries already name
 // the weights and processing version). Without this a render of a matte +
 // autocrop recipe re-ran the detection the previews had memoised, inside
-// its render slot. Malformed params are left for the compiler to report.
+// its render slot. The 5c params DO stay in the canonical op: they change
+// the keyed picture the detection reads (a stabilised or gated sequence is
+// another input, the keep union another alpha — CompileDetectFor emits the
+// same wrappers as the render), so a stack that differs in them must not
+// share a box. Malformed params are left for the compiler to report.
 func autocropDetectionOps(ops []recipe.Op, idx int) ([]recipe.Op, error) {
 	var pre []recipe.Op
 	for i, op := range ops {
@@ -252,11 +265,7 @@ func autocropDetectionOps(ops []recipe.Op, idx int) ([]recipe.Op, error) {
 			return nil, fmt.Errorf("%w: op %d (autocrop): crop to content must come before op %d (%s), which changes the frame", ErrInvalidRecipe, idx, i, op.Kind)
 		case detectionOps[op.Kind]:
 			if op.Kind == recipe.OpMatte {
-				if p, err := decodeMatteOp(i, op); err == nil {
-					if raw, err := json.Marshal(p); err == nil {
-						op = recipe.Op{Kind: recipe.OpMatte, Params: raw}
-					}
-				}
+				op = canonicalMatteOp(i, op)
 			}
 			pre = append(pre, op)
 		}
@@ -305,7 +314,7 @@ func detectionPlan(src *store.Blob, pre []recipe.Op, out recipe.Output, mattes [
 		if in.Matte == nil {
 			continue
 		}
-		if rm := findMatte(mattes, in.Matte.Model, in.Matte.Size); rm != nil {
+		if rm := findMatteInput(mattes, in.Matte); rm != nil {
 			matteKeys = append(matteKeys, rm.ClipKey)
 		}
 	}

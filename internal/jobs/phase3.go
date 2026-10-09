@@ -109,7 +109,9 @@ func (s *sources) infos() []recipe.ProbeInfo {
 
 // fillExtraInputs points every overlay input of p at its blob file and
 // every matte input (Phase 5b: ExtraInput.Matte, Source 0) at its memo
-// (fillMatteInputs: the %06d.png path, the frame count and the fps check).
+// (fillMatteInputs: the %06d.png path — of the derived stabilised / gated
+// sequence when the op asks for one (Phase 5c) —, the frame count and the
+// fps check).
 func (s *sources) fillExtraInputs(p *graph.Plan, mattes []resolvedMatte) error {
 	if err := fillMatteInputs(p, mattes); err != nil {
 		return err
@@ -129,11 +131,14 @@ func (s *sources) fillExtraInputs(p *graph.Plan, mattes []resolvedMatte) error {
 
 // compile is the previews' compile (StillSources, Proxy): it resolves the
 // stack's AI mattes first (resolveMattes in preview mode — a matte not on
-// disk yet is *ErrMattePending, no sidecar is ErrMatteUnavailable), then
-// compileWith. It returns the resolved mattes with the plan so the preview
-// keys can fold their clip keys in and the ffmpeg run can protect their
-// dirs. A render resolves its mattes in its own pre-stage (render.go) and
-// calls compileWith directly.
+// disk yet is *ErrMattePending: State MattePendingIdle when nothing was
+// started because the request was not eager (Phase 5c: previews never
+// start a pass on their own), running / loading / downloading while a pass
+// is in flight; no sidecar is ErrMatteUnavailable), then compileWith. It
+// returns the resolved mattes with the plan so the preview keys can fold
+// their clip keys in and the ffmpeg run can protect their dirs. A render
+// resolves its mattes in its own pre-stage (render.go) and calls
+// compileWith directly.
 func (m *Manager) compile(ctx context.Context, s *sources, ops []recipe.Op, out recipe.Output) (*graph.Plan, []resolvedMatte, error) {
 	mattes, err := m.resolveMattes(ctx, s.main(), ops, out, matteModePreview)
 	if err != nil {

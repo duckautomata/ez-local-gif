@@ -46,22 +46,23 @@ def test_fp16_graph_matches_fp32(tmp_path, synthetic_file):
 
 
 def test_stamps_memoise_derivations_and_rekey_on_new_weights(tmp_path, synthetic_file):
-    sc = Sidecar(tmp_path, synthetic_file, precision="fp16", env={"MATTE_PRELOAD": ""}, serve=False)
+    # MATTE_SELFTEST=0: the loader must not derive the same files concurrently (the test drives _derive itself)
+    sc = Sidecar(tmp_path, synthetic_file, precision="fp16", env={"MATTE_PRELOAD": "", "MATTE_SELFTEST": "0"}, serve=False)
     try:
-        m = sc.app.models["synthetic"]
+        m = sc.rt()  # the cpu runtime of the synthetic model
         sc.app._derive(m)
         fp16 = sc.models_dir / "synthetic.fp16.onnx"
         r16 = sc.models_dir / f"synthetic.fp16.{2 * SIZE}.onnx"
         assert fp16.is_file() and r16.is_file()
         st = json.loads((sc.models_dir / "synthetic.fp16.onnx.stamp.json").read_text())
-        assert st["src"] == m.weights and st["proc"] == matte.PROCESSING_VERSION and st["tool"] == "to_fp16"
+        assert st["src"] == m.model.weights and st["proc"] == matte.PROCESSING_VERSION and st["tool"] == "to_fp16"
         assert st["sha256"] == matte.sha256_file(str(fp16)) and st["bytes"] == fp16.stat().st_size
         assert m.graph_digest == st["sha256"] and m.precision == "fp16"
         assert m.paths == {SIZE: str(fp16), 2 * SIZE: str(r16)}
         mt = (fp16.stat().st_mtime_ns, r16.stat().st_mtime_ns)
         sc.app._derive(m)  # stamps match: nothing is rewritten
         assert (fp16.stat().st_mtime_ns, r16.stat().st_mtime_ns) == mt
-        m.weights = "0" * 64  # a re-pinned source file: every derivation is redone
+        m.model.weights = "0" * 64  # a re-pinned source file: every derivation is redone
         sc.app._derive(m)
         assert json.loads((sc.models_dir / "synthetic.fp16.onnx.stamp.json").read_text())["src"] == "0" * 64
     finally:
@@ -69,18 +70,18 @@ def test_stamps_memoise_derivations_and_rekey_on_new_weights(tmp_path, synthetic
 
 
 def test_failed_fp16_derivation_falls_back_to_fp32(tmp_path, synthetic_file, monkeypatch):
-    sc = Sidecar(tmp_path, synthetic_file, precision="fp16", env={"MATTE_PRELOAD": ""}, serve=False)
+    sc = Sidecar(tmp_path, synthetic_file, precision="fp16", env={"MATTE_PRELOAD": "", "MATTE_SELFTEST": "0"}, serve=False)
     try:
-        m = sc.app.models["synthetic"]
+        m = sc.rt()
 
         def boom(name):
             raise RuntimeError("no onnx here")
 
         monkeypatch.setattr(sc.app, "_tool", boom)
         sc.app._derive(m)
-        assert m.precision == "fp32" and m.paths == {SIZE: m.file} and m.sizes == [SIZE]
+        assert m.precision == "fp32" and m.paths == {SIZE: m.model.file} and m.sizes == [SIZE]
         assert m.default_size == SIZE and "derivation failed" in m.last_error
-        assert m.graph_digest == m.weights
+        assert m.graph_digest == m.model.weights
     finally:
         sc.close()
 
@@ -89,7 +90,8 @@ def test_selftest_subcommand_under_python_I(tmp_path):
     env = dict(os.environ, MATTE_DEVICE="cpu", MATTE_THREADS="2")
     r = subprocess.run([sys.executable, "-I", os.path.join(SIDECAR, "matte.py"), "selftest"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stderr[-2000:]
-    assert "selftest ok: device=cpu" in r.stdout  # the derivation tools print their own lines first
+    assert "selftest ok: devices=['cpu']" in r.stdout  # the derivation tools print their own lines first
+    assert "propagate in video" not in r.stderr  # sam2's tqdm bar is silenced (when sam2 is importable at all)
 
 
 def test_download_subcommand_reports_present_files(tmp_path, synthetic_file, capsys):

@@ -10,9 +10,18 @@
 // carries (notePending). A failed fetch keeps the last status and records
 // the error; an older server without the endpoint (404) leaves it unknown
 // and the mode greyed by the capabilities flag alone.
+//
+// Phase 5c adds three things that cross components: the COMPUTE state of
+// the current preview (the Preview derives it from its still's answer —
+// idle / running / computed — and the Background card's Compute matte
+// button shows it; the button's click reaches the Preview's scheduler
+// through registerMatteCompute), the device preference (setMatteDevice:
+// PUT /api/matte/settings, the answer installed as the status) and the
+// unload-on-leave (aiModeChanged: a debounced POST /api/matte/unload when
+// the Background card leaves the AI mode or is switched off).
 
-import { getMatte, messageOf, type MattePending, type MatteStatus } from './api';
-import { MATTE_POLL_MS } from './matte';
+import { getMatte, messageOf, putMatteSettings, unloadMatte, type MattePending, type MatteStatus } from './api';
+import { MATTE_POLL_MS, MATTE_UNLOAD_DEBOUNCE_MS, NO_COMPUTE, type MatteComputeState, type MatteMemoState } from './matte';
 
 export const matte = $state({
   /** GET /api/matte (or a 202) has answered at least once: `status` is the server's */
@@ -20,6 +29,10 @@ export const matte = $state({
   status: null as MatteStatus | null,
   /** the last fetch failure ('' = none); the previous status stays on screen */
   error: '',
+  /** Phase 5c: the compute state of the preview's matte (lib/matte.MatteComputeState), set by the Preview */
+  compute: { ...NO_COMPUTE } as MatteComputeState,
+  /** Phase 5c: a PUT /api/matte/settings is in flight (the Run on select is disabled meanwhile) */
+  settingDevice: false,
 });
 
 export type MatteFetcher = (signal?: AbortSignal) => Promise<MatteStatus>;
@@ -149,6 +162,153 @@ export function pollWhilePending(pending: () => boolean): void {
   $effect(() => () => hold.release());
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5c: the Compute matte button
+
+let computeHook: (() => void) | null = null;
+
+/**
+ * registerMatteCompute installs what the Compute matte button does (the
+ * Preview registers its still scheduler's computeNow while mounted; null
+ * unregisters). One Preview at a time, like registerPlayToggle.
+ */
+export function registerMatteCompute(fn: (() => void) | null): void {
+  computeHook = fn;
+}
+
+/** computeMatte presses the Compute matte button: true when a Preview was there to start the pass. */
+export function computeMatte(): boolean {
+  if (!computeHook) return false;
+  computeHook();
+  return true;
+}
+
+/** setMatteCompute publishes the preview's compute state (the Preview's effect; NO_COMPUTE when it unmounts). */
+export function setMatteCompute(c: MatteComputeState): void {
+  const cur = matte.compute;
+  if (cur.state === c.state && cur.done === c.done && cur.total === c.total && cur.device === c.device && cur.pending === c.pending) return;
+  matte.compute = { ...c };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5d: which memos the server was seen to hold ("Use this frame's matte")
+
+/**
+ * matteMemo records, per lib/matte.matteMemoKey, whether the server holds
+ * a memo (computed) or said it does not (idle): the Preview notes every
+ * still that came back as a picture or as a 202 idle (for a guided op
+ * that computed, the edge model's memo too — the gate needed it), the
+ * prompt overlay notes a mask prompt's answer. The Background card's "Use
+ * this frame's matte" reads the edge model's entry. Per page: a reload
+ * starts unknown, which is as good as the next server answer.
+ */
+export const matteMemo = $state({ known: {} as Record<string, Exclude<MatteMemoState, 'unknown'>> });
+
+/** noteMatteMemo records what the server said about a memo (an empty key is ignored). */
+export function noteMatteMemo(key: string, state: Exclude<MatteMemoState, 'unknown'>): void {
+  if (!key) return;
+  if (matteMemo.known[key] === state) return;
+  matteMemo.known[key] = state;
+}
+
+/** matteMemoState reads what is known about a memo ('unknown' for an empty key or nothing seen). */
+export function matteMemoState(key: string): MatteMemoState {
+  if (!key) return 'unknown';
+  return matteMemo.known[key] ?? 'unknown';
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5c: the device preference ("Run on")
+
+export type DeviceSetter = (device: string, signal?: AbortSignal) => Promise<MatteStatus>;
+
+/**
+ * setMatteDevice stores the server-side device preference (PUT
+ * /api/matte/settings; '' = the sidecar's default) and installs the status
+ * the server answers with. Resolves with '' on success, else the error
+ * text (the card toasts it); never rejects. A second call while one is in
+ * flight waits for the first (the select is disabled meanwhile anyway).
+ */
+export async function setMatteDevice(device: string, setter: DeviceSetter = putMatteSettings): Promise<string> {
+  matte.settingDevice = true;
+  try {
+    const s = await setter(device);
+    setMatteStatus(s);
+    return '';
+  } catch (e) {
+    return messageOf(e);
+  } finally {
+    matte.settingDevice = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5c: unload on leaving the AI mode
+
+export type Unloader = (signal?: AbortSignal) => Promise<void>;
+
+let unloadTimer: ReturnType<typeof setTimeout> | undefined;
+let unloader: Unloader = unloadMatte;
+let unloadDelay = MATTE_UNLOAD_DEBOUNCE_MS;
+/** whether the AI mode was on the last time aiModeChanged ran (so only a true → false edge unloads) */
+let aiWasOn = false;
+
+export interface UnloadOptions {
+  /** the request (tests) */
+  unload?: Unloader;
+  /** the debounce (tests) */
+  delayMs?: number;
+}
+
+/**
+ * aiModeChanged is told, on every change, whether the Background card is
+ * in the AI mode (enabled and mode 'ai'): a true → false edge schedules
+ * POST /api/matte/unload after MATTE_UNLOAD_DEBOUNCE_MS (the sidecar
+ * releases its resident models — nothing stays loaded while the user is
+ * not using AI), coming back before it fires cancels it, and errors are
+ * ignored (best-effort by contract). Idempotent for repeated same-value
+ * calls.
+ */
+export function aiModeChanged(on: boolean, opts: UnloadOptions = {}): void {
+  if (opts.unload) unloader = opts.unload;
+  if (opts.delayMs !== undefined && opts.delayMs >= 0) unloadDelay = opts.delayMs;
+  if (on) {
+    cancelMatteUnload();
+    aiWasOn = true;
+    return;
+  }
+  if (!aiWasOn) return;
+  aiWasOn = false;
+  cancelMatteUnload();
+  unloadTimer = setTimeout(() => {
+    unloadTimer = undefined;
+    void unloader().catch(() => undefined);
+  }, unloadDelay);
+}
+
+/** cancelMatteUnload drops a scheduled unload (the AI mode came back in time). */
+export function cancelMatteUnload(): void {
+  if (unloadTimer !== undefined) clearTimeout(unloadTimer);
+  unloadTimer = undefined;
+}
+
+/** matteUnloadScheduled reports whether an unload is waiting on its debounce (tests). */
+export function matteUnloadScheduled(): boolean {
+  return unloadTimer !== undefined;
+}
+
+/**
+ * trackAiMode drives aiModeChanged from a component: `on()` is read in an
+ * $effect (so every change reports), and the component going away counts
+ * as leaving (a new source resets the card, the landing page unmounts it).
+ */
+export function trackAiMode(on: () => boolean): void {
+  $effect(() => {
+    aiModeChanged(on());
+  });
+  $effect(() => () => aiModeChanged(false));
+}
+
 /** resetMatte forgets everything and stops the poll (tests). */
 export function resetMatte(): void {
   holds = 0;
@@ -159,4 +319,12 @@ export function resetMatte(): void {
   inFlight = null;
   setMatteStatus(null);
   matte.error = '';
+  matte.compute = { ...NO_COMPUTE };
+  matte.settingDevice = false;
+  matteMemo.known = {};
+  computeHook = null;
+  cancelMatteUnload();
+  unloader = unloadMatte;
+  unloadDelay = MATTE_UNLOAD_DEBOUNCE_MS;
+  aiWasOn = false;
 }

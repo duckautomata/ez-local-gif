@@ -16,9 +16,10 @@ export interface StillView {
   error: string;
   /**
    * Phase 5b: the last answer was 202 — the recipe's AI matte is being
-   * computed / deferred / waits on the model (lib/matte.mattePendingPill
-   * words it). The still on screen stays; the scheduler re-requests after
-   * matteRetryMs(state). Cleared by the next picture, error or null request.
+   * computed / idle (not started: Phase 5c) / waits on the model
+   * (lib/matte.mattePendingPill words it). The still on screen stays; the
+   * scheduler re-requests after matteRetryMs(state). Cleared by the next
+   * picture, error or null request.
    */
   pending: PendingView | null;
 }
@@ -87,10 +88,11 @@ export function stillMaxW(opts: { overlay: boolean; zoomed: boolean; wide: boole
  *   the latest state once (setPaused);
  * - a 202 answer (Phase 5b: the AI matte is pending) keeps the still on
  *   screen, sets view.pending and re-requests the same state after
- *   matteRetryMs — the poll jobs' abandon grace expects — unless a newer
- *   request, a pause or a null request supersedes it; "Compute now"
- *   (computeNow) re-requests with `eager` so a deferred pass starts, and
- *   keeps `eager` on that state's retries until a picture arrives.
+ *   matteRetryMs — the poll jobs' abandon grace expects (an idle matte
+ *   retries at the slow cadence only) — unless a newer request, a pause or
+ *   a null request supersedes it; the Compute matte button (computeNow)
+ *   re-requests with `eager` so the pass starts, and keeps `eager` on that
+ *   state's retries until a picture arrives.
  */
 export class StillScheduler {
   private readonly view: StillView;
@@ -129,7 +131,28 @@ export class StillScheduler {
   request(r: StillRequest | null): void {
     this.current = r;
     this.currentKey = StillScheduler.key(r);
+    if (this.eagerNextKey && r && this.currentKey !== this.eagerNextKey) {
+      // computeNext: the state that follows the one it was pressed in
+      // (the guided panel closing) is the one to start the pass for.
+      this.eagerKey = this.currentKey;
+      this.eagerNextKey = '';
+    }
     this.schedule(this.currentKey, r);
+  }
+
+  /** the key computeNext was pressed in: the NEXT different request carries `eager` ('' = none) */
+  private eagerNextKey = '';
+
+  /**
+   * computeNext is the Compute matte button pressed while the stage shows
+   * a state WITHOUT the matte (the guided model's Select subject panel:
+   * its still is the unkeyed source frame): the caller closes the panel,
+   * and the next different request — the keyed still — is loaded with
+   * `eager: true` as computeNow would. Nothing happens until it arrives.
+   */
+  computeNext(): void {
+    if (!this.current) return;
+    this.eagerNextKey = this.currentKey;
   }
 
   /** The still on screen belongs to this key ('' = none). */
@@ -166,10 +189,11 @@ export class StillScheduler {
   }
 
   /**
-   * computeNow is the "Compute now" of a deferred matte pass (the estimate
-   * is over the server's eager bound for stills): the current state is
-   * re-requested at once with `eager: true`, which starts the pass, and
-   * every retry of that state carries it too until a picture arrives.
+   * computeNow is the Compute matte button (Phase 5c; the 5b "Compute now"
+   * of a deferred pass): the current state is re-requested at once with
+   * `eager: true`, which starts the pass, and every retry of that state
+   * carries it too until a picture arrives. A no-op while paused (the
+   * proxy owns the stage: its own computeNow applies) or without a state.
    */
   computeNow(): void {
     const r = this.current;

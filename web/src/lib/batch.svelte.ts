@@ -27,7 +27,7 @@ import {
 } from './api';
 import type { OutputCfg } from './presets';
 import { groupFiles } from './result';
-import { app, applyPreset, buildOps, buildOutput, type OpsCfg } from './state.svelte';
+import { app, applyPreset, buildOps, buildOutput, isGuided, type OpsCfg } from './state.svelte';
 
 export interface BatchRow {
   id: number;
@@ -201,12 +201,23 @@ export async function startBatch(files: readonly File[], deps: BatchDeps = {}): 
  * edited stack with every per-source (geometry-dependent) op forced off —
  * delay, trim, crop, auto-crop, resize, flip/rotate and the overlays — and
  * the row's own unpremultiply. What remains is exactly the batch-editable
- * set: fps, speed, reverse, bounce, background keying and feather.
+ * set: fps, speed, reverse, bounce, background keying and feather. The AI
+ * mode's guided model is per source too (its prompts are boxes and clicks
+ * on ONE clip's frames): a guided choice carried over from the editor is
+ * replaced by the server's default per-frame model with no prompts and no
+ * edge, so every row keys with the device's default segmenter instead of
+ * tracking unrelated clips with another clip's prompts — or, without
+ * prompts, not keying at all (the card says so in batch).
  */
 export function batchOpsCfg(c: OpsCfg, unpremultiply: boolean): OpsCfg {
+  const background =
+    c.background.enabled && c.background.mode === 'ai' && isGuided(c.background)
+      ? { ...c.background, ai: { ...c.background.ai, model: '', modelChosen: false, prompts: [], edge: '' } }
+      : c.background;
   return {
     ...c,
     unpremultiply,
+    background,
     delay: { ...c.delay, enabled: false },
     trim: { ...c.trim, enabled: false },
     crop: { ...c.crop, enabled: false },

@@ -1,8 +1,22 @@
 # Source of requirements-cuda.txt. Regenerate the hashed pins for the image (linux x86_64, CPython 3.12) with:
 #   uv pip compile --python-platform x86_64-manylinux_2_28 --python-version 3.12 --generate-hashes \
-#      --no-strip-extras -o requirements-cuda.txt requirements-cuda.in
-# onnxruntime-gpu[cuda,cudnn] pulls the CUDA 13 runtime / cuFFT / cuRAND / NVRTC and cuDNN 9 wheels (~2 GB):
-# no system CUDA in the image, the host only needs an NVIDIA driver >= 580 and nvidia-container-toolkit.
+#      --no-strip-extras --emit-index-url --index https://download.pytorch.org/whl/cu130 \
+#      --index-strategy unsafe-best-match -o requirements-cuda.txt requirements-cuda.in
+# torch 2.14.1+cu130 (the SAM 2 tracker's runtime) and onnxruntime-gpu[cuda,cudnn] share ONE set of NVIDIA wheels:
+# torch pins them exactly (cudnn 9.24.0.43, cublas 13.1.1.3, cuda-runtime 13.0.96, …) and onnxruntime's extras are
+# compatible-release ranges (~=13.0, ~=9.0), so the resolver lands on torch's pins. No system CUDA in the image, the
+# host only needs an NVIDIA driver >= 580 and nvidia-container-toolkit. The Dockerfile prunes triton and cusolver after
+# the install (nothing links them at load time); nccl, cusparselt, nvshmem and cufile STAY — libtorch_cuda.so carries
+# them as DT_NEEDED on torch 2.14.1+cu130, so `import torch` fails without them (see PRUNE in the Dockerfile).
+# sam2 itself is installed from requirements-sam2.txt (a hashed GitHub archive of the pinned commit; its
+# dependencies hydra-core / iopath / tqdm / pillow are pinned here).
 numpy==2.5.2
 onnx==1.23.2
 onnxruntime-gpu[cuda,cudnn]==1.30.0
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
+hydra-core==1.3.7
+iopath==0.1.10
+tqdm==4.70.1
+pillow==12.3.0
+scipy==1.18.1

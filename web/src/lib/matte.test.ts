@@ -5,13 +5,30 @@
 import { describe, expect, it } from 'vitest';
 import type { MatteStatus } from './api';
 import {
+  computeButtonText,
+  computeFromPending,
+  defaultEdgeFor,
+  defaultModelFor,
   deviceLabel,
+  edgeModelFor,
+  edgeOptions,
+  effectiveDevice,
   humanSeconds,
+  isIdleState,
+  isStabiliseMode,
+  isTracker,
+  maskPromptIdleText,
+  matteMemoKey,
+  shortModelLabel,
   MATTE_DEFERRED_RETRY_MS,
   MATTE_FRAME_OVERHEAD_MS,
+  MATTE_IDLE_RETRY_MS,
   MATTE_POLL_MS,
   MATTE_PROFILE_HINT,
   MATTE_RETRY_MS,
+  MATTE_UNLOAD_DEBOUNCE_MS,
+  matteDevices,
+  matteDeviceState,
   matteEstimate,
   matteEstimateSuffix,
   matteModel,
@@ -24,6 +41,9 @@ import {
   matteVerdict,
   modelLabel,
   nextPending,
+  NO_COMPUTE,
+  STABILISE_OPTIONS,
+  stabiliseLabel,
   type PendingView,
 } from './matte';
 
@@ -89,13 +109,20 @@ describe('words', () => {
   it('the cadences and the hint are what the spec names', () => {
     expect(MATTE_RETRY_MS).toBe(500);
     expect(MATTE_POLL_MS).toBe(5000);
-    expect(MATTE_DEFERRED_RETRY_MS).toBe(MATTE_POLL_MS);
+    expect(MATTE_IDLE_RETRY_MS).toBe(MATTE_POLL_MS);
+    expect(MATTE_DEFERRED_RETRY_MS).toBe(MATTE_IDLE_RETRY_MS);
+    expect(MATTE_UNLOAD_DEBOUNCE_MS).toBe(1500);
     expect(MATTE_FRAME_OVERHEAD_MS).toBe(2);
     expect(MATTE_PROFILE_HINT).toBe('docker compose --profile matte-gpu up -d');
     expect(matteRetryMs('running')).toBe(500);
     expect(matteRetryMs('loading')).toBe(500);
     expect(matteRetryMs('downloading')).toBe(500);
     expect(matteRetryMs('deferred')).toBe(5000);
+    expect(matteRetryMs('idle')).toBe(5000);
+    expect(isIdleState('idle')).toBe(true);
+    expect(isIdleState('deferred')).toBe(true);
+    expect(isIdleState('running')).toBe(false);
+    expect(isIdleState(null)).toBe(false);
   });
 });
 
@@ -184,6 +211,17 @@ describe('matteStatusLine', () => {
   it('ready · device · the clip’s estimate; loading; downloading %; a model’s reason; the sidecar unavailable with the profile hint', () => {
     expect(matteStatusLine(gpu(), 'isnet-anime', 900)).toBe('ready · GPU · up to ~1 s for this clip');
     expect(matteStatusLine(gpu(), 'isnet-anime')).toBe('ready · GPU');
+    // Phase 5c residency: "loaded" when a session is resident, "not loaded" when the server says it is not, plain "ready" when it does not say
+    expect(matteStatusLine(gpu({ models: { 'isnet-anime': { label: '', state: 'ready', msPerFrame: 18, resident: true } } }), 'isnet-anime', 900)).toBe('loaded · GPU · up to ~1 s for this clip');
+    expect(matteStatusLine(gpu({ models: { 'isnet-anime': { label: '', state: 'ready', msPerFrame: 18, resident: false } } }), 'isnet-anime', 900)).toBe(
+      'ready · GPU · up to ~1 s for this clip · not loaded (the first Compute adds the model load)',
+    );
+    expect(matteStatusLine(gpu({ models: { 'isnet-anime': { label: '', state: 'ready', msPerFrame: 18, resident: false } } }), 'isnet-anime')).toBe('ready · GPU · not loaded (the first Compute adds the model load)');
+    const resident = both({
+      models: { ...both().models, 'birefnet-lite': { label: 'General (precise)', state: 'ready', msPerFrame: 170, devices: { cuda: { state: 'ready', msPerFrame: 170, resident: true }, cpu: { state: 'ready', msPerFrame: 4000, resident: false } } } },
+    });
+    expect(matteStatusLine(resident, 'birefnet-lite', 7650)).toBe('loaded · GPU · up to ~8 s for this clip');
+    expect(matteStatusLine({ ...resident, device: 'cpu' }, 'birefnet-lite')).toBe('ready · CPU · not loaded (the first Compute adds the model load)');
     expect(matteStatusLine(cpu(), 'isnet-anime', 40_800)).toBe('ready · CPU · up to ~41 s for this clip');
     expect(matteStatusLine(gpu(), 'birefnet-lite', 7000)).toBe('loading model…');
     expect(matteStatusLine(gpu({ models: { 'birefnet-lite': { label: '', state: 'downloading', percent: 43 } } }), 'birefnet-lite')).toBe('downloading weights 43 %');
@@ -225,5 +263,192 @@ describe('pending pill', () => {
     expect(mattePendingPill(p({ state: 'deferred', estimateMs: 180_000, device: 'cpu' }), 11_000)).toBe('AI matte: ~3 min on CPU');
     expect(mattePendingPill(p({ state: 'deferred', estimateMs: 0, device: 'cpu' }), 11_000)).toBe('AI matte: not computed yet');
     expect(mattePendingPill(p({ state: 'deferred', estimateMs: 95_000, device: '' }), 11_000)).toBe('AI matte: ~95 s on the matte service');
+    // Phase 5c: idle — nothing started; the Compute button sits next to it
+    expect(mattePendingPill(p({ state: 'idle', total: 45 }), 11_000)).toBe('AI matte not computed');
+    // a guided pass: one POST carries the whole clip, so the pill says "tracking N frames" until the masks arrive
+    expect(mattePendingPill(p({ total: 45, phase: 'tracking' }), 11_000)).toBe('AI matte: tracking 45 frames · GPU');
+    expect(mattePendingPill(p({ total: 45, phase: 'tracking', device: '' }), 11_000)).toBe('AI matte: tracking 45 frames');
+    expect(mattePendingPill(p({ done: 45, total: 45, phase: 'tracking' }), 11_000)).toBe('AI matte 45/45 · GPU');
+    expect(mattePendingPill(p({ state: 'loading', phase: 'tracking' }), 10_000)).toBe('AI matte: loading model… (0 s)');
   });
 });
+
+// ---- Phase 5c: devices, the guided tracker, stabilise / edge, the compute state
+/** a 5c GPU install offering both devices: lite the GPU default, isnet the CPU default, the tracker on the GPU only */
+function both(over: Partial<MatteStatus> = {}): MatteStatus {
+  return {
+    enabled: true,
+    device: 'cuda',
+    devices: ['cpu', 'cuda'],
+    gpu: { name: 'NVIDIA GeForce RTX 5080', totalGiB: 16, freeGiB: 12.4 },
+    defaultModel: 'birefnet-lite',
+    defaultModels: { cuda: 'birefnet-lite', cpu: 'isnet-anime' },
+    models: {
+      'sam2-tiny': {
+        label: 'Guided (click to select)',
+        kind: 'tracker',
+        state: 'ready',
+        msPerFrame: 60,
+        licence: 'Apache-2.0',
+        devices: { cuda: { state: 'ready', precision: 'bf16', msPerFrame: 60 } },
+      },
+      'birefnet-lite': {
+        label: 'General (precise)',
+        kind: 'segmenter',
+        state: 'ready',
+        msPerFrame: 170,
+        devices: { cuda: { state: 'ready', precision: 'fp32', size: 1024, msPerFrame: 170 }, cpu: { state: 'unavailable', reason: 'cpu: 14 GiB of RAM needed, 9 GiB available' } },
+      },
+      'isnet-anime': {
+        label: 'Anime (fast)',
+        state: 'ready',
+        msPerFrame: 18,
+        devices: { cuda: { state: 'ready', precision: 'fp16', size: 1024, msPerFrame: 18 }, cpu: { state: 'downloading', percent: 43, precision: 'fp32', size: 512, msPerFrame: 136 } },
+      },
+    },
+    maxSeconds: 600,
+    maxFrames: 3000,
+    ...over,
+  };
+}
+
+describe('devices (Phase 5c)', () => {
+  it('matteDevices: the offered list GPU first; a 5b status offers exactly its device; nothing when off', () => {
+    expect(matteDevices(both())).toEqual(['cuda', 'cpu']);
+    expect(matteDevices(both({ devices: ['cpu'] }))).toEqual(['cpu']);
+    expect(matteDevices(both({ devices: ['cpu', 'cpu', 'npu'] }))).toEqual(['cpu', 'npu']);
+    expect(matteDevices(gpu())).toEqual(['cuda']);
+    expect(matteDevices(cpu())).toEqual(['cpu']);
+    expect(matteDevices(gpu({ device: 'unavailable' }))).toEqual([]);
+    expect(matteDevices(off)).toEqual([]);
+    expect(matteDevices(null)).toEqual([]);
+  });
+
+  it('effectiveDevice / defaultModelFor read the status (the per-device map, else the mirrored default, else the recipe default)', () => {
+    expect(effectiveDevice(both())).toBe('cuda');
+    expect(effectiveDevice(both({ device: 'cpu' }))).toBe('cpu');
+    expect(effectiveDevice(gpu({ device: 'unavailable' }))).toBe('');
+    expect(effectiveDevice(null)).toBe('');
+    expect(defaultModelFor(both(), 'cpu')).toBe('isnet-anime');
+    expect(defaultModelFor(both(), 'cuda')).toBe('birefnet-lite');
+    expect(defaultModelFor(both(), 'npu')).toBe('birefnet-lite'); // falls back to the mirrored default
+    expect(defaultModelFor(gpu(), 'cuda')).toBe('isnet-anime');
+    expect(defaultModelFor(null, 'cuda')).toBe('isnet-anime');
+  });
+
+  it('matteDeviceState / matteMsPerFrame answer per device, mirroring the top-level fields on a 5b status', () => {
+    expect(matteDeviceState(both(), 'isnet-anime')).toMatchObject({ state: 'ready', precision: 'fp16', size: 1024, msPerFrame: 18 }); // '' = the effective device
+    expect(matteDeviceState(both(), 'isnet-anime', 'cpu')).toMatchObject({ state: 'downloading', percent: 43, msPerFrame: 136 });
+    expect(matteDeviceState(both(), 'sam2-tiny', 'cpu')).toBeNull(); // not on that device
+    expect(matteDeviceState(both(), 'nope')).toBeNull();
+    expect(matteDeviceState(gpu(), 'isnet-anime', 'cpu')).toEqual({ state: 'ready', reason: undefined, percent: undefined, msPerFrame: 18 }); // 5b: no map → the one device's
+    expect(matteMsPerFrame(both(), 'isnet-anime')).toBe(18);
+    expect(matteMsPerFrame(both(), 'isnet-anime', 'cpu')).toBe(136);
+    expect(matteMsPerFrame(both({ device: 'cpu' }), 'isnet-anime')).toBe(136); // the effective device moved
+    expect(matteMsPerFrame(both(), 'birefnet-lite', 'cpu')).toBe(0);
+    expect(matteEstimate(both({ device: 'cpu' }), 'isnet-anime', 10)).toEqual({ frames: 10, msPerFrame: 136, ms: 1380, device: 'CPU' });
+  });
+
+  it('the Model options follow the device: states, disabled with the reason, the tracker last and flagged; the status line says where it is not offered', () => {
+    const cuda = matteModelOptions(both());
+    expect(cuda.map((o) => o.id)).toEqual(['isnet-anime', 'birefnet-lite', 'sam2-tiny']);
+    expect(cuda.map((o) => o.tracker)).toEqual([false, false, true]);
+    expect(cuda[2]).toMatchObject({ text: 'Guided (click to select)', disabled: false, msPerFrame: 60 });
+    const cpu5c = matteModelOptions(both(), 'cpu');
+    expect(cpu5c[0]).toMatchObject({ text: 'Anime (fast) — downloading 43 %', disabled: false, msPerFrame: 136 });
+    expect(cpu5c[1]).toMatchObject({ text: 'General (precise) — unavailable', disabled: true, reason: 'cpu: 14 GiB of RAM needed, 9 GiB available' });
+    expect(cpu5c[2]).toMatchObject({ text: 'Guided (click to select) — unavailable', disabled: true, reason: 'not offered on CPU', tracker: true });
+    expect(matteModelOptions(both({ device: 'cpu' }))[0].text).toBe('Anime (fast) — downloading 43 %'); // '' = the effective device
+    expect(isTracker(both(), 'sam2-tiny')).toBe(true);
+    expect(isTracker(both(), 'birefnet-lite')).toBe(false);
+    expect(isTracker(null, 'sam2-tiny')).toBe(true); // the shipped id, no status yet
+    expect(isTracker(both({ models: { 'sam2-tiny': { label: 'x', kind: 'segmenter', state: 'ready' } } }), 'sam2-tiny')).toBe(false); // the status wins
+    expect(matteStatusLine(both({ device: 'cpu' }), 'sam2-tiny')).toBe('Guided (click to select) is not offered on CPU');
+    expect(matteStatusLine(both({ device: 'cpu' }), 'isnet-anime')).toBe('downloading weights 43 %');
+    expect(matteStatusLine(both({ device: 'cpu' }), 'birefnet-lite')).toBe('General (precise) unavailable — cpu: 14 GiB of RAM needed, 9 GiB available');
+    expect(matteStatusLine(both(), 'birefnet-lite', 7650)).toBe('ready · GPU · up to ~8 s for this clip');
+  });
+});
+
+describe('stabilise / edge (Phase 5c)', () => {
+  it('STABILISE_OPTIONS are Off · Light · Strong with hints; stabiliseLabel / isStabiliseMode', () => {
+    expect(STABILISE_OPTIONS.map((o) => o.id)).toEqual(['', 'light', 'strong']);
+    expect(STABILISE_OPTIONS.map((o) => o.label)).toEqual(['Off', 'Light', 'Strong']);
+    expect(STABILISE_OPTIONS[1].hint).toContain('3-frame median');
+    expect(STABILISE_OPTIONS[2].hint).toContain('short trail on fast motion');
+    expect(stabiliseLabel('')).toBe('Off');
+    expect(stabiliseLabel('strong')).toBe('Strong');
+    expect(stabiliseLabel('median5')).toBe('median5');
+    expect(isStabiliseMode('light')).toBe(true);
+    expect(isStabiliseMode('')).toBe(true);
+    expect(isStabiliseMode('median5')).toBe(false);
+  });
+
+  it('edgeOptions lists the segmenters per device then "None"; defaultEdgeFor is the device’s default per-frame model', () => {
+    expect(edgeOptions(both()).map((o) => o.id)).toEqual(['isnet-anime', 'birefnet-lite', 'none']);
+    expect(edgeOptions(both())[2]).toEqual({ id: 'none', text: 'None — tracker mask only', disabled: false, reason: '' });
+    expect(edgeOptions(both(), 'cpu')[1]).toMatchObject({ id: 'birefnet-lite', disabled: true });
+    expect(edgeOptions(null).map((o) => o.id)).toEqual(['isnet-anime', 'birefnet-lite', 'none']);
+    expect(defaultEdgeFor(both())).toBe('birefnet-lite');
+    expect(defaultEdgeFor(both(), 'cpu')).toBe('isnet-anime');
+    expect(defaultEdgeFor(both({ defaultModels: { cuda: 'sam2-tiny' } }))).toBe('isnet-anime'); // a tracker default → the first segmenter
+    expect(defaultEdgeFor(null)).toBe('isnet-anime');
+  });
+});
+
+describe('compute state (Phase 5c)', () => {
+  const base = { done: 0, total: 0, percent: 0, estimateMs: 0, device: 'cuda' };
+  it('computeFromPending: idle / deferred → idle, the pass states → running with the counts, a picture → computed, nothing yet → unknown', () => {
+    expect(computeFromPending({ ...base, state: 'idle', total: 45 }, false)).toEqual({ state: 'idle', done: 0, total: 45, device: 'GPU', pending: 'idle' });
+    expect(computeFromPending({ ...base, state: 'deferred' }, false).state).toBe('idle');
+    expect(computeFromPending({ ...base, state: 'running', done: 24, total: 45 }, false)).toEqual({ state: 'running', done: 24, total: 45, device: 'GPU', pending: 'running' });
+    expect(computeFromPending({ ...base, state: 'loading', device: 'cpu' }, false)).toMatchObject({ state: 'running', device: 'CPU', pending: 'loading' });
+    expect(computeFromPending({ ...base, state: 'running', total: 45, phase: 'tracking' }, false)).toEqual({ state: 'running', done: 0, total: 45, device: 'GPU', pending: 'tracking' });
+    expect(computeFromPending({ ...base, state: 'running', done: 45, total: 45, phase: 'tracking' }, false).pending).toBe('running');
+    expect(computeFromPending(null, true)).toEqual({ ...NO_COMPUTE, state: 'computed' });
+    expect(computeFromPending(null, false)).toEqual({ ...NO_COMPUTE, state: 'unknown' });
+  });
+
+  it('computeButtonText words the button: enabled when idle / unknown, the progress while running, "computed" once cached', () => {
+    expect(computeButtonText(NO_COMPUTE)).toMatchObject({ text: 'Compute matte', disabled: true });
+    expect(computeButtonText({ ...NO_COMPUTE, state: 'idle', device: 'GPU' })).toMatchObject({ text: 'Compute matte', disabled: false });
+    expect(computeButtonText({ ...NO_COMPUTE, state: 'idle', device: 'GPU' }).title).toContain('(GPU)');
+    expect(computeButtonText({ ...NO_COMPUTE, state: 'unknown' })).toMatchObject({ text: 'Compute matte', disabled: false });
+    expect(computeButtonText({ state: 'running', done: 24, total: 45, device: 'GPU', pending: 'running' })).toMatchObject({ text: 'computing… 24/45', disabled: true });
+    expect(computeButtonText({ state: 'running', done: 0, total: 0, device: '', pending: 'running' }).text).toBe('computing…');
+    expect(computeButtonText({ state: 'running', done: 0, total: 0, device: '', pending: 'loading' }).text).toBe('loading model…');
+    expect(computeButtonText({ state: 'running', done: 0, total: 0, device: '', pending: 'downloading' }).text).toBe('downloading weights…');
+    expect(computeButtonText({ state: 'running', done: 0, total: 45, device: 'GPU', pending: 'tracking' })).toMatchObject({ text: 'tracking… 45 frames', disabled: true });
+    expect(computeButtonText({ state: 'running', done: 0, total: 0, device: '', pending: 'tracking' }).text).toBe('tracking…');
+    expect(computeButtonText({ ...NO_COMPUTE, state: 'computed' })).toMatchObject({ text: 'computed', disabled: true });
+  });
+});
+
+describe('the mask prompt helpers (Phase 5d)', () => {
+  it('shortModelLabel drops the qualifier; edgeModelFor resolves "" to the device default; matteMemoKey needs a clip and a model', () => {
+    expect(shortModelLabel('General (precise)')).toBe('General');
+    expect(shortModelLabel('Anime (fast)')).toBe('Anime');
+    expect(shortModelLabel('sam2-tiny')).toBe('sam2-tiny');
+    expect(shortModelLabel('(x)')).toBe('(x)');
+    expect(shortModelLabel('  ')).toBe('');
+    const s = gpu({ devices: ['cuda', 'cpu'], defaultModels: { cuda: 'birefnet-lite', cpu: 'isnet-anime' } });
+    expect(edgeModelFor('', s, 'cuda')).toBe('birefnet-lite');
+    expect(edgeModelFor(undefined, s, 'cpu')).toBe('isnet-anime');
+    expect(edgeModelFor(' none ', s, 'cuda')).toBe('none');
+    expect(edgeModelFor('isnet-anime', s, 'cuda')).toBe('isnet-anime');
+    expect(edgeModelFor('', null, '')).toBe('isnet-anime'); // the recipe default without a status
+    expect(matteMemoKey('["a"]', 'birefnet-lite', 'cuda')).toBe('["a"]|birefnet-lite|cuda');
+    expect(matteMemoKey('', 'birefnet-lite', 'cuda')).toBe('');
+    expect(matteMemoKey('["a"]', '', 'cuda')).toBe('');
+    expect(matteMemoKey('["a"]', 'x', '')).toBe('["a"]|x|');
+  });
+
+  it('maskPromptIdleText names the edge model and carries the server’s reason', () => {
+    expect(maskPromptIdleText('General (precise)')).toBe('General matte not computed for this clip — switch the Model to General (precise), press Compute, then come back');
+    expect(maskPromptIdleText('Anime (fast)', ' compute the General matte first ')).toBe(
+      'Anime matte not computed for this clip — switch the Model to Anime (fast), press Compute, then come back (compute the General matte first)',
+    );
+    expect(maskPromptIdleText('')).toContain('edge matte not computed');
+  });
+});
+

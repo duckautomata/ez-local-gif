@@ -200,28 +200,103 @@ const OpMatte = "matte"
 // the recipe hash: a result rendered with other weights has another
 // ResultKey, so pulling a new sidecar image can never serve a cached
 // result made with the old weights.
+//
+// Phase 5c (on-demand mattes): Stabilise post-processes the matte SEQUENCE
+// temporally before it is read — "" = off, MatteStabiliseLight = a centred
+// 3-frame temporal median (removes every single-frame pop, zero lag),
+// MatteStabiliseStrong = the median plus a decay-0.7 hold (keeps parts
+// that drop out for a frame at the cost of a short trail on fast motion);
+// jobs derives the stabilised sequence once per clip memo (a cheap ffmpeg
+// pass, no model run) and every consumer reads it. Keep lists up to
+// MaxMatteKeep RRGGBB colours whose pixels are forced OPAQUE (the union
+// with the matte, applied after the merge) for parts the model drops;
+// KeepSimilarity is their colour tolerance (0 = the default 0.08;
+// 0.01..1, colorkey's scale). Prompts and Edge belong to the guided model
+// (MatteModelSAM2Tiny, see MattePrompt) and are an error with any other.
+// The device a pass runs on is NOT a recipe param (a server-side
+// preference, jobs.Options.MatteDevice / PUT /api/matte/settings): the
+// matte's identity is its weights, size and precision, not where it ran.
 type MatteParams struct {
-	Model    string         `json:"model,omitempty"`
-	Size     int            `json:"size,omitempty"`
-	Resolved *MatteResolved `json:"resolved,omitempty"`
+	Model          string         `json:"model,omitempty"`
+	Size           int            `json:"size,omitempty"`
+	Resolved       *MatteResolved `json:"resolved,omitempty"`
+	Stabilise      string         `json:"stabilise,omitempty"`      // "" | MatteStabiliseLight | MatteStabiliseStrong — temporal post-processing of the matte sequence
+	Keep           []string       `json:"keep,omitempty"`           // RRGGBB colours forced opaque (union with the matte), 0..MaxMatteKeep
+	KeepSimilarity float64        `json:"keepSimilarity,omitempty"` // 0 = default 0.08 (0.01..1)
+	Prompts        []MattePrompt  `json:"prompts,omitempty"`        // guided model only: >= 1 prompt with a box or a positive point
+	Edge           string         `json:"edge,omitempty"`           // guided model only: "" = the device's default per-frame model for the edge band, MatteEdgeNone = the tracker's mask alone, else a segmenter model id
+}
+
+// MattePrompt is one prompted frame of a guided (tracker) matte: Frame is
+// the OUTPUT frame index on the plan's grid (the scrubber slot the user
+// prompted on); Points are [x, y, label] with x, y in 0..1 of the SOURCE
+// frame and label 1 = keep / 0 = remove; Box is [x0, y0, x1, y1] in 0..1
+// of the SOURCE frame, or nil. Every prompted frame becomes a conditioning
+// frame of the tracker; the track propagates from the earliest prompted
+// frame backward to 0 and forward to the end. At least one prompt must
+// carry a box, a positive point or a mask (a single positive click is
+// unreliable: the UI leads with a box or a mask). The prompts enter the
+// clip memo key in canonical form (sorted by frame, fixed decimals;
+// graph.CanonicalMattePrompts).
+//
+// MaskFrom (Phase 5d) prompts the frame with a MASK instead of (or before)
+// clicks: "" = none; MattePromptMaskEdge = the edge model's per-frame matte
+// of that frame (the model MatteParams.Edge names — the device's default
+// per-frame model when Edge is "" — so Edge must not be MatteEdgeNone),
+// which is the most reliable start: "pick a frame where the per-frame model
+// got it right and track from it". No mask bytes live in the recipe: jobs
+// takes the matte PNG from the edge model's memo, scales it to the tracking
+// size and sends it as the one mask record of the track; its digest enters
+// the clip memo key through the matte client (matte.FramePrompt.MaskDigest),
+// never through the recipe. A MaskFrom prompt counts as a positive prompt
+// and needs no box or point; points and a box on the same frame refine the
+// mask (applied after it). At most one prompt of an op carries a mask (one
+// mask record per track request).
+type MattePrompt struct {
+	Frame    int          `json:"frame"`              // OUTPUT frame index on the plan's grid (the scrubber slot)
+	Points   [][3]float64 `json:"points,omitempty"`   // x, y in 0..1 of the SOURCE frame, label 1 = keep / 0 = remove
+	Box      *[4]float64  `json:"box,omitempty"`      // x0, y0, x1, y1 in 0..1 of the SOURCE frame
+	MaskFrom string       `json:"maskFrom,omitempty"` // "" | MattePromptMaskEdge: the frame's mask prompt is the edge model's matte of that frame
 }
 
 // MatteResolved is the identity of the matte a render used (the facts of
-// the sidecar's last successful ping, persisted by jobs).
+// the sidecar's last successful ping, persisted by jobs). For the guided
+// model (Phase 5c) Tracker is the tracker's weights and Edge / EdgeWeights
+// / EdgeProc identify the per-frame model that shaped the edge band (all
+// empty when Edge is MatteEdgeNone); Weights / Proc / Size / Precision
+// then describe the tracker's own run.
 type MatteResolved struct {
-	Weights   string `json:"weights"`   // sha256 of the pinned source ONNX file (sidecar/models.json)
-	Proc      string `json:"proc"`      // the sidecar's processingVersion (pre/post-processing + derivation recipe)
-	Size      int    `json:"size"`      // the effective input square
-	Precision string `json:"precision"` // fp16 / fp32 of the graph the sidecar runs for this device
+	Weights     string `json:"weights"`               // sha256 of the pinned source ONNX file (sidecar/models.json)
+	Proc        string `json:"proc"`                  // the sidecar's processingVersion (pre/post-processing + derivation recipe)
+	Size        int    `json:"size"`                  // the effective input square
+	Precision   string `json:"precision"`             // fp16 / fp32 of the graph the sidecar runs for this device
+	Tracker     string `json:"tracker,omitempty"`     // the tracker weights sha256 when the model is a tracker (Phase 5c)
+	Edge        string `json:"edge,omitempty"`        // the edge model id a tracker matte was gated with
+	EdgeWeights string `json:"edgeWeights,omitempty"` // sha256 of the edge model's pinned weights
+	EdgeProc    string `json:"edgeProc,omitempty"`    // the edge model's processingVersion
 }
 
 // Matte model ids (sidecar/models.json). The sidecar reports which of them
-// it offers (its MATTE_MODELS); the UI labels them "Anime (fast)" and
-// "General (precise)".
+// it offers (its MATTE_MODELS); the UI labels them "Anime (fast)",
+// "General (precise)" and "Guided (click to select)". MatteModelDefault is
+// the id "" resolves to in the graph; the sidecar's per-device default
+// (General on the GPU, Anime on the CPU, Phase 5c) is what the UI
+// preselects.
 const (
-	MatteModelISNetAnime   = "isnet-anime"   // Apache-2.0; the default
-	MatteModelBiRefNetLite = "birefnet-lite" // MIT; ~10x slower, every hair strand
+	MatteModelISNetAnime   = "isnet-anime"   // Apache-2.0; the CPU default
+	MatteModelBiRefNetLite = "birefnet-lite" // MIT; ~10x slower, every hair strand; the GPU default
+	MatteModelSAM2Tiny     = "sam2-tiny"     // Apache-2.0; the guided tracker (Phase 5c, MatteParams.Prompts / Edge)
 	MatteModelDefault      = MatteModelISNetAnime
+)
+
+// Matte post-processing (Phase 5c, MatteParams.Stabilise / Edge / Keep) and
+// the mask prompt source (Phase 5d, MattePrompt.MaskFrom).
+const (
+	MatteStabiliseLight  = "light"  // centred 3-frame temporal median of the matte sequence
+	MatteStabiliseStrong = "strong" // the median followed by a decay-0.7 hold (keep-biased)
+	MatteEdgeNone        = "none"   // guided model: the tracker's mask alone, no per-frame edge band
+	MaxMatteKeep         = 6        // at most this many Keep colours per matte op
+	MattePromptMaskEdge  = "edge"   // MattePrompt.MaskFrom: the mask is the edge model's per-frame matte of the prompted frame
 )
 
 // ChromaKeyParams keys out a colour in YUV (soft edges). Zero values:

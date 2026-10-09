@@ -5,10 +5,12 @@
 //	<Root>/blobs/<sha256>.json         Blob metadata (name, size, uploaded, probe info)
 //	<Root>/results/<recipeHash>/       encoded outputs + manifest.json
 //	<Root>/mattes/<clipKey>/           AI matte memo of one clip: %06d.png + matte.json (matte.go)
+//	<Root>/mattes/<clipKey>/stab-…/    derived sequences of that clip, swept with it (matte_5c.go)
 //	<Root>/mattes/frames/…/<sha>.png   the matte frames store, shared by every clip (matte.go)
 //	<Root>/tmp/                        upload staging (same filesystem as blobs)
 //	<Root>/scratch/                    scratch fallback when the tmpfs is too small (DESIGN.md §9.9)
 //	<Scratch>/<id>/                    per-job scratch (tmpfs), removed when done
+//	<Scratch>/matte-prompts/<key>.png  the guided mode's prompt-mask memo, count/byte bounded (matte_5c.go)
 //
 // The store has no database: the filesystem is the data model. A TTL/size
 // sweeper is the only maintenance.
@@ -650,8 +652,14 @@ func (s *Store) ScratchDir(id string) (string, func(), error) {
 // The mattes class (matte.go): clip dirs aged by their own mtime (TouchMatte)
 // and removed whatever ttl says once their source blob is gone, .tmp-* dirs
 // of a pass junk after an hour, frames-store files aged by their mtime
-// (TouchMatteFrame). Nothing under a Protect-ed path is ever deleted, by any
+// (TouchMatteFrame); a clip's derived dirs go with it and a derive's
+// <name>.tmp sibling is junk after an hour on its own (matte_5c.go).
+// Nothing under a Protect-ed path — or above one — is ever deleted, by any
 // pass of any class.
+//
+// Last, the prompt-mask memo on scratch (SweepMattePrompts) is bounded to
+// MattePromptsMaxEntries / MattePromptsMaxBytes, oldest first; ttl and
+// maxBytes do not apply to it.
 func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) error {
 	now := time.Now()
 	var errs []error
@@ -768,6 +776,10 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 		}
 	}
 	note(s.pruneMatteFrameDirs(ctx, now))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	note(s.sweepMattePrompts(ctx, now, MattePromptsMaxEntries, MattePromptsMaxBytes))
 	return errors.Join(errs...)
 }
 

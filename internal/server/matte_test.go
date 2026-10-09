@@ -130,12 +130,13 @@ func TestMatteEndpoint(t *testing.T) {
 // pendingJSON is the 202 body as a client decodes it: the pending fields
 // plus the /api/matte object at the same level.
 type pendingJSON struct {
-	Pending    string `json:"pending"`
-	State      string `json:"state"`
-	Done       int    `json:"done"`
-	Total      int    `json:"total"`
-	Percent    int    `json:"percent"`
-	EstimateMS int64  `json:"estimateMs"`
+	Pending       string `json:"pending"`
+	State         string `json:"state"`
+	Done          int    `json:"done"`
+	Total         int    `json:"total"`
+	Percent       int    `json:"percent"`
+	EstimateMS    int64  `json:"estimateMs"`
+	PendingReason string `json:"pendingReason"`
 	matteStatusJSON
 }
 
@@ -200,15 +201,45 @@ func TestPreviewMattePending(t *testing.T) {
 		}
 	})
 
-	t.Run("wrapped and deferred", func(t *testing.T) {
-		pending := &jobs.ErrMattePending{State: jobs.MattePendingDeferred, Total: 1800, Device: "cpu", EstimateMS: 180_000}
+	// Phase 5c: "idle" (nothing started — no eager mark, no pass in flight)
+	// replaced the 5b "deferred" state; the server passes any state through.
+	t.Run("wrapped and idle", func(t *testing.T) {
+		pending := &jobs.ErrMattePending{State: jobs.MattePendingIdle, Total: 1800, Device: "cpu", EstimateMS: 180_000}
 		rec, body := call(t, fmt.Errorf("compile: %w", pending), http.StatusBadRequest)
 		if rec.Code != http.StatusAccepted {
 			t.Fatalf("wrapped pending: status %d %s, want 202", rec.Code, body)
 		}
 		p := decodePending(t, body)
-		if p.State != "deferred" || p.Done != 0 || p.Total != 1800 || p.Percent != 0 || p.EstimateMS != 180_000 || p.Device != "cpu" {
-			t.Errorf("deferred fields = %+v", p)
+		if p.State != "idle" || p.Done != 0 || p.Total != 1800 || p.Percent != 0 || p.EstimateMS != 180_000 || p.Device != "cpu" {
+			t.Errorf("idle fields = %+v", p)
+		}
+		if !strings.Contains(string(body), `"state":"idle"`) {
+			t.Errorf("202 body lacks the idle state: %s", body)
+		}
+		// The status's own reason is always the status's (this install's:
+		// no EZLG_MATTE_URL), and an error without one sends no
+		// pendingReason …
+		want := e.jm.MatteStatus().Reason
+		if p.Reason != want || p.PendingReason != "" {
+			t.Errorf("reason = %q / pendingReason = %q, want the status's %q and none", p.Reason, p.PendingReason, want)
+		}
+		if strings.Contains(string(body), `"pendingReason"`) {
+			t.Errorf("202 body carries pendingReason for an error without one: %s", body)
+		}
+		// … and the error's rides as pendingReason, its OWN field (Phase
+		// 5d: a mask prompt whose edge matte is not computed — the SPA
+		// shows it under the panel): never in the status's reason, which
+		// the SPA installs wholesale as the live /api/matte object.
+		const reason = "compute the General matte first (the mask prompt is its matte of this frame)"
+		rec, body = call(t, &jobs.ErrMattePending{State: jobs.MattePendingIdle, Device: "cpu", Reason: reason}, http.StatusNotFound)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("idle with a reason: status %d %s, want 202", rec.Code, body)
+		}
+		if p = decodePending(t, body); p.State != "idle" || p.Device != "cpu" || p.PendingReason != reason || p.Reason != want {
+			t.Errorf("idle with a reason: state %q device %q pendingReason %q reason %q, want idle / cpu / %q / the status's %q", p.State, p.Device, p.PendingReason, p.Reason, reason, want)
+		}
+		if !strings.Contains(string(body), `"pendingReason":"compute the General matte first`) {
+			t.Errorf("202 body lacks the error's pendingReason: %s", body)
 		}
 	})
 

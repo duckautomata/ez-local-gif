@@ -22,9 +22,11 @@ export interface ProxyView {
   error: string;
   /**
    * Phase 5b: Play's answer was 202 — the recipe's AI matte is being
-   * computed (Play always starts a deferred pass: `eager`). The still stays
-   * on the stage with the pill; the player re-requests after matteRetryMs
-   * until the proxy arrives, Stop or a recipe change.
+   * computed, or (Phase 5c) idle: Play behaves like a still and never
+   * starts a pass; the Compute button (computeNow) re-requests with
+   * `eager`. The still stays on the stage with the pill; the player
+   * re-requests after matteRetryMs until the proxy arrives, Stop or a
+   * recipe change.
    */
   pending: PendingView | null;
 }
@@ -51,6 +53,8 @@ export class ProxyPlayer {
   private currentKey = '';
   /** key of the proxy on screen ('' = none) */
   private shownKey = '';
+  /** the key the Compute button was pressed for: its fetch and retries carry `eager` ('' = none) */
+  private eagerKey = '';
 
   constructor(view: ProxyView, deps: ProxyDeps) {
     this.view = view;
@@ -74,6 +78,7 @@ export class ProxyPlayer {
       return;
     }
     if (this.view.playing) this.view.stale = this.shownKey !== this.currentKey;
+    if (this.eagerKey !== this.currentKey) this.eagerKey = '';
     // A fetch for a superseded recipe must not land as "the" proxy — nor
     // may the re-request of its pending matte.
     if (this.ctrl && this.fetchingKey !== this.currentKey) this.abort();
@@ -82,10 +87,12 @@ export class ProxyPlayer {
 
   /**
    * play fetches the proxy of the current recipe (a no-op when it is
-   * already shown and fresh). With a matte op in the stack the request
-   * carries `eager: true` — Play always starts a deferred pass (spec §4.3)
-   * — and a 202 answer sets view.pending and re-requests after
-   * matteRetryMs until the proxy arrives (the still stays on the stage).
+   * already shown and fresh). Play behaves like a still (Phase 5c): with a
+   * matte op whose pass has not run the server answers 202 "idle" — the
+   * pill with the Compute button shows (computeNow) — and a 202 of any
+   * kind sets view.pending and re-requests after matteRetryMs until the
+   * proxy arrives (the still stays on the stage). Only a request the
+   * Compute button asked for carries `eager`.
    */
   async play(): Promise<void> {
     const r = this.current;
@@ -101,12 +108,14 @@ export class ProxyPlayer {
     this.view.loading = true;
     this.view.error = '';
     try {
-      const blob = await this.deps.fetch(hasMatteOp(r.ops) ? { ...r, eager: true } : r, c.signal);
+      const eager = this.eagerKey === key && hasMatteOp(r.ops);
+      const blob = await this.deps.fetch(eager ? { ...r, eager: true } : r, c.signal);
       if (c.signal.aborted) return;
       this.swapUrl(this.deps.createURL(blob));
       this.shownKey = key;
       this.view.playing = true;
       this.view.stale = key !== this.currentKey;
+      if (this.eagerKey === key) this.eagerKey = '';
       this.clearPending();
     } catch (e) {
       if (isAbortError(e) || c.signal.aborted) return;
@@ -123,6 +132,19 @@ export class ProxyPlayer {
         this.view.loading = false;
       }
     }
+  }
+
+  /**
+   * computeNow is the Compute button while Play's answer is pending and
+   * idle: the current recipe is fetched at once with `eager: true` (the
+   * pass starts) and its retries carry it until the proxy arrives.
+   */
+  computeNow(): void {
+    if (!this.current) return;
+    this.eagerKey = this.currentKey;
+    this.abort();
+    this.clearRetry();
+    void this.play();
   }
 
   private pendingAnswer(key: string, e: MattePending): void {
@@ -154,6 +176,7 @@ export class ProxyPlayer {
     this.clearPending();
     this.swapUrl(null);
     this.shownKey = '';
+    this.eagerKey = '';
     this.view.playing = false;
     this.view.stale = false;
     this.view.error = '';

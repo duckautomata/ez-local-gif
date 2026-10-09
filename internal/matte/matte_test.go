@@ -136,29 +136,29 @@ func TestWarmAndUnload(t *testing.T) {
 		}
 		w.WriteHeader(status)
 	})
-	if err := c.Warm(context.Background(), "birefnet-lite"); err != nil {
+	if err := c.Warm(context.Background(), "birefnet-lite", ""); err != nil {
 		t.Fatal(err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v1/warm" || gotQuery != "model=birefnet-lite" {
 		t.Errorf("warm request: %s %s?%s", gotMethod, gotPath, gotQuery)
 	}
-	if err := c.Unload(context.Background(), "isnet-anime"); err != nil {
+	if err := c.Unload(context.Background(), "isnet-anime", ""); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/v1/unload" || gotQuery != "model=isnet-anime" {
 		t.Errorf("unload request: %s?%s", gotPath, gotQuery)
 	}
-	if err := c.Unload(context.Background(), ""); err != nil {
+	if err := c.Unload(context.Background(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/v1/unload" || gotQuery != "" {
 		t.Errorf("unload-all request: %s?%s", gotPath, gotQuery)
 	}
-	if err := c.Warm(context.Background(), ""); err == nil {
+	if err := c.Warm(context.Background(), "", ""); err == nil {
 		t.Error("warm with no model: no error")
 	}
 	status = http.StatusServiceUnavailable
-	err := c.Warm(context.Background(), "birefnet-lite")
+	err := c.Warm(context.Background(), "birefnet-lite", "")
 	var se *StatusError
 	if !errors.As(err, &se) || se.Status != 503 || se.Message != "model loading" || se.RetryAfterMS != 2500 {
 		t.Fatalf("503 warm: %v", err)
@@ -207,7 +207,7 @@ func TestMatteRecords(t *testing.T) {
 		writeRecords(w, want, true)
 	})
 	var got [][]byte
-	err := c.Matte(context.Background(), "isnet-anime", size, frames, bytes.NewReader(body), func(png []byte) error {
+	err := c.Matte(context.Background(), "isnet-anime", "", size, frames, bytes.NewReader(body), func(png []byte) error {
 		got = append(got, png)
 		return nil
 	})
@@ -225,7 +225,7 @@ func TestMatteRecords(t *testing.T) {
 	}
 	// The body may be any reader of the right length, not only a bytes.Reader.
 	got = nil
-	err = c.Matte(context.Background(), "isnet-anime", size, frames, io.MultiReader(bytes.NewReader(body[:5]), bytes.NewReader(body[5:])), func(png []byte) error {
+	err = c.Matte(context.Background(), "isnet-anime", "", size, frames, io.MultiReader(bytes.NewReader(body[:5]), bytes.NewReader(body[5:])), func(png []byte) error {
 		got = append(got, png)
 		return nil
 	})
@@ -264,7 +264,7 @@ func TestMatteStreamErrors(t *testing.T) {
 				tc.write(w)
 			})
 			calls := 0
-			err := c.Matte(context.Background(), "isnet-anime", size, frames, bytes.NewReader(make([]byte, BodyLength(frames, size))), func([]byte) error {
+			err := c.Matte(context.Background(), "isnet-anime", "", size, frames, bytes.NewReader(make([]byte, BodyLength(frames, size))), func([]byte) error {
 				calls++
 				return nil
 			})
@@ -307,7 +307,7 @@ func TestMatteStatusErrors(t *testing.T) {
 				io.WriteString(w, tc.body)
 			})
 			calls := 0
-			err := c.Matte(context.Background(), "isnet-anime", 2, 1, bytes.NewReader(make([]byte, 12)), func([]byte) error {
+			err := c.Matte(context.Background(), "isnet-anime", "", 2, 1, bytes.NewReader(make([]byte, 12)), func([]byte) error {
 				calls++
 				return nil
 			})
@@ -344,7 +344,7 @@ func TestMatteCallbackErrorStopsTheParse(t *testing.T) {
 	})
 	boom := errors.New("disk full")
 	calls := 0
-	err := c.Matte(context.Background(), "isnet-anime", 2, 3, bytes.NewReader(make([]byte, 36)), func([]byte) error {
+	err := c.Matte(context.Background(), "isnet-anime", "", 2, 3, bytes.NewReader(make([]byte, 36)), func([]byte) error {
 		calls++
 		if calls == 2 {
 			return boom
@@ -365,16 +365,16 @@ func TestMatteBadArgsMakeNoRequest(t *testing.T) {
 	each := func([]byte) error { return nil }
 	body := bytes.NewReader(nil)
 	ctx := context.Background()
-	if err := c.Matte(ctx, "", 1024, 8, body, each); err == nil {
+	if err := c.Matte(ctx, "", "", 1024, 8, body, each); err == nil {
 		t.Error("empty model accepted")
 	}
-	if err := c.Matte(ctx, "isnet-anime", 0, 8, body, each); err == nil {
+	if err := c.Matte(ctx, "isnet-anime", "", 0, 8, body, each); err == nil {
 		t.Error("size 0 accepted")
 	}
-	if err := c.Matte(ctx, "isnet-anime", 1024, 0, body, each); err == nil {
+	if err := c.Matte(ctx, "isnet-anime", "", 1024, 0, body, each); err == nil {
 		t.Error("frames 0 accepted")
 	}
-	if err := c.Matte(ctx, "isnet-anime", 1024, 8, body, nil); err == nil {
+	if err := c.Matte(ctx, "isnet-anime", "", 1024, 8, body, nil); err == nil {
 		t.Error("nil callback accepted")
 	}
 	if hits != 0 {
@@ -389,7 +389,7 @@ func TestMatteBodyLengthMismatchFails(t *testing.T) {
 	})
 	// 1 frame of 2×2 is 12 bytes; a generic reader of 6 must fail the request.
 	short := io.MultiReader(bytes.NewReader(make([]byte, 6)))
-	err := c.Matte(context.Background(), "isnet-anime", 2, 1, short, func([]byte) error { return nil })
+	err := c.Matte(context.Background(), "isnet-anime", "", 2, 1, short, func([]byte) error { return nil })
 	if err == nil {
 		t.Fatal("short body accepted")
 	}
@@ -398,7 +398,7 @@ func TestMatteBodyLengthMismatchFails(t *testing.T) {
 		t.Errorf("length mismatch reported as a StatusError: %v", err)
 	}
 	long := io.MultiReader(bytes.NewReader(make([]byte, 20)))
-	if err := c.Matte(context.Background(), "isnet-anime", 2, 1, long, func([]byte) error { return nil }); err == nil {
+	if err := c.Matte(context.Background(), "isnet-anime", "", 2, 1, long, func([]byte) error { return nil }); err == nil {
 		t.Error("long body accepted")
 	}
 }
@@ -417,7 +417,7 @@ func TestMatteContextCancel(t *testing.T) {
 		<-started
 		cancel()
 	}()
-	err := c.Matte(ctx, "isnet-anime", 2, 1, bytes.NewReader(make([]byte, 12)), func([]byte) error { return nil })
+	err := c.Matte(ctx, "isnet-anime", "", 2, 1, bytes.NewReader(make([]byte, 12)), func([]byte) error { return nil })
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}

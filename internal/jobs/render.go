@@ -275,7 +275,8 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return nil, err
 	}
 	for i := range items {
-		applyMatteInfo(items[i].report, mattes) // render.matte: which AI matte the file was made with
+		applyMatteInfo(items[i].report, mattes)       // render.matte: which AI matte the file was made with
+		applyMatteRecipeNotes(items[i].report, r.Ops) // … and what the op asked beyond it (stabilise / keep / guided + edge)
 	}
 	return m.deliver(ctx, j, started, r, hash, scratch, items)
 }
@@ -288,7 +289,12 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 // listener) — then checked against the identity Submit hashed into the
 // recipe (checkMatteResolved: a probe may have rewritten the facts since)
 // and protected from the sweeper until release is called. It takes no
-// render slot.
+// render slot. A render ALWAYS runs the pass (Phase 5c: the explicit
+// intent the Compute matte button and Render share) — the idle state the
+// previews answer without MatteEager never applies here — and reads the
+// derived sequence the op asks for (stabilise / the tracker's edge gate,
+// resolved under the clip dir) exactly as the previews did, so the render
+// matches what was previewed.
 func (m *Manager) renderMattes(ctx context.Context, j *job, src *store.Blob, r recipe.Recipe) ([]resolvedMatte, func(), error) {
 	m.setStage(j, StageMatte, pctMatteStart, "resolving")
 	pctx := withMatteProgress(ctx, func(p ErrMattePending) {

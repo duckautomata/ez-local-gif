@@ -187,6 +187,21 @@ func matteModelID(s string) bool {
 // be >= 0 (0 = the server's default square; only sizes the sidecar lists
 // are valid, again jobs' check). Resolved is ignored: the identity of the
 // matte enters the recipe hash through it, never the filter text.
+//
+// Phase 5c (matte_5c.go): Stabilise ("", light, strong), Prompts and Edge
+// change which sequence the input reads, never the filter text — they are
+// validated, join the dedupe key and are recorded on MatteInput. Prompts
+// and Edge belong to the guided model (recipe.MatteModelSAM2Tiny): the
+// tracker needs 1..MaxMattePrompts valid prompts (validateMattePrompts —
+// which also checks a prompt's MaskFrom, Phase 5d: "" or
+// recipe.MattePromptMaskEdge, one per op, never with Edge
+// recipe.MatteEdgeNone, and counting as a positive prompt) and takes Edge
+// "", recipe.MatteEdgeNone or a per-frame model id (never itself); any
+// other model refuses both. Keep (matteKeep: at most
+// recipe.MaxMatteKeep RRGGBB colours, KeepSimilarity 0 = the 0.08
+// default) is the one param that is filter text: after the merge, one
+// union wrapper per colour forces its pixels opaque (keepColour) — Keep
+// changes the keyed picture only, so it is not part of the dedupe key.
 func (c *compiler) matte(d decodedOp, p *recipe.MatteParams) error {
 	model := p.Model
 	if model == "" {
@@ -198,19 +213,48 @@ func (c *compiler) matte(d decodedOp, p *recipe.MatteParams) error {
 	if p.Size < 0 {
 		return opErrorf(d, "size must be >= 0 (got %d)", p.Size)
 	}
-	key := matteKey{model: model, size: p.Size}
+	if !matteStabiliseMode(p.Stabilise) {
+		return opErrorf(d, "stabilise must be \"\", %q or %q (got %q)", recipe.MatteStabiliseLight, recipe.MatteStabiliseStrong, p.Stabilise)
+	}
+	if !matteEdge(p.Edge) {
+		return opErrorf(d, "edge must be \"\", %q or a model id (got %q)", recipe.MatteEdgeNone, p.Edge)
+	}
+	keep, keepSim, err := matteKeep(p)
+	if err != nil {
+		return opErrorf(d, "%v", err)
+	}
+	if model == recipe.MatteModelSAM2Tiny {
+		if err := validateMattePrompts(p.Prompts, p.Edge); err != nil {
+			return opErrorf(d, "%v", err)
+		}
+		if p.Edge == model {
+			return opErrorf(d, "edge must be a per-frame model or %q, not the tracker %q itself", recipe.MatteEdgeNone, model)
+		}
+	} else {
+		if len(p.Prompts) > 0 {
+			return opErrorf(d, "prompts need the guided model %q (got model %q)", recipe.MatteModelSAM2Tiny, model)
+		}
+		if p.Edge != "" {
+			return opErrorf(d, "edge needs the guided model %q (got model %q)", recipe.MatteModelSAM2Tiny, model)
+		}
+	}
+	prompts := CanonicalMattePrompts(p.Prompts)
+	key := matteKey{model: model, size: p.Size, stabilise: p.Stabilise, prompts: prompts, edge: p.Edge}
 	idx, ok := c.matteRefs[key]
 	if !ok {
 		fps := fnum(c.plan.FPS)
 		c.plan.ExtraInputs = append(c.plan.ExtraInputs, ExtraInput{
 			Source: 0,
 			Args:   []string{"-f", "image2", "-framerate", fps, "-start_number", "1"},
-			Matte:  &MatteInput{Model: model, Size: p.Size, FPS: fps},
+			Matte:  &MatteInput{Model: model, Size: p.Size, FPS: fps, Stabilise: p.Stabilise, Prompts: prompts, Edge: p.Edge},
 		})
 		idx = len(c.plan.ExtraInputs) - 1
 		c.matteRefs[key] = idx
 	}
 	c.mergeMatte(idx + 1)
+	for _, hex := range keep {
+		c.keepColour(hex, keepSim)
+	}
 	return nil
 }
 

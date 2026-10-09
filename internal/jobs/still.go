@@ -30,6 +30,10 @@ import (
 // limited-range YUV colour (yuv=1 after an rgba pass) and the chroma/colour
 // default similarities changed (0.2 → 0.1 / 0.1 → 0.08), so the memoised
 // stills of keyed recipes show the off-range key and the old defaults.
+// Phase 5c needs no bump: its matte params (stabilise / keep / prompts /
+// edge) are new op text, so a still of a recipe that carries them never
+// shared a key with one that does not, and the memo of a recipe without
+// them still renders the same picture.
 const stillMemoVersion = "2026-10-08.1"
 
 // Still renders a single preview frame (PNG bytes) for the recipe's op stack
@@ -101,7 +105,14 @@ func (m *Manager) StillSources(ctx context.Context, srcs []string, ops []recipe.
 	// Phase 5b: a stack with a matte op resolves its mattes inside compile
 	// (preview mode: a matte not on disk yet comes back as *ErrMattePending
 	// — the server's 202 — after mattePreviewWait, honouring the eager flag
-	// the server put on ctx); the memo key folds their clip keys in.
+	// the server put on ctx); the memo key folds their clip keys in. Phase
+	// 5c: with no memo, no pass in flight and no eager mark the state is
+	// MattePendingIdle and nothing was started — the error is handed up as
+	// is, before any key, memo or ffmpeg work, so the "not computed" still
+	// costs nothing; only an eager still (the Compute matte button) starts
+	// the pass. A memo hit reads the derived sequence the op asks for
+	// (stabilise / the tracker's edge gate, fillMatteInputs), like the
+	// render.
 	plan, mattes, err := m.compile(ctx, s, ops, subset)
 	if err != nil {
 		return nil, err
