@@ -54,7 +54,7 @@ var (
 	// later retimed to 33 ms by a delay op).
 	seq34 = with(withSeq(pngSeq, func(s *recipe.SequenceInfo) { s.Count = 34 }), func(p *recipe.ProbeInfo) { p.Frames, p.Duration = 34, 3.4 })
 	// Still AVIF with alpha (Phase 2): ffmpeg's mov demuxer exposes the
-	// colour as stream 0 (opaque yuv420p) and the alpha as a gray stream 1.
+	// color as stream 0 (opaque yuv420p) and the alpha as a gray stream 1.
 	avifAlpha = recipe.ProbeInfo{
 		Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "av1", PixFmt: "yuv420p", Bits: 8,
 		Width: 64, Height: 64, Frames: 1, HasAlpha: true, IsStill: true, Kind: recipe.KindImage,
@@ -288,7 +288,7 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "canvas with opaque colour does not add alpha (gif keeps the NTSC rate)",
+			name: "canvas with opaque color does not add alpha (gif keeps the NTSC rate)",
 			src:  h264, ops: []recipe.Op{canvas(1280, 1280, "#313338")}, out: gif(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba,pad=1280:1280:(ow-iw)/2:(oh-ih)/2:color=0x313338,format=rgba[out]",
@@ -296,7 +296,7 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "canvas with semi-transparent RRGGBBAA colour adds alpha",
+			name: "canvas with semi-transparent RRGGBBAA color adds alpha",
 			src:  h264, ops: []recipe.Op{canvas(1280, 1280, "FF000080")}, out: webp(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba,pad=1280:1280:(ow-iw)/2:(oh-ih)/2:color=0xff000080,format=rgba[out]",
@@ -1119,7 +1119,7 @@ func TestCompile(t *testing.T) {
 
 		// --- Phase 2: separate alpha stream ------------------------------
 		{
-			name: "alpha stream: a still AVIF merges colour and alpha in front of the chain",
+			name: "alpha stream: a still AVIF merges color and alpha in front of the chain",
 			src:  avifAlpha, out: webp(),
 			want: Plan{
 				Filter: alphaHead1 + "format=rgba[out]",
@@ -1148,8 +1148,8 @@ func TestCompile(t *testing.T) {
 		},
 		{
 			// ffmpeg's mov demuxer lists the one-frame primary item first; the
-			// animation's colour track is v:2 and its alpha v:3.
-			name: "alpha stream: an animated AVIF addresses its colour track, not the primary item",
+			// animation's color track is v:2 and its alpha v:3.
+			name: "alpha stream: an animated AVIF addresses its color track, not the primary item",
 			src: with(avifAlpha, func(p *recipe.ProbeInfo) {
 				p.IsStill, p.Kind, p.FPS, p.Duration, p.Frames = false, recipe.KindAnimation, 10, 2, 20
 				p.ColorStream, p.AlphaStream = 2, 3
@@ -1161,7 +1161,7 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "colour stream without alpha: an opaque animated AVIF reads its track",
+			name: "color stream without alpha: an opaque animated AVIF reads its track",
 			src: with(avifAlpha, func(p *recipe.ProbeInfo) {
 				p.IsStill, p.Kind, p.FPS, p.Duration, p.Frames = false, recipe.KindAnimation, 10, 2, 20
 				p.ColorStream, p.AlphaStream, p.HasAlpha = 1, 0, false
@@ -1467,7 +1467,7 @@ func checkPlan(t *testing.T, got, want *Plan) {
 	if !strings.HasSuffix(got.Filter, got.OutLabel) {
 		t.Errorf("Filter must end with %s: %s", got.OutLabel, got.Filter)
 	}
-	// Either a single chain from [0:v] (or [0:v:N] for an explicit colour
+	// Either a single chain from [0:v] (or [0:v:N] for an explicit color
 	// stream), or the alpha-stream merge head
 	// ("[0:v:C]…[c];[0:v:N]…[a];[c][a]alphamerge,") followed by one chain.
 	chain := got.Filter
@@ -1569,7 +1569,7 @@ func TestCompileErrors(t *testing.T) {
 		{"resize negative", h264, []recipe.Op{resize(-10, 0, "")}, webp(), "op 0 (resize): width and height must be >= 0"},
 		{"resize unknown fit", h264, []recipe.Op{resize(100, 100, "stretch")}, webp(), `op 0 (resize): fit "stretch" must be one of contain, cover, exact`},
 		{"canvas zero size", h264, []recipe.Op{canvas(0, 100, "")}, webp(), "op 0 (canvas): size must be at least 1x1"},
-		{"canvas bad colour", h264, []recipe.Op{canvas(100, 100, "red")}, webp(), `op 0 (canvas): colour "red"`},
+		{"canvas bad color", h264, []recipe.Op{canvas(100, 100, "red")}, webp(), `op 0 (canvas): color "red"`},
 		{"output negative width", h264, nil, recipe.Output{Format: "webp", Width: -1}, "output: width and height must be >= 0"},
 		{"output unknown fit", h264, nil, recipe.Output{Format: "webp", Width: 100, Height: 100, Fit: "fill"}, `output: fit "fill" must be one of contain, cover, exact`},
 		{"output negative fps", h264, nil, recipe.Output{Format: "webp", FPS: -1}, "output fps must be >= 0"},

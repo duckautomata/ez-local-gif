@@ -10,7 +10,7 @@ package graph_test
 //
 // Why the sequence head looks the way it does (all verified on FFmpeg 9.0.1):
 // fftools rebuilds the filtergraph whenever ANY decoded frame parameter
-// changes — size, pixel format or colour range — and the rebuild loses the
+// changes — size, pixel format or color range — and the rebuild loses the
 // frame the fps filter is holding: six mixed frames rendered as six copies of
 // the last one, both for mixed sizes and for same-size frames mixing
 // rgba/rgb24/pal8 (which the probe reports as Mixed=false, since it only
@@ -50,7 +50,7 @@ const seqFrameCount = 6
 const seqCanvas = 64
 
 // writeSeqFrames writes frames 000001.png … 00000N.png into dir. Frame i
-// (1-based) is sizes[(i-1)%len(sizes)] pixels, colour R = 40*i, G = 200,
+// (1-based) is sizes[(i-1)%len(sizes)] pixels, color R = 40*i, G = 200,
 // B = 0, alpha 128 on the left half and 255 on the right half, so frame
 // identity (R), order, padding (alpha 0) and the alpha halves are all
 // checkable from single pixels.
@@ -82,11 +82,11 @@ func writeSeqFrames(t *testing.T, dir string, sizes [][2]int) {
 }
 
 // writeFmtFrames writes seqFrameCount same-size (seqCanvas square) frames
-// whose PNG colour type — and so the decoded pixel format — varies per frame:
-// kinds[(i-1)%len(kinds)] is "rgba" (truecolour + alpha, alpha 128 on the
-// left half and 255 on the right), "rgb24" (opaque truecolour; Go's png
+// whose PNG color type — and so the decoded pixel format — varies per frame:
+// kinds[(i-1)%len(kinds)] is "rgba" (truecolor + alpha, alpha 128 on the
+// left half and 255 on the right), "rgb24" (opaque truecolor; Go's png
 // encoder drops the alpha channel of a fully opaque image) or "pal8"
-// (indexed). Colours follow writeSeqFrames (frame i: R = 40*i, G = 200,
+// (indexed). Colors follow writeSeqFrames (frame i: R = 40*i, G = 200,
 // B = 0), so drops, dups and reordering show in single pixels.
 func writeFmtFrames(t *testing.T, dir string, kinds []string) {
 	t.Helper()
@@ -107,7 +107,7 @@ func writeFmtFrames(t *testing.T, dir string, kinds []string) {
 			}
 			img = m
 		case "pal8":
-			// Index 0 (the zero value of Pix) is the frame colour.
+			// Index 0 (the zero value of Pix) is the frame color.
 			img = image.NewPaletted(image.Rect(0, 0, seqCanvas, seqCanvas), color.Palette{
 				color.NRGBA{R: uint8(40 * i), G: 200, A: 255},
 				color.NRGBA{A: 255},
@@ -132,8 +132,8 @@ func writeFmtFrames(t *testing.T, dir string, kinds []string) {
 	}
 }
 
-// pngPixFmt reports what ffmpeg will decode a PNG file as, from its colour
-// type: "rgb24" (truecolour), "rgba" (truecolour + alpha) or "pal8" (indexed).
+// pngPixFmt reports what ffmpeg will decode a PNG file as, from its color
+// type: "rgb24" (truecolor), "rgba" (truecolor + alpha) or "pal8" (indexed).
 func pngPixFmt(t *testing.T, path string) string {
 	t.Helper()
 	f, err := os.Open(path)
@@ -207,7 +207,7 @@ func near(got, want byte, tol int) bool {
 }
 
 // checkSeqFrame checks that frame is sequence frame n (1-based): R = 40*n
-// and G = 200 at the canvas centre, i.e. no drop, dup or colour bleed.
+// and G = 200 at the canvas centre, i.e. no drop, dup or color bleed.
 func checkSeqFrame(t *testing.T, frame []byte, index, n int) {
 	t.Helper()
 	c := pixel(frame, seqCanvas, seqCanvas/2, seqCanvas/2)
@@ -510,7 +510,7 @@ func hasCodec(t *testing.T, ff, list, name string) bool {
 }
 
 // avifWithAlpha encodes pngPath as a still AVIF through ffmpeg's avif muxer
-// two-stream path: stream 0 = colour (yuv420p), stream 1 = alpha (gray), the
+// two-stream path: stream 0 = color (yuv420p), stream 1 = alpha (gray), the
 // layout the mov demuxer exposes as [0:v:0] / [0:v:1]. The extracted alpha
 // plane inherits the PNG's RGB (identity) matrix tag, which libaom refuses
 // for a 4:2:0/monochrome stream, so it is retagged bt709 full range first.
@@ -562,12 +562,12 @@ func TestAlphaStreamAVIFPixels(t *testing.T) {
 	}
 	dir := t.TempDir()
 
-	// Straight grey disc: the colour plane is uniformly 128 (also under the
+	// Straight grey disc: the color plane is uniformly 128 (also under the
 	// transparent pixels), only the alpha carries the disc — lossy-safe.
 	straight := filepath.Join(dir, "straight.avif")
 	discPNG(t, filepath.Join(dir, "straight.png"), 128, false)
 	avifWithAlpha(t, ff, filepath.Join(dir, "straight.png"), straight)
-	// Premultiplied white disc: the colour plane is the disc matted on black
+	// Premultiplied white disc: the color plane is the disc matted on black
 	// (edge R ~ A), what the unpremultiply toggle must undo.
 	pre := filepath.Join(dir, "pre.avif")
 	discPNG(t, filepath.Join(dir, "pre.png"), 255, true)
@@ -595,11 +595,11 @@ func TestAlphaStreamAVIFPixels(t *testing.T) {
 		}
 		for i := 0; i+3 < len(f); i += 4 {
 			if !near(f[i], 128, 12) {
-				t.Errorf("pixel %d: R=%d, want ~128 everywhere (colour must come from stream 0 untouched)", i/4, f[i])
+				t.Errorf("pixel %d: R=%d, want ~128 everywhere (color must come from stream 0 untouched)", i/4, f[i])
 				break
 			}
 		}
-		// Control: without the head the master is the opaque colour stream.
+		// Control: without the head the master is the opaque color stream.
 		plain := compile(t, with(avifInfo, func(p *recipe.ProbeInfo) { p.AlphaStream = 0 }), nil, webpOut)
 		for i, f := 3, renderFrames(t, ff, straight, plain)[0]; i < len(f); i += 4 {
 			if f[i] != 255 {
@@ -608,7 +608,7 @@ func TestAlphaStreamAVIFPixels(t *testing.T) {
 		}
 	})
 
-	t.Run("hoisted unpremultiply right after the merge restores straight colour", func(t *testing.T) {
+	t.Run("hoisted unpremultiply right after the merge restores straight color", func(t *testing.T) {
 		// Sanity: merged as-is the premultiplied edge is dark (R ~ A).
 		asIs := renderFrames(t, ff, pre, compile(t, avifInfo, nil, webpOut))[0]
 		if n, _, maxR := edgeStatsWindow(asIs, 64, 192); n < 20 || maxR > 230 {

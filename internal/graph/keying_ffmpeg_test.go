@@ -4,10 +4,10 @@ package graph_test
 // docs/background-removal-proposal.md §5.3, §5.4). External test package
 // like the other *_ffmpeg_test.go files; skips when ffmpeg is not on PATH.
 //
-//   - chromakey emits its key colour as the BT.601 limited-range YUV of the
+//   - chromakey emits its key color as the BT.601 limited-range YUV of the
 //     RGB key (graph.LimitedYUV, yuv=1) behind an rgba pass into the pinned
-//     yuva444p/bt470bg/tv format, so the EXACT screen colour keys at
-//     similarity 0.02 — for green, blue and two arbitrary colours, from an
+//     yuva444p/bt470bg/tv format, so the EXACT screen color keys at
+//     similarity 0.02 — for green, blue and two arbitrary colors, from an
 //     RGB-decoded source, from bt709-tagged yuv420p sources (tv and full
 //     range: the screen-capture MP4 cases) and from a bt709-tagged ProRes
 //     4444 (an alpha source, through the key wrapper). Measured on the
@@ -19,10 +19,10 @@ package graph_test
 //     keyed below ~0.05. The pin fixes both; every source below yields the
 //     601 values and keys at 0.02.
 //   - morph close fills a 1-px hole in the matte, keeps a 3x3 hole and the
-//     silhouette, and leaves the colour planes byte-identical; grow 1 adds
+//     silhouette, and leaves the color planes byte-identical; grow 1 adds
 //     exactly one ring (corners included: coordinates=255 is the full
 //     8-neighbourhood).
-//   - three stacked colorkeys intersect: each removes its own colour and the
+//   - three stacked colorkeys intersect: each removes its own color and the
 //     earlier mattes survive the later keys.
 
 import (
@@ -44,7 +44,7 @@ const (
 	kpW    = 12 // … and side; 2-aligned so 4:2:0 chroma is exact
 )
 
-// keyProbe is a kpSize x kpSize opaque frame of the screen colour with a
+// keyProbe is a kpSize x kpSize opaque frame of the screen color with a
 // kpW x kpW subject square at (kpX0, kpX0): the picture taggedYUVClip draws
 // with lavfi, as a PNG.
 func keyProbe(screen, subject color.NRGBA) *image.NRGBA {
@@ -57,12 +57,12 @@ func keyProbe(screen, subject color.NRGBA) *image.NRGBA {
 	return img
 }
 
-// hexNRGBA parses an RRGGBB colour.
+// hexNRGBA parses an RRGGBB color.
 func hexNRGBA(t *testing.T, hex string) color.NRGBA {
 	t.Helper()
 	var r, g, b uint8
 	if _, err := fmt.Sscanf(hex, "%02x%02x%02x", &r, &g, &b); err != nil {
-		t.Fatalf("colour %q: %v", hex, err)
+		t.Fatalf("color %q: %v", hex, err)
 	}
 	return color.NRGBA{R: r, G: g, B: b, A: 255}
 }
@@ -106,7 +106,7 @@ func rawFrame(t *testing.T, ff, clip, vf, pixfmt string) []byte {
 	return data
 }
 
-// yuv709 is the BT.709 Y'CbCr triple of an RGB colour at tv or full range —
+// yuv709 is the BT.709 Y'CbCr triple of an RGB color at tv or full range —
 // what a bt709-tagged capture stores for it — so a test clip can be checked
 // to carry the encoding its tag claims.
 func yuv709(c color.NRGBA, full bool) (y, u, v int) {
@@ -130,7 +130,7 @@ func chromaStage(yuvHex, sim string) string {
 // screen pixel at least margin px from the subject (chromakey averages a
 // 3x3 neighbourhood, so the ring touching the subject is legitimately
 // opaque; a lossy source needs a wider margin), alpha 255 and the subject
-// colour (tol per channel: yuv round trips, 4:2:0 chroma) on every subject
+// color (tol per channel: yuv round trips, 4:2:0 chroma) on every subject
 // pixel at least 2 px inside it.
 func checkKeyed(t *testing.T, frames [][]byte, subject color.NRGBA, margin, tol int, name string) {
 	t.Helper()
@@ -149,7 +149,7 @@ func checkKeyed(t *testing.T, frames [][]byte, subject color.NRGBA, margin, tol 
 				case inSubject && (px[3] != 255 || !near(px[0], subject.R, tol) || !near(px[1], subject.G, tol) || !near(px[2], subject.B, tol)):
 					problem = fmt.Sprintf("subject (%d,%d) = %v, want opaque %v", x, y, px, subject)
 				case !nearSubject && px[3] != 0:
-					problem = fmt.Sprintf("screen (%d,%d) = %v, want alpha 0 (the exact key colour did not key at similarity 0.02)", x, y, px)
+					problem = fmt.Sprintf("screen (%d,%d) = %v, want alpha 0 (the exact key color did not key at similarity 0.02)", x, y, px)
 				}
 				if problem != "" {
 					if bad++; bad <= 3 {
@@ -164,11 +164,11 @@ func checkKeyed(t *testing.T, frames [][]byte, subject color.NRGBA, margin, tol 
 	}
 }
 
-func TestChromaKeyExactColourPixels(t *testing.T) {
+func TestChromaKeyExactColorPixels(t *testing.T) {
 	ff := ffmpegOrSkip(t)
 	dir := t.TempDir()
 	out := recipe.Output{Format: "webp"}
-	colours := []struct{ name, key, subject, yuv string }{
+	colors := []struct{ name, key, subject, yuv string }{
 		{"green", "00ff00", "ff0000", "913622"},
 		{"blue", "0000ff", "ff0000", "29f06e"},
 		{"custom 1e3a8a", "1e3a8a", "ff0000", "42a76e"},
@@ -177,7 +177,7 @@ func TestChromaKeyExactColourPixels(t *testing.T) {
 	keyOp := func(key string) []recipe.Op {
 		return []recipe.Op{{Kind: recipe.OpChromaKey, Params: []byte(fmt.Sprintf(`{"color":"%s","similarity":0.02}`, key))}}
 	}
-	for _, c := range colours {
+	for _, c := range colors {
 		key, subject := hexNRGBA(t, c.key), hexNRGBA(t, c.subject)
 		t.Run(c.name+" from an RGB-decoded png source", func(t *testing.T) {
 			clip, info := pngClip(t, ff, dir, "rgb-"+c.key, []image.Image{keyProbe(key, subject), keyProbe(key, subject)}, 10, false)
@@ -220,7 +220,7 @@ func TestChromaKeyExactColourPixels(t *testing.T) {
 			t.Skip("ffmpeg has no prores_ks encoder")
 		}
 		green, red := hexNRGBA(t, "00ff00"), hexNRGBA(t, "ff0000")
-		// The bottom four rows are transparent (screen colour at alpha 0, so
+		// The bottom four rows are transparent (screen color at alpha 0, so
 		// the chroma around them stays uniform): the wrapper must keep them
 		// at 0 while the opaque screen is keyed.
 		img := keyProbe(green, red)
@@ -259,8 +259,8 @@ const mpSize = 24
 
 // morphProbe is a transparent mpSize x mpSize frame with an opaque red 12x12
 // square at [6,18), a 1-px hole at (9,9) and a 3x3 hole at [13,16)². The
-// colour bytes under the transparency are distinctive ((1,2,3) around,
-// (7,77,177) in the holes) so "colour planes untouched" covers them too.
+// color bytes under the transparency are distinctive ((1,2,3) around,
+// (7,77,177) in the holes) so "color planes untouched" covers them too.
 func morphProbe() *image.NRGBA {
 	img := solid(mpSize, mpSize, color.NRGBA{R: 1, G: 2, B: 3})
 	for y := 6; y < 18; y++ {
@@ -311,6 +311,27 @@ func morph3(a []byte, w, h int, dilate bool) []byte {
 	return out
 }
 
+// morphCross is the reference 4-neighbour (cross) max / min, what ffmpeg's
+// dilation / erosion compute with coordinates=90 (top, left, right, bottom).
+func morphCross(a []byte, w, h int, dilate bool) []byte {
+	out := make([]byte, len(a))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			v := a[y*w+x]
+			for _, d := range [][2]int{{0, -1}, {-1, 0}, {1, 0}, {0, 1}} {
+				n := a[min(max(y+d[1], 0), h-1)*w+min(max(x+d[0], 0), w-1)]
+				if dilate {
+					v = max(v, n)
+				} else {
+					v = min(v, n)
+				}
+			}
+			out[y*w+x] = v
+		}
+	}
+	return out
+}
+
 func TestMorphPixels(t *testing.T) {
 	ff := ffmpegOrSkip(t)
 	dir := t.TempDir()
@@ -329,22 +350,24 @@ func TestMorphPixels(t *testing.T) {
 	}
 	dilate := func(a []byte) []byte { return morph3(a, w, h, true) }
 	erode := func(a []byte) []byte { return morph3(a, w, h, false) }
-	const (
-		dil = "dilation=coordinates=255:threshold0=0:threshold1=0:threshold2=0"
-		ero = "erosion=coordinates=255:threshold0=0:threshold1=0:threshold2=0"
-	)
+	dilateX := func(a []byte) []byte { return morphCross(a, w, h, true) }
 	at := func(a []byte, x, y int) byte { return a[y*w+x] }
+	// stage wraps the alpha stages as compiler.morph emits them on this
+	// rgba-less chain: the alpha alone is extracted, refined and merged back.
+	stage := func(alpha string) string {
+		return "format=rgba,split[e1][e1a];[e1a]alphaextract," + alpha + "[e1m];[e1][e1m]alphamerge,format=rgba"
+	}
 
 	cases := []struct {
 		name   string
 		params string
 		stage  string
-		want   func([]byte) []byte
+		want   func([]byte) []byte // nil: no exact reference, the facts decide
 		facts  func(t *testing.T, a []byte)
 	}{
 		{
 			"close fills the 1-px hole, keeps the 3x3 hole and the silhouette", `{"close":true}`,
-			"format=gbrap," + dil + "," + ero + ",format=rgba",
+			stage("dilation,erosion"),
 			func(a []byte) []byte { return erode(dilate(a)) },
 			func(t *testing.T, a []byte) {
 				if at(a, 9, 9) != 255 {
@@ -369,7 +392,7 @@ func TestMorphPixels(t *testing.T) {
 		},
 		{
 			"grow 1 adds exactly one ring", `{"grow":1}`,
-			"format=gbrap," + dil + ",format=rgba",
+			stage("dilation=coordinates=255"),
 			dilate,
 			func(t *testing.T, a []byte) {
 				for _, pt := range [][2]int{{5, 5}, {5, 12}, {18, 18}, {18, 5}, {12, 18}} {
@@ -388,12 +411,59 @@ func TestMorphPixels(t *testing.T) {
 			},
 		},
 		{
-			"close then grow 2", `{"close":true,"grow":2}`,
-			"format=gbrap," + dil + "," + ero + "," + dil + "," + dil + ",format=rgba",
-			func(a []byte) []byte { return dilate(dilate(erode(dilate(a)))) },
+			"close then grow 2: the second ring is a cross, the corner is cut", `{"close":true,"grow":2}`,
+			stage("dilation,erosion,dilation=coordinates=255,dilation=coordinates=90"),
+			func(a []byte) []byte { return dilateX(dilate(erode(dilate(a)))) },
 			func(t *testing.T, a []byte) {
-				if at(a, 4, 4) != 255 || at(a, 3, 3) != 0 || at(a, 14, 14) != 255 {
-					t.Errorf("two rings: (4,4) %d want 255, (3,3) %d want 0, 3x3 hole centre %d want 255", at(a, 4, 4), at(a, 3, 3), at(a, 14, 14))
+				if at(a, 4, 5) != 255 || at(a, 5, 4) != 255 || at(a, 4, 4) != 0 || at(a, 3, 5) != 0 || at(a, 14, 14) != 255 {
+					t.Errorf("two rings: (4,5) %d (5,4) %d want 255, corner (4,4) %d and (3,5) %d want 0 (octagon), 3x3 hole centre %d want 255",
+						at(a, 4, 5), at(a, 5, 4), at(a, 4, 4), at(a, 3, 5), at(a, 14, 14))
+				}
+			},
+		},
+		{
+			"shrink 1 trims exactly one ring off the edge", `{"grow":-1}`,
+			stage("erosion=coordinates=255"),
+			erode,
+			func(t *testing.T, a []byte) {
+				for _, pt := range [][2]int{{6, 6}, {6, 12}, {17, 17}, {12, 17}} {
+					if v := at(a, pt[0], pt[1]); v != 0 {
+						t.Errorf("edge pixel (%d,%d) alpha %d, want 0 (one ring trimmed)", pt[0], pt[1], v)
+					}
+				}
+				for _, pt := range [][2]int{{7, 7}, {16, 8}, {7, 12}, {12, 7}} {
+					if v := at(a, pt[0], pt[1]); v != 255 {
+						t.Errorf("pixel (%d,%d) alpha %d, want 255 (exactly one ring)", pt[0], pt[1], v)
+					}
+				}
+				if at(a, 8, 8) != 0 || at(a, 10, 10) != 0 {
+					t.Errorf("the 1-px hole widens to 3x3: (8,8) %d (10,10) %d, want 0", at(a, 8, 8), at(a, 10, 10))
+				}
+			},
+		},
+		{
+			"soft edge 1.5: corners rounded, the outline stays crisp", `{"smooth":1.5}`,
+			stage("gblur=sigma=1.5,lut=y=(val-128)*3+128"),
+			nil,
+			func(t *testing.T, a []byte) {
+				if v := at(a, 2, 2); v != 0 {
+					t.Errorf("far outside (2,2) alpha %d, want 0", v)
+				}
+				if v := at(a, 16, 8); v != 255 {
+					t.Errorf("interior (16,8) alpha %d, want 255", v)
+				}
+				// the straight edge keeps its place: the pixel on it stays
+				// mostly opaque, the one just outside mostly transparent
+				if in, outside := at(a, 12, 6), at(a, 12, 5); in < 160 || outside > 96 {
+					t.Errorf("edge mid (12,6) alpha %d want >= 160, outside (12,5) %d want <= 96", in, outside)
+				}
+				// the corner is rounded off: weaker than the straight edge
+				if c, e := at(a, 6, 6), at(a, 12, 6); c >= e {
+					t.Errorf("corner (6,6) alpha %d not below the edge mid %d: not rounded", c, e)
+				}
+				// the 1-px pinhole is smoothed away
+				if v := at(a, 9, 9); v < 200 {
+					t.Errorf("pinhole (9,9) alpha %d, want >= 200 (smoothed away)", v)
 				}
 			},
 		},
@@ -408,20 +478,23 @@ func TestMorphPixels(t *testing.T) {
 			if len(frames) != 2 {
 				t.Fatalf("%d frames, want 2", len(frames))
 			}
-			want := tc.want(src)
+			var want []byte
+			if tc.want != nil {
+				want = tc.want(src)
+			}
 			for i, f := range frames {
 				got := alphaPlane(f, w, h)
-				for j := range got {
+				for j := range want {
 					if got[j] != want[j] {
 						t.Errorf("frame %d: alpha (%d,%d) = %d, want %d (reference 3x3 morphology)", i, j%w, j/w, got[j], want[j])
 						break
 					}
 				}
-				// threshold0..2=0 freeze the colour planes: every colour byte
-				// — under the transparency included — is the plain decode's.
+				// only the alpha passes through a filter: every color byte —
+				// under the transparency included — is the plain decode's.
 				for j := 0; j < w*h; j++ {
 					if f[j*4] != plain[i][j*4] || f[j*4+1] != plain[i][j*4+1] || f[j*4+2] != plain[i][j*4+2] {
-						t.Errorf("frame %d: colour (%d,%d) = %v, want %v untouched", i, j%w, j/w, pixel(f, w, j%w, j/w), pixel(plain[i], w, j%w, j/w))
+						t.Errorf("frame %d: color (%d,%d) = %v, want %v untouched", i, j%w, j/w, pixel(f, w, j%w, j/w), pixel(plain[i], w, j%w, j/w))
 						break
 					}
 				}
@@ -459,9 +532,9 @@ func TestStackedColorKeysIntersect(t *testing.T) {
 		}
 	}
 	clip, info := pngClip(t, ff, dir, "bands", []image.Image{img, img}, 10, false)
-	keys := func(colours ...string) []recipe.Op {
-		ops := make([]recipe.Op, 0, len(colours))
-		for _, c := range colours {
+	keys := func(colors ...string) []recipe.Op {
+		ops := make([]recipe.Op, 0, len(colors))
+		for _, c := range colors {
 			ops = append(ops, recipe.Op{Kind: recipe.OpColorKey, Params: []byte(`{"color":"` + c + `"}`)})
 		}
 		return ops
@@ -485,7 +558,7 @@ func TestStackedColorKeysIntersect(t *testing.T) {
 					case !inSubject(x, y) && keyed[x/12] && px[3] != 0:
 						problem = fmt.Sprintf("band %d pixel (%d,%d) = %v, want alpha 0 (keyed)", x/12, x, y, px)
 					case !inSubject(x, y) && !keyed[x/12] && !isRGBA(px, bands[x/12].R, bands[x/12].G, bands[x/12].B, 255, 1):
-						problem = fmt.Sprintf("band %d pixel (%d,%d) = %v, want the opaque band colour (not keyed)", x/12, x, y, px)
+						problem = fmt.Sprintf("band %d pixel (%d,%d) = %v, want the opaque band color (not keyed)", x/12, x, y, px)
 					}
 					if problem != "" {
 						if bad++; bad <= 3 {
@@ -500,7 +573,7 @@ func TestStackedColorKeysIntersect(t *testing.T) {
 		}
 	}
 
-	t.Run("three stacked colorkeys remove their three colours and keep the subject", func(t *testing.T) {
+	t.Run("three stacked colorkeys remove their three colors and keep the subject", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{info}, keys("ff0000", "00ff00", "0000ff"), out)
 		// The first key is bare, the second and third are wrapped on the
 		// previous matte (default similarity 0.08, blend 0).
@@ -515,7 +588,7 @@ func TestStackedColorKeysIntersect(t *testing.T) {
 		}
 		check(t, p3Render(t, ff, clip, p, nil, nil), [3]bool{true, true, true}, "three keys")
 	})
-	t.Run("each key removes only its own colour: two keys leave the third band opaque", func(t *testing.T) {
+	t.Run("each key removes only its own color: two keys leave the third band opaque", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{info}, keys("ff0000", "00ff00"), out)
 		check(t, p3Render(t, ff, clip, p, nil, nil), [3]bool{true, true, false}, "red+green")
 		p = compileSrcs(t, []recipe.ProbeInfo{info}, keys("0000ff", "ff0000"), out)

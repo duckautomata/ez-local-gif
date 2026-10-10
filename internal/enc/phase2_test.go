@@ -132,7 +132,7 @@ func TestGIFArgs_Variant(t *testing.T) {
 	gifAlphaTail := func(filter string) []string { // alpha: full-canvas frames, see GIFArgs
 		return []string{"-filter_complex", filter, "-map", "[out]", "-gifflags", "-offsetting", "-loop", "0", "-f", "gif", "out.gif"}
 	}
-	t.Run("alpha: colour source takes the variant size and rate", func(t *testing.T) {
+	t.Run("alpha: color source takes the variant size and rate", func(t *testing.T) {
 		got := GIFArgs(m, GIFOptions{HasAlpha: true, Variant: &Variant{FPS: 20, Width: 160}}, "out.gif")
 		want := withRaw(gifAlphaTail(
 			"[0:v]" + vfFPS20Scale + "[v];" +
@@ -305,10 +305,10 @@ func TestPngquantArgs(t *testing.T) {
 		want          []string
 	}{
 		{"defaults: ordered (nofs), 256, speed 3", 0, 0, false, []string{"--nofs", "256", "--speed", "3", "--force", "-o", "out.png", "in.png"}},
-		{"64 colours speed 1", 64, 1, false, []string{"--nofs", "64", "--speed", "1", "--force", "-o", "out.png", "in.png"}},
+		{"64 colors speed 1", 64, 1, false, []string{"--nofs", "64", "--speed", "1", "--force", "-o", "out.png", "in.png"}},
 		{"dither drops --nofs", 128, 0, true, []string{"128", "--speed", "3", "--force", "-o", "out.png", "in.png"}},
-		{"clamps: colours 1 → 2, 999 → 256 (next), speed 20 → 11", 1, 20, false, []string{"--nofs", "2", "--speed", "11", "--force", "-o", "out.png", "in.png"}},
-		{"colours 999 → 256", 999, 0, false, []string{"--nofs", "256", "--speed", "3", "--force", "-o", "out.png", "in.png"}},
+		{"clamps: colors 1 → 2, 999 → 256 (next), speed 20 → 11", 1, 20, false, []string{"--nofs", "2", "--speed", "11", "--force", "-o", "out.png", "in.png"}},
+		{"colors 999 → 256", 999, 0, false, []string{"--nofs", "256", "--speed", "3", "--force", "-o", "out.png", "in.png"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -561,12 +561,12 @@ func TestGifsicleOptimizeArgs(t *testing.T) {
 			[]string{"in.gif", "-O2", "--loopcount=forever", "-o", "out.gif"},
 		},
 		{
-			"clamps: lossy 200, colours 256, loop 65535; dither without colours dropped; negative loop forever",
+			"clamps: lossy 200, colors 256, loop 65535; dither without colors dropped; negative loop forever",
 			nil, GifsicleOptimizeOptions{Lossy: 999, Colors: 999, Dither: "o8", Loop: 100000},
 			[]string{"in.gif", "-O2", "--lossy=200", "--colors", "256", "--dither=o8", "--loopcount=65535", "-o", "out.gif"},
 		},
 		{
-			"dither without colours is dropped, negative loop is forever", nil, GifsicleOptimizeOptions{Dither: "o8", Loop: -1, Colors: 0},
+			"dither without colors is dropped, negative loop is forever", nil, GifsicleOptimizeOptions{Dither: "o8", Loop: -1, Colors: 0},
 			[]string{"in.gif", "-O2", "--loopcount=forever", "-o", "out.gif"},
 		},
 		{

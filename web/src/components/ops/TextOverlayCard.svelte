@@ -120,28 +120,28 @@
     {/if}
     <label class="field"><span>Size (px)</span><NumField bind:value={o.size} min={4} max={1024} small /></label>
     <span class="field">
-      <span>Colour</span>
+      <span>Color</span>
       <span class="row tight">
-        <input type="color" value={rgb6(o.color)} oninput={(e) => setColor(pickerColor(e.currentTarget.value, o.color))} aria-label="Text colour" />
-        <input type="text" class="hex mono" value={'#' + o.color} onchange={(e) => setColor(e.currentTarget.value)} maxlength="9" spellcheck="false" aria-label="Text colour hex (RRGGBB or RRGGBBAA)" />
+        <input type="color" value={rgb6(o.color)} oninput={(e) => setColor(pickerColor(e.currentTarget.value, o.color))} aria-label="Text color" />
+        <input type="text" class="hex mono" value={'#' + o.color} onchange={(e) => setColor(e.currentTarget.value)} maxlength="9" spellcheck="false" aria-label="Text color hex (RRGGBB or RRGGBBAA)" />
       </span>
     </span>
   </div>
   <div class="row">
     <label class="field"><span>Outline (px)</span><NumField bind:value={o.border} min={0} max={64} small /></label>
     <span class="field">
-      <span>Outline colour</span>
+      <span>Outline color</span>
       <span class="row tight">
-        <input type="color" value={rgb6(o.borderColor)} oninput={(e) => setBorderColor(pickerColor(e.currentTarget.value, o.borderColor))} disabled={o.border <= 0} aria-label="Outline colour" />
-        <input type="text" class="hex mono" value={'#' + o.borderColor} onchange={(e) => setBorderColor(e.currentTarget.value)} disabled={o.border <= 0} maxlength="9" spellcheck="false" aria-label="Outline colour hex" />
+        <input type="color" value={rgb6(o.borderColor)} oninput={(e) => setBorderColor(pickerColor(e.currentTarget.value, o.borderColor))} disabled={o.border <= 0} aria-label="Outline color" />
+        <input type="text" class="hex mono" value={'#' + o.borderColor} onchange={(e) => setBorderColor(e.currentTarget.value)} disabled={o.border <= 0} maxlength="9" spellcheck="false" aria-label="Outline color hex" />
       </span>
     </span>
     <label class="inline"><input type="checkbox" bind:checked={o.box} /><span>Box</span></label>
     <span class="field">
-      <span>Box colour (RRGGBBAA)</span>
+      <span>Box color (RRGGBBAA)</span>
       <span class="row tight">
-        <input type="color" value={rgb6(o.boxColor)} oninput={(e) => setBoxColor(pickerColor(e.currentTarget.value, o.boxColor))} disabled={!o.box} aria-label="Box colour" />
-        <input type="text" class="hex mono" value={'#' + o.boxColor} onchange={(e) => setBoxColor(e.currentTarget.value)} disabled={!o.box} maxlength="9" spellcheck="false" aria-label="Box colour hex" />
+        <input type="color" value={rgb6(o.boxColor)} oninput={(e) => setBoxColor(pickerColor(e.currentTarget.value, o.boxColor))} disabled={!o.box} aria-label="Box color" />
+        <input type="text" class="hex mono" value={'#' + o.boxColor} onchange={(e) => setBoxColor(e.currentTarget.value)} disabled={!o.box} maxlength="9" spellcheck="false" aria-label="Box color hex" />
       </span>
     </span>
     <label class="field"><span>Box padding</span><NumField bind:value={o.boxPad} min={1} max={256} small disabled={!o.box} /></label>
@@ -157,7 +157,7 @@
   </div>
   <TimeRangeFields {o} {info} />
   <p class="hint">
-    Rendered with drawtext from a text file (no escaping issues); the colour takes an alpha suffix (#ffffff80).
+    Rendered with drawtext from a text file (no escaping issues); the color takes an alpha suffix (#ffffff80).
     {#if fontsOn}Fonts come from the server's font list ({TEXT_DEFAULTS.font} is always there).{/if}
     {#if canvas}Size is {sizePct}% of the {canvas.h} px output height — check the result at Discord's display size.{/if}
   </p>

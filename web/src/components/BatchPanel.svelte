@@ -11,7 +11,6 @@
   import { fmtKiB, fmtNum, fmtSeconds } from '../lib/format';
   import { resetRender } from '../lib/render.svelte';
   import { sizeState } from '../lib/result';
-  import { stageLabel } from '../lib/stages';
   import { setSource } from '../lib/state.svelte';
 
   const canSave = $derived(caps.features.outputSave);
@@ -89,9 +88,8 @@
         </p>
       {:else if row.running}
         <div class="prog">
-          <!-- the stage with its label (lib/stages — "AI matte" while the row's matte pass runs) and the job's message ("24/45 · GPU") -->
           <div class="row between small">
-            <span class="muted">{stageLabel(row.job?.stage) || row.job?.state || 'queued'}{#if row.job?.message}&nbsp;· {row.job.message}{/if}</span>
+            <span class="muted">{row.job?.stage || row.job?.state || 'queued'}</span>
             <span class="mono muted">{percentOf(row).toFixed(0)}%</span>
           </div>
           <div class="progress"><div style:width="{percentOf(row)}%"></div></div>

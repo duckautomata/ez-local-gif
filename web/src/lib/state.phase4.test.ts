@@ -51,8 +51,8 @@ describe('feather op (review R4)', () => {
     ops.background = { ...defaultBackground(), enabled: true, colors: ['313338'] };
     ops.autocrop = { enabled: true, padding: 0, threshold: 1 };
     expect(buildOps(ops).map((o) => o.kind)).toEqual(['colorkey', 'morph', 'feather', 'autocrop', 'resize', 'flip', 'rotate']);
-    // with the Edge cleanup off, right after the key
-    ops.background.morph = { close: false, grow: 0 };
+    // with the Edges cleanup off, right after the key
+    ops.background.morph = { close: false, grow: 0, smooth: 0 };
     expect(buildOps(ops).map((o) => o.kind)).toEqual(['colorkey', 'feather', 'autocrop', 'resize', 'flip', 'rotate']);
   });
 

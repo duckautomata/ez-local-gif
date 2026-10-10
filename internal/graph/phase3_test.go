@@ -47,7 +47,7 @@ var (
 		Width: 200, Height: 100, FPS: 30, Duration: 1, Frames: 30, HasAlpha: true, Kind: recipe.KindVideo, Premultiplied: true,
 	}
 	// Animated AVIF with alpha: the mov demuxer lists the primary item first,
-	// the animation's colour track is v:2 and its alpha v:3.
+	// the animation's color track is v:2 and its alpha v:3.
 	ovAVIFAnim = recipe.ProbeInfo{
 		Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "av1", PixFmt: "yuv420p", Bits: 8,
 		Width: 64, Height: 64, FPS: 10, Duration: 2, Frames: 20, HasAlpha: true, Kind: recipe.KindAnimation,
@@ -71,19 +71,21 @@ func resolved(x, y, w, h int) recipe.Op {
 
 // Stage text shared by the goldens.
 const (
-	ckDefault = "format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3"
+	// ckNoSpill is the default green chromakey's own stages; its despill
+	// follows as a separate masked stage (spill), or not at all with
+	// DespillOff.
 	ckNoSpill = "format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1"
 	ckWhite   = "format=rgba,colorkey=color=0xffffff:similarity=0.08:blend=0"
 	// featherDef is the feather stage at the default radius 3: gbrap orders
 	// the planes G,B,R,A, so planes=8 blurs only the alpha plane.
 	featherDef = "format=gbrap,gblur=sigma=3:planes=8,format=rgba"
-	// morphDil / morphEro are the morph op's 3x3 neighbourhood stages on
-	// gbrap frames (planes G,B,R,A): the filters have no planes option, so
-	// threshold0..2=0 freeze the colour planes and only the alpha plane is
-	// min/max-filtered; morphClose is the stage for Close without Grow.
-	morphDil   = "dilation=coordinates=255:threshold0=0:threshold1=0:threshold2=0"
-	morphEro   = "erosion=coordinates=255:threshold0=0:threshold1=0:threshold2=0"
-	morphClose = "format=gbrap," + morphDil + "," + morphEro + ",format=rgba"
+	// spillGreen is the default green despill (ffmpeg's own mix 0.5 /
+	// expand 0), applied through spill.
+	spillGreen = "despill=type=green:mix=0.5:expand=0"
+	// morphClose is the first morph with Close only, on a chain that does
+	// not end in rgba yet (ensureRGBA adds the conversion): the alpha alone
+	// is extracted, closed and merged back.
+	morphClose = "format=rgba,split[e1][e1a];[e1a]alphaextract,dilation,erosion[e1m];[e1][e1m]alphamerge"
 	ovComposit = "overlay=x=0:y=0:format=auto:shortest=1:eof_action=repeat"
 	hold       = "tpad=stop_mode=clone:stop=-1"
 	text1      = "drawtext=textfile=__EZLG_TEXT_1__:expansion=none:font=DejaVu Sans:fontsize=32:fontcolor=0xffffff:x=0:y=0"
@@ -111,6 +113,28 @@ func keyWrapped(n int, stages string) string {
 		"[k" + k + "k][k" + k + "a]alphamerge"
 }
 
+// spill is the edge-masked despill edgeDespill emits for the n-th despill
+// on a source whose despill band is r px: it joins the chain right after
+// the key — "<key>," + spill(…) + ",<rest>" — splitting the frame three
+// ways, despilling one copy, building the band mask from the alpha
+// (eroded r times, negated, blurred by r/2) and mixing the despilled copy
+// in through it; it ends in format=rgba.
+func spill(n, r int, despill string) string {
+	k := strconv.Itoa(n)
+	return "format=gbrap,split=3[d" + k + "][d" + k + "s][d" + k + "m];" +
+		"[d" + k + "s]format=rgba," + despill + ",format=gbrap[d" + k + "d];" +
+		"[d" + k + "m]alphaextract," + strings.Repeat("erosion,", r) + "negate,gblur=sigma=" + fnum(float64(r)/2) + ",format=gbrap[d" + k + "k];" +
+		"[d" + k + "][d" + k + "d][d" + k + "k]maskedmerge,format=rgba"
+}
+
+// edges is the n-th morph's alpha wrapper (compiler.morph) after the chain
+// is in rgba: "<chain>,format=rgba," + edges(…) + ",<rest>"; alpha lists
+// the stages run on the extracted alpha after alphaextract.
+func edges(n int, alpha string) string {
+	k := strconv.Itoa(n)
+	return "split[e" + k + "][e" + k + "a];[e" + k + "a]alphaextract," + alpha + "[e" + k + "m];[e" + k + "][e" + k + "m]alphamerge"
+}
+
 // --- goldens ----------------------------------------------------------------
 
 func TestCompilePhase3(t *testing.T) {
@@ -123,14 +147,14 @@ func TestCompilePhase3(t *testing.T) {
 	}{
 		// --- keying ---------------------------------------------------------
 		{
-			// Phase 5a: the key colour is the BT.601 limited-range YUV of the
+			// Phase 5a: the key color is the BT.601 limited-range YUV of the
 			// RGB key (green 00ff00 → Y 145 U 54 V 34, LimitedYUV) with yuv=1,
 			// behind an rgba pass into the pinned yuva444p/bt470bg/tv format;
 			// default similarity 0.1.
 			name: "chromakey defaults: rgba pass, pinned 601 yuva444p, limited-range green key, despill green",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down," + ckDefault + ",format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down," + ckNoSpill + "," + spill(1, 4, spillGreen) + "[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -140,7 +164,7 @@ func TestCompilePhase3(t *testing.T) {
 			ops:  []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "#0000FF", Similarity: 0.3, Blend: 0.1, DespillMix: 0.5, DespillExpand: 0.2})},
 			out:  webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x29f06e:similarity=0.3:blend=0.1:yuv=1,despill=type=blue:mix=0.5:expand=0.2:green=0:blue=-1,format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x29f06e:similarity=0.3:blend=0.1:yuv=1,format=gbrap,split=3[d1][d1s][d1m];[d1s]format=rgba,despill=type=blue:mix=0.5:expand=0.2:green=0:blue=-1,format=gbrap[d1d];[d1m]alphaextract,erosion,erosion,erosion,erosion,negate,gblur=sigma=2,format=gbrap[d1k];[d1][d1d][d1k]maskedmerge,format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -153,7 +177,7 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 		{
-			name: "chromakey on a colour that is neither green- nor blue-dominant skips despill",
+			name: "chromakey on a color that is neither green- nor blue-dominant skips despill",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "ff00ff"})}, out: webp(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x6acade:similarity=0.1:blend=0.05:yuv=1,format=rgba[out]",
@@ -161,7 +185,7 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 		{
-			name: "colorkey: rgba, eyedropper colour, default similarity 0.08 blend 0",
+			name: "colorkey: rgba, eyedropper color, default similarity 0.08 blend 0",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "313338"})}, out: gif(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba,colorkey=color=0x313338:similarity=0.08:blend=0,format=rgba[out]",
@@ -180,7 +204,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "keying runs at full resolution before any geometry op, whatever the op order",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{crop(0, 0, 640, 360), resize(320, 0, ""), chromakey(recipe.ChromaKeyParams{})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down," + ckDefault + ",crop=640:360:0:0:exact=1,format=gbrap,premultiply=inplace=1,scale=320:180:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down," + ckNoSpill + "," + spill(1, 4, spillGreen) + ",crop=640:360:0:0:exact=1,format=gbrap,premultiply=inplace=1,scale=320:180:flags=lanczos,unpremultiply=inplace=1,format=rgba[out]",
 				Width:  320, Height: 180, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -194,10 +218,17 @@ func TestCompilePhase3(t *testing.T) {
 			want: Plan{
 				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,setpts=PTS/2,fps=30:round=down,split[k1][k1m];" +
 					"[k1m]alphaextract[k1a0];" +
-					"[k1]format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3,format=rgba,split[k1k][k1km];" +
+					"[k1]format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,format=rgba,split[k1k][k1km];" +
 					"[k1km]alphaextract[k1a1];" +
 					"[k1a0][k1a1]blend=all_mode=multiply[k1a];" +
-					"[k1k][k1a]alphamerge,format=rgba[out]",
+					"[k1k][k1a]alphamerge," +
+					// the despill, masked to the band around the keyed edge
+					// (6 px at 1080p): only the alpha is eroded, so the
+					// subject's interior keeps its colors
+					"format=gbrap,split=3[d1][d1s][d1m];" +
+					"[d1s]format=rgba,despill=type=green:mix=0.5:expand=0,format=gbrap[d1d];" +
+					"[d1m]alphaextract,erosion,erosion,erosion,erosion,erosion,erosion,negate,gblur=sigma=3,format=gbrap[d1k];" +
+					"[d1][d1d][d1k]maskedmerge,format=rgba[out]",
 				Width: 1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 2, Frames: 60, Speed: 2,
 			},
 		},
@@ -221,7 +252,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "two wrapped keys on an alpha source number their labels",
 			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{}), colorkey(recipe.ColorKeyParams{Color: "ffffff"})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=20:round=down," + keyWrapped(1, ckDefault+",format=rgba") + "," + keyWrapped(2, ckWhite) + ",format=rgba[out]",
+				Filter: "[0:v]fps=20:round=down," + keyWrapped(1, ckNoSpill+",format=rgba") + "," + spill(1, 2, spillGreen) + "," + keyWrapped(2, ckWhite) + ",format=rgba[out]",
 				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
 			},
 		},
@@ -237,7 +268,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "key on an alpha-stream source follows the merge head",
 			srcs: []recipe.ProbeInfo{avifAlpha}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{})}, out: webp(),
 			want: Plan{
-				Filter: alphaHead1 + keyWrapped(1, ckDefault+",format=rgba") + ",format=rgba[out]",
+				Filter: alphaHead1 + keyWrapped(1, ckNoSpill+",format=rgba") + "," + spill(1, 1, spillGreen) + "[out]",
 				Width:  64, Height: 64, FPS: 10, HasAlpha: true, Frames: 1,
 			},
 		},
@@ -271,7 +302,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "feather at the default radius follows a wrapped key on a prores source",
 			srcs: []recipe.ProbeInfo{prores}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{}), feather(0)}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckDefault+",format=rgba") + "," + featherDef + "[out]",
+				Filter: "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckNoSpill+",format=rgba") + "," + spill(1, 6, spillGreen) + "," + featherDef + "[out]",
 				Width:  1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
@@ -334,31 +365,31 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 
-		// --- chromakey key colour (Phase 5a) ----------------------------------
+		// --- chromakey key color (Phase 5a) ----------------------------------
 		{
 			// Blue 0000ff → Y 41 U 240 V 110 (LimitedYUV); the despill type
 			// still follows the RGB key (blue-dominant → despill blue).
 			name: "chromakey blue: limited-range YUV key behind the rgba pass, despill blue",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "0000ff"})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x29f06e:similarity=0.1:blend=0.05:yuv=1,despill=type=blue:mix=0.6:expand=0.3:green=0:blue=-1,format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x29f06e:similarity=0.1:blend=0.05:yuv=1,format=gbrap,split=3[d1][d1s][d1m];[d1s]format=rgba,despill=type=blue:mix=0.5:expand=0:green=0:blue=-1,format=gbrap[d1d];[d1m]alphaextract,erosion,erosion,erosion,erosion,negate,gblur=sigma=2,format=gbrap[d1k];[d1][d1d][d1k]maskedmerge,format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
 		{
 			// 1e3a8a (30,58,138) → Y 66 U 167 V 110; blue-dominant → despill
-			// blue. Similarity 0.02 is the exact-colour band the pixel tests pin.
-			name: "chromakey custom blue-dominant colour 1e3a8a at similarity 0.02",
+			// blue. Similarity 0.02 is the exact-color band the pixel tests pin.
+			name: "chromakey custom blue-dominant color 1e3a8a at similarity 0.02",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "#1E3A8A", Similarity: 0.02})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x42a76e:similarity=0.02:blend=0.05:yuv=1,despill=type=blue:mix=0.6:expand=0.3:green=0:blue=-1,format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x42a76e:similarity=0.02:blend=0.05:yuv=1,format=gbrap,split=3[d1][d1s][d1m];[d1s]format=rgba,despill=type=blue:mix=0.5:expand=0:green=0:blue=-1,format=gbrap[d1d];[d1m]alphaextract,erosion,erosion,erosion,erosion,negate,gblur=sigma=2,format=gbrap[d1k];[d1][d1d][d1k]maskedmerge,format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
 		{
 			// facc82 (250,204,130) → Y 196 U 89 V 153; red-dominant → no
 			// despill even with a despill knob set.
-			name: "chromakey custom red-dominant colour facc82 gets no despill",
+			name: "chromakey custom red-dominant color facc82 gets no despill",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "facc82", DespillMix: 0.9})}, out: webp(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0xc45999:similarity=0.1:blend=0.05:yuv=1,format=rgba[out]",
@@ -369,13 +400,13 @@ func TestCompilePhase3(t *testing.T) {
 		// --- morph (Phase 5a) -------------------------------------------------
 		{
 			// Close = dilation then erosion of the alpha plane on gbrap frames
-			// (planes G,B,R,A); the colour planes are frozen through
+			// (planes G,B,R,A); the color planes are frozen through
 			// threshold0..2=0 (erosion/dilation have no planes option). The
 			// stage's own format=rgba doubles as the terminal one.
 			name: "morph close only after a bare chromakey on an opaque source",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{DespillOff: true}), morph(recipe.MorphParams{Close: true})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down," + ckNoSpill + "," + morphClose + "[out]",
+				Filter: "[0:v]fps=29.97:round=down," + ckNoSpill + "," + morphClose + ",format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -383,7 +414,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "morph grow only emits that many dilations and no erosion",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{Grow: 2})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=gbrap," + morphDil + "," + morphDil + ",format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=rgba," + edges(1, "dilation=coordinates=255,dilation=coordinates=90") + ",format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -391,7 +422,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "morph close then grow: the grow dilations follow the close",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{Close: true, Grow: 1})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=gbrap," + morphDil + "," + morphEro + "," + morphDil + ",format=rgba[out]",
+				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=rgba," + edges(1, "dilation,erosion,dilation=coordinates=255") + ",format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -418,7 +449,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "morph after a colorkey cleans the key's matte",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "313338"}), morph(recipe.MorphParams{Close: true})}, out: gif(),
 			want: Plan{
-				Filter: "[0:v]fps=29.97:round=down,format=rgba,colorkey=color=0x313338:similarity=0.08:blend=0," + morphClose + "[out]",
+				Filter: "[0:v]fps=29.97:round=down,format=rgba,colorkey=color=0x313338:similarity=0.08:blend=0," + morphClose + ",format=rgba[out]",
 				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
@@ -436,7 +467,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "feather then morph keeps the stack order: the grow acts on the blurred alpha",
 			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{feather(2), morph(recipe.MorphParams{Grow: 1})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]fps=20:round=down,format=gbrap,gblur=sigma=2:planes=8,format=rgba,format=gbrap," + morphDil + ",format=rgba[out]",
+				Filter: "[0:v]fps=20:round=down,format=gbrap,gblur=sigma=2:planes=8,format=rgba," + edges(1, "dilation=coordinates=255") + ",format=rgba[out]",
 				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
 			},
 		},
@@ -444,7 +475,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "morph on an alpha source without a key cleans the source alpha",
 			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{morph(recipe.MorphParams{Close: true})}, out: gif(),
 			want: Plan{
-				Filter: "[0:v]fps=20:round=down," + morphClose + "[out]",
+				Filter: "[0:v]fps=20:round=down," + morphClose + ",format=rgba[out]",
 				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
 			},
 		},
@@ -455,7 +486,7 @@ func TestCompilePhase3(t *testing.T) {
 			name: "chromakey + colorkey + morph stack on an alpha-carrying prores source",
 			srcs: []recipe.ProbeInfo{prores}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{}), colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{Close: true, Grow: 1})}, out: webp(),
 			want: Plan{
-				Filter: "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckDefault+",format=rgba") + "," + keyWrapped(2, ckWhite) + ",format=gbrap," + morphDil + "," + morphEro + "," + morphDil + ",format=rgba[out]",
+				Filter: "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckNoSpill+",format=rgba") + "," + spill(1, 6, spillGreen) + "," + keyWrapped(2, ckWhite) + ",format=rgba," + edges(1, "dilation,erosion,dilation=coordinates=255") + ",format=rgba[out]",
 				Width:  1920, Height: 1080, FPS: 30, HasAlpha: true, Duration: 4, Frames: 120,
 			},
 		},
@@ -467,6 +498,46 @@ func TestCompilePhase3(t *testing.T) {
 			want: Plan{
 				Filter: "[0:v]fps=20:round=down," + morphClose + ",crop=240:270:0:0:exact=1,format=rgba[out]",
 				Width:  240, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
+			},
+		},
+		{
+			// A negative grow shrinks the kept area: erosions instead of
+			// dilations, alternating the 3x3 square with the cross.
+			name: "morph shrink 3 erodes the alpha, alternating square and cross",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{Grow: -3})}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=rgba," + edges(1, "erosion=coordinates=255,erosion=coordinates=90,erosion=coordinates=255") + ",format=rgba[out]",
+				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
+			},
+		},
+		{
+			// Soft edge: blur, then re-sharpen around 50 % with K = 2·S.
+			name: "morph smooth 1.5 blurs the alpha and re-sharpens it (lut K 3)",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{Smooth: 1.5})}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=rgba," + edges(1, "gblur=sigma=1.5,lut=y=(val-128)*3+128") + ",format=rgba[out]",
+				Width:  1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
+			},
+		},
+		{
+			// K = 2·0.5 = 1 is the identity: the lut is left out.
+			name: "morph smooth 0.5 is a bare blur",
+			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{morph(recipe.MorphParams{Smooth: 0.5})}, out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=20:round=down,format=rgba," + edges(1, "gblur=sigma=0.5") + ",format=rgba[out]",
+				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
+			},
+		},
+		{
+			// Every part at once, in the documented order: close, shift,
+			// smooth; a second morph numbers its labels.
+			name: "morph close, shrink 1 and smooth 2, then a second morph",
+			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{Close: true, Grow: -1, Smooth: 2}), morph(recipe.MorphParams{Grow: 1})},
+			out: webp(),
+			want: Plan{
+				Filter: "[0:v]fps=29.97:round=down," + ckWhite + ",format=rgba," + edges(1, "dilation,erosion,erosion=coordinates=255,gblur=sigma=2,lut=y=(val-128)*4+128") +
+					",format=rgba," + edges(2, "dilation=coordinates=255") + ",format=rgba[out]",
+				Width: 1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 10, Frames: 299,
 			},
 		},
 
@@ -592,7 +663,7 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 		{
-			// drawtext blends an RRGGBBAA colour into the canvas' alpha plane
+			// drawtext blends an RRGGBBAA color into the canvas' alpha plane
 			// too, so translucent elements are drawn on transparent layers —
 			// one per group of adjacent elements sharing an alpha, in draw
 			// order box → border → glyphs — and composited like image overlays
@@ -647,7 +718,7 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 		{
-			name: "translucent glyphs alone: one layer; a box whose colour is translucent but off stays out of the decision",
+			name: "translucent glyphs alone: one layer; a box whose color is translucent but off stays out of the decision",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{text(recipe.TextParams{Text: "x", Color: "ffffff80", BoxColor: "00000080"})}, out: webp(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba[b1];" +
@@ -658,7 +729,7 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 		{
-			name: "text layers on a still: the colour source runs at the plan rate and the base's single frame ends the composite",
+			name: "text layers on a still: the color source runs at the plan rate and the base's single frame ends the composite",
 			srcs: []recipe.ProbeInfo{still}, ops: []recipe.Op{text(recipe.TextParams{Text: "Hi", Box: true})}, out: recipe.Output{Format: recipe.FormatPNG},
 			want: Plan{
 				Filter: "[0:v]format=rgba[b1];" +
@@ -713,7 +784,7 @@ func TestCompilePhase3(t *testing.T) {
 			},
 		},
 		{
-			name: "text colour with a trimmed hash and a colorkey before it",
+			name: "text color with a trimmed hash and a colorkey before it",
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "00ff00"}), text(recipe.TextParams{Text: "Hi", Color: " #ABCDEF "})}, out: webp(),
 			want: Plan{
 				Filter: "[0:v]fps=29.97:round=down,format=rgba,colorkey=color=0x00ff00:similarity=0.08:blend=0,format=rgba,drawtext=textfile=__EZLG_TEXT_1__:expansion=none:font=DejaVu Sans:fontsize=32:fontcolor=0xabcdef:x=0:y=0,format=rgba[out]",
@@ -958,7 +1029,7 @@ func TestCompilePhase3(t *testing.T) {
 				// The ProRes source carries alpha, so the chromakey is wrapped;
 				// the reverse follows the output fit (the frames it buffers are
 				// the 128x128 ones) and precedes the text and the overlay.
-				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,fps=25:round=down," + keyWrapped(1, ckDefault+",format=rgba") +
+				Filter: "[0:v]setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba,fps=25:round=down," + keyWrapped(1, ckNoSpill+",format=rgba") + "," + spill(1, 6, spillGreen) +
 					",crop=1080:1080:420:0:exact=1,format=gbrap,premultiply=inplace=1,scale=128:128:flags=lanczos,unpremultiply=inplace=1,format=rgba,reverse,format=rgba" +
 					",drawtext=textfile=__EZLG_TEXT_1__:expansion=none:font=DejaVu Sans:fontsize=16:fontcolor=0xffffff:x=64-text_w/2:y=124-text_h[b1]" +
 					";[1:v]format=rgba,fps=25,format=gbrap,premultiply=inplace=1,scale=16:16:flags=lanczos,unpremultiply=inplace=1,format=rgba[ov1]" +
@@ -1096,16 +1167,16 @@ func TestCompilePhase3Errors(t *testing.T) {
 		{"autocrop threshold above 255", []recipe.ProbeInfo{h264}, []recipe.Op{autocrop(recipe.AutoCropParams{Threshold: 300, Resolved: &recipe.CropParams{W: 1, H: 1}})}, "op 0 (autocrop): threshold must be between 0 and 255 (got 300)"},
 		{"autocrop padding above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{autocrop(recipe.AutoCropParams{Padding: 5000, Resolved: &recipe.CropParams{W: 1, H: 1}})}, "op 0 (autocrop): padding must be between 0 and 1024 px (got 5000)"},
 		// keying
-		{"chromakey colour with alpha", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "00ff0080"})}, `op 0 (chromakey): key colour "00ff0080" must be RRGGBB (no alpha)`},
-		{"chromakey colour name", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "green"})}, `op 0 (chromakey): colour "green": want RRGGBB or RRGGBBAA`},
+		{"chromakey color with alpha", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "00ff0080"})}, `op 0 (chromakey): key color "00ff0080" must be RRGGBB (no alpha)`},
+		{"chromakey color name", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Color: "green"})}, `op 0 (chromakey): color "green": want RRGGBB or RRGGBBAA`},
 		{"chromakey similarity above 1", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Similarity: 2})}, "op 0 (chromakey): similarity must be between 0.01 and 1 (got 2)"},
 		{"chromakey similarity below the minimum", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Similarity: 0.001})}, "op 0 (chromakey): similarity must be between 0.01 and 1 (got 0.001)"},
 		{"chromakey blend negative", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Blend: -0.1})}, "op 0 (chromakey): blend must be between 0 and 1 (got -0.1)"},
 		{"chromakey despill mix above 1", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{DespillMix: 1.5})}, "op 0 (chromakey): despillMix must be between 0 and 1 (got 1.5)"},
 		{"chromakey despill expand above 1", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{DespillExpand: 7})}, "op 0 (chromakey): despillExpand must be between 0 and 1 (got 7)"},
-		{"colorkey without a colour", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{})}, "op 0 (colorkey): colour is required"},
-		{"colorkey bad colour", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "#12345"})}, `op 0 (colorkey): colour "12345"`},
-		{"colorkey colour with alpha", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffffff"})}, "op 0 (colorkey): key colour"},
+		{"colorkey without a color", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{})}, "op 0 (colorkey): color is required"},
+		{"colorkey bad color", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "#12345"})}, `op 0 (colorkey): color "12345"`},
+		{"colorkey color with alpha", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffffff"})}, "op 0 (colorkey): key color"},
 		{"colorkey blend above 1", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "ffffff", Blend: 1.01})}, "op 0 (colorkey): blend must be between 0 and 1 (got 1.01)"},
 		{"keying invalid params json", []recipe.ProbeInfo{h264}, []recipe.Op{rawOp(recipe.OpChromaKey, `{"similarity":"lots"}`)}, "op 0 (chromakey): invalid params"},
 		// feather (validated on the opaque h264 source, where the stage would
@@ -1116,10 +1187,12 @@ func TestCompilePhase3Errors(t *testing.T) {
 		{"feather invalid params json", []recipe.ProbeInfo{h264}, []recipe.Op{rawOp(recipe.OpFeather, `{"radius":"soft"}`)}, "op 0 (feather): invalid params"},
 		// morph (validated on the opaque h264 source, where the stage would
 		// be skipped: the params are checked either way)
-		{"morph grow above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{Grow: 5})}, "op 0 (morph): grow must be between 0 and 4 (got 5)"},
-		{"morph grow negative", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{Close: true, Grow: -1})}, "op 0 (morph): grow must be between 0 and 4 (got -1)"},
-		{"morph with neither close nor grow", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{})}, "op 0 (morph): at least one of close or grow (1..4) must be set"},
-		{"morph without close or grow after a key keeps the recipe index", []recipe.ProbeInfo{gifSrc}, []recipe.Op{crop(0, 0, 10, 10), colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{})}, "op 2 (morph): at least one of close or grow"},
+		{"morph grow above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{Grow: 21})}, "op 0 (morph): grow must be between -20 and 20 (got 21)"},
+		{"morph shrink below the minimum", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{Close: true, Grow: -21})}, "op 0 (morph): grow must be between -20 and 20 (got -21)"},
+		{"morph smooth above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{Smooth: 10.5})}, "op 0 (morph): smooth must be between 0 and 10 px (got 10.5)"},
+		{"morph smooth negative", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{Close: true, Smooth: -1})}, "op 0 (morph): smooth must be between 0 and 10 px (got -1)"},
+		{"morph with neither close, grow nor smooth", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{})}, "op 0 (morph): at least one of close, grow (±1..20) or smooth must be set"},
+		{"morph without close or grow after a key keeps the recipe index", []recipe.ProbeInfo{gifSrc}, []recipe.Op{crop(0, 0, 10, 10), colorkey(recipe.ColorKeyParams{Color: "ffffff"}), morph(recipe.MorphParams{})}, "op 2 (morph): at least one of close, grow"},
 		{"morph invalid params json", []recipe.ProbeInfo{h264}, []recipe.Op{rawOp(recipe.OpMorph, `{"grow":"lots"}`)}, "op 0 (morph): invalid params"},
 		// text
 		{"text empty", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{})}, "op 0 (text): text is required"},
@@ -1131,9 +1204,9 @@ func TestCompilePhase3Errors(t *testing.T) {
 		{"font too long", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Font: long})}, "op 0 (text): font name is too long (65 characters, maximum 64)"},
 		{"text size negative", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Size: -1})}, "op 0 (text): size must be between 1 and 8192 px (got -1)"},
 		{"text size above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Size: 9000})}, "op 0 (text): size must be between 1 and 8192 px (got 9000)"},
-		{"text bad colour", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Color: "red"})}, `op 0 (text): colour "red"`},
-		{"text bad border colour", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", BorderColor: "zz"})}, `op 0 (text): border colour: colour "zz"`},
-		{"text bad box colour", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", BoxColor: "#1234567"})}, `op 0 (text): box colour: colour "1234567"`},
+		{"text bad color", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Color: "red"})}, `op 0 (text): color "red"`},
+		{"text bad border color", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", BorderColor: "zz"})}, `op 0 (text): border color: color "zz"`},
+		{"text bad box color", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", BoxColor: "#1234567"})}, `op 0 (text): box color: color "1234567"`},
 		{"text border negative", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Border: -1})}, "op 0 (text): border must be between 0 and 256 px (got -1)"},
 		{"text border above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", Border: 257})}, "op 0 (text): border must be between 0 and 256 px (got 257)"},
 		{"text box pad above the maximum", []recipe.ProbeInfo{h264}, []recipe.Op{text(recipe.TextParams{Text: "x", BoxPad: 1025})}, "op 0 (text): boxPad must be between 0 and 1024 px (got 1025)"},
@@ -1306,7 +1379,7 @@ func TestKeyOnAlphaSourcesIsWrapped(t *testing.T) {
 					if got != s.wrapped {
 						t.Errorf("wrapped %v, want %v:\n%s", got, s.wrapped, p.Filter)
 					}
-					if !s.wrapped && strings.Contains(p.Filter, "alphaextract") {
+					if !s.wrapped && strings.Contains(p.Filter, "[k1m]alphaextract") {
 						t.Errorf("opaque frames must get the bare key:\n%s", p.Filter)
 					}
 					if !strings.HasSuffix(p.Filter, ",format=rgba[out]") {
@@ -1318,11 +1391,11 @@ func TestKeyOnAlphaSourcesIsWrapped(t *testing.T) {
 	}
 	// A second key always sees alpha (the first key's), whatever the source.
 	p := mustCompile(t, h264, []recipe.Op{keys["chromakey"], keys["colorkey"]}, webp())
-	if strings.Count(p.Filter, "alphaextract") != 2 || !strings.Contains(p.Filter, ckDefault+",split[k1][k1m]") {
+	if strings.Count(p.Filter, "blend=all_mode=multiply") != 1 || !strings.Contains(p.Filter, ckNoSpill+","+spill(1, 4, spillGreen)+",split[k1][k1m]") {
 		t.Errorf("second key on an opaque source must be wrapped (once):\n%s", p.Filter)
 	}
 	p = mustCompile(t, gifSrc, []recipe.Op{keys["chromakey"], keys["colorkey"]}, webp())
-	if strings.Count(p.Filter, "alphaextract") != 4 || !strings.Contains(p.Filter, "alphamerge,split[k2][k2m]") {
+	if strings.Count(p.Filter, "blend=all_mode=multiply") != 2 || !strings.Contains(p.Filter, "maskedmerge,format=rgba,split[k2][k2m]") {
 		t.Errorf("two keys on an alpha source must both be wrapped:\n%s", p.Filter)
 	}
 }
@@ -1443,7 +1516,7 @@ func TestCompileDetect(t *testing.T) {
 			srcs: []recipe.ProbeInfo{h264}, ops: []recipe.Op{trim(1, 3), chromakey(recipe.ChromaKeyParams{})},
 			want: Plan{
 				InputArgs: []string{"-ss", "1", "-to", "3"},
-				Filter:    "[0:v]fps=29.97:round=down," + ckDefault + ",format=rgba[out]",
+				Filter:    "[0:v]fps=29.97:round=down," + ckNoSpill + "," + spill(1, 4, spillGreen) + "[out]",
 				Width:     1280, Height: 720, FPS: 29.97, HasAlpha: true, Duration: 2, Frames: 59,
 				TrimStart: 1, TrimEnd: 3,
 			},
@@ -1505,7 +1578,7 @@ func TestCompileDetect(t *testing.T) {
 			srcs: []recipe.ProbeInfo{vp9}, ops: []recipe.Op{chromakey(recipe.ChromaKeyParams{})},
 			want: Plan{
 				InputArgs: []string{"-c:v", "libvpx-vp9"},
-				Filter:    "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckDefault+",format=rgba") + ",format=rgba[out]",
+				Filter:    "[0:v]format=rgba,fps=30:round=down," + keyWrapped(1, ckNoSpill+",format=rgba") + "," + spill(1, 2, spillGreen) + "[out]",
 				Width:     640, Height: 360, FPS: 30, HasAlpha: true, Duration: 2, Frames: 60,
 			},
 		},
@@ -1578,7 +1651,7 @@ func TestCompileDetect(t *testing.T) {
 			name: "morph after a wrapped key is part of the detection plan",
 			srcs: []recipe.ProbeInfo{gifSrc}, ops: []recipe.Op{colorkey(recipe.ColorKeyParams{Color: "313338"}), morph(recipe.MorphParams{Close: true, Grow: 1}), autocrop(recipe.AutoCropParams{Threshold: 8})},
 			want: Plan{
-				Filter: "[0:v]fps=20:round=down," + keyWrapped(1, "format=rgba,colorkey=color=0x313338:similarity=0.08:blend=0") + ",format=gbrap," + morphDil + "," + morphEro + "," + morphDil + ",format=rgba[out]",
+				Filter: "[0:v]fps=20:round=down," + keyWrapped(1, "format=rgba,colorkey=color=0x313338:similarity=0.08:blend=0") + ",format=rgba," + edges(1, "dilation,erosion,dilation=coordinates=255") + ",format=rgba[out]",
 				Width:  480, Height: 270, FPS: 20, HasAlpha: true, Duration: 3, Frames: 60,
 			},
 		},
@@ -1637,10 +1710,10 @@ func TestCompileDetectErrors(t *testing.T) {
 		{"trim on a still", []recipe.ProbeInfo{still}, []recipe.Op{trim(1, 2)}, "op 0 (trim): the source is a still image and cannot be trimmed"},
 		{"speed out of range", []recipe.ProbeInfo{h264}, []recipe.Op{speed(0)}, "op 0 (speed): factor must be > 0"},
 		{"fps op zero", []recipe.ProbeInfo{h264}, []recipe.Op{fps(0)}, "op 0 (fps): fps must be > 0"},
-		{"morph without close or grow", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{})}, "op 0 (morph): at least one of close or grow (1..4) must be set"},
-		{"morph grow above the maximum", []recipe.ProbeInfo{gifSrc}, []recipe.Op{morph(recipe.MorphParams{Grow: 9})}, "op 0 (morph): grow must be between 0 and 4 (got 9)"},
+		{"morph without close, grow or smooth", []recipe.ProbeInfo{h264}, []recipe.Op{morph(recipe.MorphParams{})}, "op 0 (morph): at least one of close, grow (±1..20) or smooth must be set"},
+		{"morph grow above the maximum", []recipe.ProbeInfo{gifSrc}, []recipe.Op{morph(recipe.MorphParams{Grow: 29})}, "op 0 (morph): grow must be between -20 and 20 (got 29)"},
 		{"chromakey similarity above 1", []recipe.ProbeInfo{h264}, []recipe.Op{chromakey(recipe.ChromaKeyParams{Similarity: 2})}, "op 0 (chromakey): similarity must be between 0.01 and 1 (got 2)"},
-		{"colorkey without a colour", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{})}, "op 0 (colorkey): colour is required"},
+		{"colorkey without a color", []recipe.ProbeInfo{h264}, []recipe.Op{colorkey(recipe.ColorKeyParams{})}, "op 0 (colorkey): color is required"},
 		// Errors name the op by its index in the given slice, ignored ops included.
 		{"malformed key params keep the recipe index", []recipe.ProbeInfo{h264}, []recipe.Op{crop(0, 0, 10, 10), rawOp(recipe.OpChromaKey, `{"similarity":"lots"}`)}, "op 1 (chromakey): invalid params"},
 		{"sequence without sequence info", []recipe.ProbeInfo{with(pngSeq, func(p *recipe.ProbeInfo) { p.Sequence = nil })}, nil, "image sequence source has no sequence info"},
@@ -1853,10 +1926,10 @@ func TestBindTextFiles(t *testing.T) {
 	}
 }
 
-// --- Phase 5a: the chromakey key colour -------------------------------------
+// --- Phase 5a: the chromakey key color -------------------------------------
 
 // TestLimitedYUV: the BT.601 limited-range conversion behind every chromakey
-// key colour (chromakey=color=0xYYUUVV:yuv=1 in the pinned
+// key color (chromakey=color=0xYYUUVV:yuv=1 in the pinned
 // yuva444p/bt470bg/tv format, see chromaKey). The green and blue triples are
 // the frame values ffmpeg's own conversion writes for those RGB frames
 // (within 1, keying_ffmpeg_test.go); every triple lies in the limited range.
@@ -1920,13 +1993,13 @@ func TestMorphIsHoistedLikeFeather(t *testing.T) {
 	} {
 		t.Run(s.name, func(t *testing.T) {
 			for _, p := range []*Plan{mustCompile(t, s.src, s.ops, webp()), mustDetect(t, s.src, s.ops)} {
-				if got := strings.Contains(p.Filter, morphClose); got != s.want {
+				if got := strings.Contains(p.Filter, "[e1a]alphaextract,dilation,erosion[e1m];[e1][e1m]alphamerge"); got != s.want {
 					t.Errorf("morph stage present %v, want %v:\n%s", got, s.want, p.Filter)
 				}
 			}
 		})
 	}
-	for _, bad := range []recipe.Op{morph(recipe.MorphParams{}), morph(recipe.MorphParams{Grow: 5})} {
+	for _, bad := range []recipe.Op{morph(recipe.MorphParams{}), morph(recipe.MorphParams{Grow: 21}), morph(recipe.MorphParams{Smooth: 11})} {
 		if _, err := Compile(h264, []recipe.Op{bad}, webp()); err == nil || !strings.Contains(err.Error(), "op 0 (morph)") {
 			t.Errorf("Compile(%s) on an opaque source: %v, want a morph validation error", bad.Params, err)
 		}

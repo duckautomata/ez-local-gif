@@ -242,10 +242,10 @@ func TestLintAPNGContainerRule(t *testing.T) {
 		"bad depth": {func(c []rawChunk) []rawChunk {
 			c[0].data[8] = 7
 			return c
-		}, "colour type 6 with bit depth 7 is not a valid PNG combination"},
+		}, "color type 6 with bit depth 7 is not a valid PNG combination"},
 		"tRNS with RGBA": {func(c []rawChunk) []rawChunk {
 			return append([]rawChunk{c[0], {"tRNS", []byte{0, 0, 0, 0, 0, 0}}}, c[1:]...)
-		}, "tRNS chunk is not allowed with colour type 6"},
+		}, "tRNS chunk is not allowed with color type 6"},
 		"no IDAT": {func(c []rawChunk) []rawChunk {
 			return append(append([]rawChunk(nil), c[:4]...), c[5:]...)
 		}, "no IDAT chunk"},
@@ -315,7 +315,7 @@ func TestLintAPNGContainerDisposeBlendTRNSOrder(t *testing.T) {
 	edge := patchFCTL(t, data, 2, func(f []byte) { f[24], f[25] = 2, 1 })
 	expectCheck(t, lintAPNG(t, edge, TargetSticker), RuleAPNGContainer, true, false)
 
-	// tRNS before PLTE with indexed colour: decoders silently drop the alpha.
+	// tRNS before PLTE with indexed color: decoders silently drop the alpha.
 	idx := readFixture(t, "ff_indexed.apng")
 	swapPLTETRNS := func(c []rawChunk) []rawChunk {
 		p, tr := nthChunk(t, c, "PLTE", 0), nthChunk(t, c, "tRNS", 0)
@@ -327,7 +327,7 @@ func TestLintAPNGContainerDisposeBlendTRNSOrder(t *testing.T) {
 		t.Errorf("tRNS order: %+v ok=%v", c, r.OK)
 	}
 	// The fixture's own order (PLTE then tRNS) stays clean, and the ordering
-	// check is about indexed colour only: RGB with a suggested palette keeps
+	// check is about indexed color only: RGB with a suggested palette keeps
 	// its tRNS whatever the order.
 	expectCheck(t, lintAPNG(t, idx, TargetSticker), RuleAPNGContainer, true, false)
 	rgb := mutatePNG(t, synthAPNG{w: 4, h: 4, colorType: pngRGB, plte: 4, trns: 6}.bytes(), swapPLTETRNS)
@@ -576,18 +576,18 @@ func TestLintAPNGMinDelayRule(t *testing.T) {
 	}
 }
 
-// apng.indexed OK means "indexed 8-bit-alpha APNG" (colour type 3 + PLTE +
+// apng.indexed OK means "indexed 8-bit-alpha APNG" (color type 3 + PLTE +
 // tRNS — the sticker default rung); everything else fails at LevelInfo
 // without affecting Report.OK.
 func TestLintAPNGIndexedRule(t *testing.T) {
 	c := expectCheck(t, lintAPNG(t, readFixture(t, "ff_indexed.apng"), TargetSticker), RuleAPNGIndexed, true, false)
-	if c.Level != LevelInfo || c.Detail != "indexed 8-bit-alpha APNG: indexed 8-bit (colour type 3), 256-entry palette, tRNS with 1 entry (8-bit alpha)" {
+	if c.Level != LevelInfo || c.Detail != "indexed 8-bit-alpha APNG: indexed 8-bit (color type 3), 256-entry palette, tRNS with 1 entry (8-bit alpha)" {
 		t.Errorf("indexed: %+v", c)
 	}
 	// RGBA is not indexed: the check fails (info) but the report stays OK.
 	r := lintAPNG(t, readFixture(t, "ff_rgba.apng"), TargetSticker)
 	c = expectCheck(t, r, RuleAPNGIndexed, false, false)
-	if c.Level != LevelInfo || c.Detail != "RGBA 8-bit (colour type 6); not an indexed 8-bit-alpha APNG (the sticker default rung)" {
+	if c.Level != LevelInfo || c.Detail != "RGBA 8-bit (color type 6); not an indexed 8-bit-alpha APNG (the sticker default rung)" {
 		t.Errorf("rgba: %+v", c)
 	}
 	if !r.OK {
@@ -598,14 +598,14 @@ func TestLintAPNGIndexedRule(t *testing.T) {
 	opaqueIdx := synthAPNG{w: 8, h: 8, colorType: pngIndexed, plte: 16, animated: true, frames: []synthFrame{{w: 8, h: 8, num: 1, den: 10}, {w: 8, h: 8, num: 1, den: 10}}}
 	r = lintAPNG(t, opaqueIdx.bytes(), TargetSticker)
 	c = expectCheck(t, r, RuleAPNGIndexed, false, false)
-	if c.Level != LevelInfo || c.Detail != "indexed APNG without tRNS (opaque): indexed 8-bit (colour type 3), 16-entry palette" || r.HasAlpha || !r.OK {
+	if c.Level != LevelInfo || c.Detail != "indexed APNG without tRNS (opaque): indexed 8-bit (color type 3), 16-entry palette" || r.HasAlpha || !r.OK {
 		t.Errorf("opaque indexed: %+v alpha=%v ok=%v", c, r.HasAlpha, r.OK)
 	}
-	// Colour type 3 without PLTE is a container error (and not indexed-OK).
+	// Color type 3 without PLTE is a container error (and not indexed-OK).
 	noPLTE := opaqueIdx
 	noPLTE.plte = 0
 	rn := lintAPNG(t, noPLTE.bytes(), TargetSticker)
-	if c := findCheck(t, rn, RuleAPNGContainer); c.OK || !strings.Contains(c.Detail, "indexed colour (type 3) without a PLTE chunk") {
+	if c := findCheck(t, rn, RuleAPNGContainer); c.OK || !strings.Contains(c.Detail, "indexed color (type 3) without a PLTE chunk") {
 		t.Errorf("no PLTE: %+v", c)
 	}
 	expectCheck(t, rn, RuleAPNGIndexed, false, false)

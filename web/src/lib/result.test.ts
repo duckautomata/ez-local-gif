@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { Recipe, Report, ResultFile } from './api';
-import { chatSizes, descLine, groupFiles, isFramesResult, isImageFormat, matteCheck, matteLine, matteRecipeNotes, matteSummary, RULE_RENDER_MATTE, sizeState } from './result';
+import type { ResultFile } from './api';
+import { chatSizes, descLine, groupFiles, isFramesResult, isImageFormat, sizeState } from './result';
 
 function file(name: string, extra: Partial<ResultFile> = {}): ResultFile {
   return {
@@ -21,9 +21,9 @@ function file(name: string, extra: Partial<ResultFile> = {}): ResultFile {
 describe('groupFiles', () => {
   it('separates primary, alternatives, frames and archive', () => {
     const g = groupFiles([
-      file('alt2.gif', { kind: 'alternative', index: 2, desc: 'fit at 12.5 fps · 64 colours' }),
-      file('out.gif', { kind: 'output', desc: 'fit at 20 fps · 128 colours · lossy 60' }),
-      file('alt1.gif', { kind: 'alternative', index: 1, desc: 'fit at 16.7 fps · 128 colours' }),
+      file('alt2.gif', { kind: 'alternative', index: 2, desc: 'fit at 12.5 fps · 64 colors' }),
+      file('out.gif', { kind: 'output', desc: 'fit at 20 fps · 128 colors · lossy 60' }),
+      file('alt1.gif', { kind: 'alternative', index: 1, desc: 'fit at 16.7 fps · 128 colors' }),
       file('frames.zip', { kind: 'archive', format: 'zip' }),
       file('f00002.png', { kind: 'frame', index: 2, desc: 'frame 2 (0.04 s)' }),
       file('f00001.png', { kind: 'frame', index: 1, desc: 'frame 1 (0.00 s)' }),
@@ -34,7 +34,7 @@ describe('groupFiles', () => {
     expect(g.archive?.name).toBe('frames.zip');
     expect(g.others).toEqual([]);
     expect(isFramesResult(g)).toBe(false);
-    expect(descLine(g.primary, true)).toEqual({ label: 'Fit', text: 'fit at 20 fps · 128 colours · lossy 60' });
+    expect(descLine(g.primary, true)).toEqual({ label: 'Fit', text: 'fit at 20 fps · 128 colors · lossy 60' });
   });
 
   it('treats a missing kind as the primary (Phase 1 manifests)', () => {
@@ -75,12 +75,12 @@ describe('descLine', () => {
   // W8: only a recipe that actually carried fitBytes > 0 gets the bold 'Fit:'
   // label; the Optimize preset's descs are plain settings.
   it('labels a non-fit desc (Optimize) as Settings, never Fit', () => {
-    const f = file('out.gif', { kind: 'output', desc: 'gifsicle: lossy 30 · 256 colours' });
-    expect(descLine(f, false)).toEqual({ label: 'Settings', text: 'gifsicle: lossy 30 · 256 colours' });
+    const f = file('out.gif', { kind: 'output', desc: 'gifsicle: lossy 30 · 256 colors' });
+    expect(descLine(f, false)).toEqual({ label: 'Settings', text: 'gifsicle: lossy 30 · 256 colors' });
     expect(descLine(file('out.gif', { desc: 'gifsicle -O2 (lossless)' }), false)?.label).toBe('Settings');
   });
   it('labels a fit-search desc as Fit (including the cannot-fit report)', () => {
-    expect(descLine(file('out.gif', { desc: 'fit at 20 fps · 128 colours' }), true)?.label).toBe('Fit');
+    expect(descLine(file('out.gif', { desc: 'fit at 20 fps · 128 colors' }), true)?.label).toBe('Fit');
     expect(descLine(file('out.gif', { desc: 'cannot fit under 256 KiB: smallest attempt is 300 KiB' }), true)?.label).toBe('Fit');
   });
   it('is null without a desc or file', () => {
@@ -106,58 +106,5 @@ describe('sizeState / chatSizes / isImageFormat', () => {
     for (const f of ['gif', 'webp', 'apng', 'avif', 'png', 'jpeg']) expect(isImageFormat(f), f).toBe(true);
     expect(isImageFormat('zip')).toBe(false);
     expect(isImageFormat('frames')).toBe(false);
-  });
-});
-
-// Phase 5b: the render.matte info check names the AI matte a render used.
-describe('matteCheck / matteSummary', () => {
-  const report = (checks: Report['checks']): Report => ({ rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 1, limit: 2, width: 1, height: 1, frames: 1, durationMs: 1, minDelayMs: 1, loopForever: true, hasAlpha: true, ok: true, checks });
-  const chk = (rule: string, detail: string) => ({ rule, level: 'info' as const, ok: true, fixed: false, detail });
-
-  it('finds the check and words the line without a doubled prefix', () => {
-    expect(RULE_RENDER_MATTE).toBe('render.matte');
-    const r = report([chk('render.alpha', 'alpha kept'), chk('render.matte', 'isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes')]);
-    expect(matteCheck(r)?.rule).toBe('render.matte');
-    expect(matteSummary(r)).toBe('isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes');
-    expect(matteSummary(report([chk('render.matte', 'AI matte: birefnet-lite fp32 1024²')]))).toBe('birefnet-lite fp32 1024²');
-    expect(matteSummary(report([chk('render.matte', '  ai MATTE :  x ')]))).toBe('x');
-    expect(matteSummary(report([chk('render.matte', '')]))).toBe('see the Discord checks');
-    expect(matteSummary(report([chk('render.alpha', 'alpha kept')]))).toBeNull();
-    expect(matteCheck(report(null))).toBeNull();
-    expect(matteSummary(null)).toBeNull();
-    expect(matteSummary(undefined)).toBeNull();
-  });
-});
-
-// Phase 5c: what the recipe's matte op asked for beyond the model joins the
-// line when the server's detail does not already say it.
-describe('matteRecipeNotes / matteLine', () => {
-  const report = (detail: string): Report => ({ rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 1, limit: 2, width: 1, height: 1, frames: 1, durationMs: 1, minDelayMs: 1, loopForever: true, hasAlpha: true, ok: true, checks: [{ rule: 'render.matte', level: 'info', ok: true, fixed: false, detail }] });
-  const recipe = (params: object | undefined): Pick<Recipe, 'ops'> => ({ ops: [{ kind: 'trim', params: { start: 1 } }, params ? { kind: 'matte', params } : { kind: 'matte' }] });
-
-  it('words stabilise, keep colours and the guided model with its edge', () => {
-    expect(matteRecipeNotes(recipe(undefined))).toEqual([]);
-    expect(matteRecipeNotes(recipe({ model: 'birefnet-lite' }))).toEqual([]);
-    expect(matteRecipeNotes(recipe({ stabilise: 'light' }))).toEqual(['stabilise light']);
-    expect(matteRecipeNotes(recipe({ keep: ['ff0000', '00ff00'], keepSimilarity: 0.2 }))).toEqual(['2 keep colours']);
-    expect(matteRecipeNotes(recipe({ keep: ['ff0000'] }))).toEqual(['1 keep colour']);
-    expect(matteRecipeNotes(recipe({ model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1] }], edge: 'none', stabilise: 'strong' }))).toEqual(['guided (sam2-tiny) + no edge model · 1 prompted frame', 'stabilise strong']);
-    expect(matteRecipeNotes(recipe({ model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1] }, { frame: 4, points: [[0.5, 0.5, 1]] }], resolved: { weights: 'w', proc: '1', size: 0, precision: 'fp16', edge: 'birefnet-lite' } }))).toEqual([
-      'guided (sam2-tiny) + edge birefnet-lite · 2 prompted frames',
-    ]);
-    expect(matteRecipeNotes(recipe({ model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1] }], edge: 'isnet-anime' }))).toEqual(['guided (sam2-tiny) + edge isnet-anime · 1 prompted frame']);
-    expect(matteRecipeNotes({ ops: [{ kind: 'colorkey', params: { color: '313338' } }] })).toEqual([]);
-    expect(matteRecipeNotes(null)).toEqual([]);
-  });
-
-  it('matteLine appends only what the detail lacks, and stands alone without a check', () => {
-    const r = recipe({ stabilise: 'light', keep: ['ff0000'] });
-    expect(matteLine(report('isnet-anime fp16 1024², 45 mattes'), r)).toBe('isnet-anime fp16 1024², 45 mattes · stabilise light · 1 keep colour');
-    expect(matteLine(report('AI matte: isnet-anime · cuda · stabilise light · 1 keep colour'), r)).toBe('isnet-anime · cuda · stabilise light · 1 keep colour');
-    expect(matteLine(report('isnet-anime · Stabilise: light'), r)).toBe('isnet-anime · Stabilise: light · 1 keep colour');
-    expect(matteLine(null, r)).toBe('stabilise light · 1 keep colour');
-    expect(matteLine(null, recipe({ model: 'birefnet-lite' }))).toBeNull();
-    expect(matteLine(report(''), recipe({ model: 'birefnet-lite' }))).toBe('see the Discord checks');
-    expect(matteLine(null, { ops: [] })).toBeNull();
   });
 });

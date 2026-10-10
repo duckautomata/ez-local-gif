@@ -20,7 +20,7 @@ synthetic alpha channel:
 | `ff_still_alpha.webp` | `ffmpeg -f lavfi -i $ALPHA -frames:v 1 -c:v libwebp -lossless 1 -pix_fmt bgra -map_metadata -1 -f webp` — simple VP8L still with alpha |
 | `ff_rgba.apng` | `ffmpeg -f lavfi -i $ALPHA -c:v apng -pred mixed -pix_fmt rgba -plays 0 -f apng` — RGBA APNG, 10 frames at 1/10 s (fcTL before IDAT, sub-rect diff frames, dispose/blend mixed), `acTL num_plays 0`; fully compliant sticker |
 | `ff_plays1.apng` | same with `-plays 1` (`apng.plays-forever` fails for Discord targets, passes with an info note for `TargetNone`) |
-| `ff_indexed.apng` | indexed 8-bit-alpha APNG built in the runtime image (DESIGN.md §4.2 rung B): `ffmpeg -f lavfi -i $ALPHA -vf "tile=4x3:color=black@0" -frames:v 1 -c:v png sheet.png` → `pngquant --nofs --speed 3 64 sheet.png` → `ffmpeg -framerate 10 -i sheet_q.png -vf "untile=4x3,setpts=N/(10*TB)" -frames:v 10 -fps_mode passthrough -c:v apng -pix_fmt pal8 -pred mixed -plays 0 -f apng` → `oxipng -o2 --strip safe` — colour type 3, 256-entry PLTE, 1-entry tRNS |
+| `ff_indexed.apng` | indexed 8-bit-alpha APNG built in the runtime image (DESIGN.md §4.2 rung B): `ffmpeg -f lavfi -i $ALPHA -vf "tile=4x3:color=black@0" -frames:v 1 -c:v png sheet.png` → `pngquant --nofs --speed 3 64 sheet.png` → `ffmpeg -framerate 10 -i sheet_q.png -vf "untile=4x3,setpts=N/(10*TB)" -frames:v 10 -fps_mode passthrough -c:v apng -pix_fmt pal8 -pred mixed -plays 0 -f apng` → `oxipng -o2 --strip safe` — color type 3, 256-entry PLTE, 1-entry tRNS |
 | `ff_still.png` | `ffmpeg -f lavfi -i $ALPHA -frames:v 1 -c:v png -pix_fmt rgba` — plain RGBA PNG (no acTL; ffmpeg's apng muxer writes the same for a single frame) |
 | `ff_still_opaque.png` | `ffmpeg -f lavfi -i $SRC -frames:v 1 -c:v png -pix_fmt rgb24` — plain RGB PNG, no alpha |
 | `ff_still.jpg` | `ffmpeg -f lavfi -i $SRC -frames:v 1 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p` — baseline JPEG |
@@ -30,7 +30,7 @@ synthetic alpha channel:
 | `ff_2frame.webm` | `ffmpeg -f lavfi -i $SRC -frames:v 2 -c:v libvpx-vp9 -crf 40 -b:v 0 -cpu-used 8 -row-mt 1 -pix_fmt yuv420p -an` — EBML DocType webm, V_VP9, 64x64, 2 SimpleBlocks / 0.2 s |
 
 Edge-case GIFs (missing GCE, disposal 0/3, missing NETSCAPE, delay 0, comment
-extension, local colour table, wrong LSD background index, …) are built in Go
+extension, local color table, wrong LSD background index, …) are built in Go
 by the tests with image/gif.EncodeAll plus byte surgery (see
 `fixtures_test.go`). The canvas-simulation fixtures for `gif.noop-frame-disposal`
 and `MergeGIFHolds` (gifsicle's hold → clear-only frame in its -O2 and -O1

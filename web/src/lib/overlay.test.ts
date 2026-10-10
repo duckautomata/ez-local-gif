@@ -168,7 +168,7 @@ describe('overlay state helpers', () => {
     expect(selectionAfterToggle(7, 7, false, true)).toBe(0);
   });
 
-  it('pickerColor keeps the alpha suffix of the colour the picker replaces (review W5)', () => {
+  it('pickerColor keeps the alpha suffix of the color the picker replaces (review W5)', () => {
     expect(pickerColor('#FF0000', 'ffffff80')).toBe('ff000080');
     expect(pickerColor('#ff0000', 'ffffff')).toBe('ff0000');
     expect(pickerColor('00ff00', '00000080')).toBe('00ff0080');

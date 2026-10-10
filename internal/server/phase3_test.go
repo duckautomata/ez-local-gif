@@ -43,20 +43,12 @@ func TestFeatures(t *testing.T) {
 		want := map[string]bool{
 			"fit": true, "sequence": true, "optimize": true,
 			"keying": true, "overlays": true, "proxy": true, "fonts": fonts,
-			"feather": true, "bounce": true,
-			// Phase 5a: the morph op kind, a property of the build like
-			// feather/bounce.
-			"morph": true,
+			"feather": true, "bounce": true, "morph": true,
 			// Phase 4 flags: this env has no input/output dirs, and gifski
 			// mirrors the version-probed toolchain (TestCapabilitiesInOut
 			// covers the enabled side, TestGifskiFeatureProbed the resolved-
 			// but-unrunnable one).
 			"inputPick": false, "outputSave": false, "gifski": versions["gifski"] != "",
-			// Phase 5b: no matte sidecar is configured for this manager
-			// (Options.MatteURL ""), so the live flag is off — a plain install
-			// behaves exactly as before (TestMatteEndpoint ties it to
-			// GET /api/matte).
-			"matte": false,
 		}
 		if got := e.s.features(fonts, versions); !maps.Equal(got, want) {
 			t.Errorf("features(%v) = %v, want %v", fonts, got, want)

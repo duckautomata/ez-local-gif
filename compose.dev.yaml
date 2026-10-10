@@ -14,21 +14,6 @@
 #      this file's EZLG_DATA=/data so re-runs are never answered from the ezlg-data-dev result
 #      cache; the EZLG_URL=… variant reuses the running stack's volume and will warn on cache hits)
 #
-# AI matte sidecar (Phase 5b/5c): compose.yaml is pull-only; this file adds the build:
-# blocks so contributors build sidecar/Dockerfile from source (local image names, so a
-# dev build never masquerades as the published tag; the sidecar's own `docker build
-# --target cpu|cuda` tags the same names). The profiles are the same:
-#   docker compose -f compose.yaml -f compose.dev.yaml build matte          # cpu target (minutes; + torch cpu for the guided model)
-#   docker compose -f compose.yaml -f compose.dev.yaml build matte-gpu      # cuda target (~20–30 min: onnxruntime-gpu + torch cu130
-#                                                                           #   share the NVIDIA wheels; several GB downloaded)
-#   docker compose -f compose.yaml -f compose.dev.yaml --profile matte up --build       # app + CPU sidecar
-#   # integration test with the matte cases (the sidecar must be up first — `run` starts no profile services;
-#   # the 5c cases — device settings, Compute-button idle state, stabilise, keep colours, the guided tracker —
-#   # need the sidecar built from this checkout, not the published tag):
-#   docker compose -f compose.yaml -f compose.dev.yaml --profile matte up -d matte
-#   docker compose -f compose.yaml -f compose.dev.yaml run --rm -e EZLG_START_SERVER=1 \
-#       -e EZLG_TEST_MATTE_URL=http://matte:9402 app bash scripts/integration-test.sh
-#
 # The Go server is not auto-restarted on edits: `docker compose ... restart app`
 # (or run everything by hand in `... run --rm --service-ports app bash`, see
 # docs/DEVELOPMENT.md "Development loop").
@@ -78,8 +63,6 @@ services:
       EZLG_DATA: /data
       EZLG_SCRATCH: /dev/shm/ezl
       GOFLAGS: -buildvcs=false
-      # EZLG_MATTE_URL is inherited from compose.yaml (http://matte:9402): the dev
-      # server gets AI mattes as soon as a matte profile is up next to it.
     # (folded scalar: keep these lines at the same indentation so they join into one line)
     # The binary is built to /tmp (inside the container, not the bind mount) and
     # exec'd — see `init:` above for why not `go run`.
@@ -87,19 +70,6 @@ services:
       sh -c "cd web && npm ci
       && (npm run dev -- --host 0.0.0.0 --port 5173 &)
       && cd .. && go build -o /tmp/ezlg ./cmd/ezlg && exec /tmp/ezlg serve"
-
-  # ---- AI matte sidecar built from source (profiles, env, hardening and the
-  # ezlg-models volume come from compose.yaml; only the image source changes).
-  matte:
-    build:
-      context: ./sidecar
-      target: cpu
-    image: ezlg-matte:local
-  matte-gpu:
-    build:
-      context: ./sidecar
-      target: cuda
-    image: ezlg-matte-cuda:local
 
 volumes:
   ezlg-gomod:

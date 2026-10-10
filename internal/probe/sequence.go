@@ -249,7 +249,7 @@ func stdlibSequenceFrameFacts(files []string) ([]frameFacts, error) {
 
 // stdlibFrameFacts reads an image header with image.DecodeConfig. Whether
 // the frame is worth an alpha scan is decided from what ffmpeg's decoder
-// would produce for that format, not from the colour model alone
+// would produce for that format, not from the color model alone
 // (headerAdmitsAlpha).
 func stdlibFrameFacts(path string) (frameFacts, error) {
 	f, err := os.Open(path)
@@ -268,14 +268,14 @@ func stdlibFrameFacts(path string) (frameFacts, error) {
 }
 
 // headerAdmitsAlpha reports whether a frame of the decoded format can carry
-// transparency that ffmpeg would decode. The stdlib colour model alone
+// transparency that ffmpeg would decode. The stdlib color model alone
 // under-reports two cases:
-//   - GIF: image/gif's DecodeConfig returns the global colour table (all
+//   - GIF: image/gif's DecodeConfig returns the global color table (all
 //     opaque); the transparent index lives in each frame's Graphic Control
 //     Extension, which a config-only decode never reads. ffmpeg's gif
 //     decoder always emits bgra, so every GIF frame is a candidate.
-//   - PNG: image/png reports RGBAModel/GrayModel for truecolour/gray files
-//     and stops parsing at IHDR for them, so a tRNS colour key goes unseen;
+//   - PNG: image/png reports RGBAModel/GrayModel for truecolor/gray files
+//     and stops parsing at IHDR for them, so a tRNS color key goes unseen;
 //     a cheap chunk walk (pngHasTRNS) decides those. (Paletted PNGs are
 //     fine: DecodeConfig folds tRNS into the palette's alpha.)
 func headerAdmitsAlpha(path, format string, m color.Model) bool {
@@ -294,11 +294,11 @@ func headerAdmitsAlpha(path, format string, m color.Model) bool {
 	return false
 }
 
-// modelHasAlpha reports whether a decoded header's colour model can carry
-// transparency: the NRGBA models image/png uses for colour types with an
+// modelHasAlpha reports whether a decoded header's color model can carry
+// transparency: the NRGBA models image/png uses for color types with an
 // alpha channel, or a palette with a translucent entry (PNG paletted tRNS).
 // Format-level cases the model cannot show (GIF per-frame transparency, PNG
-// truecolour/gray tRNS colour keys) live in headerAdmitsAlpha.
+// truecolor/gray tRNS color keys) live in headerAdmitsAlpha.
 func modelHasAlpha(m color.Model) bool {
 	switch m {
 	case color.NRGBAModel, color.NRGBA64Model:
@@ -319,8 +319,8 @@ func modelHasAlpha(m color.Model) bool {
 const maxPNGHeaderChunks = 64
 
 // pngHasTRNS reports whether a PNG file carries a tRNS chunk before its
-// image data — the transparency of truecolour/gray PNGs, which DecodeConfig's
-// colour model cannot show. It walks the chunk list after the 8-byte
+// image data — the transparency of truecolor/gray PNGs, which DecodeConfig's
+// color model cannot show. It walks the chunk list after the 8-byte
 // signature (length, type, skip data+CRC), stdlib-only and reading a few
 // hundred bytes; any read problem means "no".
 func pngHasTRNS(path string) bool {

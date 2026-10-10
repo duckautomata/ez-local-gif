@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MattePending, type MattePendingBody, type MattePendingState, type StillRequest } from './api';
-import { MATTE_DEFERRED_RETRY_MS, MATTE_IDLE_RETRY_MS, MATTE_RETRY_MS } from './matte';
+import type { StillRequest } from './api';
 import { CANVAS_STILL_MAXW, DECODE_ERROR, FIT_STILL_MAXW, FIT_STILL_MAXW_WIDE, StillScheduler, stillMaxW, type StillView } from './still';
 
 describe('stillMaxW', () => {
@@ -38,8 +37,7 @@ interface Call {
 function harness(debounceMs = 150) {
   const calls: Call[] = [];
   const revoked: string[] = [];
-  const pendings: MattePending[] = [];
-  const view: StillView = { url: null, loading: false, error: '', pending: null };
+  const view: StillView = { url: null, loading: false, error: '' };
   const still = new StillScheduler(view, {
     fetch(req, signal) {
       return new Promise<Blob>((resolve, reject) => {
@@ -50,28 +48,8 @@ function harness(debounceMs = 150) {
     createURL: (b) => `blob:${b.size}`,
     revokeURL: (u) => revoked.push(u),
     debounceMs,
-    onPending: (p) => pendings.push(p),
   });
-  return { still, view, calls, revoked, pendings };
-}
-
-/** a 202 answer (Phase 5b): the pending fields plus a minimal status object */
-function pendingErr(state: MattePendingState, over: Partial<MattePendingBody> = {}): MattePending {
-  return new MattePending({
-    pending: 'matte',
-    state,
-    done: 0,
-    total: 0,
-    percent: 0,
-    estimateMs: 0,
-    device: 'cuda',
-    enabled: true,
-    defaultModel: 'isnet-anime',
-    models: { 'isnet-anime': { label: 'Anime (fast)', state: 'ready', msPerFrame: 18 } },
-    maxSeconds: 600,
-    maxFrames: 3000,
-    ...over,
-  });
+  return { still, view, calls, revoked };
 }
 
 function req(t: number, extra: Partial<StillRequest> = {}): StillRequest {
@@ -112,7 +90,7 @@ describe('StillScheduler', () => {
     expect(h.view.loading).toBe(true);
     h.calls[0].resolve();
     await flush();
-    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '' });
     expect(h.still.displayedKey).toBe(StillScheduler.key(A));
   });
 
@@ -157,7 +135,7 @@ describe('StillScheduler', () => {
 
     b.resolve(); // B "lands" anyway (e.g. the response was already in the pipe)
     await flush();
-    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '' });
     expect(h.still.displayedKey).toBe(StillScheduler.key(A));
     expect(h.revoked).toEqual([]);
   });
@@ -174,7 +152,7 @@ describe('StillScheduler', () => {
 
     h.still.request(A);
     await vi.advanceTimersByTimeAsync(1000);
-    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '' });
     expect(h.calls).toHaveLength(2);
   });
 
@@ -198,7 +176,7 @@ describe('StillScheduler', () => {
     expect(h.calls[2].req).toEqual(A);
     h.calls[2].resolve();
     await flush();
-    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '' });
     // the broken URL is released once the new image has loaded
     h.still.imageLoaded();
     expect(h.revoked).toEqual(['blob:3']);
@@ -210,12 +188,12 @@ describe('StillScheduler', () => {
     await vi.advanceTimersByTimeAsync(150);
     h.calls[0].reject(new Error('boom'));
     await flush();
-    expect(h.view).toEqual({ url: null, loading: false, error: 'boom', pending: null });
+    expect(h.view).toEqual({ url: null, loading: false, error: 'boom' });
     h.still.request(B);
     await vi.advanceTimersByTimeAsync(150);
     h.calls[1].resolve();
     await flush();
-    expect(h.view).toEqual({ url: 'blob:5', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:5', loading: false, error: '' });
   });
 
   it('never records an error from an aborted request', async () => {
@@ -256,7 +234,7 @@ describe('StillScheduler', () => {
     const b = h.calls[1];
     h.still.request(null);
     expect(b.signal.aborted).toBe(true);
-    expect(h.view).toEqual({ url: null, loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: null, loading: false, error: '' });
     expect(h.revoked).toEqual(['blob:3']);
     expect(h.still.displayedKey).toBe('');
   });
@@ -296,7 +274,7 @@ describe('StillScheduler', () => {
     expect(h.calls[3].req.t).toBe(1.25); // the latest state only
     h.calls[3].resolve();
     await flush();
-    expect(h.view).toEqual({ url: 'blob:6', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:6', loading: false, error: '' });
     expect(h.revoked).toEqual(['blob:3']); // blob:5 waits for the next load as usual
     h.still.imageLoaded();
     expect(h.revoked).toEqual(['blob:3', 'blob:5']);
@@ -313,7 +291,7 @@ describe('StillScheduler', () => {
     h.still.setPaused(false);
     await vi.advanceTimersByTimeAsync(1000);
     expect(h.calls).toHaveLength(1);
-    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '', pending: null });
+    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: '' });
     expect(h.revoked).toEqual([]);
     // a request while not paused fetches as before
     h.still.request(B);
@@ -336,248 +314,5 @@ describe('StillScheduler', () => {
     c.resolve();
     await flush();
     expect(h.view.url).toBeNull();
-  });
-});
-
-// Phase 5b: a 202 answer (the recipe's AI matte is being computed) is not an
-// error — the still on screen stays, the pending state shows and the same
-// state is re-requested after MATTE_RETRY_MS (inside jobs' abandon grace)
-// unless superseded; a deferred pass waits for "Compute now" (eager).
-describe('StillScheduler — AI matte pending (Phase 5b)', () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-
-  it('a 202 keeps the still on screen, shows the pending state, hands the status over and re-requests after 500 ms', async () => {
-    const h = harness();
-    await display(h, 0);
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    const b = h.calls[1];
-    b.reject(pendingErr('running', { done: 24, total: 45, percent: 53, estimateMs: 810 }));
-    await flush();
-    expect(h.view.url).toBe('blob:3'); // the previous still stays under the pill
-    expect(h.view.error).toBe('');
-    expect(h.view.loading).toBe(false);
-    expect(h.view.pending).toMatchObject({ state: 'running', done: 24, total: 45, percent: 53, estimateMs: 810, device: 'cuda' });
-    expect(h.view.pending?.since).toBe(Date.now());
-    expect(h.pendings).toHaveLength(1);
-    expect(h.pendings[0].status.models?.['isnet-anime']?.msPerFrame).toBe(18);
-    expect(h.still.displayedKey).toBe(StillScheduler.key(A)); // B never landed
-    // the re-request: the same state, no eager, exactly at the retry delay
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS - 1);
-    expect(h.calls).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(h.calls).toHaveLength(3);
-    expect(h.calls[2].req).toEqual(B);
-    expect(h.calls[2].req).not.toHaveProperty('eager');
-    expect(h.view.loading).toBe(true);
-    expect(h.view.pending?.state).toBe('running'); // the pill stays up through the retry
-    // a later 202 updates the counts but keeps `since`
-    const since = h.view.pending?.since;
-    await vi.advanceTimersByTimeAsync(700);
-    h.calls[2].reject(pendingErr('running', { done: 40, total: 45 }));
-    await flush();
-    expect(h.view.pending).toMatchObject({ done: 40, total: 45, since });
-    // the picture arrives: pending cleared, the still swapped
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
-    h.calls[3].resolve();
-    await flush();
-    expect(h.view).toEqual({ url: 'blob:5', loading: false, error: '', pending: null });
-    expect(h.still.displayedKey).toBe(StillScheduler.key(B));
-  });
-
-  it('a newer request supersedes the re-request; returning to the displayed state drops the pending state', async () => {
-    const h = harness();
-    await display(h, 0);
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[1].reject(pendingErr('running', { done: 1, total: 45 }));
-    await flush();
-    expect(h.view.pending).not.toBeNull();
-    h.still.request(req(0.75)); // a newer state before the retry fires
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls).toHaveLength(3);
-    expect(h.calls[2].req.t).toBe(0.75);
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(h.calls).toHaveLength(3); // no retry of B
-    h.calls[2].reject(pendingErr('running', { done: 2, total: 45 }));
-    await flush();
-    h.still.request(A); // back to what is on screen
-    expect(h.view.pending).toBeNull();
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(h.calls).toHaveLength(3); // nothing fetched, nothing retried
-    expect(h.view.url).toBe('blob:3');
-  });
-
-  it('a deferred pass is re-requested at the poll cadence only; "Compute now" re-requests at once with eager and keeps it until the picture', async () => {
-    const h = harness();
-    await display(h, 0);
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[1].reject(pendingErr('deferred', { estimateMs: 180_000, device: 'cpu' }));
-    await flush();
-    expect(h.view.pending).toMatchObject({ state: 'deferred', estimateMs: 180_000, device: 'cpu' });
-    await vi.advanceTimersByTimeAsync(MATTE_DEFERRED_RETRY_MS - 1);
-    expect(h.calls).toHaveLength(2); // not every 500 ms: nothing changes by itself
-    await vi.advanceTimersByTimeAsync(1);
-    expect(h.calls).toHaveLength(3);
-    expect(h.calls[2].req).not.toHaveProperty('eager');
-    h.calls[2].reject(pendingErr('deferred', { estimateMs: 180_000, device: 'cpu' }));
-    await flush();
-    // Compute now: at once, with eager
-    h.still.computeNow();
-    expect(h.calls).toHaveLength(4);
-    expect(h.calls[3].req).toEqual({ ...B, eager: true });
-    expect(h.calls[3].signal.aborted).toBe(false);
-    h.calls[3].reject(pendingErr('running', { done: 3, total: 300, device: 'cpu' }));
-    await flush();
-    expect(h.view.pending?.state).toBe('running');
-    // its retries carry eager too, at the running cadence…
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
-    expect(h.calls).toHaveLength(5);
-    expect(h.calls[4].req).toEqual({ ...B, eager: true });
-    h.calls[4].resolve();
-    await flush();
-    expect(h.view.pending).toBeNull();
-    expect(h.view.url).toBe('blob:5');
-    // …but a new state after the picture is plain again
-    h.still.request(req(0.75));
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls[5].req).toEqual(req(0.75));
-  });
-
-  it('pausing drops the pending state and its re-request; resuming fetches the state once', async () => {
-    const h = harness();
-    await display(h, 0);
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[1].reject(pendingErr('loading'));
-    await flush();
-    expect(h.view.pending?.state).toBe('loading');
-    h.still.setPaused(true);
-    expect(h.view.pending).toBeNull();
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(h.calls).toHaveLength(2);
-    h.still.setPaused(false);
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls).toHaveLength(3);
-    expect(h.calls[2].req).toEqual(B);
-  });
-
-  it('an error, a null request, retry and dispose all clear the pending state and its re-request', async () => {
-    const h = harness();
-    await display(h, 0);
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[1].reject(pendingErr('downloading', { percent: 43 }));
-    await flush();
-    expect(h.view.pending).toMatchObject({ state: 'downloading', percent: 43 });
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
-    h.calls[2].reject(new Error('AI matte failed: sidecar unreachable'));
-    await flush();
-    expect(h.view).toEqual({ url: 'blob:3', loading: false, error: 'AI matte failed: sidecar unreachable', pending: null });
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(h.calls).toHaveLength(3); // an error ends the polling
-    // retry re-requests and clears
-    h.still.retry();
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[3].reject(pendingErr('running', { done: 1, total: 2 }));
-    await flush();
-    expect(h.view.pending).not.toBeNull();
-    h.still.request(null);
-    expect(h.view).toEqual({ url: null, loading: false, error: '', pending: null });
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(h.calls).toHaveLength(4);
-    // dispose
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[4].reject(pendingErr('running', { done: 1, total: 2 }));
-    await flush();
-    h.still.dispose();
-    expect(h.view.pending).toBeNull();
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(h.calls).toHaveLength(5);
-  });
-});
-
-// Phase 5c: a preview never starts a pass — the server answers 202 "idle"
-// until the Compute matte button (computeNow: `eager`) or a render ran
-// it. Like 5b's deferred state it is re-requested at the poll cadence only.
-describe('StillScheduler — idle matte (Phase 5c)', () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-
-  it('an idle 202 keeps the still, retries slowly, and the Compute button re-requests at once with eager until the picture', async () => {
-    const h = harness();
-    await display(h, 0);
-    h.still.request(B);
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[1].reject(pendingErr('idle', { total: 45, device: 'cuda' }));
-    await flush();
-    expect(h.view.url).toBe('blob:3');
-    expect(h.view.pending).toMatchObject({ state: 'idle', total: 45, device: 'cuda' });
-    expect(MATTE_IDLE_RETRY_MS).toBe(5000);
-    await vi.advanceTimersByTimeAsync(MATTE_IDLE_RETRY_MS - 1);
-    expect(h.calls).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(h.calls).toHaveLength(3);
-    expect(h.calls[2].req).toEqual(B); // plain: the preview never starts the pass
-    h.calls[2].reject(pendingErr('idle', { total: 45 }));
-    await flush();
-    h.still.computeNow();
-    expect(h.calls).toHaveLength(4);
-    expect(h.calls[3].req).toEqual({ ...B, eager: true });
-    h.calls[3].reject(pendingErr('running', { done: 1, total: 45 }));
-    await flush();
-    expect(h.view.pending?.state).toBe('running');
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
-    expect(h.calls[4].req).toEqual({ ...B, eager: true });
-    h.calls[4].resolve();
-    await flush();
-    expect(h.view).toEqual({ url: 'blob:5', loading: false, error: '', pending: null });
-    expect(h.still.displayedKey).toBe(StillScheduler.key(B));
-    // a render started the pass meanwhile: the slow retry of another idle state sees it running, no eager needed
-    h.still.request(req(0.75));
-    await vi.advanceTimersByTimeAsync(150);
-    h.calls[5].reject(pendingErr('idle'));
-    await flush();
-    await vi.advanceTimersByTimeAsync(MATTE_IDLE_RETRY_MS);
-    expect(h.calls[6].req).toEqual(req(0.75));
-    h.calls[6].reject(pendingErr('running', { done: 10, total: 45 }));
-    await flush();
-    expect(h.view.pending?.state).toBe('running');
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
-    expect(h.calls).toHaveLength(8);
-  });
-
-  it('computeNext (the guided panel): the NEXT different request is loaded with eager, the same state and later ones are plain', async () => {
-    const h = harness();
-    await display(h, 0); // the prompt-mode still (no matte op) is on screen
-    h.still.computeNext();
-    h.still.request(A); // the same state: nothing to do
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(h.calls).toHaveLength(1);
-    h.still.request(B); // the panel closed: the keyed still
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls).toHaveLength(2);
-    expect(h.calls[1].req).toEqual({ ...B, eager: true });
-    h.calls[1].reject(pendingErr('running', { done: 1, total: 45 }));
-    await flush();
-    await vi.advanceTimersByTimeAsync(MATTE_RETRY_MS);
-    expect(h.calls[2].req).toEqual({ ...B, eager: true }); // its retries too
-    h.calls[2].resolve();
-    await flush();
-    expect(h.view.pending).toBeNull();
-    h.still.request(req(0.75));
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls[3].req).toEqual(req(0.75)); // plain again
-    // pressed and then superseded twice: only the first different state is eager
-    h.still.computeNext();
-    h.still.request(A);
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls[4].req).toEqual({ ...A, eager: true });
-    h.still.request(req(0.9)); // (B is the still on screen: nothing to fetch for it)
-    await vi.advanceTimersByTimeAsync(150);
-    expect(h.calls[5].req).toEqual(req(0.9));
   });
 });

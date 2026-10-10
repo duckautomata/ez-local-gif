@@ -73,7 +73,7 @@ func encodeCv(t testing.TB, frames []cvFrame) []byte {
 		}
 		if f.trans > 0 {
 			// Alpha 0 with the RGB kept: image/gif flags the index and still
-			// writes the same colour table bytes.
+			// writes the same color table bytes.
 			pal = append(color.Palette(nil), pal...)
 			c := pal[f.trans-1].(color.RGBA)
 			pal[f.trans-1] = color.RGBA{c.R, c.G, c.B, 0}
@@ -422,12 +422,12 @@ func TestWalkGIFCanvasVerdicts(t *testing.T) {
 			{rect: cvRectA, pix: func(x, y int) byte { return picture(x, y+1) }, delay: 4, disposal: 2, interlace: true},
 			{rect: cvRectB, fill: 3, delay: 10, disposal: 1},
 		}, []frameVerdict{vC, vC, vC}},
-		{"local colour table with the same RGB at another index", []cvFrame{
+		{"local color table with the same RGB at another index", []cvFrame{
 			{rect: cvRectA, fill: 2, delay: 100, disposal: 1},
 			{rect: cvRectA, fill: 6, delay: 4, disposal: 2, local: swapped},
 			{rect: cvRectB, fill: 3, delay: 10, disposal: 1},
 		}, []frameVerdict{vC, vU, vC}},
-		{"local colour table with another RGB at the same index", []cvFrame{
+		{"local color table with another RGB at the same index", []cvFrame{
 			{rect: cvRectA, fill: 2, delay: 100, disposal: 1},
 			{rect: cvRectA, fill: 2, delay: 4, disposal: 2, local: swapped},
 			{rect: cvRectB, fill: 3, delay: 10, disposal: 1},

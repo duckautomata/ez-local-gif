@@ -8,14 +8,14 @@ import (
 
 // Knob names returned by KnobFor. Candidate.Desc renders them for humans:
 // KnobLossy as "lossy N", KnobQuality as "quality Q" with Q = 100 - knob
-// (the knob is the documented 100-quality inversion), KnobColourStep as
-// "colour step N", anything else as "<name> N".
+// (the knob is the documented 100-quality inversion), KnobColorStep as
+// "color step N", anything else as "<name> N".
 const (
-	KnobLossy      = "lossy"       // gif: gifsicle --lossy N
-	KnobQuality    = "quality"     // webp/avif/jpeg: encoder quality = 100 - knob
-	KnobColourStep = "colour step" // apng/png: palette halvings below the rung's colours, floored at 64 (256 → 128 → 64)
-	KnobCRF        = "crf"         // mp4/webm (Phase 4): the encoder CRF itself (larger = smaller file), enc.MP4Options.CRF / enc.WebMOptions.CRF
-	KnobLevel      = "level"       // unknown formats: abstract 0..100 harshness
+	KnobLossy     = "lossy"      // gif: gifsicle --lossy N
+	KnobQuality   = "quality"    // webp/avif/jpeg: encoder quality = 100 - knob
+	KnobColorStep = "color step" // apng/png: palette halvings below the rung's colors, floored at 64 (256 → 128 → 64)
+	KnobCRF       = "crf"        // mp4/webm (Phase 4): the encoder CRF itself (larger = smaller file), enc.MP4Options.CRF / enc.WebMOptions.CRF
+	KnobLevel     = "level"      // unknown formats: abstract 0..100 harshness
 )
 
 // knobFor implements KnobFor.
@@ -26,9 +26,9 @@ func knobFor(format string) Knob {
 	case recipe.FormatWebP, recipe.FormatAVIF:
 		return Knob{Min: 5, Max: 90, Mild: 20, Harsh: 70, Name: KnobQuality}
 	case recipe.FormatAPNG, recipe.FormatPNG:
-		// DESIGN.md §5.4 floors the colour search at 64: at most two
-		// halvings below the (default 256-colour) palette.
-		return Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}
+		// DESIGN.md §5.4 floors the color search at 64: at most two
+		// halvings below the (default 256-color) palette.
+		return Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColorStep}
 	case recipe.FormatJPEG:
 		return Knob{Min: 10, Max: 80, Mild: 20, Harsh: 60, Name: KnobQuality}
 	case recipe.FormatMP4:
@@ -47,21 +47,21 @@ func knobFor(format string) Knob {
 	}
 }
 
-// colourStepKnob bounds the colour-step knob of an indexed APNG/PNG rung by
-// its own palette: DESIGN.md §5.4 floors the fit search at 64 colours, so
+// colorStepKnob bounds the color-step knob of an indexed APNG/PNG rung by
+// its own palette: DESIGN.md §5.4 floors the fit search at 64 colors, so
 // the harshest step is log2(colors/64) halvings — 256 → steps 0..2, 128 →
 // 0..1, 64 → the single point 0 (probed once and otherwise skipped, see
 // searchRung). The mild probe is always the rung's own palette; the harsh
 // probe at most two halvings below it.
-func colourStepKnob(colors int) *Knob {
+func colorStepKnob(colors int) *Knob {
 	steps := 0
 	for c := colors; c > 64; c /= 2 {
 		steps++
 	}
-	return &Knob{Min: 0, Max: steps, Mild: 0, Harsh: min(2, steps), Name: KnobColourStep}
+	return &Knob{Min: 0, Max: steps, Mild: 0, Harsh: min(2, steps), Name: KnobColorStep}
 }
 
-// truecolorKnob is the single-point knob of an RGBA truecolour probe rung:
+// truecolorKnob is the single-point knob of an RGBA truecolor probe rung:
 // there is nothing to search (mild == harsh == 0), so the rung costs exactly
 // one encode and is skipped when it does not fit.
 var truecolorKnob = &Knob{Name: "probe"}

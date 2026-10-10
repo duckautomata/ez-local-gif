@@ -48,7 +48,7 @@ type ProbeInfo struct {
 	// then expressed as the "unpremultiply" op.
 	Premultiplied bool `json:"premultiplied"`
 
-	// ColorStream is the video-stream index ("v:N") of the colour stream the
+	// ColorStream is the video-stream index ("v:N") of the color stream the
 	// graph must read. 0 for almost every source; > 0 for animated AVIF,
 	// where ffmpeg's mov demuxer lists the one-frame primary item first and
 	// the animation track after it (typically v:2, with its alpha at v:3).
@@ -57,7 +57,7 @@ type ProbeInfo struct {
 	// AlphaStream is the video-stream index ("v:N") of a separate
 	// single-plane alpha stream belonging to ColorStream (ffmpeg's mov
 	// demuxer exposes AVIF alpha this way). 0 = the alpha, if any, is in the
-	// colour stream's pix_fmt. When > 0 the graph merges it with alphamerge
+	// color stream's pix_fmt. When > 0 the graph merges it with alphamerge
 	// before any other stage.
 	AlphaStream int `json:"alphaStream,omitempty"`
 
@@ -123,7 +123,7 @@ type DelayParams struct {
 // fit), so their coordinates are in output pixels — what the preview shows.
 const (
 	OpChromaKey = "chromakey" // ChromaKeyParams — greenscreen/bluescreen keying in YUV 4:4:4 + despill
-	OpColorKey  = "colorkey"  // ColorKeyParams — make one RGB colour (eyedropper) transparent
+	OpColorKey  = "colorkey"  // ColorKeyParams — make one RGB color (eyedropper) transparent
 	OpReverse   = "reverse"   // no params — play backwards (after the geometry stages; trim applies in source time)
 	OpBounce    = "bounce"    // Phase 4, no params — forward then backward ("ping-pong"): frames and duration double; emitted after the output fit like reverse; stills/proxies of a bounced plan are never seeked; at most graph.MaxBounces per recipe
 	OpAutoCrop  = "autocrop"  // AutoCropParams — crop to the content bounding box (resolved by jobs before compiling)
@@ -138,7 +138,7 @@ const (
 const OpFeather = "feather"
 
 // FeatherParams softens the alpha edge with a Gaussian blur of the alpha
-// plane only (a "feather" / "soft edge"); the colour planes are untouched.
+// plane only (a "feather" / "soft edge"); the color planes are untouched.
 // Radius is the Gaussian sigma in SOURCE pixels: 0 means the default 3,
 // anything else must lie in 0.1..50 (a compile error otherwise). The visible
 // soft edge spans roughly 2-3x Radius, which is how the UI labels the knob
@@ -159,157 +159,49 @@ type FeatherParams struct {
 	Radius float64 `json:"radius,omitempty"`
 }
 
-// OpMorph (Phase 5a) cleans the frame's alpha plane with 3x3 morphology
-// (MorphParams). Like feather it is hoisted into the keying group, in stack
-// order, so it acts on whatever key or matte precedes it in the stack, and
-// it is skipped entirely while the frames carry no alpha (an opaque source
-// with no key in front of it); its params are validated either way.
+// OpMorph (Phase 5a, revised 2026-10-09) refines the frame's alpha edge
+// (MorphParams): fill pinholes, shift the edge in or out, smooth a jagged
+// outline. Like feather it is hoisted into the keying group, in stack order,
+// so it acts on whatever key precedes it in the stack, and it is skipped
+// entirely while the frames carry no alpha (an opaque source with no key in
+// front of it); its params are validated either way. Only the alpha plane
+// changes; the color is never touched.
 const OpMorph = "morph"
 
-// MorphParams: Close applies a dilation followed by an erosion (a 3x3
-// "close": fills pinholes of up to 1 px without growing the silhouette);
-// Grow (0..4) applies that many extra dilations afterwards (recovers eaten
-// subject interiors at the cost of a fringe of as many source pixels). At
-// least one of Close / Grow > 0 must be set, else the op is a compile
-// error. The colour planes are never touched.
+// MorphParams, applied in this order, all in SOURCE pixels (the stage runs
+// before any geometry, like feather):
+//
+//   - Close: a 3x3 dilation followed by a 3x3 erosion of the alpha (fills
+//     pinholes of up to 1 px without moving the outline).
+//   - Grow: shifts the edge by that many pixels, -graph.MaxMorphGrow ..
+//     +graph.MaxMorphGrow. Negative SHRINKS the kept (opaque) area — it trims
+//     a leftover rim of background the key did not catch; positive grows it
+//     (recovers an eaten edge at the cost of a fringe).
+//   - Smooth: the "soft edge" radius, 0..graph.MaxMorphSmooth: the alpha is
+//     blurred with that Gaussian sigma and then re-sharpened around its 50 %
+//     level, which rounds off a jagged or noisy outline into a clean edge
+//     about 1.5 px wide (thin features narrower than ~2x Smooth fade out).
+//     Feather, by contrast, leaves the edge soft.
+//
+// At least one of Close, Grow != 0 or Smooth > 0 must be set, else the op is
+// a compile error.
 type MorphParams struct {
-	Close bool `json:"close,omitempty"`
-	Grow  int  `json:"grow,omitempty"`
+	Close  bool    `json:"close,omitempty"`
+	Grow   int     `json:"grow,omitempty"`
+	Smooth float64 `json:"smooth,omitempty"`
 }
 
-// OpMatte (Phase 5b) keys the main source with an AI matte (MatteParams):
-// one alpha frame per master frame, computed by the matte sidecar on the
-// frames the temporal stages yield (delay / unpremultiply / trim / speed /
-// fps — the output frame grid), memoised by jobs per frame and per clip,
-// and read back as an image2 sequence input of the plan. Like
-// chromakey / colorkey / feather it is hoisted into the keying group: full
-// resolution, before any geometry, in stack order. On opaque frames the
-// matte becomes the alpha; on frames that already carry alpha it is
-// multiplied in (intersected), never substituted. The model sees RGB only:
-// keys, morph, feather and geometry are not part of its memo key. A plan
-// with an unresolved matte input is unusable (enc returns nil argv).
-const OpMatte = "matte"
-
-// MatteParams: Model "" = MatteModelDefault and must otherwise be an id the
-// sidecar offers. Size is the model input square in px; 0 = the server's
-// default for its device (isnet-anime: 1024 on CUDA, 512 on CPU;
-// birefnet-lite: 1024) — API-only, no UI control; only sizes the sidecar
-// lists are valid. Resolved is filled by jobs (Submit, previews, render)
-// from the sidecar's pinned facts and STRIPPED from client input exactly
-// like AutoCropParams.Resolved — but, unlike the crop box, it is KEPT in
-// the recipe hash: a result rendered with other weights has another
-// ResultKey, so pulling a new sidecar image can never serve a cached
-// result made with the old weights.
-//
-// Phase 5c (on-demand mattes): Stabilise post-processes the matte SEQUENCE
-// temporally before it is read — "" = off, MatteStabiliseLight = a centred
-// 3-frame temporal median (removes every single-frame pop, zero lag),
-// MatteStabiliseStrong = the median plus a decay-0.7 hold (keeps parts
-// that drop out for a frame at the cost of a short trail on fast motion);
-// jobs derives the stabilised sequence once per clip memo (a cheap ffmpeg
-// pass, no model run) and every consumer reads it. Keep lists up to
-// MaxMatteKeep RRGGBB colours whose pixels are forced OPAQUE (the union
-// with the matte, applied after the merge) for parts the model drops;
-// KeepSimilarity is their colour tolerance (0 = the default 0.08;
-// 0.01..1, colorkey's scale). Prompts and Edge belong to the guided model
-// (MatteModelSAM2Tiny, see MattePrompt) and are an error with any other.
-// The device a pass runs on is NOT a recipe param (a server-side
-// preference, jobs.Options.MatteDevice / PUT /api/matte/settings): the
-// matte's identity is its weights, size and precision, not where it ran.
-type MatteParams struct {
-	Model          string         `json:"model,omitempty"`
-	Size           int            `json:"size,omitempty"`
-	Resolved       *MatteResolved `json:"resolved,omitempty"`
-	Stabilise      string         `json:"stabilise,omitempty"`      // "" | MatteStabiliseLight | MatteStabiliseStrong — temporal post-processing of the matte sequence
-	Keep           []string       `json:"keep,omitempty"`           // RRGGBB colours forced opaque (union with the matte), 0..MaxMatteKeep
-	KeepSimilarity float64        `json:"keepSimilarity,omitempty"` // 0 = default 0.08 (0.01..1)
-	Prompts        []MattePrompt  `json:"prompts,omitempty"`        // guided model only: >= 1 prompt with a box or a positive point
-	Edge           string         `json:"edge,omitempty"`           // guided model only: "" = the device's default per-frame model for the edge band, MatteEdgeNone = the tracker's mask alone, else a segmenter model id
-}
-
-// MattePrompt is one prompted frame of a guided (tracker) matte: Frame is
-// the OUTPUT frame index on the plan's grid (the scrubber slot the user
-// prompted on); Points are [x, y, label] with x, y in 0..1 of the SOURCE
-// frame and label 1 = keep / 0 = remove; Box is [x0, y0, x1, y1] in 0..1
-// of the SOURCE frame, or nil. Every prompted frame becomes a conditioning
-// frame of the tracker; the track propagates from the earliest prompted
-// frame backward to 0 and forward to the end. At least one prompt must
-// carry a box, a positive point or a mask (a single positive click is
-// unreliable: the UI leads with a box or a mask). The prompts enter the
-// clip memo key in canonical form (sorted by frame, fixed decimals;
-// graph.CanonicalMattePrompts).
-//
-// MaskFrom (Phase 5d) prompts the frame with a MASK instead of (or before)
-// clicks: "" = none; MattePromptMaskEdge = the edge model's per-frame matte
-// of that frame (the model MatteParams.Edge names — the device's default
-// per-frame model when Edge is "" — so Edge must not be MatteEdgeNone),
-// which is the most reliable start: "pick a frame where the per-frame model
-// got it right and track from it". No mask bytes live in the recipe: jobs
-// takes the matte PNG from the edge model's memo, scales it to the tracking
-// size and sends it as the one mask record of the track; its digest enters
-// the clip memo key through the matte client (matte.FramePrompt.MaskDigest),
-// never through the recipe. A MaskFrom prompt counts as a positive prompt
-// and needs no box or point; points and a box on the same frame refine the
-// mask (applied after it). At most one prompt of an op carries a mask (one
-// mask record per track request).
-type MattePrompt struct {
-	Frame    int          `json:"frame"`              // OUTPUT frame index on the plan's grid (the scrubber slot)
-	Points   [][3]float64 `json:"points,omitempty"`   // x, y in 0..1 of the SOURCE frame, label 1 = keep / 0 = remove
-	Box      *[4]float64  `json:"box,omitempty"`      // x0, y0, x1, y1 in 0..1 of the SOURCE frame
-	MaskFrom string       `json:"maskFrom,omitempty"` // "" | MattePromptMaskEdge: the frame's mask prompt is the edge model's matte of that frame
-}
-
-// MatteResolved is the identity of the matte a render used (the facts of
-// the sidecar's last successful ping, persisted by jobs). For the guided
-// model (Phase 5c) Tracker is the tracker's weights and Edge / EdgeWeights
-// / EdgeProc identify the per-frame model that shaped the edge band (all
-// empty when Edge is MatteEdgeNone); Weights / Proc / Size / Precision
-// then describe the tracker's own run.
-type MatteResolved struct {
-	Weights     string `json:"weights"`               // sha256 of the pinned source ONNX file (sidecar/models.json)
-	Proc        string `json:"proc"`                  // the sidecar's processingVersion (pre/post-processing + derivation recipe)
-	Size        int    `json:"size"`                  // the effective input square
-	Precision   string `json:"precision"`             // fp16 / fp32 of the graph the sidecar runs for this device
-	Tracker     string `json:"tracker,omitempty"`     // the tracker weights sha256 when the model is a tracker (Phase 5c)
-	Edge        string `json:"edge,omitempty"`        // the edge model id a tracker matte was gated with
-	EdgeWeights string `json:"edgeWeights,omitempty"` // sha256 of the edge model's pinned weights
-	EdgeProc    string `json:"edgeProc,omitempty"`    // the edge model's processingVersion
-}
-
-// Matte model ids (sidecar/models.json). The sidecar reports which of them
-// it offers (its MATTE_MODELS); the UI labels them "Anime (fast)",
-// "General (precise)" and "Guided (click to select)". MatteModelDefault is
-// the id "" resolves to in the graph; the sidecar's per-device default
-// (General on the GPU, Anime on the CPU, Phase 5c) is what the UI
-// preselects.
-const (
-	MatteModelISNetAnime   = "isnet-anime"   // Apache-2.0; the CPU default
-	MatteModelBiRefNetLite = "birefnet-lite" // MIT; ~10x slower, every hair strand; the GPU default
-	MatteModelSAM2Tiny     = "sam2-tiny"     // Apache-2.0; the guided tracker (Phase 5c, MatteParams.Prompts / Edge)
-	MatteModelDefault      = MatteModelISNetAnime
-)
-
-// Matte post-processing (Phase 5c, MatteParams.Stabilise / Edge / Keep) and
-// the mask prompt source (Phase 5d, MattePrompt.MaskFrom).
-const (
-	MatteStabiliseLight  = "light"  // centred 3-frame temporal median of the matte sequence
-	MatteStabiliseStrong = "strong" // the median followed by a decay-0.7 hold (keep-biased)
-	MatteEdgeNone        = "none"   // guided model: the tracker's mask alone, no per-frame edge band
-	MaxMatteKeep         = 6        // at most this many Keep colours per matte op
-	MattePromptMaskEdge  = "edge"   // MattePrompt.MaskFrom: the mask is the edge model's per-frame matte of the prompted frame
-)
-
-// ChromaKeyParams keys out a colour in YUV (soft edges). Zero values:
-// Color "00ff00", Similarity 0.1 (0.01..1; Phase 5a — was 0.2), Blend 0.05
-// (0..1), Despill on with Mix 0.6 and Expand 0.3 (DespillOff disables it).
-// The defaults are graph's (internal/graph/phase3.go) and are mirrored by
-// the SPA's CHROMA_DEFAULTS (web/src/lib/state.svelte.ts).
+// ChromaKeyParams keys out a color in YUV (soft edges). Zero values:
+// Color "00ff00", Similarity 0.1 (0.01..1), Blend 0.05 (0..1), Despill
+// on with Mix 0.5 and Expand 0 (DespillOff disables it). Despill only
+// touches a band around the keyed edge (the compiler masks it with the
+// alpha), never the subject's interior.
 //
 // Blend 0 therefore means the DEFAULT 0.05, not "no blend": a hard key edge
 // needs a small positive value such as 0.001 (the UI's slider floors at
 // 0.01 for the same reason). Despill applies only when Color has a single
 // dominant channel (green or blue; the despill type follows that channel);
-// for any other colour it is skipped even when DespillMix/DespillExpand are
+// for any other color it is skipped even when DespillMix/DespillExpand are
 // set. On frames that already carry alpha the key's matte is intersected
 // with the incoming alpha (the compiler wraps the key), never substituted
 // for it.
@@ -322,10 +214,9 @@ type ChromaKeyParams struct {
 	DespillExpand float64 `json:"despillExpand,omitempty"`
 }
 
-// ColorKeyParams makes one RGB colour transparent (the eyedropper picks it).
-// Zero values: Similarity 0.08 (0.01..1; Phase 5a — was 0.1), Blend 0
-// (0..1); graph's defaults, mirrored by the SPA's COLORKEY_DEFAULTS. Color
-// is required.
+// ColorKeyParams makes one RGB color transparent (the eyedropper picks it).
+// Zero values: Similarity 0.08 (0.01..1), Blend 0 (0..1). Color is required.
+// A Color-mode stack keys several colors with one colorkey op each.
 type ColorKeyParams struct {
 	Color      string  `json:"color"`
 	Similarity float64 `json:"similarity,omitempty"`
@@ -674,17 +565,17 @@ func IsHash(s string) bool {
 	return true
 }
 
-// NormalizeHex returns a lowercase RRGGBB (or RRGGBBAA) hex colour without a
+// NormalizeHex returns a lowercase RRGGBB (or RRGGBBAA) hex color without a
 // leading '#', or an error.
 func NormalizeHex(s string) (string, error) {
 	s = strings.TrimPrefix(strings.TrimSpace(s), "#")
 	s = strings.ToLower(s)
 	if len(s) != 6 && len(s) != 8 {
-		return "", fmt.Errorf("colour %q: want RRGGBB or RRGGBBAA", s)
+		return "", fmt.Errorf("color %q: want RRGGBB or RRGGBBAA", s)
 	}
 	for _, c := range s {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return "", fmt.Errorf("colour %q: not hex", s)
+			return "", fmt.Errorf("color %q: not hex", s)
 		}
 	}
 	return s, nil

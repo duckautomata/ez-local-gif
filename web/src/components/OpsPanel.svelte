@@ -29,7 +29,7 @@
     <div class="card note-card">
       <p>
         <b>{preset.label}</b> works on the GIF file directly with gifsicle — no decode, no re-quantisation — so the edit ops
-        below are not applied (lossy, colours, dither and frame drop live in the Output card).
+        below are not applied (lossy, colors, dither and frame drop live in the Output card).
       </p>
       <p class="hint">Need to trim, crop or resize? <button type="button" class="sm" onclick={() => applyPreset('chat')}>Switch to Chat</button> (re-encodes).</p>
     </div>

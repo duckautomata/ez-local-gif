@@ -34,24 +34,6 @@
 //	EZLG_INPUT           read-only "pick from /input" directory (default "/input"); checked
 //	                     once at startup like EZLG_OUTPUT (features.inputPick); the listing
 //	                     itself is read per request
-//	EZLG_MATTE_URL       base URL of the AI matte sidecar (default "" = AI mattes off:
-//	                     capabilities features.matte false, a recipe with a matte op is
-//	                     refused). compose sets http://matte:9402 and the matte (CPU) /
-//	                     matte-gpu (CUDA) profiles start the service; it is probed every
-//	                     30 s and the feature follows its answers (jobs.Options.MatteURL)
-//	EZLG_MATTE_MAX_SECONDS cap on the estimated wall time of one AI matte pass, frames x the
-//	                     sidecar's measured ms per frame (default 600; <= 0 keeps the
-//	                     default); a longer clip is refused up-front with a message asking
-//	                     to trim, lower the fps or pick the fast model
-//	                     (jobs.Options.MatteMaxSeconds)
-//	EZLG_MATTE_MAX_FRAMES cap on the frames one AI matte pass may send to the sidecar
-//	                     (default 3000; <= 0 keeps the default), applied up-front from the
-//	                     plan and at run time from the frames streamed
-//	                     (jobs.Options.MatteMaxFrames)
-//	EZLG_MATTE_DEVICE    the device AI matte passes run on when the sidecar offers several
-//	                     ("cuda" / "cpu"; default "" = the sidecar's default) — the startup
-//	                     value of the preference PUT /api/matte/settings changes at run time
-//	                     (jobs.Options.MatteDevice, Phase 5c)
 //	EZLG_FFMPEG etc.     override tool paths (see ffrun.LookupTools; EZLG_FC_LIST for the
 //	                     fontconfig fc-list behind GET /api/fonts)
 //
@@ -151,17 +133,7 @@ type serveConfig struct {
 	// the directory is not usable at startup.
 	outputDir string
 	inputDir  string
-	// matteURL / matteMaxSeconds / matteMaxFrames are jobs.Options.MatteURL /
-	// MatteMaxSeconds / MatteMaxFrames (EZLG_MATTE_URL, EZLG_MATTE_MAX_SECONDS,
-	// EZLG_MATTE_MAX_FRAMES, Phase 5b); "" disables AI mattes, <= 0 keeps the
-	// manager's defaults.
-	matteURL        string
-	matteMaxSeconds int
-	matteMaxFrames  int
-	// matteDevice is jobs.Options.MatteDevice (EZLG_MATTE_DEVICE, Phase 5c);
-	// "" = the sidecar's default device.
-	matteDevice string
-	drain       time.Duration
+	drain     time.Duration
 }
 
 func serveConfigFromEnv() serveConfig {
@@ -176,13 +148,7 @@ func serveConfigFromEnv() serveConfig {
 		maxMaster: envInt("EZLG_MAX_MASTER_BYTES", jobs.DefaultMaxMasterBytes),
 		outputDir: envStr("EZLG_OUTPUT", "/output"),
 		inputDir:  envStr("EZLG_INPUT", "/input"),
-		// os.Getenv rather than envStr: an explicitly empty EZLG_MATTE_URL
-		// is the documented "off" and must not fall back to anything.
-		matteURL:        os.Getenv("EZLG_MATTE_URL"),
-		matteMaxSeconds: int(envInt("EZLG_MATTE_MAX_SECONDS", jobs.DefaultMatteMaxSeconds)),
-		matteMaxFrames:  int(envInt("EZLG_MATTE_MAX_FRAMES", jobs.DefaultMatteMaxFrames)),
-		matteDevice:     os.Getenv("EZLG_MATTE_DEVICE"),
-		drain:           drainTimeout,
+		drain:     drainTimeout,
 	}
 }
 
@@ -232,26 +198,14 @@ func runServer(ctx context.Context, cfg serveConfig, ln net.Listener) error {
 		maxUpload = server.DefaultMaxUploadBytes
 	}
 	jm := jobs.NewManager(st, tools, jobs.Options{
-		Concurrency:     cfg.conc,
-		MaxMasterBytes:  cfg.maxMaster,
-		OutputDir:       cfg.outputDir,
-		InputDir:        cfg.inputDir,
-		MaxUploadBytes:  maxUpload,
-		MatteURL:        cfg.matteURL,
-		MatteMaxSeconds: cfg.matteMaxSeconds,
-		MatteMaxFrames:  cfg.matteMaxFrames,
-		MatteDevice:     cfg.matteDevice,
+		Concurrency:    cfg.conc,
+		MaxMasterBytes: cfg.maxMaster,
+		OutputDir:      cfg.outputDir,
+		InputDir:       cfg.inputDir,
+		MaxUploadBytes: maxUpload,
 	})
 	log.Printf("phase 4 file exchange: save to %s = %v (EZLG_OUTPUT), pick from %s = %v (EZLG_INPUT)",
 		cfg.outputDir, jm.OutputSaveEnabled(), cfg.inputDir, jm.InputPickEnabled())
-
-	// Phase 5b: the matte sidecar probe (every 30 s; features.matte flips
-	// off after three misses, transitions only are logged). Runs under ctx
-	// like the sweeper and returns at once when EZLG_MATTE_URL is empty.
-	if cfg.matteURL != "" {
-		log.Printf("phase 5b AI matte: sidecar %s (EZLG_MATTE_URL), caps %d s / %d frames", cfg.matteURL, jm.MatteStatus().MaxSeconds, jm.MatteStatus().MaxFrames)
-	}
-	go jm.RunMatteProbe(ctx)
 
 	h := server.NewServer(server.Config{MaxUploadBytes: maxUpload, Version: Version}, st, jm, tools, web.Dist())
 	srv := &http.Server{

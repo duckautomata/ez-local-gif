@@ -79,7 +79,7 @@ func TestWebMArgsRealEncode(t *testing.T) {
 	videoTailChecks(t, ff, out, 8)
 }
 
-// TestVideoColorTagsReal: both video tails must produce files whose colour
+// TestVideoColorTagsReal: both video tails must produce files whose color
 // metadata says bt709 (what players assume for untagged web video) and whose
 // flattened matte round-trips to 0x313338 within ±2 per channel when decoded
 // WITH the tagged matrix — the point of the matte flatten is matching
@@ -160,8 +160,8 @@ func TestVideoCRFIsMonotonic(t *testing.T) {
 	}
 }
 
-// writePNGFrames writes n solid-colour 40x30 PNG frames and returns their
-// paths (zero-padded, ordered) and colours.
+// writePNGFrames writes n solid-color 40x30 PNG frames and returns their
+// paths (zero-padded, ordered) and colors.
 func writePNGFrames(t *testing.T, dir string, n int) ([]string, []color.NRGBA) {
 	t.Helper()
 	paths := make([]string, 0, n)
@@ -218,7 +218,7 @@ func TestGifskiArgsReal(t *testing.T) {
 	}
 }
 
-// solidGIF encodes a full-frame solid-colour GIF with the given delays.
+// solidGIF encodes a full-frame solid-color GIF with the given delays.
 func solidGIF(t *testing.T, path string, w, h int, delays []int) []color.NRGBA {
 	t.Helper()
 	g := &gif.GIF{LoopCount: 0}
@@ -283,7 +283,7 @@ func TestGifsicleFastPathReal(t *testing.T) {
 	if g.LoopCount != 5 {
 		t.Errorf("LoopCount = %d, want 5", g.LoopCount)
 	}
-	// Lossless: the first kept frame is source frame 1's colour, bit-exact.
+	// Lossless: the first kept frame is source frame 1's color, bit-exact.
 	r0, g0, b0, _ := g.Image[0].At(g.Image[0].Rect.Min.X, g.Image[0].Rect.Min.Y).RGBA()
 	want := colors[1]
 	if byte(r0>>8) != want.R || byte(g0>>8) != want.G || byte(b0>>8) != want.B {

@@ -55,7 +55,7 @@ type gifLinter struct {
 // non-NETSCAPE application extensions stripped). Unfixable violations
 // (disposal 3, a frame that leaves the picture unchanged but clears a
 // different area than its predecessor — gif.noop-frame-disposal, see
-// gifcanvas.go —, interlaced frames, local colour tables, no free palette
+// gifcanvas.go —, interlaced frames, local color tables, no free palette
 // slot, over byte limit, sticker duration/frame/fps limits, and — as a
 // warning — a sticker side over 320 px) are reported as failed checks so
 // the caller can fall back to a re-encode. The returned bytes equal data
@@ -140,7 +140,7 @@ func gifTiming(frames []gifFrame) (durationMS, minDelayMS int) {
 // through: a frame whose GCE transparency flag is set and whose pixel data
 // contains the transparent index (assumed when the pixels cannot be
 // decoded), or a frame 0 that does not cover the logical screen (browsers
-// leave the border transparent; lilliput would paint the background colour
+// leave the border transparent; lilliput would paint the background color
 // unless frame 0 declares transparency).
 func (l *gifLinter) analyseTransparency() {
 	frames, _ := l.g.frames()
@@ -257,7 +257,7 @@ func neighbourDelay(frames []gifFrame, i int) uint16 {
 
 // ruleFrame0Transparency: when the animation is transparent, frame 0's GCE
 // must carry the transparency flag — lilliput decides whether the canvas is
-// transparent or filled with the background colour from frame 0 alone. When
+// transparent or filled with the background color from frame 0 alone. When
 // frame 0 has no transparent pixels the flag is set with an index its pixels
 // do not use, so its appearance does not change.
 func (l *gifLinter) ruleFrame0Transparency() {
@@ -302,11 +302,11 @@ func (l *gifLinter) ruleFrame0Transparency() {
 func (l *gifLinter) chooseFrame0TransIndex(frames []gifFrame) (int, string) {
 	f0 := &frames[0]
 	if f0.image.hasLCT() {
-		return -1, "frame 0 uses a local colour table"
+		return -1, "frame 0 uses a local color table"
 	}
 	palette := l.g.gctColors()
 	if palette == 0 {
-		return -1, "the file has no global colour table"
+		return -1, "the file has no global color table"
 	}
 	pix, err := l.pix.get(f0)
 	if err != nil {
@@ -457,7 +457,7 @@ func (l *gifLinter) ruleDisposal() {
 // counts are set to 0, a missing block is inserted with count 0. For
 // TargetNone any count is acceptable — the recipe's Loop setting is the
 // user's choice — and only reported; the block merely has to exist before
-// the first image: a missing one is inserted right after the global colour
+// the first image: a missing one is inserted right after the global color
 // table with count 0 (or with the file's own count when a block sits later
 // in the stream), and a malformed loop sub-block is repaired the same way.
 // Well-formed blocks are never rewritten for TargetNone.
@@ -537,9 +537,9 @@ func (l *gifLinter) ruleNetscapeLoop() {
 	if len(before) == 0 {
 		l.g.insertBlock(0, newNetscapeLoop(want))
 		if want == 0 {
-			fixes = append(fixes, "inserted loop-forever block after the global colour table")
+			fixes = append(fixes, "inserted loop-forever block after the global color table")
 		} else {
-			fixes = append(fixes, fmt.Sprintf("inserted a block with loop count %d after the global colour table", want))
+			fixes = append(fixes, fmt.Sprintf("inserted a block with loop count %d after the global color table", want))
 		}
 	}
 	l.dirty = true
@@ -607,8 +607,8 @@ func (l *gifLinter) ruleMinDelay() {
 	l.checks.outcome(rule, LevelWarn, l.fix, detail)
 }
 
-// ruleGlobalPalette: a single global colour table, no local ones (per-frame
-// palettes have produced random-colour glitches on Discord). An error for
+// ruleGlobalPalette: a single global color table, no local ones (per-frame
+// palettes have produced random-color glitches on Discord). An error for
 // Discord targets (IsDiscord), a warning otherwise; a file with no palette
 // at all is always an error.
 func (l *gifLinter) ruleGlobalPalette() {
@@ -627,14 +627,14 @@ func (l *gifLinter) ruleGlobalPalette() {
 		}
 	}
 	if len(none) > 0 {
-		l.checks.fail(rule, LevelError, fmt.Sprintf("no global colour table and no local one on %s", frameList(none)))
+		l.checks.fail(rule, LevelError, fmt.Sprintf("no global color table and no local one on %s", frameList(none)))
 		return
 	}
 	if len(local) > 0 {
-		l.checks.fail(rule, level, fmt.Sprintf("local colour table on %s (%d of %s); re-encode with one global palette", frameList(local), len(local), plural(len(frames), "frame")))
+		l.checks.fail(rule, level, fmt.Sprintf("local color table on %s (%d of %s); re-encode with one global palette", frameList(local), len(local), plural(len(frames), "frame")))
 		return
 	}
-	l.checks.pass(rule, level, fmt.Sprintf("single global colour table (%d entries), no local tables", l.g.gctColors()))
+	l.checks.pass(rule, level, fmt.Sprintf("single global color table (%d entries), no local tables", l.g.gctColors()))
 }
 
 // ruleNoInterlace: no interlaced frames.

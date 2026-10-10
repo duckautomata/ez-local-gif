@@ -47,17 +47,17 @@ describe('ResultCard (SSR)', () => {
   it('shows the primary with its fit summary, in-chat thumbnails and two alternatives', () => {
     const out = html(
       result([
-        file('out.gif', { kind: 'output', desc: 'fit at 20 fps · 128 colours · lossy 60', report: { rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 200_000, limit: 262_144, width: 128, height: 128, frames: 40, durationMs: 2000, minDelayMs: 50, loopForever: true, hasAlpha: true, ok: true, checks: [check('gif.emote-dims', 'warn', true)] } }),
-        file('alt1.gif', { kind: 'alternative', index: 1, bytes: 150_000, desc: 'fit at 16.7 fps · 128 colours · lossy 80' }),
-        file('alt2.gif', { kind: 'alternative', index: 2, bytes: 100_000, desc: 'fit at 12.5 fps · 64 colours · lossy 100' }),
+        file('out.gif', { kind: 'output', desc: 'fit at 20 fps · 128 colors · lossy 60', report: { rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 200_000, limit: 262_144, width: 128, height: 128, frames: 40, durationMs: 2000, minDelayMs: 50, loopForever: true, hasAlpha: true, ok: true, checks: [check('gif.emote-dims', 'warn', true)] } }),
+        file('alt1.gif', { kind: 'alternative', index: 1, bytes: 150_000, desc: 'fit at 16.7 fps · 128 colors · lossy 80' }),
+        file('alt2.gif', { kind: 'alternative', index: 2, bytes: 100_000, desc: 'fit at 12.5 fps · 64 colors · lossy 100' }),
       ]),
     );
-    expect(out).toContain('fit at 20 fps · 128 colours · lossy 60');
+    expect(out).toContain('fit at 20 fps · 128 colors · lossy 60');
     expect(out).toContain('<b>Fit:</b>'); // the recipe carried fitBytes, so the desc is a fit report
     expect(out).not.toContain('Settings:');
     expect(out).toContain('Alternatives');
-    expect(out).toContain('fit at 16.7 fps · 128 colours · lossy 80');
-    expect(out).toContain('fit at 12.5 fps · 64 colours · lossy 100');
+    expect(out).toContain('fit at 16.7 fps · 128 colors · lossy 80');
+    expect(out).toContain('fit at 12.5 fps · 64 colors · lossy 100');
     // every file gets download + edit-as-source
     expect(out.match(/Edit as source/g)?.length).toBe(3);
     expect(out).toContain('?dl=1');
@@ -95,7 +95,7 @@ describe('ResultCard (SSR)', () => {
             loopForever: true,
             hasAlpha: true,
             ok: true,
-            checks: [check('apng.sticker', 'warn', false, '400x400: Discord shrinks stickers to 320x320'), check('apng.indexed', 'info', false, 'RGBA truecolour output')],
+            checks: [check('apng.sticker', 'warn', false, '400x400: Discord shrinks stickers to 320x320'), check('apng.indexed', 'info', false, 'RGBA truecolor output')],
           },
         }),
       ],
@@ -112,7 +112,7 @@ describe('ResultCard (SSR)', () => {
     // label must read correctly for that outcome too, not just for ✓.
     expect(out).toContain('Indexed 8-bit-alpha APNG (sticker default rung)');
     expect(out).toContain('●');
-    expect(out).toContain('RGBA truecolour output');
+    expect(out).toContain('RGBA truecolor output');
   });
 
   it('renders a frames result as a lazy thumbnail grid with per-frame downloads and the zip', () => {
@@ -143,12 +143,12 @@ describe('ResultCard (SSR)', () => {
   });
 
   it('shows an Optimize desc under the neutral Settings label, never as a Fit line (W8)', () => {
-    const res = result([file('out.gif', { kind: 'output', desc: 'gifsicle: lossy 30 · 256 colours', limit: 0, report: null })], {
+    const res = result([file('out.gif', { kind: 'output', desc: 'gifsicle: lossy 30 · 256 colors', limit: 0, report: null })], {
       recipe: { v: 1, sources: ['c'.repeat(64)], ops: [], output: { format: 'gif', preset: 'optimize' } },
     });
     const out = html(res);
     expect(out).toContain('Settings:');
-    expect(out).toContain('gifsicle: lossy 30 · 256 colours');
+    expect(out).toContain('gifsicle: lossy 30 · 256 colors');
     expect(out).not.toContain('<b>Fit:</b>');
     expect(out).not.toContain('Fit search ran');
   });
@@ -164,42 +164,6 @@ describe('ResultCard (SSR)', () => {
     expect(out).toContain('stage backdrop-white');
     expect(out).not.toContain('stage backdrop-dark');
     app.ui.resultBackdrop = 'dark';
-  });
-
-  // Phase 5b: the render.matte info check says which model produced the file
-  it('shows the render.matte info check as an "AI matte:" line and in the Discord checks with its label', () => {
-    const report = {
-      rulesVersion: 'x',
-      format: 'gif',
-      target: 'emote' as const,
-      bytes: 200_000,
-      limit: 262_144,
-      width: 128,
-      height: 128,
-      frames: 45,
-      durationMs: 1800,
-      minDelayMs: 40,
-      loopForever: true,
-      hasAlpha: true,
-      ok: true,
-      checks: [check('gif.emote-dims', 'warn', true), { ...check('render.matte', 'info', true, 'isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes') }],
-    };
-    const res = result([file('out.gif', { kind: 'output', report })], {
-      recipe: { v: 1, sources: ['c'.repeat(64)], ops: [{ kind: 'matte', params: { model: 'isnet-anime', resolved: { weights: 'f15622d8', proc: '1', size: 1024, precision: 'fp16' } } }], output: { format: 'gif', target: 'emote', preset: 'emote' } },
-    });
-    let out = html(res);
-    expect(out).toMatch(/<p class="fitline matte[^"]*"[^>]*><span class="muted">AI matte:<\/span> isnet-anime fp16 1024², weights f15622d8…, 45 mattes, fill pinholes<\/p>/);
-    expect(out).toContain('AI matte as rendered'); // the DiscordChecks label
-    expect(out).toContain('render.matte');
-    // a detail that already starts with "AI matte:" is not doubled
-    report.checks[1] = check('render.matte', 'info', true, 'AI matte: birefnet-lite fp32 1024², weights 9c0e1a2b…, 45 mattes');
-    out = html(result([file('out.gif', { kind: 'output', report })]));
-    expect(out).toContain('<span class="muted">AI matte:</span> birefnet-lite fp32 1024², weights 9c0e1a2b…, 45 mattes</p>');
-    expect(out).not.toContain('AI matte: AI matte');
-    // no check, no line
-    out = html(result([file('out.gif', { kind: 'output', report: { ...report, checks: [check('gif.emote-dims', 'warn', true)] } })]));
-    expect(out).not.toContain('fitline matte');
-    expect(out).not.toContain('AI matte:');
   });
 
   it('a static PNG whose recipe carries fitBytes never claims a fit ran (the server ignores it)', () => {

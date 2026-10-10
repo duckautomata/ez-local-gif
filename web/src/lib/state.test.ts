@@ -234,13 +234,13 @@ describe('buildOutput', () => {
 
     cfg.format = 'apng';
     expect(buildOutput(cfg)).toEqual({ format: 'apng', colors: 128, loop: 2, preset: 'custom' });
-    cfg.colors = 0; // RGBA truecolour → no colours key
+    cfg.colors = 0; // RGBA truecolor → no colors key
     expect(buildOutput(cfg)).toEqual({ format: 'apng', loop: 2, preset: 'custom' });
 
     cfg.format = 'avif';
     expect(buildOutput(cfg)).toEqual({ format: 'avif', quality: 55, loop: 2, preset: 'custom' });
 
-    cfg.format = 'png'; // static: no quality, no loop; colours 0 = full colour
+    cfg.format = 'png'; // static: no quality, no loop; colors 0 = full color
     expect(buildOutput(cfg)).toEqual({ format: 'png', preset: 'custom' });
     cfg.colors = 256; // pngquant palette
     expect(buildOutput(cfg)).toEqual({ format: 'png', colors: 256, preset: 'custom' });

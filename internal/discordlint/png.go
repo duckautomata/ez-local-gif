@@ -18,7 +18,7 @@ import (
 // pngSignature is the 8-byte PNG file signature.
 var pngSignature = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}
 
-// PNG colour types (IHDR byte 9).
+// PNG color types (IHDR byte 9).
 const (
 	pngGray      = 0
 	pngRGB       = 2
@@ -231,7 +231,7 @@ func (f *pngFile) addIHDR(i int, c pngChunk) {
 		f.problem("IHDR dimensions %dx%d are outside 1..%d", h.width, h.height, pngMaxDimension)
 	}
 	if !pngValidDepth(h.colorType, h.bitDepth) {
-		f.problem("colour type %d with bit depth %d is not a valid PNG combination", h.colorType, h.bitDepth)
+		f.problem("color type %d with bit depth %d is not a valid PNG combination", h.colorType, h.bitDepth)
 	}
 	if h.compression != 0 || h.filter != 0 {
 		f.problem("IHDR compression/filter method %d/%d, want 0/0", h.compression, h.filter)
@@ -241,7 +241,7 @@ func (f *pngFile) addIHDR(i int, c pngChunk) {
 	}
 }
 
-// pngValidDepth reports whether the colour type / bit depth pair is one the
+// pngValidDepth reports whether the color type / bit depth pair is one the
 // PNG spec allows.
 func pngValidDepth(colorType, depth byte) bool {
 	switch colorType {
@@ -263,7 +263,7 @@ func (f *pngFile) addPLTE(c pngChunk) {
 	if f.idat > 0 {
 		f.problem("PLTE chunk after the first IDAT")
 	}
-	// For indexed colour the spec requires tRNS after PLTE; libpng silently
+	// For indexed color the spec requires tRNS after PLTE; libpng silently
 	// discards a tRNS it sees first, so the palette alpha is lost.
 	if f.hasTRNS && f.ihdr != nil && f.ihdr.colorType == pngIndexed {
 		f.problem("tRNS chunk appears before PLTE; decoders silently discard the palette alpha — move tRNS after PLTE")
@@ -405,13 +405,13 @@ func (f *pngFile) finish() {
 	}
 }
 
-// checkPalette validates PLTE/tRNS against the colour type.
+// checkPalette validates PLTE/tRNS against the color type.
 func (f *pngFile) checkPalette() {
 	h := f.ihdr
 	switch h.colorType {
 	case pngIndexed:
 		if f.plte < 0 {
-			f.problem("indexed colour (type 3) without a PLTE chunk")
+			f.problem("indexed color (type 3) without a PLTE chunk")
 		} else if f.hasTRNS && len(f.trns) > f.plte {
 			f.problem("tRNS has %d entries but PLTE only %d", len(f.trns), f.plte)
 		}
@@ -421,11 +421,11 @@ func (f *pngFile) checkPalette() {
 		}
 	case pngRGB:
 		if f.hasTRNS && len(f.trns) != 6 {
-			f.problem("tRNS for truecolour must be 6 bytes, got %d", len(f.trns))
+			f.problem("tRNS for truecolor must be 6 bytes, got %d", len(f.trns))
 		}
 	case pngGrayAlpha, pngRGBA:
 		if f.hasTRNS {
-			f.problem("tRNS chunk is not allowed with colour type %d (alpha channel present)", h.colorType)
+			f.problem("tRNS chunk is not allowed with color type %d (alpha channel present)", h.colorType)
 		}
 	}
 }
@@ -433,8 +433,8 @@ func (f *pngFile) checkPalette() {
 // animated reports whether the file carries an animation control chunk.
 func (f *pngFile) animated() bool { return f.actl != nil }
 
-// hasAlpha is structural: an alpha channel (colour type 4/6) or a tRNS chunk
-// (palette alpha, or a single transparent colour for grey/RGB).
+// hasAlpha is structural: an alpha channel (color type 4/6) or a tRNS chunk
+// (palette alpha, or a single transparent color for grey/RGB).
 func (f *pngFile) hasAlpha() bool {
 	if f.hasTRNS {
 		return true
@@ -479,10 +479,10 @@ func (f *pngFile) timing() (totalUS, minUS int64) {
 	return totalUS, max(minUS, 0)
 }
 
-// colourDescription words the pixel format for details, e.g. "RGBA 8-bit
-// (colour type 6)" or "indexed 8-bit (colour type 3), 256-entry palette,
+// colorDescription words the pixel format for details, e.g. "RGBA 8-bit
+// (color type 6)" or "indexed 8-bit (color type 3), 256-entry palette,
 // tRNS with 64 entries".
-func (f *pngFile) colourDescription() string {
+func (f *pngFile) colorDescription() string {
 	h := f.ihdr
 	if h == nil {
 		return "unknown pixel format (no IHDR)"
@@ -500,9 +500,9 @@ func (f *pngFile) colourDescription() string {
 	case pngRGBA:
 		name = "RGBA"
 	default:
-		name = "unknown colour type"
+		name = "unknown color type"
 	}
-	s := fmt.Sprintf("%s %d-bit (colour type %d)", name, h.bitDepth, h.colorType)
+	s := fmt.Sprintf("%s %d-bit (color type %d)", name, h.bitDepth, h.colorType)
 	if h.colorType == pngIndexed {
 		if f.plte >= 0 {
 			s += fmt.Sprintf(", %d-entry palette", f.plte)
@@ -516,7 +516,7 @@ func (f *pngFile) colourDescription() string {
 	case f.hasTRNS && h.colorType == pngIndexed:
 		s += fmt.Sprintf(", tRNS with %d entries (8-bit alpha)", len(f.trns))
 	case f.hasTRNS:
-		s += ", tRNS (one transparent colour)"
+		s += ", tRNS (one transparent color)"
 	}
 	if h.interlace == 1 {
 		s += ", Adam7 interlaced"

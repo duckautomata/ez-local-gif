@@ -83,7 +83,7 @@ func TestDisposeCompleteFramesLeavesOthersAlone(t *testing.T) {
 	restore[1].disposal = 3
 	opaque := []cvFrame{{rect: cvFull, fill: 4, delay: 4, disposal: 1}, {rect: cvFull, fill: 3, delay: 4, disposal: 1}}
 	for name, frames := range map[string][]cvFrame{
-		"a frame smaller than the screen": sub, "a local colour table": local, "a frame without GCE": noGCE,
+		"a frame smaller than the screen": sub, "a local color table": local, "a frame without GCE": noGCE,
 		"disposal 3": restore, "no transparent frame at all": opaque,
 	} {
 		in := encodeCv(t, frames)

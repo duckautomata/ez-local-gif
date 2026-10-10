@@ -475,10 +475,10 @@ func TestScanMasterAlpha(t *testing.T) {
 	// A non-alpha byte below 255 must not count.
 	buf[masterAlphaChunk*2+7] = 0xFF
 	buf[masterAlphaChunk*2+6] = 0x00
-	p3 := filepath.Join(dir, "colour.rgba")
+	p3 := filepath.Join(dir, "color.rgba")
 	os.WriteFile(p3, buf, 0o644)
 	if has, _ := scanMasterAlpha(p3); has {
-		t.Error("colour byte counted as alpha")
+		t.Error("color byte counted as alpha")
 	}
 	if _, err := scanMasterAlpha(filepath.Join(dir, "missing")); err == nil {
 		t.Error("missing file accepted")
@@ -514,7 +514,7 @@ func TestGifsicleLoopWiring(t *testing.T) {
 // TestHoldRepairOptions pins the two gifsicle passes of repairGIFHolds: step
 // A coalesces to full-canvas disposal-2 frames without the optimiser and
 // without anything lossy (it must stay pixel-exact — it is also the
-// fallback), step B re-optimises with the caller's lossy / colours / dither.
+// fallback), step B re-optimises with the caller's lossy / colors / dither.
 func TestHoldRepairOptions(t *testing.T) {
 	coalesce, reopt := holdRepairOptions(enc.GifsicleOptions{Lossy: 60, Colors: 64, Loop: 2, Unoptimize: true, NoOptimize: true, OptimizeLevel: 3, NoCareful: true})
 	if got, want := strings.Join(enc.GifsicleArgs("in.gif", "out.gif", coalesce), " "), "-U --disposal=background --careful --loopcount=2 in.gif -o out.gif"; got != want {

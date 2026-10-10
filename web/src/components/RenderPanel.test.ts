@@ -5,10 +5,8 @@
 // under the cap. The Render button stays enabled either way.
 import { render } from 'svelte/server';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Job, MatteStatus, ProbeInfo, Source } from '../lib/api';
+import type { ProbeInfo, Source } from '../lib/api';
 import { resetFeatures, setFeatures } from '../lib/capabilities.svelte';
-import { resetMatte, setMatteStatus } from '../lib/matte.svelte';
-import { render as renderState, resetRender } from '../lib/render.svelte';
 import { app, applyPreset, resetApp, setSource } from '../lib/state.svelte';
 import RenderPanel from './RenderPanel.svelte';
 
@@ -183,95 +181,5 @@ describe('RenderPanel (SSR): frame-master estimate', () => {
     app.ops.speed.enabled = false;
     app.ops.fps.enabled = false;
     expect(html()).not.toContain('Frames export is capped');
-  });
-});
-
-// Phase 5b: with the AI mode on, the estimate line appends the matte pass's
-// predicted time from /api/matte's ms per frame, and a refusal note appears
-// when the clip is over the server's matte caps (jobs refuses up-front).
-describe('RenderPanel (SSR): AI matte estimate and caps', () => {
-  afterEach(() => {
-    resetFeatures();
-    resetMatte();
-    resetRender();
-    resetApp();
-  });
-  function status(over: Partial<MatteStatus> = {}): MatteStatus {
-    return { enabled: true, device: 'cuda', defaultModel: 'isnet-anime', models: { 'isnet-anime': { label: 'Anime (fast)', state: 'ready', msPerFrame: 18 }, 'birefnet-lite': { label: 'General (precise)', state: 'ready', msPerFrame: 170 } }, maxSeconds: 600, maxFrames: 3000, ...over };
-  }
-  const matteNote = (out: string) => (out.match(/<p class="note error estimate matte[^"]*"[^>]*>([\s\S]*?)<\/p>/)?.[1] ?? '').replace(/<[^>]+>/g, '');
-
-  it('appends "· up to ~N s AI matte (GPU)" from the frame count × ms per frame of the chosen model; nothing without AI or a measurement', () => {
-    setSource(src);
-    applyPreset('chat');
-    setMatteStatus(status());
-    expect(estimateText(html())).not.toContain('AI matte');
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai' };
-    // 704 frames × (18 + 2) ms = 14.08 s
-    expect(estimateText(html())).toBe('2560×1440 · 704 frames · ~9.7 GiB of decoded frames · up to ~14 s AI matte (GPU)');
-    expect(html()).not.toContain('note error');
-    // the precise model: 704 × 172 ms = 121 s → "2 min"
-    app.ops.background.ai.model = 'birefnet-lite';
-    expect(estimateText(html())).toContain('· up to ~2 min AI matte (GPU)');
-    // on CPU the device word follows
-    setMatteStatus(status({ device: 'cpu', models: { 'isnet-anime': { label: '', state: 'ready', msPerFrame: 136 } } }));
-    app.ops.background.ai.model = 'isnet-anime';
-    expect(estimateText(html())).toContain('· up to ~97 s AI matte (CPU)'); // 704 × 138 ms
-    // a bounce doubles the master, not the mattes: the suffix stays at the forward count
-    app.ops.bounce = true;
-    const bounced = estimateText(html());
-    expect(bounced).toContain('1408 frames');
-    expect(bounced).toContain('· up to ~97 s AI matte (CPU)');
-    app.ops.bounce = false;
-    // no measurement yet (loading) → no suffix; no status at all → none either
-    setMatteStatus(status({ models: { 'isnet-anime': { label: '', state: 'loading' } } }));
-    expect(estimateText(html())).not.toContain('AI matte');
-    setMatteStatus(null);
-    expect(estimateText(html())).not.toContain('AI matte');
-    // the mode off: the plain line
-    app.ops.background.enabled = false;
-    setMatteStatus(status());
-    expect(estimateText(html())).toBe('2560×1440 · 704 frames · ~9.7 GiB of decoded frames');
-  });
-
-  it('over the matte caps: the server’s refusal note with the way out, next to the (muted) master estimate', () => {
-    setSource(src);
-    applyPreset('chat');
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai' };
-    // the frame cap: 704 frames over a 500-frame EZLG_MATTE_MAX_FRAMES
-    setMatteStatus(status({ maxFrames: 500 }));
-    let out = html();
-    expect(matteNote(out)).toBe("An AI matte of 704 frames is over this server's 500-frame cap (EZLG_MATTE_MAX_FRAMES), so Render will be refused (unless this clip’s matte is already cached): trim the clip or lower the fps.");
-    expect(out).toMatch(/<p class="estimate small muted[^"]*"/); // the master line stays muted: the master cap is unknown here
-    // the seconds cap: CPU lite at 900 ms × 704 frames ≈ 10.6 min over 600 s
-    setMatteStatus(status({ device: 'cpu', models: { 'birefnet-lite': { label: '', state: 'ready', msPerFrame: 898 } } }));
-    app.ops.background.ai.model = 'birefnet-lite';
-    out = html();
-    expect(matteNote(out)).toBe(
-      "An AI matte of 704 frames would take up to ~11 min on this server's CPU — over its 600 s cap (EZLG_MATTE_MAX_SECONDS), so Render will be refused (unless this clip’s matte is already cached): trim the clip, lower the fps or pick a faster model.",
-    );
-    expect(estimateText(out)).toContain('· up to ~11 min AI matte (CPU)');
-    // trimmed under the cap: the note goes, the suffix stays
-    app.ops.trim = { enabled: true, start: 0, end: 10 }; // 300 frames × 900 ms = 270 s
-    out = html();
-    expect(matteNote(out)).toBe('');
-    expect(estimateText(out)).toContain('· up to ~5 min AI matte (CPU)');
-    // the Render button is never gated on it
-    const button = out.match(/<button[^>]*class="primary big[^"]*"[^>]*>/)?.[0] ?? '';
-    expect(button).not.toContain('disabled');
-  });
-
-  it('a running job at the matte stage reads "AI matte" with the pass’s message', () => {
-    setSource(src);
-    applyPreset('chat');
-    const job: Job = { id: 'j1', recipeHash: 'b'.repeat(64), recipe: { v: 1, sources: ['a'.repeat(64)], ops: [{ kind: 'matte' }], output: { format: 'gif' } }, state: 'running', stage: 'matte', percent: 12, message: '24/45 · GPU', created: '' };
-    renderState.running = true;
-    renderState.job = job;
-    const out = html();
-    expect(out).toContain('<b>AI matte</b>');
-    expect(out).toContain('24/45 · GPU');
-    expect(out).toContain('12%');
-    renderState.job = { ...job, stage: 'master', message: '' };
-    expect(html()).toContain('<b>Decoding frames</b>');
   });
 });

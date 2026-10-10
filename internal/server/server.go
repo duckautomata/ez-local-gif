@@ -41,71 +41,11 @@
 //	GET  /api/fonts                 Phase 3: {"fonts": [{"family","style","file"}, …]} — faces drawtext can use
 //	                                (fc-list inside the container; empty list when unavailable; always an
 //	                                array, never null; Cache-Control: no-cache)
-//	GET  /api/matte                 Phase 5b: the AI matte sidecar as of the app's last probe (a snapshot,
-//	                                jobs.Manager.MatteStatus; Cache-Control: no-cache — the SPA polls it):
-//	                                {"enabled": <features.matte>, "device": "cuda"|"cpu"|"unavailable"|"",
-//	                                "reason": "<why the feature or the device is off, when it is>",
-//	                                "gpu": {"name","totalGiB","freeGiB"} | absent,
-//	                                "defaultModel": "isnet-anime", "models": {id: {"label", "state":
-//	                                ready|loading|downloading|missing|unavailable, "percent", "msPerFrame",
-//	                                "reason", "licence", "sizes"}, …} (always an object, empty without a
-//	                                sidecar), "maxSeconds": N, "maxFrames": N (EZLG_MATTE_MAX_SECONDS /
-//	                                _MAX_FRAMES as applied)}. 200 on every install; "enabled" is false and
-//	                                "reason" says why on one without EZLG_MATTE_URL or with the sidecar down.
-//	                                Phase 5c (each omitted when the sidecar did not report it): "device" is
-//	                                the EFFECTIVE device passes run on (the preference below, else the
-//	                                sidecar's default) and "defaultModel" its default; "devices": ["cuda",
-//	                                "cpu"] (every device the sidecar offers — the SPA's "Run on" select
-//	                                shows when there are several); "defaultModels": {device: id}; per model
-//	                                "kind": "segmenter"|"tracker" ("" = segmenter; the tracker is the
-//	                                guided model "sam2-tiny"), "resident": bool (a session is loaded on
-//	                                the default device right now — "ready" alone means downloaded and
-//	                                self-tested, the first pass adds the model load) and "devices":
-//	                                {device: {"state", "reason", "precision", "percent", "size",
-//	                                "msPerFrame", "resident"}} — that device's own readiness, estimate
-//	                                and residency.
-//	PUT  /api/matte/settings        Phase 5c: {"device": "cuda"|"cpu"|""} → the server-side device
-//	                                preference for matte passes (jobs.Manager.SetMatteDevice: validated
-//	                                against the devices the sidecar offers, persisted under
-//	                                /data/mattes/settings.json; "" resets to the sidecar's default; the
-//	                                device is never a recipe parameter) → 200 with the GET /api/matte
-//	                                object ("device" now the effective one). 400 for a body without
-//	                                "device", a name that is not a short lowercase token, or a device the
-//	                                sidecar does not offer (the error lists the offered ones); 503 naming
-//	                                the compose profile when there is no sidecar to validate against.
-//	POST /api/matte/unload          Phase 5c: asks the sidecar to release every resident model session now
-//	                                (jobs.Manager.UnloadMatte; the SPA calls it when the Background card
-//	                                leaves the AI mode or is disabled) → 204, always: best effort, a
-//	                                sidecar that is off or does not answer is logged, never reported. No
-//	                                body.
-//	POST /api/matte/prompt          Phase 5c (guided mode): {"src" | "sources", "ops", "output", "frame": N,
-//	                                "prompts": [{"frame": N, "points": [[x, y, label]], "box": [x0, y0, x1,
-//	                                y1]}]} — the recipe whose matte op names the guided model
-//	                                ("sam2-tiny", or any model GET /api/matte lists with kind "tracker"),
-//	                                the OUTPUT frame index to mask and the matte op's own prompts array
-//	                                (coordinates 0..1 of the source frame, label 1 = keep / 0 = remove; a
-//	                                {"obj", "prompts"} object is accepted too); only the prompts of
-//	                                "frame" are used → image/png: that frame's 8-bit gray mask from the
-//	                                tracker's image predictor, the live overlay the SPA draws after every
-//	                                click (jobs.Manager.MattePromptMask; Cache-Control: private,
-//	                                max-age=3600). 202 with the /api/still pending body while the tracker
-//	                                is loading or downloading, or — a mask prompt ({"frame": N, "maskFrom":
-//	                                "edge"}, the 5c follow-up) whose edge matte is not computed — "idle"
-//	                                with "pendingReason" ("compute the General matte first …"; the
-//	                                status's own "reason" is never overwritten) and the edge pass's own
-//	                                running state while one is in flight; 400 without a matte op, with a model that is
-//	                                not a tracker, without "prompts", with no prompts on "frame" or with
-//	                                prompts that have neither a box nor a positive point; 404 for an
-//	                                unknown source, 409 for one not probed yet; 503 naming the compose
-//	                                profile when no sidecar can answer.
 //	POST /api/proxy                 Phase 3: {"sources": [hash, …], "ops": [...], "output": {...}, "maxW": 360,
 //	                                "maxSeconds": 10} → image/webp (animated, lossy, alpha): the Play preview.
 //	                                Same memo/cancel semantics as /api/still ("src" is accepted too; 0 = the
 //	                                defaults; negative maxW/maxSeconds → 400). 400 when a source is missing,
-//	                                409 when one is not probed yet, 504 after 60 s. Phase 5b: "eager": true
-//	                                and the 202 pending answer exactly as for /api/still (Phase 5c: Play
-//	                                behaves like a still — it is not eager and answers 202 "idle" until the
-//	                                matte was computed).
+//	                                409 when one is not probed yet, 504 after 60 s.
 //	GET  /api/sources/{hash}        → recipe.Source
 //	                                Phase 3: overlay assets are ordinary uploads; a recipe lists them in
 //	                                "sources" after the main source and overlay ops reference them by index.
@@ -115,24 +55,10 @@
 //	                                Phase 3: "sources": [hash, …] (main source first) in place of — or
 //	                                agreeing with — "src" (jobs.Manager.StillSources); 404 for an
 //	                                unknown source, 409 for one not probed yet
-//	                                Phase 5b: a recipe with a matte op whose AI matte is not on disk yet
-//	                                answers 202 Accepted (Cache-Control: no-store) with
-//	                                {"pending": "matte", "state": running|idle|loading|downloading,
-//	                                "done": N, "total": N, "percent": 0..100, "estimateMs": N, plus every
-//	                                field of the GET /api/matte object at the same level} — the pass runs
-//	                                (or waits on the model), the client keeps its picture and re-requests.
-//	                                Phase 5c: a preview never starts a pass on its own — with no pass in
-//	                                flight the state is "idle" (nothing started; the SPA shows "AI matte
-//	                                not computed — Compute") until a request with "eager": true (the
-//	                                Compute matte button) or a render starts it; 503 naming the compose
-//	                                profile when no sidecar can produce the matte (jobs.ErrMatteUnavailable)
 //	POST /api/jobs                  recipe.Recipe → 202 jobs.Job (503 + Retry-After while shutting down;
 //	                                400 for an output.target outside the set /api/capabilities "targets"
 //	                                lists — the error names the valid ones; 400 for a source that is not
-//	                                uploaded, 409 for one not probed yet — every entry of "sources";
-//	                                Phase 5b: 400 for a recipe with a matte op while features.matte is
-//	                                false — the error carries the reason and names the compose profile
-//	                                "docker compose --profile matte-gpu up -d" — checked before sources)
+//	                                uploaded, 409 for one not probed yet — every entry of "sources")
 //	GET  /api/jobs/{id}             → jobs.Job
 //	DELETE /api/jobs/{id}           cancel → 204
 //	GET  /api/jobs/{id}/events      text/event-stream of jobs.Event ("event: progress|done|error",
@@ -164,25 +90,9 @@
 //	                                "fonts": <true iff /api/fonts lists at least one face>,
 //	                                "feather": true, "bounce": true (the Phase 4 op kinds, named so
 //	                                the SPA can gate those cards on older servers),
-//	                                "morph": true (the Phase 5a op kind, named for the same reason —
-//	                                an older server 400s the unknown kind: an op {"kind": "morph",
-//	                                "params": {"close": bool, "grow": 0..4}} cleans the alpha plane
-//	                                with 3x3 morphology, hoisted into the keying group like feather
-//	                                — "close" (dilation then erosion) fills pinholes of up to 1 px
-//	                                without growing the silhouette, "grow" adds that many extra
-//	                                dilations in SOURCE pixels; at least one of the two must be set
-//	                                or the recipe is a compile error; the colour planes are never
-//	                                touched and the op is skipped on frames without alpha —
-//	                                recipe.MorphParams; the SPA gates the Background card's Edge
-//	                                cleanup fold on it),
 //	                                "inputPick": <true iff the /input dir was readable at startup>,
 //	                                "outputSave": <true iff the /output dir was writable at startup>,
-//	                                "gifski": <true iff the gifski binary answered its version probe>,
-//	                                "matte": <true iff a matte sidecar is configured (EZLG_MATTE_URL) and
-//	                                answered its last probes — jobs.Manager.MatteEnabled; the Phase 5b
-//	                                op kind {"kind": "matte", "params": {"model": "<id>"}} (recipe.
-//	                                MatteParams) is refused with 400 by POST /api/jobs while it is false,
-//	                                and GET /api/matte carries the reason and the live sidecar state>}}
+//	                                "gifski": <true iff the gifski binary answered its version probe>}}
 //	GET  /healthz                   "ok"
 //	GET  /*                         embedded SPA: real files as-is; extension-less paths fall back
 //	                                to index.html (client routes); paths with a file extension or
@@ -204,14 +114,14 @@
 // Result files are served with strict name validation; ?dl=1 names the
 // download after the source.
 //
-// Cross-site protection: state-changing requests (POST/PUT/DELETE) that a
+// Cross-site protection: state-changing requests (POST/DELETE) that a
 // browser marks as coming from another site — Sec-Fetch-Site: cross-site,
 // or an Origin whose host is not this server's — are refused with 403, and
 // the JSON endpoints (/api/still, /api/proxy, /api/jobs,
 // /api/sources/from-result, /api/sources/from-input,
-// /api/results/{recipeHash}/save, /api/matte/settings, /api/matte/prompt)
-// require Content-Type application/json (415 otherwise). The SPA's own
-// requests and header-less clients such as curl are unaffected.
+// /api/results/{recipeHash}/save) require Content-Type application/json
+// (415 otherwise). The SPA's own requests and header-less clients such as curl
+// are unaffected.
 //
 // Lifecycle: NewServer returns a *Server whose Shutdown cancels every render
 // accepted through POST /api/jobs (and any preview pre-warming), ends open
@@ -265,13 +175,6 @@ const (
 	fontsTimeout = 15 * time.Second
 	// capabilitiesTimeout bounds the tool probes behind GET /api/capabilities.
 	capabilitiesTimeout = 10 * time.Second
-	// matteSettingsTimeout bounds PUT /api/matte/settings (Phase 5c: the
-	// manager validates the device against its probe snapshot and writes
-	// one small settings file).
-	matteSettingsTimeout = 15 * time.Second
-	// matteUnloadTimeout bounds the sidecar round trip behind POST
-	// /api/matte/unload (best effort: the answer is 204 either way).
-	matteUnloadTimeout = 15 * time.Second
 	// sseShutdownGrace is how long an open SSE stream keeps forwarding
 	// events after Shutdown begins, so the client sees the job's terminal
 	// "cancelled" event instead of a bare EOF, before the stream is ended.
@@ -394,10 +297,6 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /api/sources/{hash}", s.handleGetSource)
 	mux.HandleFunc("GET /api/input", s.handleListInput)
 	mux.HandleFunc("GET /api/fonts", s.handleFonts)
-	mux.HandleFunc("GET /api/matte", s.handleMatte)
-	mux.HandleFunc("PUT /api/matte/settings", s.handleMatteSettings)
-	mux.HandleFunc("POST /api/matte/unload", s.handleMatteUnload)
-	mux.HandleFunc("POST /api/matte/prompt", s.handleMattePrompt)
 	mux.HandleFunc("POST /api/still", s.handleStill)
 	mux.HandleFunc("POST /api/proxy", s.handleProxy)
 	mux.HandleFunc("POST /api/jobs", s.handleCreateJob)

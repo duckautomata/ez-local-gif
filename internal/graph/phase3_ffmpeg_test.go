@@ -1,7 +1,7 @@
 package graph_test
 
 // Real-ffmpeg pixel checks of the Phase 3 recipes: chromakey/colorkey +
-// despill, reverse, drawtext (font=, colours, anchors, enable, text-file
+// despill, reverse, drawtext (font=, colors, anchors, enable, text-file
 // path escaping) and overlays (every anchor, looping gif/apng/webp/video,
 // hold of a non-looping overlay, opacity, base alpha, timing). External test
 // package so internal/graph stays process-free; skips when ffmpeg is not on
@@ -145,8 +145,8 @@ func isRGBA(p [4]byte, r, g, b, a byte, tol int) bool {
 
 // --- keying -----------------------------------------------------------------
 
-// keyFrame is a 16x16 frame on a solid screen colour with an 8x8 square of
-// subject colour at (4,4) and a 1 px ring around it blended half/half with
+// keyFrame is a 16x16 frame on a solid screen color with an 8x8 square of
+// subject color at (4,4) and a 1 px ring around it blended half/half with
 // the screen (what an anti-aliased edge looks like), all opaque.
 func keyFrame(screen, subject color.NRGBA) *image.NRGBA {
 	img := solid(16, 16, screen)
@@ -197,12 +197,15 @@ func TestChromaKeyPixels(t *testing.T) {
 
 	t.Run("green screen: background keyed, subject intact, despill pulls the green out of the edge", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{greenInfo}, []recipe.Op{{Kind: recipe.OpChromaKey}}, out)
-		if !p.HasAlpha || !strings.Contains(p.Filter, "format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3") {
+		if !p.HasAlpha || !strings.Contains(p.Filter, "format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,format=gbrap,split=3[d1][d1s][d1m];[d1s]format=rgba,despill=type=green:mix=0.5:expand=0,format=gbrap[d1d];") {
 			t.Fatalf("plan: alpha %v filter %s", p.HasAlpha, p.Filter)
 		}
 		// The (128,128,0) ring keeps alpha 255 (its chroma is far from the
-		// screen) and despill drops its green to 76 (measured on 9.0.1).
-		check(t, p3Render(t, ff, greenClip, p, nil, nil), 16, 76, 0, "despill")
+		// screen) and lies in the despill band next to the keyed screen:
+		// despill (mix 0.5, expand 0: G - (R+B)/2 = 64 at full strength)
+		// drops its green to 69 through the blurred band mask (measured on
+		// the 2026-08 git build).
+		check(t, p3Render(t, ff, greenClip, p, nil, nil), 16, 69, 0, "despill")
 	})
 	t.Run("despill off leaves the green fringe", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{greenInfo}, []recipe.Op{{Kind: recipe.OpChromaKey, Params: []byte(`{"despillOff":true}`)}}, out)
@@ -210,14 +213,31 @@ func TestChromaKeyPixels(t *testing.T) {
 	})
 	t.Run("blue screen despills blue", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{blueInfo}, []recipe.Op{{Kind: recipe.OpChromaKey, Params: []byte(`{"color":"0000ff"}`)}}, out)
-		if !strings.Contains(p.Filter, "despill=type=blue:mix=0.6:expand=0.3:green=0:blue=-1,") {
+		if !strings.Contains(p.Filter, "despill=type=blue:mix=0.5:expand=0:green=0:blue=-1,") {
 			t.Fatalf("filter: %s", p.Filter)
 		}
-		check(t, p3Render(t, ff, blueClip, p, nil, nil), 16, 0, 76, "blue despill")
+		check(t, p3Render(t, ff, blueClip, p, nil, nil), 16, 0, 69, "blue despill")
+	})
+	t.Run("despill leaves the subject's interior alone", func(t *testing.T) {
+		// A green-leaning subject color far from the screen's chroma: a
+		// full-frame despill (G - (R+B)/2) would take it from G 160 to 80 —
+		// what made a blue-screen video look grey / brown. Masked to the
+		// band around the keyed edge, the interior keeps its color.
+		sea := color.NRGBA{R: 40, G: 160, B: 120, A: 255}
+		clip, info := pngClip(t, ff, dir, "sea", []image.Image{keyFrame(green, sea), keyFrame(green, sea)}, 10, false)
+		p := compileSrcs(t, []recipe.ProbeInfo{info}, []recipe.Op{{Kind: recipe.OpChromaKey}}, out)
+		for i, f := range p3Render(t, ff, clip, p, nil, nil) {
+			if bg := pixel(f, 16, 0, 0); bg[3] != 0 {
+				t.Errorf("frame %d: background alpha %d, want 0", i, bg[3])
+			}
+			if c := pixel(f, 16, 8, 8); !isRGBA(c, 40, 160, 120, 255, 3) {
+				t.Errorf("frame %d: interior pixel %v, want the subject's (40,160,120) untouched", i, c)
+			}
+		}
 	})
 	t.Run("keying happens before the crop, at full resolution", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{greenInfo}, []recipe.Op{{Kind: recipe.OpCrop, Params: []byte(`{"x":2,"y":2,"w":12,"h":12}`)}, {Kind: recipe.OpChromaKey}}, out)
-		if p.Width != 12 || !strings.Contains(p.Filter, ",despill=type=green:mix=0.6:expand=0.3,crop=12:12:2:2:exact=1,") {
+		if p.Width != 12 || !strings.Contains(p.Filter, "maskedmerge,format=rgba,crop=12:12:2:2:exact=1,") {
 			t.Fatalf("plan: %dx%d %s", p.Width, p.Height, p.Filter)
 		}
 		frames := p3Render(t, ff, greenClip, p, nil, nil)
@@ -238,7 +258,7 @@ func TestColorKeyPixels(t *testing.T) {
 	clip, info := pngClip(t, ff, dir, "green", []image.Image{keyFrame(green, red), keyFrame(green, red)}, 10, false)
 	out := recipe.Output{Format: "webp"}
 
-	t.Run("exact colour keyed, edge and subject untouched", func(t *testing.T) {
+	t.Run("exact color keyed, edge and subject untouched", func(t *testing.T) {
 		p := compileSrcs(t, []recipe.ProbeInfo{info}, []recipe.Op{{Kind: recipe.OpColorKey, Params: []byte(`{"color":"#00FF00"}`)}}, out)
 		if !p.HasAlpha || !strings.Contains(p.Filter, "format=rgba,colorkey=color=0x00ff00:similarity=0.08:blend=0,") {
 			t.Fatalf("plan: alpha %v filter %s", p.HasAlpha, p.Filter)
@@ -275,10 +295,10 @@ func TestColorKeyPixels(t *testing.T) {
 }
 
 // alphaProbe is a 16x16 transparent frame with three opaque-or-not 4x4
-// blocks: half-alpha red at (6,2), opaque green (the key colour) at (10,2)
+// blocks: half-alpha red at (6,2), opaque green (the key color) at (10,2)
 // and opaque red at (2,10). Interior pixels of each block — and of the
 // transparent background at (3,3) — have a uniform 3x3 neighbourhood, so
-// chromakey's neighbourhood average reads one colour there.
+// chromakey's neighbourhood average reads one color there.
 func alphaProbe() *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
 	block := func(x0, y0 int, c color.NRGBA) {
@@ -295,13 +315,13 @@ func alphaProbe() *image.NRGBA {
 }
 
 // TestKeyKeepsAlphaPixels: ffmpeg's chromakey and colorkey assign the alpha
-// plane from the colour distance alone, so a bare key on a source that
-// already carries transparency turned every transparent pixel whose colour
-// is not the key colour opaque ((0,0,0,0) → (0,0,0,255)) and hardened
+// plane from the color distance alone, so a bare key on a source that
+// already carries transparency turned every transparent pixel whose color
+// is not the key color opaque ((0,0,0,0) → (0,0,0,255)) and hardened
 // half-alpha edges to 255 (verified on FFmpeg 9.0.1 — the gyan build, the
 // 2026-08 git build and the ezlg-dev image agree). The compiled wrapper
 // (keyKeepingAlpha) intersects the incoming alpha with the key's matte:
-// transparent stays 0, the half-alpha edge stays 128, the key colour goes
+// transparent stays 0, the half-alpha edge stays 128, the key color goes
 // to 0 and the opaque subject stays 255.
 func TestKeyKeepsAlphaPixels(t *testing.T) {
 	ff := ffmpegOrSkip(t)
@@ -312,7 +332,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 	wrapper := "split[k1][k1m];[k1m]alphaextract[k1a0];[k1]"
 
 	// checkProbe asserts the four probe pixels of every frame; tol is the
-	// colour tolerance (the chromakey chain's yuva444p round trip costs 1,
+	// color tolerance (the chromakey chain's yuva444p round trip costs 1,
 	// a lossy ProRes source a few more), atol the alpha tolerance.
 	checkProbe := func(t *testing.T, frames [][]byte, name string, tol, atol int) {
 		t.Helper()
@@ -327,7 +347,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 				t.Errorf("%s frame %d: half-alpha edge %v, want (255,0,0,128)", name, i, px)
 			}
 			if px := pixel(f, 16, 11, 3); !near(px[3], 0, atol) {
-				t.Errorf("%s frame %d: key-colour pixel %v, want alpha 0 (keyed)", name, i, px)
+				t.Errorf("%s frame %d: key-color pixel %v, want alpha 0 (keyed)", name, i, px)
 			}
 			if px := pixel(f, 16, 3, 11); !near(px[3], 255, atol) || !near(px[0], 255, tol) || !near(px[1], 0, tol) || !near(px[2], 0, tol) {
 				t.Errorf("%s frame %d: subject pixel %v, want opaque red", name, i, px)
@@ -341,7 +361,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 		op   recipe.Op
 		key  string // the bare key stages the wrapper must carry
 	}{
-		{"chromakey", chroma, "[k1]format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3,format=rgba,split[k1k][k1km];"},
+		{"chromakey", chroma, "[k1]format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,format=rgba,split[k1k][k1km];"},
 		{"colorkey", colorGreen, "[k1]format=rgba,colorkey=color=0x00ff00:similarity=0.08:blend=0,split[k1k][k1km];"},
 	} {
 		t.Run(tc.name+" on an rgba source keeps its alpha", func(t *testing.T) {
@@ -376,7 +396,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 		}
 		// The planar-YUV alpha head turns the tv-range 12-bit decode into
 		// exact 8-bit rgba alpha, so the transparent pixel is exactly 0 and
-		// the two mattes meet at 8 bits; only the colour is lossy.
+		// the two mattes meet at 8 bits; only the color is lossy.
 		frames := p3Render(t, ff, mov, p, nil, nil)
 		if len(frames) != discFrames {
 			t.Fatalf("%d frames, want %d", len(frames), discFrames)
@@ -395,7 +415,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 		// background and the already keyed green at 0.
 		colorRed := recipe.Op{Kind: recipe.OpColorKey, Params: []byte(`{"color":"ff0000"}`)}
 		p := compileSrcs(t, []recipe.ProbeInfo{info}, []recipe.Op{chroma, colorRed}, out)
-		if !strings.Contains(p.Filter, "alphamerge,split[k2][k2m];[k2m]alphaextract[k2a0];[k2]format=rgba,colorkey=color=0xff0000") {
+		if !strings.Contains(p.Filter, "maskedmerge,format=rgba,split[k2][k2m];[k2m]alphaextract[k2a0];[k2]format=rgba,colorkey=color=0xff0000") {
 			t.Fatalf("filter: %s", p.Filter)
 		}
 		for i, f := range p3Render(t, ff, clip, p, nil, nil) {
@@ -411,12 +431,12 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 		green := color.NRGBA{G: 255, A: 255}
 		red := color.NRGBA{R: 255, A: 255}
 		screen, sinfo := pngClip(t, ff, dir, "screen", []image.Image{keyFrame(green, red), keyFrame(green, red)}, 10, false)
-		// A second key of a colour that is not in the picture changes nothing:
+		// A second key of a color that is not in the picture changes nothing:
 		// the background keyed by the first stays transparent (a bare second
 		// key brought it back to 255), the subject and its edge stay opaque.
 		blue := recipe.Op{Kind: recipe.OpColorKey, Params: []byte(`{"color":"0000ff"}`)}
 		p := compileSrcs(t, []recipe.ProbeInfo{sinfo}, []recipe.Op{chroma, blue}, out)
-		if !strings.Contains(p.Filter, "fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=") || !strings.Contains(p.Filter, "expand=0.3,"+wrapper+"format=rgba,colorkey=color=0x0000ff") {
+		if !strings.Contains(p.Filter, "fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=") || !strings.Contains(p.Filter, "maskedmerge,format=rgba,"+wrapper+"format=rgba,colorkey=color=0x0000ff") {
 			t.Fatalf("filter: %s", p.Filter)
 		}
 		for i, f := range p3Render(t, ff, screen, p, nil, nil) {
@@ -430,7 +450,7 @@ func TestKeyKeepsAlphaPixels(t *testing.T) {
 				t.Errorf("frame %d: edge %v, want alpha 255", i, e)
 			}
 		}
-		// A second key of the subject's colour removes the subject and keeps
+		// A second key of the subject's color removes the subject and keeps
 		// the background transparent.
 		keyRed := recipe.Op{Kind: recipe.OpColorKey, Params: []byte(`{"color":"ff0000","similarity":0.05}`)}
 		p = compileSrcs(t, []recipe.ProbeInfo{sinfo}, []recipe.Op{chroma, keyRed}, out)
@@ -605,7 +625,7 @@ func TestDrawTextPixels(t *testing.T) {
 		return m
 	}
 	const layerTail = ",format=gbrap,setparams=alpha_mode=premultiplied,unpremultiply=inplace=1,format=rgba"
-	t.Run("RRGGBBAA colour renders at exactly its alpha over a clear base", func(t *testing.T) {
+	t.Run("RRGGBBAA color renders at exactly its alpha over a clear base", func(t *testing.T) {
 		p, half := render(t, clear, clearInfo, []recipe.Op{textOp(`{"text":"Hi","color":"ff000080","size":20,"x":2,"y":2}`)})
 		if !strings.Contains(p.Filter, "[b1];color=c=0x00000000:s=64x32:r=10,format=rgba,drawtext=textfile=__EZLG_TEXT_1__:expansion=none:font=DejaVu Sans:fontsize=20:fontcolor=0xff0000:x=2:y=2"+layerTail+",colorchannelmixer=aa=0.502[t1];[b1][t1]overlay=format=auto:shortest=1:eof_action=repeat,format=rgba[out]") {
 			t.Fatalf("filter: %s", p.Filter)
@@ -618,10 +638,10 @@ func TestDrawTextPixels(t *testing.T) {
 			t.Errorf("max alpha %d with fontcolor 0xff000080, want 128", a)
 		}
 		if a := maxA(full[0]); a != 255 {
-			t.Errorf("max alpha %d with an opaque colour, want 255", a)
+			t.Errorf("max alpha %d with an opaque color, want 255", a)
 		}
 	})
-	t.Run("translucent white glyphs over a clear base keep their colour, edges included", func(t *testing.T) {
+	t.Run("translucent white glyphs over a clear base keep their color, edges included", func(t *testing.T) {
 		// The layer leaves drawtext premultiplied (white at coverage c is
 		// (255c,255c,255c,255c)); the layer tail makes it straight, so every
 		// glyph pixel — anti-aliased edges too — is pure white at its
@@ -683,7 +703,7 @@ func TestDrawTextPixels(t *testing.T) {
 			}
 		}
 		// Half black over blue is (0,0,127), so the same text with an OPAQUE
-		// box of that colour, which drawtext draws in place, must render
+		// box of that color, which drawtext draws in place, must render
 		// pixel for pixel the same — anti-aliased glyph edges included (a
 		// straight composite of the premultiplied layer darkened them by the
 		// coverage a second time: (15,15,111) where in place gives (61,61,127)).
@@ -737,7 +757,7 @@ func TestDrawTextPixels(t *testing.T) {
 		}
 		frames := p3Render(t, ff, bluePNG, p, nil, []string{path})
 		if len(frames) != 1 {
-			t.Fatalf("%d frames, want 1 (the infinite colour source must not extend a still)", len(frames))
+			t.Fatalf("%d frames, want 1 (the infinite color source must not extend a still)", len(frames))
 		}
 		if px := pixel(frames[0], 16, 15, 15); !isBlue(px) || px[3] != 255 {
 			t.Errorf("corner %v, want opaque blue", px)
@@ -1174,7 +1194,7 @@ func TestCompileDetectPixels(t *testing.T) {
 	if p.Width != 16 || p.Height != 16 || !p.HasAlpha || p.Frames != 3 || p.Reversed || len(p.ExtraInputs) != 0 || len(p.TextFiles) != 0 {
 		t.Fatalf("plan: %dx%d alpha %v frames %d reversed %v extras %d texts %d", p.Width, p.Height, p.HasAlpha, p.Frames, p.Reversed, len(p.ExtraInputs), len(p.TextFiles))
 	}
-	if want := "[0:v]fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,despill=type=green:mix=0.6:expand=0.3,format=rgba[out]"; p.Filter != want {
+	if want := "[0:v]fps=10:round=down,format=rgba,format=yuva444p:color_spaces=bt470bg:color_ranges=tv,chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1,format=gbrap,split=3[d1][d1s][d1m];[d1s]format=rgba,despill=type=green:mix=0.5:expand=0,format=gbrap[d1d];[d1m]alphaextract,erosion,negate,gblur=sigma=0.5,format=gbrap[d1k];[d1][d1d][d1k]maskedmerge,format=rgba[out]"; p.Filter != want {
 		t.Fatalf("filter\n got: %s\nwant: %s", p.Filter, want)
 	}
 	got := p3Render(t, ff, clip, p, nil, nil)

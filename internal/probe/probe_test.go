@@ -412,8 +412,8 @@ func TestDeriveAVIFWithAlphaStream(t *testing.T) {
 }
 
 // avifenc 1.2.1 writes an animated AVIF as a primary still item (+ its alpha
-// item) followed by the colour/alpha tracks; ffprobe 9.0.1 reports them as
-// [Color item 1 frame, Alpha item 1 frame, colour track, alpha track] (see
+// item) followed by the color/alpha tracks; ffprobe 9.0.1 reports them as
+// [Color item 1 frame, Alpha item 1 frame, color track, alpha track] (see
 // TestProbeAVIFIntegration for the real file). The probe must describe the
 // track, not the one-frame item, and name the track's alpha stream.
 const avifencAnimJSON = `{"streams":[
@@ -433,13 +433,13 @@ func TestDeriveAVIFLayouts(t *testing.T) {
 		t.Errorf("animated avif alpha: has=%v stream=%d mode=%v", in.HasAlpha, in.AlphaStream, d.alpha)
 	}
 	if in.ColorStream != 2 {
-		t.Errorf("animated avif colour track must be v:2 (the one-frame primary item is v:0), got %d", in.ColorStream)
+		t.Errorf("animated avif color track must be v:2 (the one-frame primary item is v:0), got %d", in.ColorStream)
 	}
 	if in.Width != 64 || in.Height != 48 || in.Codec != "av1" {
 		t.Errorf("animated avif facts: %+v", in)
 	}
 
-	// Opaque animated AVIF: [Color item, colour track] → no alpha stream.
+	// Opaque animated AVIF: [Color item, color track] → no alpha stream.
 	d = mustDerive(t, `{"streams":[
 	  {"index":0,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"1/1","avg_frame_rate":"1/1","nb_frames":"1","tags":{"title":"Color"}},
 	  {"index":1,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p","r_frame_rate":"10/1","avg_frame_rate":"10/1","duration":"1.000000","nb_frames":"10"}],
@@ -448,7 +448,7 @@ func TestDeriveAVIFLayouts(t *testing.T) {
 		t.Errorf("opaque animated avif reported alpha: %+v", d.info)
 	}
 	if d.info.Kind != recipe.KindAnimation || d.info.Frames != 10 || d.info.ColorStream != 1 {
-		t.Errorf("opaque animated avif (colour track v:1): %+v", d.info)
+		t.Errorf("opaque animated avif (color track v:1): %+v", d.info)
 	}
 
 	// Opaque still: one stream.
@@ -460,7 +460,7 @@ func TestDeriveAVIFLayouts(t *testing.T) {
 	}
 
 	// An alpha plane of another size or frame count does not belong to the
-	// colour stream; a 10-bit gray plane does.
+	// color stream; a 10-bit gray plane does.
 	d = mustDerive(t, `{"streams":[
 	  {"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"yuv420p10le","nb_frames":"1"},
 	  {"codec_name":"av1","codec_type":"video","width":32,"height":24,"pix_fmt":"gray","nb_frames":"1"},
@@ -476,12 +476,12 @@ func TestDeriveAVIFLayouts(t *testing.T) {
 }
 
 // TestDeriveMonochromeAVIF: monochrome (yuv400) AVIFs report a gray pix_fmt
-// for every stream, colour ones included, so pix_fmt alone cannot tell
-// colour from alpha. The most-frames rule must still describe an animation
+// for every stream, color ones included, so pix_fmt alone cannot tell
+// color from alpha. The most-frames rule must still describe an animation
 // by its track (excluding only "Alpha"-titled items — the alpha TRACK of an
 // animation carries default=1 and no title, so only position separates it,
 // and ties go to the first stream: libavif and ffmpeg's avif muxer write
-// the colour track before its alpha track).
+// the color track before its alpha track).
 func TestDeriveMonochromeAVIF(t *testing.T) {
 	grayStream := func(index int, nb string, extra string) string {
 		return `{"index":` + strconv.Itoa(index) + `,"codec_name":"av1","codec_type":"video","width":64,"height":48,"pix_fmt":"gray",
@@ -501,11 +501,11 @@ func TestDeriveMonochromeAVIF(t *testing.T) {
 		t.Errorf("gray animated avif must be described by its track: %+v", d.info)
 	}
 	if d.info.ColorStream != 1 || d.info.AlphaStream != 0 || d.info.HasAlpha {
-		t.Errorf("gray animated avif streams: colour v:%d alpha v:%d has=%v", d.info.ColorStream, d.info.AlphaStream, d.info.HasAlpha)
+		t.Errorf("gray animated avif streams: color v:%d alpha v:%d has=%v", d.info.ColorStream, d.info.AlphaStream, d.info.HasAlpha)
 	}
 
 	// Gray animation with alpha: [gray Color item, gray Alpha item, gray
-	// track, gray alpha track (default=1, no title)] → colour track v:2
+	// track, gray alpha track (default=1, no title)] → color track v:2
 	// (first of the 10-frame tie), alpha track v:3.
 	d = mustDerive(t, avis(
 		grayStream(0, "1", `,"disposition":{"default":1},"tags":{"title":"Color"}`),
@@ -517,7 +517,7 @@ func TestDeriveMonochromeAVIF(t *testing.T) {
 	}
 
 	// Gray still with an alpha item: [gray Color 1f, gray Alpha 1f] → v:0
-	// colour, v:1 alpha, still.
+	// color, v:1 alpha, still.
 	d = mustDerive(t, `{"streams":[`+
 		grayStream(0, "1", `,"disposition":{"default":1},"tags":{"title":"Color"}`)+","+
 		grayStream(1, "1", `,"disposition":{"default":0},"tags":{"title":"Alpha"}`)+
@@ -1010,7 +1010,7 @@ func TestProbeMonochromeAVIFIntegration(t *testing.T) {
 		t.Errorf("monochrome animated avif reduced to a still of the primary item: %+v", info)
 	}
 	if info.ColorStream != 1 || info.AlphaStream != 0 || info.HasAlpha {
-		t.Errorf("monochrome avif streams: colour v:%d alpha v:%d has=%v", info.ColorStream, info.AlphaStream, info.HasAlpha)
+		t.Errorf("monochrome avif streams: color v:%d alpha v:%d has=%v", info.ColorStream, info.AlphaStream, info.HasAlpha)
 	}
 	if info.Width != 64 || info.Height != 48 || info.Codec != "av1" {
 		t.Errorf("monochrome avif facts: %+v", info)
@@ -1161,10 +1161,10 @@ func pngChunk(buf *bytes.Buffer, typ string, data []byte) {
 	buf.Write(tail[:])
 }
 
-// writeRGBTrnsPNG writes a truecolour (colour type 2) PNG with a tRNS colour
+// writeRGBTrnsPNG writes a truecolor (color type 2) PNG with a tRNS color
 // key — a layout Go's encoder never produces and whose DecodeConfig model is
 // the opaque RGBAModel (the config decode stops at IHDR). keyUsed paints
-// pixel (0,0) in the key colour, which ffmpeg decodes as transparent.
+// pixel (0,0) in the key color, which ffmpeg decodes as transparent.
 func writeRGBTrnsPNG(t *testing.T, path string, w, h int, keyUsed bool) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -1173,9 +1173,9 @@ func writeRGBTrnsPNG(t *testing.T, path string, w, h int, keyUsed bool) {
 	binary.BigEndian.PutUint32(ihdr[0:4], uint32(w))
 	binary.BigEndian.PutUint32(ihdr[4:8], uint32(h))
 	ihdr[8] = 8 // bit depth
-	ihdr[9] = 2 // colour type: truecolour
+	ihdr[9] = 2 // color type: truecolor
 	pngChunk(&buf, "IHDR", ihdr)
-	// Colour key (255, 0, 255), one 16-bit sample per channel.
+	// Color key (255, 0, 255), one 16-bit sample per channel.
 	pngChunk(&buf, "tRNS", []byte{0, 255, 0, 0, 0, 255})
 	var raw bytes.Buffer
 	for y := 0; y < h; y++ {
@@ -1206,7 +1206,7 @@ func writeRGBTrnsPNG(t *testing.T, path string, w, h int, keyUsed bool) {
 // writeSeqGIF writes one single-frame GIF file as sequence frame n of dir.
 // When transparent, the palette carries a fully transparent entry used by
 // pixel (0,0), so the encoder writes the GCE transparency flag — which a
-// config-only decode never sees (the global colour table is opaque either
+// config-only decode never sees (the global color table is opaque either
 // way).
 func writeSeqGIF(t *testing.T, dir string, n int, transparent bool) {
 	t.Helper()
@@ -1233,8 +1233,8 @@ func writeSeqGIF(t *testing.T, dir string, n int, transparent bool) {
 }
 
 // TestHeaderAlphaFacts pins the format-aware alpha-candidate decision on
-// real files: GIF frames and colour-keyed truecolour PNGs must be scan
-// candidates even though their stdlib colour models look opaque.
+// real files: GIF frames and color-keyed truecolor PNGs must be scan
+// candidates even though their stdlib color models look opaque.
 func TestHeaderAlphaFacts(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1244,10 +1244,10 @@ func TestHeaderAlphaFacts(t *testing.T) {
 		t.Error("tRNS chunk missed")
 	}
 	if ff, err := stdlibFrameFacts(keyed); err != nil || !ff.alphaP || ff.w != 8 || ff.h != 6 {
-		t.Errorf("colour-keyed png facts = %+v (%v)", ff, err)
+		t.Errorf("color-keyed png facts = %+v (%v)", ff, err)
 	}
 
-	// Plain opaque truecolour PNG (Go writes colour type 2 for an opaque
+	// Plain opaque truecolor PNG (Go writes color type 2 for an opaque
 	// RGBA image): no tRNS, not a candidate.
 	plain := filepath.Join(dir, "plain.png")
 	img := image.NewRGBA(image.Rect(0, 0, 8, 6))
@@ -1264,10 +1264,10 @@ func TestHeaderAlphaFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if pngHasTRNS(plain) {
-		t.Error("plain truecolour png reported tRNS")
+		t.Error("plain truecolor png reported tRNS")
 	}
 	if ff, err := stdlibFrameFacts(plain); err != nil || ff.alphaP {
-		t.Errorf("plain truecolour png must not be a candidate: %+v (%v)", ff, err)
+		t.Errorf("plain truecolor png must not be a candidate: %+v (%v)", ff, err)
 	}
 
 	// Every GIF frame is a candidate: the transparent index lives in the
@@ -1291,7 +1291,7 @@ func TestHeaderAlphaFacts(t *testing.T) {
 
 // TestProbeSequenceLateAlphaIntegration: transparency that only later frames
 // carry must be found — GIF frames hide the transparent index in each
-// frame's GCE and truecolour PNGs in a tRNS colour key, both invisible to
+// frame's GCE and truecolor PNGs in a tRNS color key, both invisible to
 // the stdlib header models, so an opaque first frame must not suppress the
 // alpha scan of the rest.
 func TestProbeSequenceLateAlphaIntegration(t *testing.T) {
@@ -1339,7 +1339,7 @@ func TestProbeSequenceLateAlphaIntegration(t *testing.T) {
 		t.Fatalf("ProbeSequence rgb+tRNS: %v", err)
 	}
 	if !info.HasAlpha {
-		t.Errorf("colour-keyed png frames with late transparency: HasAlpha false: %+v", info)
+		t.Errorf("color-keyed png frames with late transparency: HasAlpha false: %+v", info)
 	}
 }
 
@@ -1412,7 +1412,7 @@ func TestSequenceFrameFactHelpers(t *testing.T) {
 	if w, h, mixed := largestFrame([]frameFacts{{w: 16, h: 12}, {w: 16, h: 12}}); w != 16 || h != 12 || mixed {
 		t.Errorf("largestFrame uniform = %d x %d %v", w, h, mixed)
 	}
-	// Colour models.
+	// Color models.
 	if !modelHasAlpha(color.NRGBAModel) || !modelHasAlpha(color.NRGBA64Model) {
 		t.Error("NRGBA models carry alpha")
 	}

@@ -120,15 +120,15 @@ func (e *e2e) lavfi(name, graphText, pixFmt string) *store.Blob {
 }
 
 // opaqueGIFFrames builds a w x h GIF whose frames are the given solid
-// colours at delayCS centiseconds each, looping forever.
-func opaqueGIFFrames(t *testing.T, w, h, delayCS int, colours ...color.RGBA) []byte {
+// colors at delayCS centiseconds each, looping forever.
+func opaqueGIFFrames(t *testing.T, w, h, delayCS int, colors ...color.RGBA) []byte {
 	t.Helper()
 	pal := color.Palette{}
-	for _, c := range colours {
+	for _, c := range colors {
 		pal = append(pal, c)
 	}
 	g := &gif.GIF{LoopCount: 0}
-	for i := range colours {
+	for i := range colors {
 		fr := image.NewPaletted(image.Rect(0, 0, w, h), pal)
 		for y := 0; y < h; y++ {
 			for x := 0; x < w; x++ {
@@ -251,7 +251,7 @@ const greenScreen = "color=c=0x00FF00:s=64x48:r=10:d=1[bg];color=c=0xDC1E1E:s=16
 // greenSteps is the green-screen clip for the autocrop tests: the red 16x12
 // square sits at x=8 for the first half second and at x=18 for the second
 // (y=18), so the 5 fps detection sampler sees both positions and the union
-// box is exactly 26x12 at (8,18); composited in RGB so the key colour is
+// box is exactly 26x12 at (8,18); composited in RGB so the key color is
 // exact.
 const greenSteps = "color=c=0x00FF00:s=64x48:r=10:d=1[bg];color=c=0xDC1E1E:s=16x12:r=10:d=1[fg];[bg][fg]overlay=x='8+10*floor(2*t)':y=18:format=rgb"
 
@@ -625,7 +625,7 @@ func resolvedBox(t *testing.T, ops []recipe.Op) recipe.CropParams {
 }
 
 // alphaSquarePNG is the still counterpart of alphaSquare: a transparent
-// 64x48 PNG with an opaque 24x24 square of colour c at (16,12).
+// 64x48 PNG with an opaque 24x24 square of color c at (16,12).
 func alphaSquarePNG(t *testing.T, c color.NRGBA) []byte {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, 64, 48))
@@ -852,7 +852,7 @@ func TestAutoCropDetection(t *testing.T) {
 	}
 	// A different padding is the same detection (the memo holds the raw box
 	// and the padding is arithmetic on read): served without ffmpeg, padded
-	// as asked. A different key colour is a different detection: no memo,
+	// as asked. A different key color is a different detection: no memo,
 	// so no ffmpeg.
 	got, err = noFF.ResolveAutoCrop(e.ctx, square.Hash, []recipe.Op{autocropOp(`{"padding":3}`)})
 	if err != nil {
@@ -861,13 +861,13 @@ func TestAutoCropDetection(t *testing.T) {
 	if box := resolvedBox(t, got); box != (recipe.CropParams{X: 13, Y: 9, W: 30, H: 30}) {
 		t.Errorf("memoised box at padding 3 = %+v", box)
 	}
-	rawKey, _ := autocropKey(square.Hash, nil, 1, "10", nil)
+	rawKey, _ := autocropKey(square.Hash, nil, 1)
 	if raw, ok := readAutocropMemo(filepath.Join(e.st.Scratch, autocropDir, rawKey+".json"), square.Info); !ok || raw != (recipe.CropParams{X: 16, Y: 12, W: 24, H: 24}) {
 		t.Errorf("memo entry = %+v (%v), want the raw unpadded box", raw, ok)
 	}
 	blueKey := recipe.Op{Kind: recipe.OpColorKey, Params: json.RawMessage(`{"color":"0000ff","similarity":0.1}`)}
 	if _, err := noFF.ResolveAutoCrop(e.ctx, steps.Hash, []recipe.Op{blueKey, autocropOp(`{}`)}); err == nil {
-		t.Error("a different key colour was served from the memo")
+		t.Error("a different key color was served from the memo")
 	}
 }
 
@@ -1199,15 +1199,15 @@ func TestProxyStillWithOverlay(t *testing.T) {
 	if !base.Info.IsStill {
 		t.Fatalf("main source must probe as a still: %+v", base.Info)
 	}
-	colours := make([]color.RGBA, 0, 10)
+	colors := make([]color.RGBA, 0, 10)
 	for i := 0; i < 10; i++ {
 		if i%2 == 0 {
-			colours = append(colours, red)
+			colors = append(colors, red)
 		} else {
-			colours = append(colours, green)
+			colors = append(colors, green)
 		}
 	}
-	ov := e.store("blink.gif", opaqueGIFFrames(t, 16, 12, 10, colours...))
+	ov := e.store("blink.gif", opaqueGIFFrames(t, 16, 12, 10, colors...))
 	if ov.Info.IsStill || ov.Info.Frames != 10 {
 		t.Fatalf("overlay probe: %+v", ov.Info)
 	}

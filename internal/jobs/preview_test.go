@@ -718,7 +718,7 @@ func TestAutoCropDetachedLeader(t *testing.T) {
 	if n := fakeMarkers(marker); n != 1 {
 		t.Fatalf("%d detections started after the leader left, want the one still running", n)
 	}
-	key, _ := autocropKey(src, nil, 1, "25", nil)
+	key, _ := autocropKey(src, nil, 1)
 	memo := filepath.Join(st.Scratch, autocropDir, key+".json")
 	if _, err := os.Stat(memo); err == nil {
 		t.Fatal("memo written before the detection finished")

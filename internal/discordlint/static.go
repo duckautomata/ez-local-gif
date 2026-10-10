@@ -170,7 +170,7 @@ func probePNGStatic(data []byte) staticInfo {
 	}
 	w, h := f.dims()
 	info := staticInfo{width: w, height: h, alpha: f.hasAlpha()}
-	info.desc = fmt.Sprintf("PNG %dx%d, %s, %s", w, h, f.colourDescription(), alphaWord(info.alpha))
+	info.desc = fmt.Sprintf("PNG %dx%d, %s, %s", w, h, f.colorDescription(), alphaWord(info.alpha))
 	if f.animated() {
 		info.desc += fmt.Sprintf("; animated (APNG, %s) — only the default image counts as a still", plural(f.frameCount(), "frame"))
 	}
@@ -274,15 +274,15 @@ func jpegFrameInfo(marker byte, seg []byte) staticInfo {
 	case 0xC3, 0xC7, 0xCB, 0xCF:
 		mode = "lossless"
 	}
-	colour := "YCbCr"
+	color := "YCbCr"
 	switch comps {
 	case 1:
-		colour = "greyscale"
+		color = "greyscale"
 	case 4:
-		colour = "CMYK/YCCK"
+		color = "CMYK/YCCK"
 	}
 	info := staticInfo{width: w, height: h}
-	info.desc = fmt.Sprintf("JPEG %dx%d, %s, %d-bit %s (%s), no alpha", w, h, mode, precision, colour, plural(comps, "component"))
+	info.desc = fmt.Sprintf("JPEG %dx%d, %s, %d-bit %s (%s), no alpha", w, h, mode, precision, color, plural(comps, "component"))
 	if h == 0 {
 		info.desc += "; height 0 in SOF (defined later by a DNL marker)"
 	}

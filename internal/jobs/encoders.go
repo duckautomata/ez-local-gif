@@ -101,7 +101,7 @@ func variantKey(v *enc.Variant) string {
 func (m *Manager) produceAPNG(ctx context.Context, j *job, scratch string, master enc.Master, out recipe.Output, target discordlint.Target) (produced, error) {
 	path := filepath.Join(scratch, "enc.png")
 	if out.Colors > 0 {
-		m.progress(j, pctEncodeStart, fmt.Sprintf("apng: quantising to %d colours", out.Colors))
+		m.progress(j, pctEncodeStart, fmt.Sprintf("apng: quantising to %d colors", out.Colors))
 		sheet, err := m.renderTileSheet(ctx, scratch, "", master, nil)
 		if err != nil {
 			return produced{}, err
@@ -132,7 +132,7 @@ func (m *Manager) produceAPNG(ctx context.Context, j *job, scratch string, maste
 	return m.finalFile(scratch, recipe.FormatAPNG, data, &report)
 }
 
-// encodeRGBAAPNG writes a truecolour APNG of the master (through v).
+// encodeRGBAAPNG writes a truecolor APNG of the master (through v).
 func (m *Manager) encodeRGBAAPNG(ctx context.Context, master enc.Master, v *enc.Variant, loop int, outPath string) error {
 	args := enc.APNGArgs(master, enc.APNGOptions{Loop: loop, Variant: v}, outPath)
 	if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, args, nil); err != nil {
@@ -142,7 +142,7 @@ func (m *Manager) encodeRGBAAPNG(ctx context.Context, master enc.Master, v *enc.
 }
 
 // tileSheet is the rendered sprite sheet of one variant (shared by every
-// colour count the fit search probes on that rung).
+// color count the fit search probes on that rung).
 type tileSheet struct {
 	path       string
 	cols, rows int
@@ -163,7 +163,7 @@ func (m *Manager) renderTileSheet(ctx context.Context, scratch, tag string, mast
 		return nil, fmt.Errorf("apng: no tile grid for %d frames of %dx%d", frames, w, h)
 	}
 	if cols*w > tileSheetMaxSide || rows*h > tileSheetMaxSide {
-		return nil, fmt.Errorf("%w: %d frames of %dx%d do not fit one sprite sheet for palette quantisation; lower the fps, trim or resize (or use truecolour APNG: colours 0)", ErrInvalidRecipe, frames, w, h)
+		return nil, fmt.Errorf("%w: %d frames of %dx%d do not fit one sprite sheet for palette quantisation; lower the fps, trim or resize (or use truecolor APNG: colors 0)", ErrInvalidRecipe, frames, w, h)
 	}
 	sheet := &tileSheet{path: filepath.Join(scratch, "tile"+tag+".png"), cols: cols, rows: rows, frames: frames, fps: variantFPS(master, v)}
 	if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, enc.TileArgs(master, v, cols, rows, sheet.path), nil); err != nil {
@@ -177,7 +177,7 @@ func (m *Manager) renderTileSheet(ctx context.Context, scratch, tag string, mast
 // indexed APNG at outPath.
 func (m *Manager) quantizeUntile(ctx context.Context, scratch, tag string, sheet *tileSheet, colors, loop int, outPath string) error {
 	if m.tools.Pngquant == "" {
-		return errors.New("indexed APNG needs pngquant, which is not available on this server (use truecolour APNG: colours 0)")
+		return errors.New("indexed APNG needs pngquant, which is not available on this server (use truecolor APNG: colors 0)")
 	}
 	q := filepath.Join(scratch, "quant"+tag+".png")
 	if err := ffrun.Run(ctx, m.tools.Pngquant, enc.PngquantArgs(sheet.path, q, colors, false, 0)); err != nil {
@@ -383,7 +383,7 @@ func (m *Manager) produceStatic(ctx context.Context, j *job, scratch string, mas
 // encodePNGStill writes the first frame as RGBA PNG and quantises it with
 // pngquant (error diffusion is fine for a still): colors > 0 → an exact
 // palette; colors 0 → the DESIGN.md §4.2 default --quality 70-100 pass,
-// keeping the full-colour encode when pngquant reports the quality floor is
+// keeping the full-color encode when pngquant reports the quality floor is
 // unreachable (exit status 99) or is not installed.
 func (m *Manager) encodePNGStill(ctx context.Context, scratch, tag string, master enc.Master, v *enc.Variant, colors int, outPath string) error {
 	if err := ffrun.RunFFmpeg(ctx, m.tools.FFmpeg, enc.PNGStillArgs(master, enc.StillOptions{Variant: v}, outPath), nil); err != nil {
@@ -391,7 +391,7 @@ func (m *Manager) encodePNGStill(ctx context.Context, scratch, tag string, maste
 	}
 	if m.tools.Pngquant == "" {
 		if colors > 0 {
-			log.Printf("jobs: pngquant not available; png keeps full colour")
+			log.Printf("jobs: pngquant not available; png keeps full color")
 		}
 		return nil
 	}
@@ -402,7 +402,7 @@ func (m *Manager) encodePNGStill(ctx context.Context, scratch, tag string, maste
 	}
 	if err := ffrun.Run(ctx, m.tools.Pngquant, args); err != nil {
 		if colors <= 0 && pngquantCannotReachQuality(err) {
-			return nil // §4.2: below the quality floor everywhere — keep the full-colour encode
+			return nil // §4.2: below the quality floor everywhere — keep the full-color encode
 		}
 		return fmt.Errorf("pngquant: %w", err)
 	}

@@ -44,7 +44,7 @@ const LABELS: Record<string, string> = {
   'apng.not-emote': 'APNG cannot be an animated emote',
   'apng.attachment': 'APNG attachments show only frame 0',
   // Reads correctly for both outcomes: ✓ when the output is indexed, and a
-  // neutral info dot when an RGBA-truecolour output fails the check.
+  // neutral info dot when an RGBA-truecolor output fails the check.
   'apng.indexed': 'Indexed 8-bit-alpha APNG (sticker default rung)',
   // video (Phase 4: mp4 / webm attachments — structural lint, never rewritten)
   'video.container': 'Valid MP4 / WebM container',
@@ -61,8 +61,6 @@ const LABELS: Record<string, string> = {
   'static.format': 'Image summary',
   // render pipeline / fit engine (internal/jobs)
   'render.alpha': 'Transparency as rendered',
-  // Phase 5b: an info check naming the AI matte a render used (model, precision, size, weights, matte count, cleanup)
-  'render.matte': 'AI matte as rendered',
   'fit.target': 'Fit-to-size budget reached',
 };
 

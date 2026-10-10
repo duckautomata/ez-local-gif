@@ -13,7 +13,7 @@ import (
 var ErrAnalysisCap = errors.New("over the analysis cap")
 
 // Playing a GIF: the same per-spec compositing as walkGIFCanvas (gifcanvas.go:
-// 0 = background / cleared, any drawn pixel an opaque colour value, disposal 2
+// 0 = background / cleared, any drawn pixel an opaque color value, disposal 2
 // clears the frame's rectangle, 3 restores it), but on a canvas that spans the
 // whole logical screen and with the picture handed out after every frame — so
 // two files can be compared, which the walker's bounding-box canvas and
@@ -21,7 +21,7 @@ var ErrAnalysisCap = errors.New("over the analysis cap")
 
 // gifShown is one stretch of an animation: a picture and how long it stays.
 type gifShown struct {
-	hash    uint64 // of the composited canvas (colour values, not palette indices)
+	hash    uint64 // of the composited canvas (color values, not palette indices)
 	clear   int    // pixels showing the background
 	delayCS int
 }
@@ -139,7 +139,7 @@ func PlayGIF(data []byte) (*GIFPlayback, error) {
 			p.shown[len(p.shown)-1].delayCS += delay
 			return
 		}
-		// FNV-1a over the colour values.
+		// FNV-1a over the color values.
 		hash, clear := uint64(14695981039346656037), 0
 		for _, v := range canvas {
 			if v == 0 {
@@ -173,7 +173,7 @@ func (p *GIFPlayback) ShowsBackground() bool {
 }
 
 // Same reports whether q shows the same animation as p: the same pictures
-// (colours and transparency — whatever the frame rectangles, disposals,
+// (colors and transparency — whatever the frame rectangles, disposals,
 // palette order or number of frames that produce them) for the same time
 // each. The last picture's duration is compared too; loop counts and whatever
 // happens after the last frame are not. When they differ, detail says where.
@@ -187,7 +187,7 @@ func (p *GIFPlayback) Same(q *GIFPlayback) (same bool, detail string) {
 		case x.clear != y.clear:
 			return false, fmt.Sprintf("picture %d (from %d cs on) differs: %d vs %d background pixels", i, at, x.clear, y.clear)
 		case x.hash != y.hash:
-			return false, fmt.Sprintf("picture %d (from %d cs on) differs in colour (the same %d background pixels)", i, at, x.clear)
+			return false, fmt.Sprintf("picture %d (from %d cs on) differs in color (the same %d background pixels)", i, at, x.clear)
 		case x.delayCS != y.delayCS:
 			return false, fmt.Sprintf("picture %d (from %d cs on) is shown for %d cs vs %d cs", i, at, x.delayCS, y.delayCS)
 		}
@@ -204,8 +204,8 @@ func (p *GIFPlayback) Same(q *GIFPlayback) (same bool, detail string) {
 //
 // jobs guards the hold repair with these: a gifsicle coalesce that changes the
 // picture must never be delivered as a repair (gifsicle drops all transparency
-// when the first frame has none, and with local colour tables or more than
-// 256 colours per picture it gives up — "too complex to unoptimize", exit 0 —
+// when the first frame has none, and with local color tables or more than
+// 256 colors per picture it gives up — "too complex to unoptimize", exit 0 —
 // yet still rewrites the disposals).
 func SameGIFAnimation(a, b []byte) (same bool, detail string, err error) {
 	pa, err := PlayGIF(a)
@@ -220,13 +220,13 @@ func SameGIFAnimation(a, b []byte) (same bool, detail string, err error) {
 	return same, detail, nil
 }
 
-// gifLeadInImage is a 1x1 image at 0,0 on the global colour table whose one
+// gifLeadInImage is a 1x1 image at 0,0 on the global color table whose one
 // pixel is index 0: descriptor, LZW minimum code size 2, the codes clear / 0 /
 // end-of-information, block terminator.
 var gifLeadInImage = []byte{gifImageIntro, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0x02, 0x02, 0x44, 0x01, 0x00}
 
 // PrependTransparentFrame inserts a 1x1, zero-delay, entirely transparent
-// frame (transparent index 0 of the global colour table, disposal 2) in front
+// frame (transparent index 0 of the global color table, disposal 2) in front
 // of the first frame — after the extensions that precede it, so a NETSCAPE
 // loop block stays first. It draws nothing and changes no picture.
 //
@@ -234,11 +234,11 @@ var gifLeadInImage = []byte{gifImageIntro, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0x02, 0x02
 // whether the canvas is transparent at all: a first frame without the
 // transparency flag, or one that does not use its transparent index, makes
 // every coalesced frame opaque — the clip's later transparency is painted
-// over with the background colour. With this lead-in (dropped again by the
+// over with the background color. With this lead-in (dropped again by the
 // frame selection "#1-", enc.GifsicleOptions.SkipFirstFrame) the coalesce is
 // exact, and byte-identical where it already was. The frame must use the
 // global table: with a local one gifsicle refuses to unoptimise at all. A file
-// without a global colour table is refused (index 0 would mean nothing); a
+// without a global color table is refused (index 0 would mean nothing); a
 // GIF87a header is relabelled, as the frame needs a Graphic Control Extension.
 func PrependTransparentFrame(data []byte) ([]byte, error) {
 	g, err := parseGIF(data)
@@ -246,7 +246,7 @@ func PrependTransparentFrame(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("discordlint: %w", err)
 	}
 	if !g.hasGCT() {
-		return nil, fmt.Errorf("discordlint: no global colour table to take the transparent index from")
+		return nil, fmt.Errorf("discordlint: no global color table to take the transparent index from")
 	}
 	frames, _ := g.frames()
 	if len(frames) == 0 {

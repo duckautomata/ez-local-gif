@@ -16,5 +16,3 @@ docs
 !README.md
 .vscode
 .idea
-sidecar
-.env

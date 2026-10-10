@@ -2,7 +2,7 @@ package graph_test
 
 // Real-ffmpeg pixel checks of the feather op (Phase 3 review item 4): the
 // compiled "format=gbrap,gblur=sigma=R:planes=8,format=rgba" stage must turn
-// a hard alpha edge into a monotonic gradient while leaving the colour
+// a hard alpha edge into a monotonic gradient while leaving the color
 // planes untouched, both on a source that carries alpha and through the full
 // green-screen chain (chromakey, then feather on the key's matte). External
 // test package like the other *_ffmpeg_test.go files; skips when ffmpeg is
@@ -104,7 +104,7 @@ func TestFeatherPixels(t *testing.T) {
 		}
 		for i, f := range frames {
 			checkFeatheredEdge(t, f, w, 16, edge, 1, w-2, 2, 16, "feather")
-			// planes=8 blurs only the alpha plane: the colour bytes of every
+			// planes=8 blurs only the alpha plane: the color bytes of every
 			// formerly opaque pixel are exactly the source's red, whatever
 			// their blurred alpha is now.
 			for x := edge; x < w; x++ {
@@ -127,7 +127,8 @@ func TestFeatherPixels(t *testing.T) {
 		}, out)
 		// The key on the opaque source is bare and the feather follows it.
 		if !strings.Contains(p.Filter, "chromakey=color=0x913622:similarity=0.1:blend=0.05:yuv=1") ||
-			!strings.Contains(p.Filter, "despill=type=green:mix=0.6:expand=0.3,format=gbrap,gblur=sigma=3:planes=8,format=rgba") {
+			!strings.Contains(p.Filter, "despill=type=green:mix=0.5:expand=0,") ||
+			!strings.Contains(p.Filter, "maskedmerge,format=rgba,format=gbrap,gblur=sigma=3:planes=8,format=rgba") {
 			t.Fatalf("filter: %s", p.Filter)
 		}
 		frames := p3Render(t, ff, clip, p, nil, nil)

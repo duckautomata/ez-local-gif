@@ -11,7 +11,7 @@ package enc
 // ignores WebM alpha, so both tails flatten the RGBA master onto
 // Output.Matte exactly like the JPEG tail does (matte underlay in the
 // filter), then pad to even dimensions — libx264/libvpx refuse odd sizes at
-// yuv420p — with the same matte as the pad colour.
+// yuv420p — with the same matte as the pad color.
 
 import (
 	"math"
@@ -43,7 +43,7 @@ const (
 	maxVP9CRF  = 63
 )
 
-// evenPad pads a frame up to even dimensions; the pad colour is filled with
+// evenPad pads a frame up to even dimensions; the pad color is filled with
 // the matte so an added row/column is invisible on the flattened output.
 const evenPad = "pad=ceil(iw/2)*2:ceil(ih/2)*2:color=0x"
 
@@ -55,7 +55,7 @@ type MP4Options struct {
 	// the fit engine's knob (the searched range is 12..40, see fit.KnobFor).
 	// 0 = DefaultX264CRF.
 	CRF     int
-	Matte   string // RRGGBB flattened background and pad colour (0 = "313338")
+	Matte   string // RRGGBB flattened background and pad color (0 = "313338")
 	Variant *Variant
 }
 
@@ -75,7 +75,7 @@ type WebMOptions struct {
 	// the fit engine's knob (the searched range is 15..55, see fit.KnobFor).
 	// 0 = DefaultVP9CRF.
 	CRF     int
-	Matte   string // RRGGBB flattened background and pad colour (0 = "313338")
+	Matte   string // RRGGBB flattened background and pad color (0 = "313338")
 	Variant *Variant
 }
 

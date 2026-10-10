@@ -32,7 +32,7 @@ import (
 	"github.com/duckautomata/ez-local-gif/internal/store"
 )
 
-// solidPNG encodes a w x h opaque PNG of one colour.
+// solidPNG encodes a w x h opaque PNG of one color.
 func solidPNG(t *testing.T, w, h int, c color.NRGBA) []byte {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
@@ -168,7 +168,7 @@ func TestStillFrameIndexContract(t *testing.T) {
 		source{"cfr video at 24 fps", clipBlob.Hash, clipBlob.Path, []recipe.Op{{Kind: recipe.OpFPS, Params: json.RawMessage(`{"fps":24}`)}}},
 	)
 
-	// Image sequence: 7 frames of distinct solid colours at 100 ms.
+	// Image sequence: 7 frames of distinct solid colors at 100 ms.
 	var parts []store.SequencePart
 	for i := 1; i <= 7; i++ {
 		parts = append(parts, store.SequencePart{Name: fmt.Sprintf("frame%d.png", i), R: bytes.NewReader(solidPNG(t, 16, 12, color.NRGBA{R: uint8(30 * i), G: 90, B: 160, A: 255}))})

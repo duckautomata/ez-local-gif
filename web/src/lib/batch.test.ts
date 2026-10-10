@@ -137,41 +137,12 @@ describe('batchOpsCfg / rowRecipe (global ops only)', () => {
     expect(recipe?.sources).toEqual(['a'.repeat(64)]);
     expect(recipe?.ops.map((o) => o.kind)).toEqual(['unpremultiply', 'speed', 'fps', 'chromakey', 'morph', 'feather', 'reverse', 'bounce']);
     expect(rowRecipe({ source: null, unpremultiply: false }, c, defaultOutput())).toBeNull();
-    // Colour mode in batch: typed hex rows, one colorkey each, then the morph
-    c.background = { ...c.background, mode: 'colour', colors: ['313338', 'facc82'] };
-    expect(rowRecipe({ source: src('a'), unpremultiply: false }, c, defaultOutput())?.ops.map((o) => o.kind)).toEqual([
-      'speed',
-      'fps',
-      'colorkey',
-      'colorkey',
-      'morph',
-      'feather',
-      'reverse',
-      'bounce',
-    ]);
-  });
-
-  it('the guided model never reaches a batch row: its prompts are one clip’s, so rows key with the server’s default per-frame model', () => {
-    const c = defaultOps(info());
-    c.background = {
-      ...c.background,
-      enabled: true,
-      mode: 'ai',
-      ai: { ...c.background.ai, model: 'sam2-tiny', modelChosen: true, edge: 'birefnet-lite', prompts: [{ frame: 0, box: [0.1, 0.1, 0.5, 0.5], points: [{ x: 0.3, y: 0.3, label: 1 }] }] },
-    };
-    const b = batchOpsCfg(c, false);
-    expect(b.background.ai).toMatchObject({ model: '', modelChosen: false, prompts: [], edge: '' });
-    expect(b.background.ai.stabilise).toBe(c.background.ai.stabilise);
-    expect(c.background.ai.model).toBe('sam2-tiny'); // the editor's choice is untouched
+    // Color mode in batch: typed hex rows, one colorkey each, then the morph (Edges) with its settings
+    c.background = { ...c.background, mode: 'color', colors: ['313338', 'facc82'], morph: { close: true, grow: -2, smooth: 1.5 } };
     const ops = rowRecipe({ source: src('a'), unpremultiply: false }, c, defaultOutput())?.ops ?? [];
-    const matteOp = ops.find((o) => o.kind === 'matte');
-    expect(matteOp).toBeDefined();
-    expect(JSON.stringify(matteOp)).not.toContain('sam2');
-    expect(JSON.stringify(matteOp)).not.toContain('prompts');
-    expect(JSON.stringify(matteOp)).not.toContain('edge');
-    // a per-frame model carries over as it is
-    c.background.ai = { ...c.background.ai, model: 'birefnet-lite', prompts: [] };
-    expect(batchOpsCfg(c, false).background.ai.model).toBe('birefnet-lite');
+    expect(ops.map((o) => o.kind)).toEqual(['speed', 'fps', 'colorkey', 'colorkey', 'morph', 'feather', 'reverse', 'bounce']);
+    expect(ops[4]).toEqual({ kind: 'morph', params: { close: true, grow: -2, smooth: 1.5 } });
+    expect(batchOpsCfg(c, false).background).toBe(c.background); // carried over as it is
   });
 });
 

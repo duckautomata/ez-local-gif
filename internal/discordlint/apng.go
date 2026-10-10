@@ -19,7 +19,7 @@ const (
 	RuleAPNGSticker    = "apng.sticker"       // sticker: dims > 320 on a side → warn (Discord shrinks); duration <= 5000 ms, frames <= 1000, fps <= 60 → error
 	RuleAPNGNotEmote   = "apng.not-emote"     // error for emote: APNG is not an animated-emoji format
 	RuleAPNGAttachment = "apng.attachment"    // info for every attachment tier (IsAttachment): Discord shows only frame 0 of APNG attachments
-	RuleAPNGIndexed    = "apng.indexed"       // info (non-blocking): OK only for colour type 3 + PLTE + tRNS — the indexed 8-bit-alpha APNG the sticker default rung produces; detail lists palette size
+	RuleAPNGIndexed    = "apng.indexed"       // info (non-blocking): OK only for color type 3 + PLTE + tRNS — the indexed 8-bit-alpha APNG the sticker default rung produces; detail lists palette size
 )
 
 // Frame-delay thresholds for apng.min-delay (DESIGN.md §5.3: delays >= 20 ms
@@ -42,7 +42,7 @@ const stickerMaxSide = 320
 // "apng" (or "png" when there is no acTL), Width/Height from IHDR, Frames
 // from acTL num_frames (1 for a plain PNG), DurationMS and MinDelayMS from
 // the fcTL delays (delay_num/delay_den, den 0 → 100), LoopForever
-// (num_plays == 0; also true for a plain PNG), HasAlpha (colour type 4/6, or
+// (num_plays == 0; also true for a plain PNG), HasAlpha (color type 4/6, or
 // 3 with tRNS, or tRNS chunk present). No fixer in Phase 2 (the encoders
 // are ours); OK is false when any LevelError check fails.
 //
@@ -262,14 +262,14 @@ func (l *apngLinter) ruleMinDelay() {
 }
 
 // ruleIndexed is informational and non-blocking: OK is true only for an
-// indexed 8-bit-alpha APNG (colour type 3 with PLTE and tRNS — what the
+// indexed 8-bit-alpha APNG (color type 3 with PLTE and tRNS — what the
 // sticker default rung produces), so the UI and tests can tell an indexed
 // output from an RGBA or opaque-indexed one. A LevelInfo failure does not
 // affect Report.OK (allOK only counts LevelError).
 func (l *apngLinter) ruleIndexed() {
 	const rule = RuleAPNGIndexed
 	f := l.f
-	desc := f.colourDescription()
+	desc := f.colorDescription()
 	if f.ihdr != nil && f.ihdr.colorType == pngIndexed && f.plte >= 0 {
 		if f.hasTRNS {
 			l.checks.pass(rule, LevelInfo, "indexed 8-bit-alpha APNG: "+desc)

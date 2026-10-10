@@ -12,8 +12,8 @@ function answer(features?: Record<string, boolean>, formats?: string[]): Capabil
   if (formats) c.formats = formats;
   return c;
 }
-/** the Phase 4, 5a and 5b names, off — what a Phase 3 server's answer maps to */
-const noPhase4 = { feather: false, bounce: false, inputPick: false, outputSave: false, gifski: false, morph: false, matte: false };
+/** the Phase 4 and 5a names, off — what a Phase 3 server's answer maps to */
+const noPhase4 = { feather: false, bounce: false, inputPick: false, outputSave: false, gifski: false, morph: false };
 const phase3 = { fit: true, sequence: true, optimize: true, keying: true, overlays: true, proxy: true, fonts: true, ...noPhase4 };
 
 describe('featuresFrom', () => {
@@ -186,14 +186,15 @@ describe('phase4OpsOffered (feather / bounce gating)', () => {
   });
 });
 
-// Phase 5a: the Background card's Edge cleanup fold (the morph op) gates on
-// its own explicit name — a Phase 4 server names feather / bounce but not
-// morph and 400s on the op, so there is no formats-list fallback for it.
-describe('features.morph (Edge cleanup gating)', () => {
+// Phase 5a: the Background card's Edges fold (the morph op) gates on its own
+// explicit name — a Phase 4 server names feather / bounce but not morph and
+// 400s on the op, so there is no formats-list fallback for it.
+describe('features.morph (Edges gating)', () => {
   afterEach(() => resetFeatures());
 
   it('is on until the server answers, off for a server that does not name it, on when it does', () => {
     expect(FEATURE_NAMES).toContain('morph');
+    expect(FEATURE_NAMES).not.toContain('matte');
     expect(caps.features.morph).toBe(true);
     setFeatures(answer({ ...phase3, feather: true, bounce: true, gifski: true }, ['gif', 'mp4', 'webm'])); // a Phase 4 server
     expect(caps.features.morph).toBe(false);
@@ -202,27 +203,5 @@ describe('features.morph (Edge cleanup gating)', () => {
     expect(caps.features.morph).toBe(true);
     resetFeatures();
     expect(caps.features.morph).toBe(true);
-  });
-});
-
-// Phase 5b: the Background card's AI mode gates on features.matte, which a
-// server reports true only while its probe of the matte sidecar answers —
-// a plain install (no compose profile) says false, a Phase 5a server does
-// not name it at all; either way the mode is disabled with the reason.
-describe('features.matte (AI mode gating)', () => {
-  afterEach(() => resetFeatures());
-
-  it('is on until the server answers, off for a server that does not name it or says false, on when it says true', () => {
-    expect(FEATURE_NAMES).toContain('matte');
-    expect(caps.features.matte).toBe(true);
-    setFeatures(answer({ ...phase3, feather: true, bounce: true, gifski: true, morph: true })); // a Phase 5a server
-    expect(caps.features.matte).toBe(false);
-    expect(caps.features.morph).toBe(true);
-    setFeatures(answer({ ...phase3, morph: true, matte: false })); // a 5b server without the profile running
-    expect(caps.features.matte).toBe(false);
-    setFeatures(answer({ ...phase3, morph: true, matte: true }));
-    expect(caps.features.matte).toBe(true);
-    resetFeatures();
-    expect(caps.features.matte).toBe(true);
   });
 });

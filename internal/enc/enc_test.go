@@ -1069,7 +1069,7 @@ func TestGIFArgs(t *testing.T) {
 			m:    Master{Path: "/dev/shm/ezl/job1/frames.rgba", Width: 320, Height: 240, FPS: 25},
 			o: GIFOptions{
 				Colors: 999, Dither: "bogus", BayerScale: 9, AlphaThreshold: 300,
-				Matte: "not-a-colour", Loop: -5, StatsMode: "weird", HasAlpha: true,
+				Matte: "not-a-color", Loop: -5, StatsMode: "weird", HasAlpha: true,
 			},
 			want: append(append([]string{}, raw...), gifAlphaTail(
 				"[0:v]split[c][a];"+
@@ -1096,21 +1096,21 @@ func TestGIFArgs(t *testing.T) {
 					"[p2][pal]paletteuse=dither=none:diff_mode=rectangle:alpha_threshold=128[out]", "0")...),
 		},
 		{
-			name: "2 colours with alpha is raised to 3",
+			name: "2 colors with alpha is raised to 3",
 			m:    testMaster(),
 			o:    GIFOptions{Colors: 2, HasAlpha: true},
 			want: append(append([]string{}, raw...), gifAlphaTail(
 				strings.Replace(gifAlphaFilter, "max_colors=256", "max_colors=3", 1), "0")...),
 		},
 		{
-			name: "3 colours with alpha passes through",
+			name: "3 colors with alpha passes through",
 			m:    testMaster(),
 			o:    GIFOptions{Colors: 3, HasAlpha: true},
 			want: append(append([]string{}, raw...), gifAlphaTail(
 				strings.Replace(gifAlphaFilter, "max_colors=256", "max_colors=3", 1), "0")...),
 		},
 		{
-			name: "2 colours without alpha is allowed",
+			name: "2 colors without alpha is allowed",
 			m:    testMaster(),
 			o:    GIFOptions{Colors: 2},
 			want: append(append([]string{}, raw...), gifTail(
@@ -1128,7 +1128,7 @@ func TestGIFArgs(t *testing.T) {
 					"[p2][pal]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle[out]", "65535")...),
 		},
 		{
-			name: "fractional fps is written identically in -r and the colour source",
+			name: "fractional fps is written identically in -r and the color source",
 			m:    Master{Path: "/dev/shm/ezl/job1/frames.rgba", Width: 128, Height: 128, FPS: 100.0 / 3, HasAlpha: true},
 			o:    GIFOptions{HasAlpha: true},
 			want: append([]string{"-f", "rawvideo", "-pix_fmt", "rgba", "-s", "128x128", "-r", "33.333333", "-i", "/dev/shm/ezl/job1/frames.rgba"},
@@ -1176,7 +1176,7 @@ func TestGifsicleArgs(t *testing.T) {
 			want: []string{"-U", "-O1", "--careful", "--loopcount=forever", "in.gif", "-o", "out.gif"},
 		},
 		{
-			name: "clamps: level > 3, lossy > 200, colours > 256; dither without colours is dropped",
+			name: "clamps: level > 3, lossy > 200, colors > 256; dither without colors is dropped",
 			o:    GifsicleOptions{OptimizeLevel: 7, Lossy: 500, Colors: 1000, Dither: "o8"},
 			want: []string{"-O3", "--careful", "--lossy=200", "--colors", "256", "--dither=o8", "--loopcount=forever", "in.gif", "-o", "out.gif"},
 		},

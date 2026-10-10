@@ -74,10 +74,10 @@ func ffmpegMajor(version string) int {
 	return 0
 }
 
-// discPNG writes a discSize x discSize PNG of a disc in colour c with a soft
-// (anti-aliased) 1 px edge. premultiplied stores c*alpha in the colour
+// discPNG writes a discSize x discSize PNG of a disc in color c with a soft
+// (anti-aliased) 1 px edge. premultiplied stores c*alpha in the color
 // channels (what a Resolve "Alpha Mode: Premultiplied" ProRes 4444 export
-// carries: matted onto black); otherwise the colour is stored straight.
+// carries: matted onto black); otherwise the color is stored straight.
 func discPNG(t *testing.T, path string, c uint8, premultiplied bool) {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, discSize, discSize))
@@ -189,7 +189,7 @@ func TestUnpremultiplyPixels(t *testing.T) {
 		t.Fatalf("premultiplied source without unpremultiply: %d edge pixels, R in [%d,%d]; expected dark edges (R ~ A)", n, minR, maxR)
 	}
 
-	t.Run("hoisted unpremultiply restores straight colour", func(t *testing.T) {
+	t.Run("hoisted unpremultiply restores straight color", func(t *testing.T) {
 		p := compile(t, proresInfo, unpre, recipe.Output{Format: "webp"})
 		if !strings.Contains(p.Filter, "setparams=alpha_mode=premultiplied,unpremultiply=inplace=1") {
 			t.Fatalf("filter: %s", p.Filter)
@@ -241,7 +241,7 @@ func TestUnpremultiplyPixels(t *testing.T) {
 
 // blocksPNG writes a 48x16 PNG of three 16x16 blocks: fully transparent
 // black, half-alpha red stored premultiplied ((128,0,0,128): the straight
-// colour is (255,0,0)) and opaque red.
+// color is (255,0,0)) and opaque red.
 func blocksPNG(t *testing.T, path string) {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, 48, 16))
@@ -269,7 +269,7 @@ func blocksPNG(t *testing.T, path string) {
 // "format=gbrap12le,…,unpremultiply" head copied the alpha plane with a +7
 // drift and no expansion (256→263), and the later gbrap12le→rgba expansion
 // left alpha 1 under every transparent pixel (129 for 128), which made every
-// encoder code the transparent area's colour and Crop to content at
+// encoder code the transparent area's color and Crop to content at
 // threshold 1 find the whole frame.
 func TestNativeYUVAAlphaIsExact(t *testing.T) {
 	ff := ffmpegOrSkip(t)
@@ -282,9 +282,9 @@ func TestNativeYUVAAlphaIsExact(t *testing.T) {
 	const w = 48
 
 	// checkBlocks asserts the alpha of every pixel of the three blocks (0,
-	// 128 +-1, 255) and the colour at the block centres: red R > 240 for the
+	// 128 +-1, 255) and the color at the block centres: red R > 240 for the
 	// half-alpha block when straight (the unpremultiply op), ~128 when the
-	// premultiplied colour is left as stored.
+	// premultiplied color is left as stored.
 	checkBlocks := func(t *testing.T, f []byte, halfR int, name string) {
 		t.Helper()
 		for y := 0; y < 16; y++ {

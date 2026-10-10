@@ -15,13 +15,13 @@
 // step further and composite the animation on a canvas (gifcanvas.go) to
 // find frames that do not change the picture.
 //
-// WebP is parsed as RIFF: VP8X flags/canvas, ANIM (bg colour, loop count),
+// WebP is parsed as RIFF: VP8X flags/canvas, ANIM (bg color, loop count),
 // ANMF frames (offset, size, duration, blend/dispose, ALPH/VP8/VP8L payload
 // to detect per-frame alpha), EXIF/XMP/ICCP presence.
 //
 // APNG is parsed at chunk level (IHDR, PLTE, tRNS, acTL, fcTL, fdAT, IDAT,
 // IEND; CRCs are not verified): frame rectangles, delays, loop count,
-// colour type / palette. Static images (PNG, JPEG, WebP, AVIF) only have
+// color type / palette. Static images (PNG, JPEG, WebP, AVIF) only have
 // their header read for dimensions and alpha.
 //
 // Video (MP4, WebM — Phase 4) is checked structurally and never rewritten:
@@ -189,7 +189,7 @@ type Report struct {
 //	2026-08-19.1  APNG (apng.*) and static-image (static.*) rules; gif.sticker-dims
 //	              is a warning only when a side exceeds 320 px (Discord shrinks
 //	              larger stickers and accepts smaller / non-square ones).
-//	2026-08-19.2  apng.indexed OK now means colour type 3 + PLTE + tRNS (the
+//	2026-08-19.2  apng.indexed OK now means color type 3 + PLTE + tRNS (the
 //	              indexed 8-bit-alpha APNG of the sticker default rung); RGBA
 //	              and opaque-indexed files fail the check at LevelInfo, which
 //	              does not affect Report.OK.
@@ -198,7 +198,7 @@ type Report struct {
 //	              >= 20 ms (a Discord-legal 60 fps sticker now passes with only
 //	              the note), >= 20 ms is clean; apng.container now rejects
 //	              out-of-range fcTL dispose_op/blend_op (libpng rejects such
-//	              files) and tRNS-before-PLTE for indexed colour (the palette
+//	              files) and tRNS-before-PLTE for indexed color (the palette
 //	              alpha is silently discarded), and caps the listed unknown
 //	              chunk types at 32 ("and N more types").
 //	2026-08-19.4  Attachment tiers: "attachment" (20 MB, free) is joined by

@@ -8,12 +8,12 @@
 #   make-test-clip.sh seq OUTDIR [frames=12] [size=320x320]
 #   make-test-clip.sh green OUT.mov|OUT.mp4 [seconds=2] [size=160x160]
 #
-# Content: testsrc2 colour bars/gradients as RGB, with an alpha channel made of
+# Content: testsrc2 color bars/gradients as RGB, with an alpha channel made of
 #   - a soft-edged circle orbiting the centre once per clip (seamless loop),
 #   - a hard-edged opaque block (top-left),
 #   - a 50 %-alpha block (top-right) — GIF thresholds it, WebP/APNG keep it soft.
 # Outside the shapes RGB is NOT black, so a viewer that ignores alpha shows
-# colour there (an easy tell), and "premultiplied" mode multiplies RGB by alpha
+# color there (an easy tell), and "premultiplied" mode multiplies RGB by alpha
 # before encoding — exactly what DaVinci Resolve does for ProRes 4444
 # "Alpha Mode: Premultiplied" exports.
 #
@@ -22,7 +22,7 @@
 # .gif  → palettegen/paletteuse GIF with 1-bit transparency, loop forever
 # .avif → animated AVIF with 8-bit alpha, repeats forever: avifenc from RGBA
 #         PNG frames when avifenc is on PATH (the app's path), otherwise
-#         ffmpeg's avif muxer with a colour + alpha (gray) libaom pair
+#         ffmpeg's avif muxer with a color + alpha (gray) libaom pair
 # seq   → OUTDIR/f00001.png … f0000N.png, straight-alpha RGBA PNG frames of the
 #         same animation (N frames at FPS, orbit closes over the N frames) —
 #         an image-sequence upload for the integration test
@@ -196,10 +196,10 @@ case "$kind" in
       "$avifenc" -j all -s 8 -q 60 --qalpha 90 -y 420 --fps "$fps" --repetition-count infinite \
         "$scratch"/f[0-9][0-9][0-9][0-9][0-9].png "$out" >/dev/null
     else
-      # ffmpeg's avif muxer takes a colour stream plus an optional alpha stream
-      # (single-plane gray). libaom needs explicit colour tags on the gray
+      # ffmpeg's avif muxer takes a color stream plus an optional alpha stream
+      # (single-plane gray). libaom needs explicit color tags on the gray
       # stream or it rejects it ("Subsampling must be 0 with AOM_CICP_MC_IDENTITY").
-      echo "make-test-clip: note: avifenc not found; using ffmpeg's avif muxer (libaom colour + alpha streams)" >&2
+      echo "make-test-clip: note: avifenc not found; using ffmpeg's avif muxer (libaom color + alpha streams)" >&2
       ff -f lavfi -i "$graph" \
         -filter_complex "[0:v]format=rgba,split[c][a];[c]format=yuv420p[col];[a]alphaextract,format=gray,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709[alp]" \
         -map "[col]" -map "[alp]" \
@@ -212,7 +212,7 @@ esac
 echo "make-test-clip: wrote $(stat -c %s "$out") bytes"
 if [ "$kind" = avif ]; then
   # ffmpeg's mov demuxer shows an animated AVIF as up to four streams (the
-  # primary still item colour/alpha, then the animation tracks), so report
+  # primary still item color/alpha, then the animation tracks), so report
   # every stream rather than just v:0 (which is always 1 frame).
   "$ffprobe" -v error -show_entries stream=index,codec_name,pix_fmt,width,height,nb_frames -of default=nw=1 "$out"
 else

@@ -1,13 +1,11 @@
 // Server-side renders of the batch UI (Phase 4): rows with probe facts,
 // per-row unpremultiply, per-row progress / result chips with Download +
-// Save to /output, the batch render panel, and (Phase 5a) the Background
-// card of the batch ops panel in its typed-hex-only form.
+// Save to /output, and the batch render panel.
 import { render } from 'svelte/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ProbeInfo, Recipe, Result, Source } from '../lib/api';
 import { addPendingRow, batch, enterBatch, exitBatch, rowUploaded, rowUploadFailed } from '../lib/batch.svelte';
 import { resetFeatures, setFeatures } from '../lib/capabilities.svelte';
-import { resetMatte, setMatteStatus } from '../lib/matte.svelte';
 import { app, resetApp } from '../lib/state.svelte';
 import BatchOpsPanel from './BatchOpsPanel.svelte';
 import BatchPanel from './BatchPanel.svelte';
@@ -49,7 +47,7 @@ const result: Result = {
       duration: 2,
       limit: 262_144,
       kind: 'output',
-      desc: 'fit at 20 fps · 128 colours',
+      desc: 'fit at 20 fps · 128 colors',
       report: { rulesVersion: 'x', format: 'gif', target: 'emote', bytes: 200_000, limit: 262_144, width: 128, height: 128, frames: 40, durationMs: 2000, minDelayMs: 50, loopForever: true, hasAlpha: true, ok: true, checks: [] },
     },
   ],
@@ -91,7 +89,7 @@ describe('BatchPanel (SSR)', () => {
     expect(out).toContain('Download');
     expect(out).toContain('?dl=1');
     expect(out).toContain('Save to /output'); // capabilities unknown → optimistic
-    expect(out).toContain('fit at 20 fps · 128 colours');
+    expect(out).toContain('fit at 20 fps · 128 colors');
     // after a save, the final name shows
     batch.rows[0].savedAs = 'out-3.gif';
     out = render(BatchPanel, { props: {} }).body;
@@ -112,22 +110,6 @@ describe('BatchPanel (SSR)', () => {
     expect(out).toContain('encoder exploded');
     expect(out).toContain('Retry');
     expect(out).toContain('Ready — “Render all”');
-  });
-
-  // Phase 5b: a row's SSE shows its matte stage with the pass's progress
-  it('a running row at the matte stage reads "AI matte" with the job message', () => {
-    const a = addPendingRow('a.mov');
-    rowUploaded(a, src('a'));
-    batch.rows[0].running = true;
-    batch.rows[0].job = { id: 'j', recipeHash: 'f'.repeat(64), recipe, state: 'running', stage: 'matte', percent: 7, message: '24/45 · GPU', created: '' };
-    let out = render(BatchPanel, { props: {} }).body;
-    // (SSR writes the &nbsp; as the character itself, with a hydration marker between)
-    expect(out).toMatch(/AI matte(?:<!--[^>]*-->)* · 24\/45 · GPU/);
-    expect(out).toContain('7%');
-    batch.rows[0].job = { ...batch.rows[0].job!, stage: 'encode', message: '' };
-    out = render(BatchPanel, { props: {} }).body;
-    expect(out).toContain('>Encoding<');
-    expect(out).not.toContain('AI matte');
   });
 
   it('an upload-failed row keeps Retry enabled while the dropped File is on the row (WEB-10)', () => {
@@ -160,40 +142,25 @@ describe('BatchOpsPanel (SSR) — Background card without a preview', () => {
   });
   const html = () => render(BatchOpsPanel, { props: {} }).body;
 
-  it('Colour mode takes typed hex only (no eyedropper: the card is mounted with picker off); Screen as in the editor', () => {
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'colour', colors: [''] };
+  it('Color mode takes typed hex only (no eyedropper: the card is mounted with picker off); Screen as in the editor', () => {
+    app.ops.background = { ...app.ops.background, enabled: true, mode: 'color', colors: [''] };
     let out = html();
     expect(out).toContain('type the hex values in the Background card');
     // the card's collapsed summary is the batch one — no "pick … on the preview"
-    expect(out).toContain('type a colour to remove');
-    expect(out).not.toContain('pick a colour on the preview');
+    expect(out).toContain('type a color to remove');
+    expect(out).not.toContain('pick a color on the preview');
     expect(out).not.toContain('Pick from preview');
     app.ops.background.colors = ['313338', 'facc82'];
     out = html();
-    expect(out).toContain('2 colours · similarity 0.08 · fill pinholes');
+    expect(out).toContain('2 colors · similarity 0.08 · fill pinholes');
     app.ops.background.mode = 'screen';
+    app.ops.background.morph = { close: true, grow: -2, smooth: 0 };
     out = html();
-    expect(out).toContain('greenscreen · similarity 0.10 · fill pinholes');
+    expect(out).toContain('greenscreen · similarity 0.10 · fill pinholes · shift −2 px');
     // the other batch cards are still there
     expect(out).toContain('Enable Frame rate');
     expect(out).toContain('Enable Speed');
     expect(out).toContain('Enable Feather');
-  });
-
-  // Phase 5b: the AI mode is offered in batch like keying (every row's render
-  // runs its own pass). The card mounts collapsed here, so its summary is
-  // what shows; the open body with picker off is BackgroundCard.test's.
-  it('offers the AI mode: the collapsed card summarises it and the hint names it', () => {
-    resetMatte();
-    setMatteStatus({ enabled: true, device: 'cuda', defaultModel: 'isnet-anime', models: { 'isnet-anime': { label: 'Anime (fast)', state: 'ready', msPerFrame: 18 }, 'birefnet-lite': { label: 'General (precise)', state: 'ready', msPerFrame: 170 } }, maxSeconds: 600, maxFrames: 3000 });
-    let out = html();
-    expect(out).toMatch(/or\s+use its AI mode \(every row gets its own matte/);
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai' };
-    out = html();
-    expect(out).toContain('>AI · fill pinholes</span>');
-    app.ops.background.ai.model = 'birefnet-lite';
-    expect(html()).toContain('>AI · General (precise) · fill pinholes</span>');
-    resetMatte();
   });
 });
 

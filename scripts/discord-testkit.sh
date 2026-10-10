@@ -236,7 +236,7 @@ bits_of() {
 #     yuva444p12le (range tv) with its alpha on the luma range (12-bit
 #     256..3750); format=gbrap12le copied that plane same-depth (+7, no
 #     expansion) and the later rgba conversion left every transparent pixel at
-#     alpha 1 with full colour underneath — bigger WebP/APNG/AVIF, and an
+#     alpha 1 with full color underneath — bigger WebP/APNG/AVIF, and an
 #     autocrop at threshold 1 that saw the whole frame. format=rgba off the
 #     yuva frame gives exact 0/128/255 alpha (DESIGN.md §4.1, §9 item 5).
 #     Straight yuva sources take the same single format=rgba.
@@ -420,7 +420,7 @@ fit_gif() {
     gif_palette "$m" "$w" "$h" "$tmp" "$colors" "$fps_" "$maxs"
     gifsicle_o2 "$tmp" "$out" --lossy="$lossy" --colors "$colors"
     size=$(fsize "$out")
-    RUNG[$(basename "$out")]="${fps_} fps · ${colors} colours · lossy ${lossy}"
+    RUNG[$(basename "$out")]="${fps_} fps · ${colors} colors · lossy ${lossy}"
     if [ "$size" -le "$aim" ]; then return; fi
   done
   OVER[$(basename "$out")]=1
@@ -457,7 +457,7 @@ fit_apng_indexed() {
     read -r fps_ colors <<<"$rung"
     apng_indexed "$m" "$w" "$h" "$out" "$colors" "$fps_" "$maxs" || { rm -f "$out"; return; }
     size=$(fsize "$out")
-    RUNG[$(basename "$out")]="${fps_} fps · ${colors} colours · pal8"
+    RUNG[$(basename "$out")]="${fps_} fps · ${colors} colors · pal8"
     if [ "$size" -le "$aim" ]; then return; fi
   done
   OVER[$(basename "$out")]=1
@@ -554,7 +554,7 @@ verify_line() { # verify_line FILE → "WxH · N frames · <format facts>"
         "$(grep -a -o acTL "$f" | wc -l)" "$(grep -a -o fcTL "$f" | wc -l)" \
         "$(grep -a -o PLTE "$f" | wc -l)" "$(grep -a -o tRNS "$f" | wc -l)") ;;
     *.avif)
-      # ffprobe sees the colour and alpha planes as two streams; avifdec knows the sequence.
+      # ffprobe sees the color and alpha planes as two streams; avifdec knows the sequence.
       if have avifdec; then
         facts=$(avifdec --info "$f" 2>/dev/null | awk -F': *' '/Repeat Count/ {r=$2} /Alpha/ {a=$2} /timescales per second/ {n=$0; sub(/^ *\* */, "", n)} END { printf "avifdec: alpha=%s, repeat=%s, %s", a, r, n }')
       else
@@ -632,15 +632,15 @@ attachment. Re-run this checklist after an encoder or linter change and update t
 |---|---|---|---|
 | \`a_gif_ffmpeg-palette_gifsicle-O2.gif\` | Default GIF path: palettegen/paletteuse, matte #313338, alpha_threshold 128, bayer 3, single global palette, then \`gifsicle -O2 --careful\` (frame-diff optimised) | chat attachment | transparent, dark fringe on light theme only, no flicker |
 | \`b_gif_ffmpeg-palette_gifsicle-U.gif\` | Same frames coalesced by plain \`gifsicle -U\` (full frames; gifsicle writes a disposal 0/2 mix). Kept as a historical comparison (the 2026-08-19 results refer to it) — not the app's fallback any more: since 2026-09-19 that is \`gifsicle -U --disposal=background\` + MergeGIFHolds (DESIGN.md §5.3) | chat attachment | identical look to (a), bigger file |
-| \`c_gif_gifski_local-palettes.gif\` | gifski quality 90 from RGBA PNGs, matte #313338 (per-frame local palettes — historically glitchy on Discord) | chat attachment | best gradients; watch for random per-frame colour changes |
+| \`c_gif_gifski_local-palettes.gif\` | gifski quality 90 from RGBA PNGs, matte #313338 (per-frame local palettes — historically glitchy on Discord) | chat attachment | best gradients; watch for random per-frame color changes |
 | \`d_gif_ffmpeg-only.gif\` | ffmpeg palette GIF with no gifsicle pass (ffmpeg's own GCE/disposal choices) | chat attachment | same as (a); black background here means the linter fixer is required |
 | \`e_webp_lossy_yuva420p_q80.webp\` | Animated WebP, libwebp_anim lossy q80 yuva420p (ffmpeg converts RGB→YUV, the app's default), \`-loop 0\`, no metadata | chat attachment | soft alpha survives, loops forever, no ghost trails |
-| \`e2_webp_lossy_bgra_q80.webp\` | Same lossy settings fed \`-pix_fmt bgra\` (libwebp does the RGB→YUV step itself; alpha stays lossless) — the yuva420p vs bgra comparison from DESIGN.md §9 | chat attachment | same as (e); note any difference in edge colour, chroma bleed on the soft edge, or size |
+| \`e2_webp_lossy_bgra_q80.webp\` | Same lossy settings fed \`-pix_fmt bgra\` (libwebp does the RGB→YUV step itself; alpha stays lossless) — the yuva420p vs bgra comparison from DESIGN.md §9 | chat attachment | same as (e); note any difference in edge color, chroma bleed on the soft edge, or size |
 | \`f_webp_lossless_bgra.webp\` | Animated WebP lossless bgra | chat attachment | pixel-exact, loops forever |
 | \`g_apng_rgba.png\` | APNG RGBA \`-plays 0\` (Discord shows only frame 0 for APNG *attachments*) | chat attachment (expect still) | still first frame is a known limitation, not a bug |
 | \`h1_emote128_gif.gif\` | Emote GIF 128×128 fitted under 256 KiB (${RUNG[h1_emote128_gif.gif]:-n/a}) | Server Settings › Emoji | animates at ~22 px, transparent, keeps looping |
 | \`h2_emote128_webp.webp\` | Emote animated WebP 128×128 (${RUNG[h2_emote128_webp.webp]:-n/a}) | Server Settings › Emoji | accepted, animates, soft alpha kept |
-| \`i3_sticker320_apng-indexed.png\` | **Sticker default:** APNG 320×320, ≤ 5 s, indexed colour with 8-bit alpha (PLTE + tRNS, one shared palette; ${RUNG[i3_sticker320_apng-indexed.png]:-n/a}) — user-verified best sticker (animates at 25 fps, soft alpha) | Server Settings › Stickers | animates in the picker and in chat, soft alpha, no "frame rate too small/large" error |
+| \`i3_sticker320_apng-indexed.png\` | **Sticker default:** APNG 320×320, ≤ 5 s, indexed color with 8-bit alpha (PLTE + tRNS, one shared palette; ${RUNG[i3_sticker320_apng-indexed.png]:-n/a}) — user-verified best sticker (animates at 25 fps, soft alpha) | Server Settings › Stickers | animates in the picker and in chat, soft alpha, no "frame rate too small/large" error |
 | \`i1_sticker320_gif.gif\` | Sticker GIF exactly 320×320, ≤ 5 s (${RUNG[i1_sticker320_gif.gif]:-n/a}) — the fallback rung when no indexed APNG fits | Server Settings › Stickers | accepted, animates in the picker and in chat (1-bit alpha) |
 | \`i2_sticker320_apng-rgba.png\` | Sticker APNG exactly 320×320, ≤ 5 s, RGBA 8-bit alpha (${RUNG[i2_sticker320_apng-rgba.png]:-n/a}) — probe rung, usually fits only at a low fps | Server Settings › Stickers | same as (i3) at whatever fps it fitted |
 EOF
@@ -669,9 +669,9 @@ preview and in-chat (160 px).
 ## What to look for
 
 - **Alpha survives** — the area outside the circle/blocks shows the chat background, not black,
-  white or garbage colour. Compare dark and light theme.
+  white or garbage color. Compare dark and light theme.
 - **No black background** — the classic lilliput symptom (frame 0 without a transparency flag).
-- **No colour flicker / random per-frame colours** — especially (a), (c), (d) after Discord's
+- **No color flicker / random per-frame colors** — especially (a), (c), (d) after Discord's
   GIF→WebP transcode.
 - **First-frame still** — with autoplay off the still shown must be a real, non-blank frame.
 - **Loops forever** — the animation must not stop after one pass (NETSCAPE loop / WebP loop 0 /

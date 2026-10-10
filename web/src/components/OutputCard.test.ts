@@ -168,7 +168,7 @@ describe('OutputCard (SSR)', () => {
     expect(out).not.toContain('Alpha threshold'); // no re-quantisation → no threshold/matte path
     expect(out).not.toContain('Matte');
     expect(out).toContain('Lossy');
-    expect(out).toContain('Dither'); // gifsicle dithers when it drops colours
+    expect(out).toContain('Dither'); // gifsicle dithers when it drops colors
     expect(targetSelect(out)).toMatch(/<option value=""[^>]*selected/);
   });
 
@@ -179,15 +179,15 @@ describe('OutputCard (SSR)', () => {
     expect(out).toContain('Fit to ≤');
     expect(out).not.toContain('keep size');
     expect(out).toContain('keep fps');
-    expect(out).toContain('lossy → frame drop → colours');
-    expect(out).not.toContain('colours → downscale');
+    expect(out).toContain('lossy → frame drop → colors');
+    expect(out).not.toContain('colors → downscale');
     // the re-encoding presets keep both checkboxes and the full ladder wording
     applyPreset('chat');
     app.output.fitEnabled = true;
     const out2 = html();
     expect(out2).toContain('keep size');
     expect(out2).toContain('keep fps');
-    expect(out2).toContain('lossy → fps → colours → downscale');
+    expect(out2).toContain('lossy → fps → colors → downscale');
   });
 
   it('Frames: frame format select, no fit / target controls', () => {
@@ -218,13 +218,13 @@ describe('OutputCard (SSR)', () => {
     expect(html()).toContain('no fit search for a static PNG');
   });
 
-  it('Sticker with fit on locks the APNG colour select to the indexed fit ladder', () => {
+  it('Sticker with fit on locks the APNG color select to the indexed fit ladder', () => {
     applyPreset('sticker'); // apng, fit 512 KiB on
     let out = html();
-    expect(out).toContain('Colours (fit ladder: 256 → 128 → 64 indexed)');
-    expect(out).toContain('turn fit off to pick a fixed palette or RGBA truecolour');
+    expect(out).toContain('Colors (fit ladder: 256 → 128 → 64 indexed)');
+    expect(out).toContain('turn fit off to pick a fixed palette or RGBA truecolor');
     expect(out).toContain('fit off only'); // the RGBA option no longer claims fit behaviour
-    // preset-locked size-fit select + the locked colour select; the target select is never locked
+    // preset-locked size-fit select + the locked color select; the target select is never locked
     expect(out.match(/<select disabled/g)?.length).toBe(2);
     app.output.fitEnabled = false;
     out = html();

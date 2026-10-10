@@ -9,7 +9,7 @@ import (
 )
 
 // Block-level GIF model. The parser keeps every byte it does not need to
-// interpret (LZW data, colour tables, unknown extensions) verbatim, so a
+// interpret (LZW data, color tables, unknown extensions) verbatim, so a
 // parsed file re-serialises byte-exact when nothing was changed and a fixed
 // file differs from the input only in the bytes the fixer touched.
 
@@ -30,7 +30,7 @@ type gifFile struct {
 	header    [6]byte // "GIF87a" / "GIF89a"
 	width     uint16  // Logical Screen Descriptor
 	height    uint16
-	lsdPacked byte // GCT flag 0x80, colour resolution 0x70, sort 0x08, GCT size 0x07
+	lsdPacked byte // GCT flag 0x80, color resolution 0x70, sort 0x08, GCT size 0x07
 	bgIndex   byte
 	aspect    byte
 	gct       []byte // raw Global Color Table (nil when the flag is clear)
@@ -321,7 +321,7 @@ func parseGIF(data []byte) (*gifFile, error) {
 		n := 3 * g.gctColors()
 		gct, err := r.take(n)
 		if err != nil {
-			return nil, fmt.Errorf("gif: truncated global colour table: %w", err)
+			return nil, fmt.Errorf("gif: truncated global color table: %w", err)
 		}
 		g.gct = gct
 	}
@@ -456,7 +456,7 @@ func (r *gifReader) image() (*gifImage, error) {
 	if b.hasLCT() {
 		lct, err := r.take(3 * b.lctColors())
 		if err != nil {
-			return nil, fmt.Errorf("local colour table: %w", err)
+			return nil, fmt.Errorf("local color table: %w", err)
 		}
 		b.lct = lct
 	}

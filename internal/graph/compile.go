@@ -168,8 +168,6 @@ func decodeOp(i int, op recipe.Op) (decodedOp, error) {
 		params = new(recipe.FeatherParams)
 	case recipe.OpMorph:
 		params = new(recipe.MorphParams)
-	case recipe.OpMatte:
-		params = new(recipe.MatteParams)
 	case recipe.OpAutoCrop:
 		params = new(recipe.AutoCropParams)
 	case recipe.OpText:
@@ -222,11 +220,10 @@ type compiler struct {
 	chains     []string
 	labels     int              // base labels handed out by closeChain ("[bN]")
 	extras     map[int]extraRef // overlay source index → its ExtraInput (dedupe)
-	matteRefs  map[matteKey]int // (model, size, stabilise, prompts, edge) of a matte op → its ExtraInput position (dedupe, see compiler.matte)
 	ovs        int              // overlay ops compiled so far (labels "[ovN]")
-	mattes     int              // matte merges emitted so far (labels "[mN…]", see mergeMatte)
-	keeps      int              // keep-colour union wrappers emitted so far (labels "[uN…]", see keepColour)
 	keys       int              // alpha-keeping key wrappers emitted so far (labels "[kN…]", see keyKeepingAlpha)
+	despills   int              // edge-masked despill stages emitted so far (labels "[dN…]", see edgeDespill)
+	edges      int              // morph alpha wrappers emitted so far (labels "[eN…]", see morph)
 	layers     int              // translucent text layers emitted so far (labels "[tN]", see textLayers)
 	bounces    int              // bounce ops emitted so far (labels "[fN]"/"[rN]"/"[rrN]", see bounce); each doubles Duration and Frames in assemble
 	rgbaCanvas bool             // the canvas was forced to rgba for the final-canvas ops
@@ -237,18 +234,6 @@ type compiler struct {
 type extraRef struct {
 	index    int  // position in Plan.ExtraInputs
 	infinite bool // the input never ends by construction (-loop 1 / -stream_loop -1)
-}
-
-// matteKey identifies the matte sequence a matte op reads: two matte ops
-// with the same resolved model and size share one ExtraInput (Phase 5b)
-// — and, Phase 5c, the same stabilise mode, canonical prompts and edge
-// model, since each of those names another derived sequence on disk.
-type matteKey struct {
-	model     string
-	size      int
-	stabilise string
-	prompts   string
-	edge      string
 }
 
 // sequence holds the resolved facts of an image-sequence source.
@@ -275,24 +260,8 @@ func newCompiler(srcs []recipe.ProbeInfo, out recipe.Output) *compiler {
 		nativeYUVA: planarYUVAlpha(src),
 		input:      mainInput,
 		extras:     map[int]extraRef{},
-		matteRefs:  map[matteKey]int{},
 		plan:       Plan{OutLabel: outLabel, Speed: 1},
 	}
-}
-
-// temporalPrefix compiles the stages every entry point shares — the source
-// head (image sequence / separate alpha stream), the alpha head (hoisted
-// unpremultiply), trim, speed and fps — so CompileWithSources,
-// CompileDetectFor and CompileMatteInput yield the same leading stages and
-// the same InputArgs for the same source, ops and Output (Phase 5b: the
-// matte sidecar sees exactly the frames the render keys, the detection
-// samples the render's grid). ops is the stack the caller decoded (the
-// temporal kinds are picked out of it; the rest is ignored here).
-func (c *compiler) temporalPrefix(ops []decodedOp) error {
-	if err := c.source(ops); err != nil {
-		return err
-	}
-	return c.temporal(ops)
 }
 
 // planarYUVAlpha reports whether src decodes to a planar YUV format with an
@@ -434,7 +403,7 @@ func (c *compiler) sequenceSource(ops []decodedOp) error {
 //
 // Sequences are special for fftools: by default it rebuilds the whole
 // filtergraph whenever ANY decoded frame parameter changes — not just the
-// size but also the pixel format or colour range (rgba vs rgb24 PNGs, one
+// size but also the pixel format or color range (rgba vs rgb24 PNGs, one
 // indexed PNG-8 among RGBA frames, yuvj420p vs yuvj444p JPEGs) — and the
 // rebuild loses the frame the fps filter holds at every change (verified on
 // FFmpeg 9.0.1: six mixed frames came out as six copies of the last one).
@@ -472,7 +441,7 @@ func (c *compiler) sequenceHead(mixed bool) {
 }
 
 // alphaStreamHead merges a separate single-plane alpha stream (ffmpeg's mov
-// demuxer exposes AVIF alpha as stream AlphaStream next to the colour stream
+// demuxer exposes AVIF alpha as stream AlphaStream next to the color stream
 // ColorStream — v:0 for a still AVIF, the animation track (typically v:2,
 // alpha v:3) for an animated one, because the one-frame primary item comes
 // first) into the main stream before every other stage:
@@ -544,7 +513,7 @@ func (c *compiler) temporal(ops []decodedOp) error {
 //     the unpremultiply copies the alpha plane with a +7 drift and no
 //     expansion (256→263), and the later gbrap12le(tv)→rgba expansion then
 //     leaves alpha 1 under every fully transparent pixel (and 129 for 128):
-//     every encoder had to code the full unpremultiplied colour of those
+//     every encoder had to code the full unpremultiplied color of those
 //     pixels (bigger WebP/APNG/AVIF, worse fit results) and Crop to content
 //     at threshold 1 found the whole frame. Measured on FFmpeg 9.0.1:
 //     the native head gives alpha 0 / 128 / 255 exactly and RGB within 1 of
@@ -1118,7 +1087,6 @@ func (c *compiler) assemble() (*Plan, error) {
 			p.Frames *= 2
 		}
 	}
-	p.Bounces = c.bounces
 	p.Bounced = c.bounces > 0
 	return p, nil
 }
@@ -1175,7 +1143,7 @@ func (c *compiler) emitCenterCrop(w, h int) {
 
 // emitScale emits a lanczos scale to w x h. When the frame carries alpha the
 // scale is wrapped in premultiply/unpremultiply (on planar gbrap) so
-// transparent edges do not bleed their (usually black) colour. A no-op
+// transparent edges do not bleed their (usually black) color. A no-op
 // scale is skipped.
 //
 // No alpha_mode tag is needed here: premultiply's required input mode
@@ -1200,8 +1168,8 @@ func (c *compiler) emitScale(w, h int) {
 }
 
 // emitPad pads the current frame to w x h, centred, with the given ffmpeg
-// colour. The frame must not be larger than w x h (callers crop first). The
-// stream is forced to rgba first: pad ignores the colour's alpha on
+// color. The frame must not be larger than w x h (callers crop first). The
+// stream is forced to rgba first: pad ignores the color's alpha on
 // alpha-less formats (transparent padding would come out black) and rgba has
 // no chroma subsampling, so odd sizes/offsets stay exact.
 func (c *compiler) emitPad(w, h int, color string, transparent bool) {
@@ -1217,7 +1185,7 @@ func (c *compiler) emitPad(w, h int, color string, transparent bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Size / colour helpers.
+// Size / color helpers.
 // ---------------------------------------------------------------------------
 
 // normalizeFit validates a fit mode; "" means contain.
@@ -1271,7 +1239,7 @@ func roundDiv(a, b int) int {
 	return (a + b/2) / b
 }
 
-// padColor converts a CanvasParams colour ("" = fully transparent, else
+// padColor converts a CanvasParams color ("" = fully transparent, else
 // RRGGBB or RRGGBBAA) to ffmpeg's 0x notation and reports whether the
 // padding is (partly) transparent.
 func padColor(s string) (color string, transparent bool, err error) {

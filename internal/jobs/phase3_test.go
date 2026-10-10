@@ -163,12 +163,12 @@ func TestDecodeAutoCropAndDetectionOps(t *testing.T) {
 		t.Errorf("keying in front of the autocrop: %+v %v", before, err)
 	}
 	src := strings.Repeat("a", 64)
-	kAfter, err1 := autocropKey(src, after, 1, "25", nil)
-	kBefore, err2 := autocropKey(src, before, 1, "25", nil)
+	kAfter, err1 := autocropKey(src, after, 1)
+	kBefore, err2 := autocropKey(src, before, 1)
 	if err1 != nil || err2 != nil || kAfter != kBefore {
 		t.Errorf("[autocrop, colorkey] and [colorkey, autocrop] must share a memo key: %s vs %s (%v %v)", short(kAfter), short(kBefore), err1, err2)
 	}
-	if kNone, _ := autocropKey(src, nil, 1, "25", nil); kNone == kAfter {
+	if kNone, _ := autocropKey(src, nil, 1); kNone == kAfter {
 		t.Error("[autocrop, colorkey] shares the unkeyed stack's memo key")
 	}
 	// Geometry in front of the autocrop is refused; behind it, it is fine
@@ -219,45 +219,45 @@ func TestAutocropKey(t *testing.T) {
 	src := strings.Repeat("a", 64)
 	trim := recipe.Op{Kind: recipe.OpTrim, Params: json.RawMessage(`{"start":1,"end":2}`)}
 	trimSpaced := recipe.Op{Kind: recipe.OpTrim, Params: json.RawMessage(`{ "end": 2, "start": 1 }`)}
-	k, err := autocropKey(src, []recipe.Op{trim}, 1, "25", nil)
+	k, err := autocropKey(src, []recipe.Op{trim}, 1)
 	if err != nil || !recipe.IsHash(k) {
 		t.Fatalf("key %q %v", k, err)
 	}
-	if k2, _ := autocropKey(src, []recipe.Op{trimSpaced}, 1, "25", nil); k2 != k {
+	if k2, _ := autocropKey(src, []recipe.Op{trimSpaced}, 1); k2 != k {
 		t.Error("key depends on params formatting")
 	}
 	chroma := recipe.Op{Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"00ff00"}`)}
 	feather := recipe.Op{Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":2}`)}
 	morph := recipe.Op{Kind: recipe.OpMorph, Params: json.RawMessage(`{"close":true}`)}
 	for name, other := range map[string]func() (string, error){
-		"threshold": func() (string, error) { return autocropKey(src, []recipe.Op{trim}, 2, "25", nil) },
-		"ops":       func() (string, error) { return autocropKey(src, nil, 1, "25", nil) },
-		"source":    func() (string, error) { return autocropKey(strings.Repeat("b", 64), []recipe.Op{trim}, 1, "25", nil) },
-		"keying":    func() (string, error) { return autocropKey(src, []recipe.Op{trim, chroma}, 1, "25", nil) },
-		"feather":   func() (string, error) { return autocropKey(src, []recipe.Op{trim, feather}, 1, "25", nil) },
-		"morph":     func() (string, error) { return autocropKey(src, []recipe.Op{trim, morph}, 1, "25", nil) },
-		"key colour": func() (string, error) {
-			return autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"0000ff"}`)}}, 1, "25", nil)
+		"threshold": func() (string, error) { return autocropKey(src, []recipe.Op{trim}, 2) },
+		"ops":       func() (string, error) { return autocropKey(src, nil, 1) },
+		"source":    func() (string, error) { return autocropKey(strings.Repeat("b", 64), []recipe.Op{trim}, 1) },
+		"keying":    func() (string, error) { return autocropKey(src, []recipe.Op{trim, chroma}, 1) },
+		"feather":   func() (string, error) { return autocropKey(src, []recipe.Op{trim, feather}, 1) },
+		"morph":     func() (string, error) { return autocropKey(src, []recipe.Op{trim, morph}, 1) },
+		"key color": func() (string, error) {
+			return autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpChromaKey, Params: json.RawMessage(`{"color":"0000ff"}`)}}, 1)
 		},
 		"key kind": func() (string, error) {
-			return autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpColorKey, Params: json.RawMessage(`{"color":"00ff00"}`)}}, 1, "25", nil)
+			return autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpColorKey, Params: json.RawMessage(`{"color":"00ff00"}`)}}, 1)
 		},
 	} {
 		if k2, err := other(); err != nil || k2 == k {
 			t.Errorf("key ignores %s (%v)", name, err)
 		}
 	}
-	if _, err := autocropKey(src, []recipe.Op{{Kind: recipe.OpTrim, Params: json.RawMessage(`{bad`)}}, 1, "25", nil); !errors.Is(err, ErrInvalidRecipe) {
+	if _, err := autocropKey(src, []recipe.Op{{Kind: recipe.OpTrim, Params: json.RawMessage(`{bad`)}}, 1); !errors.Is(err, ErrInvalidRecipe) {
 		t.Errorf("bad params: %v", err)
 	}
 	// The feather radius is in the key too (a wider feather is a wider box).
-	kFeather, _ := autocropKey(src, []recipe.Op{trim, feather}, 1, "25", nil)
-	if k2, err := autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":5}`)}}, 1, "25", nil); err != nil || k2 == kFeather {
+	kFeather, _ := autocropKey(src, []recipe.Op{trim, feather}, 1)
+	if k2, err := autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpFeather, Params: json.RawMessage(`{"radius":5}`)}}, 1); err != nil || k2 == kFeather {
 		t.Errorf("key ignores the feather radius (%v)", err)
 	}
 	// So are the morph params (each grow step widens the box by a ring).
-	kMorph, _ := autocropKey(src, []recipe.Op{trim, morph}, 1, "25", nil)
-	if k2, err := autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpMorph, Params: json.RawMessage(`{"close":true,"grow":2}`)}}, 1, "25", nil); err != nil || k2 == kMorph {
+	kMorph, _ := autocropKey(src, []recipe.Op{trim, morph}, 1)
+	if k2, err := autocropKey(src, []recipe.Op{trim, {Kind: recipe.OpMorph, Params: json.RawMessage(`{"close":true,"grow":2}`)}}, 1); err != nil || k2 == kMorph {
 		t.Errorf("key ignores the morph grow (%v)", err)
 	}
 	// The key is versioned (a bump discards memo entries the old detection
@@ -327,11 +327,11 @@ func TestResolveAutoCropMemoAndErrors(t *testing.T) {
 	// in front of the autocrop (here the unpremultiply) and the threshold,
 	// not the resize behind it and not the padding, which is applied on
 	// read.
-	key, err := autocropKey(src, []recipe.Op{{Kind: recipe.OpUnpremultiply}}, 8, "25", nil)
+	key, err := autocropKey(src, []recipe.Op{{Kind: recipe.OpUnpremultiply}}, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other, _ := autocropKey(src, nil, 8, "25", nil); other == key {
+	if other, _ := autocropKey(src, nil, 8); other == key {
 		t.Fatal("the unpremultiply op is not in the key")
 	}
 	memo := filepath.Join(st.Scratch, autocropDir, key+".json")
@@ -367,7 +367,7 @@ func TestResolveAutoCropMemoAndErrors(t *testing.T) {
 		}
 	}
 	// A memoised "nothing detected" (empty box) resolves to the full frame.
-	emptyKey, _ := autocropKey(src, []recipe.Op{{Kind: recipe.OpUnpremultiply}}, 200, "25", nil)
+	emptyKey, _ := autocropKey(src, []recipe.Op{{Kind: recipe.OpUnpremultiply}}, 200)
 	if err := os.WriteFile(filepath.Join(st.Scratch, autocropDir, emptyKey+".json"), []byte(`{"x":0,"y":0,"w":0,"h":0}`), 0o644); err != nil {
 		t.Fatal(err)
 	}

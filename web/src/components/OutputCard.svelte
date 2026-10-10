@@ -54,8 +54,8 @@
   // fit row for static PNG / frames — the server would ignore fitBytes.
   const fitCapable = $derived(fitsFormat(out.format));
   // Under fit the APNG rungs dictate the palette (indexed 256 → 128 → 64,
-  // internal/fit stickerAPNGSteps) and RGBA truecolour is never tried, so the
-  // colour select is a fit-off knob.
+  // internal/fit stickerAPNGSteps) and RGBA truecolor is never tried, so the
+  // color select is a fit-off knob.
   const apngFitLocked = $derived(out.format === 'apng' && out.fitEnabled);
   // MP4 / WebM are offered only when the target allows them (never emote /
   // sticker) AND the server encodes them (capabilities "formats" — an older
@@ -129,14 +129,14 @@
     { v: 128, label: '128 (indexed)' },
     { v: 64, label: '64 (indexed)' },
     { v: 32, label: '32 (indexed)' },
-    { v: 0, label: 'RGBA truecolour (largest; fit off only)' },
+    { v: 0, label: 'RGBA truecolor (largest; fit off only)' },
   ];
   const pngColors: { v: number; label: string }[] = [
     { v: 256, label: '256 (pngquant, near-lossless)' },
     { v: 128, label: '128 (pngquant)' },
     { v: 64, label: '64 (pngquant)' },
     { v: 32, label: '32 (pngquant)' },
-    { v: 0, label: 'full colour (oxipng only, largest)' },
+    { v: 0, label: 'full color (oxipng only, largest)' },
   ];
 
   const matteMode = $derived(out.matte === DEFAULT_MATTE ? 'dark' : out.matte === WHITE_MATTE ? 'light' : 'custom');
@@ -172,7 +172,7 @@
     normalizeColors();
     reseedQuality(app.output, prev);
   }
-  /** GIF always has a palette: a "0 = truecolour" left over from APNG/PNG becomes 256. */
+  /** GIF always has a palette: a "0 = truecolor" left over from APNG/PNG becomes 256. */
   function normalizeColors() {
     if (out.format === 'gif' && !(out.colors > 0)) app.output.colors = 256;
   }
@@ -354,7 +354,7 @@
   {:else if out.format === 'gif'}
     <div class="row">
       <label class="field">
-        <span>Colours</span>
+        <span>Colors</span>
         <select bind:value={app.output.colors}>
           {#each gifColors as c (c)}<option value={c}>{c}</option>{/each}
         </select>
@@ -380,14 +380,14 @@
   {:else if out.format === 'apng'}
     <div class="row">
       <label class="field">
-        <span>Colours{apngFitLocked ? ' (fit ladder: 256 → 128 → 64 indexed)' : ''}</span>
+        <span>Colors{apngFitLocked ? ' (fit ladder: 256 → 128 → 64 indexed)' : ''}</span>
         <select bind:value={app.output.colors} disabled={apngFitLocked}>
           {#each apngColors as c (c.v)}<option value={c.v}>{c.label}</option>{/each}
         </select>
       </label>
     </div>
     {#if apngFitLocked}
-      <p class="hint">Fit always searches the indexed pngquant ladder; turn fit off to pick a fixed palette or RGBA truecolour.</p>
+      <p class="hint">Fit always searches the indexed pngquant ladder; turn fit off to pick a fixed palette or RGBA truecolor.</p>
     {/if}
   {:else if out.format === 'webp'}
     <div class="row">
@@ -413,7 +413,7 @@
   {:else if out.format === 'png'}
     <div class="row">
       <label class="field">
-        <span>Colours</span>
+        <span>Colors</span>
         <select bind:value={app.output.colors}>
           {#each pngColors as c (c.v)}<option value={c.v}>{c.label}</option>{/each}
         </select>
@@ -457,13 +457,13 @@
         {#if !out.fitEnabled}
           off — the knobs above are used as-is.
         {:else if out.preset === 'optimize'}
-          ladder, cheapest first: lossy → frame drop → colours (gifsicle only, never scaled); 2 runner-ups as alternatives.
+          ladder, cheapest first: lossy → frame drop → colors (gifsicle only, never scaled); 2 runner-ups as alternatives.
         {:else if video && crf}
           secant search over the {crf.label} alone (size and fps stay); 2 runner-ups as alternatives.
         {:else if gifskiOn}
           search over the gifski quality; 2 runner-ups as alternatives.
         {:else}
-          ladder, cheapest first: lossy → fps → colours → downscale{out.target === 'sticker' ? ' (stickers are never downscaled)' : ''}; 2
+          ladder, cheapest first: lossy → fps → colors → downscale{out.target === 'sticker' ? ' (stickers are never downscaled)' : ''}; 2
           runner-ups as alternatives.
         {/if}
       </span>
@@ -486,14 +486,14 @@
               value={out.encoder === 'gifski' ? 'gifski' : ''}
               onchange={(e) => (app.output.encoder = e.currentTarget.value === 'gifski' ? 'gifski' : '')}
               aria-label="GIF encoder"
-              title="gifski quantises and dithers every frame itself (much slower). To pass the GIF checks the result is then re-quantised to one shared palette, so the gain over the default encoder is small on colour-rich clips — attachments / no target only (Discord emotes break with it)"
+              title="gifski quantises and dithers every frame itself (much slower). To pass the GIF checks the result is then re-quantised to one shared palette, so the gain over the default encoder is small on color-rich clips — attachments / no target only (Discord emotes break with it)"
             >
               <option value="">ffmpeg palette (default)</option>
               <option value="gifski">gifski (HQ, slow)</option>
             </select>
           </label>
           {#if gifskiOn}
-            <span class="hint">gifski quantises and dithers itself — the colours / lossy / dither / matte knobs do not apply; quality is gifski’s own 1–100.</span>
+            <span class="hint">gifski quantises and dithers itself — the colors / lossy / dither / matte knobs do not apply; quality is gifski’s own 1–100.</span>
           {/if}
         </div>
       {/if}
@@ -504,7 +504,7 @@
               {#if out.format === 'gif'}
                 Matte — blended under semi-transparent edges before the 1-bit cut
               {:else if video}
-                Matte — video has no alpha: transparency is flattened onto this colour
+                Matte — video has no alpha: transparency is flattened onto this color
               {:else}
                 Matte — background the image is flattened onto
               {/if}
@@ -515,7 +515,7 @@
                 <button type="button" aria-pressed={matteMode === 'light'} onclick={() => setMatte(WHITE_MATTE)} title="#ffffff, Discord light theme">Discord light</button>
                 <button type="button" aria-pressed={matteMode === 'custom'} onclick={() => hexInput?.focus()}>Custom</button>
               </span>
-              <input type="color" value={'#' + out.matte} oninput={(e) => setMatte(e.currentTarget.value)} aria-label="Matte colour" />
+              <input type="color" value={'#' + out.matte} oninput={(e) => setMatte(e.currentTarget.value)} aria-label="Matte color" />
               <input
                 bind:this={hexInput}
                 type="text"
@@ -531,7 +531,7 @@
         </div>
         {#if out.format === 'gif'}
           <p class="hint">
-            GIF has 1-bit alpha: every semi-transparent edge pixel is dropped or blended onto this colour, so pick the matte for the
+            GIF has 1-bit alpha: every semi-transparent edge pixel is dropped or blended onto this color, so pick the matte for the
             theme your audience uses — on the other theme the edge shows as a thin outline. For soft alpha use WebP / AVIF
             (attachments, emoji) or APNG (stickers).
           </p>
@@ -546,7 +546,7 @@
               <NumField bind:value={app.output.alphaThreshold} min={1} max={255} small />
             </span>
           </label>
-          <label class="inline" title="Threshold {TRIM_FRINGE_THRESHOLD}: drops more of the semi-transparent edge, so less of the matte colour shows on the other theme">
+          <label class="inline" title="Threshold {TRIM_FRINGE_THRESHOLD}: drops more of the semi-transparent edge, so less of the matte color shows on the other theme">
             <input type="checkbox" checked={trimFringe} onchange={(e) => setTrimFringe(e.currentTarget.checked)} />
             <span>Trim fringe</span>
           </label>

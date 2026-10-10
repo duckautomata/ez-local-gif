@@ -153,9 +153,6 @@ func TestCheckFastPathSpec(t *testing.T) {
 		{"reverse op", info, base(gif, op("reverse", ""))},
 		{"bounce op", info, base(gif, op("bounce", ""))},
 		{"speed op", info, base(gif, op("speed", `{"factor":2}`))},
-		{"morph op", info, base(gif, op("morph", `{"close":true}`))},
-		{"morph op, grow only", info, base(gif, op("morph", `{"grow":1}`))},
-		{"matte op", info, base(gif, op("matte", `{}`))},
 		{"text op", info, base(gif, op("text", `{"text":"hi"}`))},
 		{"two crops", info, base(gif, op("crop", `{"x":0,"y":0,"w":20,"h":20}`), op("crop", `{"x":0,"y":0,"w":10,"h":10}`))},
 		{"two trims", info, base(gif, op("trim", `{"start":0}`), op("trim", `{"start":0.08}`))},
@@ -442,7 +439,7 @@ func TestFitKnobPhase4(t *testing.T) {
 }
 
 // TestFitLadderVideo: DESIGN §5.4 — video fits as rendered, one rung, the
-// secant search on the CRF knob alone; no fps/size/colour rungs.
+// secant search on the CRF knob alone; no fps/size/color rungs.
 func TestFitLadderVideo(t *testing.T) {
 	master := enc.Master{Width: 1920, Height: 1080, FPS: 30, Frames: 300}
 	for _, format := range []string{recipe.FormatMP4, recipe.FormatWebM} {
@@ -460,9 +457,9 @@ func TestFitLadderVideo(t *testing.T) {
 	}
 }
 
-// TestGifskiLadderDropsColourRungs: the generic gif ladder's palette rungs
+// TestGifskiLadderDropsColorRungs: the generic gif ladder's palette rungs
 // collapse for the gifski encoder (it quantises itself).
-func TestGifskiLadderDropsColourRungs(t *testing.T) {
+func TestGifskiLadderDropsColorRungs(t *testing.T) {
 	master := enc.Master{Width: 320, Height: 240, FPS: 25, Frames: 100}
 	out := recipe.Output{Format: "gif", Encoder: "gifski"}
 	rungs := fitLadder(recipe.FormatGIF, out, master)
@@ -476,7 +473,7 @@ func TestGifskiLadderDropsColourRungs(t *testing.T) {
 	}
 	plain := fitLadder(recipe.FormatGIF, recipe.Output{Format: "gif"}, master)
 	if len(rungs) >= len(plain) {
-		t.Errorf("gifski ladder (%d rungs) must be smaller than the palette ladder (%d): colour rungs collapse", len(rungs), len(plain))
+		t.Errorf("gifski ladder (%d rungs) must be smaller than the palette ladder (%d): color rungs collapse", len(rungs), len(plain))
 	}
 }
 

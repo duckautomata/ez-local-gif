@@ -4,13 +4,9 @@
 //	<Root>/blobs/<sha256>.seq/         uploaded image sequences (directory blobs, see sequence.go)
 //	<Root>/blobs/<sha256>.json         Blob metadata (name, size, uploaded, probe info)
 //	<Root>/results/<recipeHash>/       encoded outputs + manifest.json
-//	<Root>/mattes/<clipKey>/           AI matte memo of one clip: %06d.png + matte.json (matte.go)
-//	<Root>/mattes/<clipKey>/stab-…/    derived sequences of that clip, swept with it (matte_5c.go)
-//	<Root>/mattes/frames/…/<sha>.png   the matte frames store, shared by every clip (matte.go)
 //	<Root>/tmp/                        upload staging (same filesystem as blobs)
 //	<Root>/scratch/                    scratch fallback when the tmpfs is too small (DESIGN.md §9.9)
 //	<Scratch>/<id>/                    per-job scratch (tmpfs), removed when done
-//	<Scratch>/matte-prompts/<key>.png  the guided mode's prompt-mask memo, count/byte bounded (matte_5c.go)
 //
 // The store has no database: the filesystem is the data model. A TTL/size
 // sweeper is the only maintenance.
@@ -63,8 +59,8 @@ const ManifestName = "manifest.json"
 //	4:        AVIF is described by its animation track (not the one-frame
 //	          primary item libavif writes first) and carries AlphaStream;
 //	          image sequences (Kind sequence, Info.Sequence) are new
-//	5:        sequence HasAlpha considers GIF frames and colour-keyed
-//	          (RGB/gray + tRNS) PNG frames whose stdlib colour model looks
+//	5:        sequence HasAlpha considers GIF frames and color-keyed
+//	          (RGB/gray + tRNS) PNG frames whose stdlib color model looks
 //	          opaque; monochrome (yuv400/gray) AVIF animations are described
 //	          by their track, not the one-frame primary item; sequences
 //	          whose frames ffmpeg cannot read via the image2 pattern are
@@ -137,11 +133,6 @@ type Store struct {
 	// metaMu serialises read-modify-write cycles on blob meta files so that
 	// a concurrent duplicate upload cannot clobber freshly stored probe info.
 	metaMu sync.Mutex
-
-	// protected (Phase 5b) counts the dirs Protect currently holds for a
-	// render or preview; the sweeper skips them (see matte.go).
-	protectMu sync.Mutex
-	protected map[string]int
 }
 
 // New creates the directory layout and returns a Store. When scratch cannot
@@ -634,32 +625,19 @@ func (s *Store) ScratchDir(id string) (string, func(), error) {
 	return dir, cleanup, nil
 }
 
-// Sweep deletes blobs, results and mattes older than ttl (ttl <= 0 disables
-// the age pass), then oldest results — if still over, blobs older than an
-// hour — and, last, mattes until total size <= maxBytes (0 = no cap). It
-// never deletes a result dir that is being written (no manifest yet and
-// mtime < 1 h ago); abandoned upload temp files, manifest-less result dirs
-// older than an hour, and blob payloads whose meta file is missing
-// (unreachable orphans from a crash or partial delete) older than blobGrace
-// are removed as junk whatever ttl says.
+// Sweep deletes blobs and results older than ttl (ttl <= 0 disables the age
+// pass), then oldest results — and, if still over, blobs older than an hour —
+// until total size <= maxBytes (0 = no cap). It never deletes a result dir
+// that is being written (no manifest yet and mtime < 1 h ago); abandoned
+// upload temp files, manifest-less result dirs older than an hour, and blob
+// payloads whose meta file is missing (unreachable orphans from a crash or
+// partial delete) older than blobGrace are removed as junk whatever ttl says.
 //
 // A blob's age is the newer of its payload and meta mtimes: TouchBlob
 // (render / still) refreshes the payload, PutBlob / SetBlobInfo the meta. A
 // blob whose meta was written less than an hour ago (just uploaded or just
 // probed, i.e. about to be used) is never deleted by either pass, whatever
 // ttl says.
-//
-// The mattes class (matte.go): clip dirs aged by their own mtime (TouchMatte)
-// and removed whatever ttl says once their source blob is gone, .tmp-* dirs
-// of a pass junk after an hour, frames-store files aged by their mtime
-// (TouchMatteFrame); a clip's derived dirs go with it and a derive's
-// <name>.tmp sibling is junk after an hour on its own (matte_5c.go).
-// Nothing under a Protect-ed path — or above one — is ever deleted, by any
-// pass of any class.
-//
-// Last, the prompt-mask memo on scratch (SweepMattePrompts) is bounded to
-// MattePromptsMaxEntries / MattePromptsMaxBytes, oldest first; ttl and
-// maxBytes do not apply to it.
 func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) error {
 	now := time.Now()
 	var errs []error
@@ -682,12 +660,6 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 	if err != nil {
 		return err
 	}
-	mattes, err := s.listMattes(now)
-	if err != nil {
-		// The memo is optional (a plain install has none): the other two
-		// classes are still swept.
-		note(err)
-	}
 
 	// Age pass.
 	var keptResults []resultEntry
@@ -695,7 +667,7 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if (r.junk || (ttl > 0 && now.Sub(r.mtime) > ttl)) && !s.isProtected(r.path) {
+		if r.junk || (ttl > 0 && now.Sub(r.mtime) > ttl) {
 			note(os.RemoveAll(r.path))
 			continue
 		}
@@ -711,21 +683,15 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 		// writes payload and meta back-to-back under metaMu), junk whatever
 		// ttl says — left behind, it would also block PutSequence re-uploads
 		// of the same frames until reclaimed.
-		if b.metaMtime.IsZero() && now.Sub(b.mtime) > blobGrace && !s.anyProtected(b.files) {
+		if b.metaMtime.IsZero() && now.Sub(b.mtime) > blobGrace {
 			note(s.removeOrphanBlob(b))
 			continue
 		}
-		if ttl > 0 && now.Sub(b.mtime) > ttl && !b.metaFresh(now) && !s.anyProtected(b.files) {
+		if ttl > 0 && now.Sub(b.mtime) > ttl && !b.metaFresh(now) {
 			note(s.removeBlobFiles(b))
 			continue
 		}
 		keptBlobs = append(keptBlobs, b)
-	}
-	// After the blob pass, so a clip whose source expired just now is dead
-	// weight already.
-	keptMattes, err := s.sweepMattesAge(ctx, now, ttl, mattes, note)
-	if err != nil {
-		return err
 	}
 
 	// Size pass.
@@ -737,9 +703,6 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 		for _, b := range keptBlobs {
 			total += b.size
 		}
-		for _, m := range keptMattes {
-			total += m.size
-		}
 		sort.Slice(keptResults, func(i, j int) bool { return keptResults[i].mtime.Before(keptResults[j].mtime) })
 		for _, r := range keptResults {
 			if total <= maxBytes {
@@ -748,14 +711,13 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if r.inProgress || s.isProtected(r.path) {
+			if r.inProgress {
 				continue
 			}
 			note(os.RemoveAll(r.path))
 			total -= r.size
 		}
 		sort.Slice(keptBlobs, func(i, j int) bool { return keptBlobs[i].mtime.Before(keptBlobs[j].mtime) })
-		evictedBlobs := map[string]bool{}
 		for _, b := range keptBlobs {
 			if total <= maxBytes {
 				break
@@ -763,23 +725,13 @@ func (s *Store) Sweep(ctx context.Context, ttl time.Duration, maxBytes int64) er
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if now.Sub(b.mtime) < blobGrace || b.metaFresh(now) || s.anyProtected(b.files) {
+			if now.Sub(b.mtime) < blobGrace || b.metaFresh(now) {
 				continue
 			}
 			note(s.removeBlobFiles(b))
 			total -= b.size
-			evictedBlobs[b.hash] = true
-		}
-		// Mattes last: the most expensive thing on the disk to regenerate.
-		if err := s.sweepMattesSize(ctx, keptMattes, &total, maxBytes, evictedBlobs, note); err != nil {
-			return err
 		}
 	}
-	note(s.pruneMatteFrameDirs(ctx, now))
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	note(s.sweepMattePrompts(ctx, now, MattePromptsMaxEntries, MattePromptsMaxBytes))
 	return errors.Join(errs...)
 }
 
@@ -799,9 +751,8 @@ func (s *Store) sweepTmp(ctx context.Context, now time.Time) error {
 		if err != nil {
 			continue
 		}
-		path := filepath.Join(s.Root, tmpDir, e.Name())
-		if now.Sub(info.ModTime()) > inProgressGrace && !s.isProtected(path) {
-			errs = append(errs, os.RemoveAll(path))
+		if now.Sub(info.ModTime()) > inProgressGrace {
+			errs = append(errs, os.RemoveAll(filepath.Join(s.Root, tmpDir, e.Name())))
 		}
 	}
 	return errors.Join(errs...)

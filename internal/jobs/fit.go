@@ -205,7 +205,7 @@ func (m *Manager) renderFit(ctx context.Context, j *job, scratch string, master 
 			rungs = kept
 		}
 		if len(rungs) == 0 {
-			return nil, errors.New("the APNG fit search needs pngquant, which is not available on this server (remove the fit budget for truecolour APNG, or pick another format)")
+			return nil, errors.New("the APNG fit search needs pngquant, which is not available on this server (remove the fit budget for truecolor APNG, or pick another format)")
 		}
 	}
 	run := &fitRun{
@@ -278,7 +278,7 @@ func knobsFor(rungs []fit.Rung, request string, out recipe.Output) map[string]fi
 // lossy 0 used to come out at the knob's default mild, lossy 30). gif →
 // Output.Lossy (or the gifski quality knob when the recipe picked that
 // encoder); webp/avif/jpeg → 100 - the effective quality (the format's
-// default when Output.Quality is 0); apng/png → colour step 0; mp4/webm →
+// default when Output.Quality is 0); apng/png → color step 0; mp4/webm →
 // the user's Quality itself, which IS the encoder CRF for video (0 =
 // enc.DefaultX264CRF / DefaultVP9CRF; fit.KnobCRF). When the user's setting is
 // harsher than the knob's default harsh probe, the harsh probe moves to Max
@@ -341,7 +341,7 @@ func gifskiFitKnob(out recipe.Output) fit.Knob {
 }
 
 // dropIndexedAPNGRungs removes the rungs that would need pngquant (indexed
-// APNG; the RGBA truecolour probes and every other format stay), so a fit
+// APNG; the RGBA truecolor probes and every other format stay), so a fit
 // search without the tool never renders sprite sheets it cannot quantise.
 func dropIndexedAPNGRungs(rungs []fit.Rung, request string) (kept []fit.Rung, dropped int) {
 	for _, r := range rungs {
@@ -355,7 +355,7 @@ func dropIndexedAPNGRungs(rungs []fit.Rung, request string) (kept []fit.Rung, dr
 }
 
 // describe renders the binding knob of a candidate ("fit at 20 fps · 128
-// colours · lossy 60").
+// colors · lossy 60").
 func (r *fitRun) describe(c *fitCandidate) string {
 	desc := "fit at " + c.rung.Label
 	if k := knobDesc(c.format, c.rung, r.out, c.knob); k != "" {
@@ -395,7 +395,7 @@ func knobDesc(format string, rung fit.Rung, out recipe.Output, knob int) string 
 		if from := pngColors(rung, out, 0); from > 0 {
 			return fmt.Sprintf("palette %d → %d", from, pngColors(rung, out, knob))
 		}
-		return fmt.Sprintf("full colour → %d", pngColors(rung, out, knob))
+		return fmt.Sprintf("full color → %d", pngColors(rung, out, knob))
 	}
 	return fmt.Sprintf("q %d", qualityFromKnob(knob))
 }
@@ -557,7 +557,7 @@ func effectiveFormat(r fit.Rung, request string) string {
 // alone per §5.4; FitKeepSize/FitKeepFPS are vacuously honoured), the
 // generic ladder otherwise. FitKeepSize/FitKeepFPS are honoured for every
 // ladder; rungs that cannot change anything against this master (fps drops
-// on a still) are neutralised and duplicates dropped. Generic colour rungs
+// on a still) are neutralised and duplicates dropped. Generic color rungs
 // are clamped against the user's own palette (clampGenericColors), and a
 // lossless WebP request gets a single lossless probe as the mildest rung.
 func fitLadder(format string, out recipe.Output, master enc.Master) []fit.Rung {
@@ -604,22 +604,22 @@ func fitLadder(format string, out recipe.Output, master enc.Master) []fit.Rung {
 	}
 	if format == recipe.FormatGIF && isGifskiOutput(out) {
 		// gifski builds its own per-frame palettes: the generic ladder's
-		// colour/dither dimension does not apply, so those rungs collapse
+		// color/dither dimension does not apply, so those rungs collapse
 		// onto their fps/size siblings (filterRungs dedupes them away).
-		rungs = dropColourRungs(rungs)
+		rungs = dropColorRungs(rungs)
 	}
 	return filterRungs(rungs, master)
 }
 
-// dropColourRungs neutralises the palette dimension of a ladder (used for
-// the gifski encoder, which quantises itself): colours and dither are
-// cleared, the label loses its "<n> colours" part, and per-rung colour-step
+// dropColorRungs neutralises the palette dimension of a ladder (used for
+// the gifski encoder, which quantises itself): colors and dither are
+// cleared, the label loses its "<n> colors" part, and per-rung color-step
 // knobs no longer apply.
-func dropColourRungs(rungs []fit.Rung) []fit.Rung {
+func dropColorRungs(rungs []fit.Rung) []fit.Rung {
 	out := make([]fit.Rung, 0, len(rungs))
 	for _, r := range rungs {
 		if r.Colors > 0 {
-			r.Label = stripColoursLabel(r.Label, r.Colors)
+			r.Label = stripColorsLabel(r.Label, r.Colors)
 			r.Colors = 0
 			r.Knob = nil
 		}
@@ -631,9 +631,9 @@ func dropColourRungs(rungs []fit.Rung) []fit.Rung {
 
 // clampGenericColors post-filters the generic ladder against the user's own
 // palette size: a rung palette at or above Output.Colors is not a degrade
-// step — encoding at it would quantise to MORE colours than the user asked
+// step — encoding at it would quantise to MORE colors than the user asked
 // for, making the ladder non-monotone — so such rungs fall back to "as
-// requested" (Colors 0; pure colour rungs then collapse onto the rung before
+// requested" (Colors 0; pure color rungs then collapse onto the rung before
 // them and are dropped by filterRungs). Rung palettes strictly below the
 // user's are kept: they are genuinely harsher.
 func clampGenericColors(rungs []fit.Rung, userColors int) []fit.Rung {
@@ -643,21 +643,21 @@ func clampGenericColors(rungs []fit.Rung, userColors int) []fit.Rung {
 	out := make([]fit.Rung, 0, len(rungs))
 	for _, r := range rungs {
 		if r.Colors >= userColors && r.Colors > 0 {
-			r.Label = stripColoursLabel(r.Label, r.Colors)
+			r.Label = stripColorsLabel(r.Label, r.Colors)
 			r.Colors = 0
-			r.Knob = nil // a colour-step knob bounded by the old palette no longer applies
+			r.Knob = nil // a color-step knob bounded by the old palette no longer applies
 		}
 		out = append(out, r)
 	}
 	return out
 }
 
-// stripColoursLabel removes the "<n> colours" part from a rung label after
+// stripColorsLabel removes the "<n> colors" part from a rung label after
 // its palette was clamped to "as requested".
-func stripColoursLabel(label string, colors int) string {
+func stripColorsLabel(label string, colors int) string {
 	parts := strings.Split(label, " · ")
 	kept := parts[:0]
-	needle := fmt.Sprintf("%d colours", colors)
+	needle := fmt.Sprintf("%d colors", colors)
 	for _, p := range parts {
 		if p == needle {
 			continue
@@ -718,7 +718,7 @@ func (r *fitRun) encode(ctx context.Context, rung fit.Rung, knob int, attempt in
 	// encodeGIFAt merges the held frames before gifsicle sees them, so this
 	// is the safety net (a lossy pass can still flatten two near-identical
 	// frames into a hold — reproduced with gifsicle 1.96 at lossy >= 1 on
-	// frames that differ by a few near-colour pixels, see
+	// frames that differ by a few near-color pixels, see
 	// TestRenderFitRepairsLossyHolds; gifski's loop pass optimises too): the
 	// candidate on disk and the size the search sees are the repaired file's.
 	// Known limitation: the repair's -O2 pass applies --lossy=knob to bytes
@@ -728,13 +728,13 @@ func (r *fitRun) encode(ctx context.Context, rung fit.Rung, knob int, attempt in
 	// behind the single-output gifski render: produceGifski → lintGIF), minus
 	// --lossy: lintGIF hands Output.Lossy to the rungs, the fit passes none
 	// because its knob is gifski's quality, not gifsicle's lossy. gifski puts
-	// a local colour table on every frame and marks unchanged pixels
+	// a local color table on every frame and marks unchanged pixels
 	// transparent from frame 1 on, so its raw output fails
 	// gif.frame0-transparency for every target (the fixer cannot give a frame
 	// 0 with a local table its flag) and gif.global-palette for the Discord
 	// ones — only the "gifsicle --colors" rung makes such a file pass.
 	// Without it a loop-forever fit never found a candidate, and a finite
-	// loop count's gifsicle pass let one through by accident (a <= 256-colour
+	// loop count's gifsicle pass let one through by accident (a <= 256-color
 	// clip) or only at the small rungs (target none, richer clips).
 	// TestFitEncodeGifskiLadderCall pins this call.
 	repaired, replaced := false, false
@@ -813,7 +813,7 @@ func knobName(format string, out recipe.Output) string {
 		}
 		return "lossy"
 	case recipe.FormatAPNG, recipe.FormatPNG:
-		return "colour step"
+		return "color step"
 	case recipe.FormatMP4, recipe.FormatWebM:
 		return "crf"
 	}
@@ -850,7 +850,7 @@ func (r *fitRun) encodeCandidate(ctx context.Context, format, id string, rung fi
 		if m.tools.Gifsicle == "" && r.gifsicleWarned.CompareAndSwap(false, true) {
 			log.Printf("jobs: gifsicle is not available; the gif fit search cannot apply the lossy knob")
 		}
-		// The palette pass already quantised to min(rung, user) colours;
+		// The palette pass already quantised to min(rung, user) colors;
 		// passing --colors to gifsicle as well would median-cut + dither the
 		// frames a second time, so it only applies the lossy knob and loop.
 		// Whether a clip mixes opaque and transparent frames (and so needs
@@ -872,7 +872,7 @@ func (r *fitRun) encodeCandidate(ctx context.Context, format, id string, rung fi
 		path := filepath.Join(r.dir, "c"+id+".png")
 		if rung.Truecolor {
 			// The RGBA probe rung of the sticker ladder must deliver real
-			// truecolour bytes, not the indexed pipeline under an RGBA label.
+			// truecolor bytes, not the indexed pipeline under an RGBA label.
 			if err := m.encodeRGBAAPNG(ctx, master, v, out.Loop, path); err != nil {
 				return "", err
 			}
@@ -928,9 +928,9 @@ func (r *fitRun) encodeCandidate(ctx context.Context, format, id string, rung fi
 // 1..100 quality (webp/avif/jpeg).
 func qualityFromKnob(knob int) int { return min(max(100-knob, 1), 100) }
 
-// apngColors maps an APNG rung + knob (colour reduction steps) onto a
-// palette size: the rung's colours (else the request's, else 256) halved per
-// step. The fit search never quantises below 64 colours (DESIGN.md §5.4);
+// apngColors maps an APNG rung + knob (color reduction steps) onto a
+// palette size: the rung's colors (else the request's, else 256) halved per
+// step. The fit search never quantises below 64 colors (DESIGN.md §5.4);
 // an explicit user base below 64 is kept as-is instead of halved further.
 func apngColors(rung fit.Rung, out recipe.Output, knob int) int {
 	base := rung.Colors
@@ -948,10 +948,10 @@ func apngColors(rung fit.Rung, out recipe.Output, knob int) int {
 	return max(c, floor)
 }
 
-// pngColors maps a static-PNG rung + knob (colour reduction steps) onto a
-// pngquant palette size. Unlike apngColors, 0 means "keep full colour" (no
+// pngColors maps a static-PNG rung + knob (color reduction steps) onto a
+// pngquant palette size. Unlike apngColors, 0 means "keep full color" (no
 // quantisation, encodePNGStill skips pngquant): the first step of a
-// full-colour rung drops to the default palette (256), later steps halve it,
+// full-color rung drops to the default palette (256), later steps halve it,
 // never below 2.
 func pngColors(rung fit.Rung, out recipe.Output, knob int) int {
 	base := rung.Colors

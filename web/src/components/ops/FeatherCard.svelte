@@ -37,7 +37,7 @@
   </label>
   <p class="hint">
     Softens the transparency edge (a Gaussian blur of the alpha) — most useful after Background removal, or on the
-    rough 1-bit alpha of a GIF source. GIF output still thresholds back to 1-bit alpha (the matte colour decides);
+    rough 1-bit alpha of a GIF source. GIF output still thresholds back to 1-bit alpha (the matte color decides);
     WebP, APNG and AVIF keep the soft edge. The radius is in source pixels, so it scales down with the output — a 3 px
     feather on a 720 px source is ~0.5 px after the emote fit.
   </p>

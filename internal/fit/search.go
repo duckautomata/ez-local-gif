@@ -392,7 +392,7 @@ func secantStep(loKnob, hiKnob int, fLo, fHi float64) int {
 	return min(max(est, loKnob+1), hiKnob-1)
 }
 
-// candidate builds the Candidate for a fitting sample. Truecolour rungs get
+// candidate builds the Candidate for a fitting sample. Truecolor rungs get
 // no knob clause in Desc (their single-point knob changes nothing).
 func (s *searcher) candidate(r Rung, k Knob, p sample) *Candidate {
 	desc := "fit at " + labelOf(r)

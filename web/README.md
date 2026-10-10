@@ -46,24 +46,13 @@ into the Go binary by `web/embed.go`.
                                  /overlay cfg, sequence fps/duration, effectiveOps (Optimize sends no ops)
     src/lib/overlay.ts           text / image overlay cfg + the drag-box geometry (anchor maths,
                                  footprints, time-range visibility)
-    src/lib/eyedropper.ts        display px → still px mapping, canvas pixel read, hex helpers
+    src/lib/eyedropper.ts        display px → still px mapping, canvas pixel / image read, hex helpers,
+                                 landPick (Color rows), estimateScreenColor (Screen auto-match)
     src/lib/proxy.ts             ProxyPlayer: the on-demand animated preview behind Play (stale state)
     src/lib/fonts.ts             font families for the Text card (GET /api/fonts, DejaVu Sans fallback)
     src/lib/presets.ts           presets (Emote, Sticker, Chat GIF/WebP/AVIF, Optimize, Frames, Custom),
                                  formats per preset, fit budgets, matte / trim-fringe constants
-    src/lib/still.ts             StillScheduler: preview still debounce/abort/object-URL logic (unit-tested),
-                                 the 202 "AI matte pending" re-request + "Compute now" (eager)
-    src/lib/matte.ts             Phase 5b pure helpers: model options / labels, the clip estimate and caps
-                                 verdict (jobs' up-front refusal), status line, pending pill, retry cadence
-    src/lib/matte.svelte.ts      the live GET /api/matte object: reference-counted 5 s polling while the AI
-                                 mode is visible or a preview is pending; a 202 installs its status too;
-                                 Phase 5c: the preview's compute state + the Compute matte hook, the device
-                                 preference (PUT /api/matte/settings), the debounced unload on leaving AI
-    src/lib/prompts.ts           Phase 5c guided model: the prompt maths (boxes / ± points normalised to the
-                                 source frame, per-frame edits, keyframes, the wire / recipe shapes)
-    src/lib/promptmask.ts        PromptMaskScheduler: the live mask of the Select subject panel
-                                 (POST /api/matte/prompt, debounce / abort / 202 retry, unit-tested)
-    src/lib/stages.ts            job stage labels (incl. "AI matte") for the Render panel and batch rows
+    src/lib/still.ts             StillScheduler: preview still debounce/abort/object-URL logic (unit-tested)
     src/lib/render.svelte.ts     job submission / progress / result state
     src/lib/format.ts            formatting helpers, snapFPS/gifDelays, fitSize, fmtTimecode, frame grid
     src/lib/result.ts            result-manifest grouping (primary / alternatives / frames / archive), chat sizes
@@ -78,11 +67,9 @@ into the Go binary by `web/embed.go`.
     src/lib/editsource.ts        "edit as source": open tab → POST /api/sources/from-result → navigate
     src/lib/toast.svelte.ts      toasts
     src/components/…             UploadZone (+ /input picker, mixed-drop choice), ProbeBadge, Preview
-                                 (+ CropOverlay, PromptOverlay — the guided model's prompt canvas —,
-                                 OverlayLayer drag boxes, eyedropper layer, Play/Stop),
+                                 (+ CropOverlay, OverlayLayer drag boxes, eyedropper layer, Play/Stop),
                                  AnchorGrid, ops/* (Trim, Crop + auto-crop, Resize, Fps, Speed + reverse
-                                 + bounce, Background + ColourRows (the colour rows shared by the Colour
-                                 mode and the AI mode's Keep colours), FlipRotate, Delay, OverlaysPanel →
+                                 + bounce, Background, FlipRotate, Delay, OverlaysPanel →
                                  TextOverlayCard / ImageOverlayCard + TimeRangeFields), OutputCard,
                                  RenderPanel, ResultCard (+ InChat, Save to /output), DiscordChecks,
                                  BatchPanel / BatchOpsPanel / BatchRenderPanel, ShortcutsOverlay,
@@ -114,7 +101,7 @@ into the Go binary by `web/embed.go`.
   frames (`frameSpan`).
 - Output card: "Use for" chips Emote · Sticker · Chat · Optimize · Frames ·
   Custom pre-fill it — Emote (GIF, 128², fit 256 KiB on), Sticker (indexed APNG
-  256 colours, 320², fit 512 KiB on, keep size), Chat (GIF by default; the
+  256 colors, 320², fit 512 KiB on, keep size), Chat (GIF by default; the
   Format select offers GIF / WebP / AVIF and `onFormat` re-seeds lossy 20 /
   q 80 / q 60), Optimize (GIF source only: gifsicle-only, no ops,
   drop-every-Nth-frame fps chips), Frames (frame format png/jpeg/webp), Custom.
@@ -171,94 +158,42 @@ into the Go binary by `web/embed.go`.
   flip/rotate and without output sizing, so the canvas overlay maps display
   pixels straight onto source pixels.
 - Ops are serialised in the order unpremultiply, delay, trim, speed, fps,
-  chromakey/colorkey, crop/autocrop, resize, flip, rotate, reverse, then the
+  chromakey/colorkey × N, morph, feather, crop/autocrop, resize, flip, rotate,
+  reverse, bounce, then the
   text/overlay ops in the user's card order (the compiler hoists
   unpremultiply and delay anyway).
 
 ### Phase 3 editing ops
 
-- **Background card** (`app.ops.background`, Phase 5a/5b): None · AI ·
-  Colour · Screen. AI (Phase 5b, `ai.model`) emits one `matte` op — the
-  sidecar model named unless it is the recipe default `isnet-anime`
-  (`MATTE_MODEL_DEFAULT`; the Go zero value resolves to it); the Model
-  select is fed by `GET /api/matte` (`lib/matte.svelte.ts`: ids, labels,
-  live states — loading / downloading shown, missing / unavailable greyed
-  with the reason — and the server's `defaultModel`, which becomes the
-  explicit choice as soon as it is known), the status line reads "ready ·
-  GPU · up to ~N s for this clip" / "loading model…" / "downloading weights
-  43 %" / "sidecar unavailable — run `docker compose --profile matte-gpu up
-  -d`", and the mode is disabled with the reason when `features.matte` is
-  false (a plain install without the compose profile). A still / proxy of
-  a matte recipe may answer **202** while the pass runs: `fetchStill` /
-  `fetchProxy` throw `MattePending`, the schedulers keep the picture on
-  stage, show the pill ("AI matte 24/45 · GPU", "loading model… (12 s)",
-  "AI matte not computed" + **Compute** while idle) and re-request
-  after 500 ms (5 s while idle); only the Compute button sends `eager`.
-  The Render panel appends "· up to ~N s AI matte (GPU|CPU)" to its
-  estimate line and shows the server's refusal note over
-  `EZLG_MATTE_MAX_FRAMES` / `_MAX_SECONDS`; the Result card shows the
-  `render.matte` info check as an "AI matte:" line (plus what the recipe's
-  matte op asked for — guided + edge, stabilise, keep — when the detail
-  lacks it, `lib/result.matteLine`).
-  **Phase 5c** (on demand, device choice, stabilise, keep, guided): nothing
-  in the AI mode starts a pass — a preview of an uncomputed matte answers
-  202 `idle` and shows the last picture with the pill; the card's **Compute
-  matte** button (`lib/matte.svelte` `registerMatteCompute` → the Preview's
-  `still.computeNow()` / `player.computeNow()`, `eager: true`) or Render
-  starts it, and the button reads "computing… 24/45" / "computed" from the
-  compute state the Preview publishes (`setMatteCompute`, derived from its
-  still's 202 / picture). Play behaves like a still (no `eager`). **Run on**
-  (GPU / CPU, only when `MatteStatus.devices` lists both) is a server-side
-  preference — `PUT /api/matte/settings {device}`, reflected in
-  `MatteStatus.device` (the effective device), never a recipe param; the
-  model states, estimate and the Model select's default follow that device
-  (`defaultModels`), a user-picked model stays (`ai.modelChosen`), an
-  auto-filled one follows. Leaving the AI mode (or the card going away)
-  `POST /api/matte/unload`s after a 1.5 s debounce (`aiModeChanged`).
-  **Stabilise** (`ai.stabilise`: Off / Light (default) / Strong → the op's
-  `stabilise`, sent whenever set since the recipe zero value is off) is
-  derived server-side from the cached matte — no model run, so it shows
-  without Compute. **Keep colours** (Advanced fold, `ai.keep` /
-  `ai.keepSimilarity` → `keep` / `keepSimilarity`, up to 6, the same
-  `ColourRows` as the Colour mode; the eyedropper lands in a keep row when
-  `app.ui.pickTarget` is `'keep'` and the card stays in AI) force picked
-  colours opaque in-graph. **Guided (click to select)** (`sam2-tiny`, kind
-  `tracker`, listed last; disabled in batch): picking it opens the Select
-  subject panel (`app.ui.promptOpen`) — the preview shows the SOURCE-frame
-  still like crop mode but unkeyed (`stillRequest({promptMode})`) under
-  `PromptOverlay` (drag = the frame's box with the crop rectangle's
-  handles, click = + point, Shift/right-click = − point, click a marker to
-  remove it; the mask of that frame under that frame's prompts is fetched
-  from `POST /api/matte/prompt` after every change — `lib/promptmask` —
-  and painted at 50 % green); prompts live in `ai.prompts`
-  (`lib/prompts.FramePrompts`, 0..1 of the source frame, keyed by the
-  forward-grid frame `forwardFrame`), the keyframe strip jumps
-  (`scrubFrameFor`) / deletes per frame, Clear forgets all, Edge picks the
-  per-frame model that refines the tracker's band ('' = the device's
-  default). The op carries `prompts` (rounded to 4 decimals, frame-sorted)
-  and `edge`; with nothing that selects (no box, no + click) **no matte op
-  is emitted** (like a Colour row without a pick) and the Render panel says
-  so. Screen (Green / Blue sub-choice, `screen`) emits `chromakey` (key
-  colour — preset `00ff00` / `0000ff` or custom —, similarity default 0.1,
-  blend, despill on/off + mix/expand under Advanced); recipe zero values are
-  left out of the params, and because the Go zero value of blend *is* the
-  0.05 default, the blend slider floors at 0.01. Colour emits one `colorkey`
-  per picked row (`colors`, up to 6 via "+ add colour"; similarity default
-  0.08; a colour picked twice is keyed once — duplicates collapsed, the
-  second op would only redo the first's work) — `backgroundOps` — and either
-  mode is followed by the `morph` op of
-  the "Edge cleanup" fold (`morph`: fill pinholes on by default, grow 0–4;
-  hidden and switched off on a server without `features.morph`), then
-  feather (`buildOps`). The **eyedropper** (`app.ui.pickColor`, the row it
-  fills in `app.ui.pickRow`) arms a transparent button layer over the
-  preview still, which is requested *without* the card's ops while armed
-  (`buildOps({keyPreview})`); a click maps display px → still px
-  (`lib/eyedropper.displayToPixel`), reads the pixel through a canvas and
-  lands the hex in the armed row (`lib/eyedropper.landPick` →
-  `state.applyPickedColor`); the hex field of each row is the keyboard path
-  (and the only path in batch, where the card is mounted with `picker`
-  off); Esc cancels. The crop-mode still sends `{ format, fps }`
-  (`cropPreviewOutput`), never the geometry but always the rate.
+- **Background card** (`app.ops.background`): None · Color · Screen.
+  **Color** emits one `colorkey` per non-empty, de-duplicated row (up to
+  `MAX_KEY_COLORS` = 6, "+ add color"), all sharing similarity / blend
+  (defaults 0.08 / 0 left out). Each row has a "Pick from preview"
+  **eyedropper** (`app.ui.pickColor` + `pickRow`, `pickTarget` `'color'`):
+  it arms a transparent button layer over the preview still, which is
+  requested *without* the card's ops while armed (`buildOps({keyPreview})`);
+  a click maps display px → still px (`lib/eyedropper.displayToPixel`), reads
+  the pixel through a canvas and lands the hex in the armed row
+  (`state.applyPickedColor` → `eyedropper.landPick`); the hex fields are the
+  keyboard path; Esc cancels. Selecting Color with nothing picked arms row 0.
+  **Screen** emits `chromakey` (Green / Blue sub-choice `bg.screen`, key
+  color, similarity, blend, despill on/off + mix/expand under Advanced);
+  recipe zero values (similarity 0.1, blend 0.05, mix 0.5, expand 0 — the
+  same numbers as `internal/graph/phase3.go`) are left out of the params,
+  and because the Go zero value of blend *is* the 0.05 default, the blend
+  slider floors at 0.01. Pressing Green / Blue (or entering Screen with the
+  preset key) **auto-matches** the key color from the unkeyed preview frame
+  (`pickTarget` `'screen-auto'`: the eyedropper's key-free still; once it is
+  decoded the Preview reads it whole and `state.applyScreenSample` takes the
+  per-channel median of the screen pixels — `eyedropper.estimateScreenColor`
+  — or keeps the preset when under 2 % of the frame is screen); "Pick from
+  preview" next to the key color (`pickTarget` `'screen'`) takes it from a
+  click. Batch mounts the card with `picker={false}`: typed hex only, no
+  auto-match. The **Edges** fold (features.morph) emits `morph` right after
+  the keys, only when a key was emitted and a field is set: Fill pinholes
+  (`close`, on by default), Shift edge (`grow`, −20..+20 source px —
+  negative trims a leftover rim, positive grows the subject) and Soft edge
+  (`smooth`, 0..10 px).
 - **Crop card**: "Auto-crop to content" (`app.ops.autocrop`: padding, alpha
   threshold under Advanced for alpha sources) emits `autocrop` instead of the
   manual `crop`; the rectangle fields are disabled while it is on and the
@@ -280,8 +215,8 @@ into the Go binary by `web/embed.go`.
   image" append cards (stable ids; ▲ ▼ reorder = drawing order, ✕ remove; each
   card has its own enable toggle). Text: textarea, font from `GET /api/fonts`
   (`lib/fonts.ts` reduces faces to families; DejaVu Sans is always offered and
-  is the fallback when the endpoint is empty or down), size, colour
-  (RRGGBB[AA]), outline width/colour, box + colour + padding (≥ 1: the Go zero
+  is the fallback when the endpoint is empty or down), size, color
+  (RRGGBB[AA]), outline width/color, box + color + padding (≥ 1: the Go zero
   value means the default 8), anchor (3×3 grid — switching keeps the element
   in place by moving X/Y), X/Y, time range. Image: the asset is an ordinary
   `POST /api/upload` (pick or drop onto the card); the card keeps the returned
@@ -327,9 +262,7 @@ into the Go binary by `web/embed.go`.
   which was meant). One row per file (name, probe badge, per-row unpremultiply
   auto-default from `info.premultiplied`), the shared "Use for" chips + Output
   card once at the top. Only geometry-independent global ops are offered:
-  unpremultiply (per-row), fps, speed, feather, background removal (AI
-  included — every row's render runs its own matte pass, one at a time
-  through the sidecar, and its row shows the "AI matte" stage), reverse,
+  unpremultiply (per-row), fps, speed, feather, background removal, reverse,
   bounce — trim/crop/autocrop/resize/canvas/overlays/text are disabled ("Open
   in editor" on a row seeds the single view with that source). "Render all" =
   one ordinary `POST /api/jobs` per row (same ops + output, that row's source);

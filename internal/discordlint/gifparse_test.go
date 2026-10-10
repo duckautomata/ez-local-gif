@@ -64,7 +64,7 @@ func TestParseGIFStructureOfFFmpegAlpha(t *testing.T) {
 		t.Errorf("header/LSD: %q %dx%d", g.header[:], g.width, g.height)
 	}
 	if !g.hasGCT() || g.gctColors() != 256 || len(g.gct) != 768 {
-		t.Errorf("GCT: flag=%v colours=%d bytes=%d", g.hasGCT(), g.gctColors(), len(g.gct))
+		t.Errorf("GCT: flag=%v colors=%d bytes=%d", g.hasGCT(), g.gctColors(), len(g.gct))
 	}
 	if g.bgIndex != 255 {
 		t.Errorf("bg index %d, want 255 (ffmpeg writes the reserved transparent index)", g.bgIndex)
@@ -113,7 +113,7 @@ func TestParseGIFErrors(t *testing.T) {
 		{"empty", nil, "shorter than header"},
 		{"short", []byte("GIF89a"), "shorter than header"},
 		{"signature", append([]byte("PNG89a"), good[6:]...), "bad signature"},
-		{"truncated GCT", good[:20], "truncated global colour table"},
+		{"truncated GCT", good[:20], "truncated global color table"},
 		{"truncated image", good[:len(good)-10], "image"},
 		{"unknown introducer", append(append([]byte(nil), good[:fxHeaderLen]...), 0x7F), "unknown block introducer 0x7F"},
 	}

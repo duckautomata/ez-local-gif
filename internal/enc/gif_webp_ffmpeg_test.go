@@ -23,7 +23,7 @@ import (
 )
 
 // rgbaMaster writes a frames-long 16x16 RGBA master whose left half is a
-// moving opaque colour bar and whose right half is fully transparent.
+// moving opaque color bar and whose right half is fully transparent.
 func rgbaMaster(t *testing.T, dir string, frames int) enc.Master {
 	t.Helper()
 	const w, h = 16, 16
@@ -92,7 +92,7 @@ func TestGIFArgsAlphaMinColors(t *testing.T) {
 	if len(g.Image) != 4 {
 		t.Errorf("got %d frames, want 4", len(g.Image))
 	}
-	// max_colors=3 = 2 colours + the transparent slot: at most 3 distinct
+	// max_colors=3 = 2 colors + the transparent slot: at most 3 distinct
 	// palette indices are used across all frames (the encoder always writes a
 	// full 256-entry table, so count the indices actually referenced).
 	used := map[uint8]bool{}
@@ -116,7 +116,7 @@ func TestGIFArgsAlphaMinColors(t *testing.T) {
 		t.Logf("max_colors=2 + reserve_transparent=1 rejected as expected: %s", strings.TrimSpace(string(o)))
 	}
 
-	// Without alpha, 2 colours is fine.
+	// Without alpha, 2 colors is fine.
 	m2 := m
 	m2.HasAlpha = false
 	out2 := filepath.Join(dir, "c2-opaque.gif")
@@ -172,7 +172,7 @@ func TestLoopCountsOnDisk(t *testing.T) {
 }
 
 // webpANIMLoopCount walks the RIFF chunks of a WebP and returns the ANIM
-// chunk's loop count (bytes 4..5 after the background colour).
+// chunk's loop count (bytes 4..5 after the background color).
 func webpANIMLoopCount(data []byte) (int, bool) {
 	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
 		return 0, false

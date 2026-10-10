@@ -81,143 +81,6 @@
 #               refused; POST /api/results/{hash}/save writes the Phase 1 GIF
 #               into the temp /output dir byte-identically, twice → two
 #               distinct collision-safe names; an unknown file name is 404
-#
-# Phase 5 (AI background removal — the matte op + the matte sidecar,
-#   docs/background-removal-proposal.md; the sidecar cases run only when
-#   EZLG_TEST_MATTE_URL is set, see Env, and are skipped with a note otherwise):
-#   matte-off   a recipe with a matte op against a server whose features.matte
-#               is false → 400 naming the compose profile. Runs against the
-#               server under test when its feature is off; otherwise (with
-#               EZLG_START_SERVER=1) against a second throw-away server started
-#               WITHOUT EZLG_MATTE_URL on EZLG_TEST_OFF_PORT; otherwise skipped
-#   matte-api   GET /api/matte → enabled true with the default model "ready"
-#               (waits up to EZLG_TEST_MATTE_WAIT s: a cold sidecar first
-#               downloads and self-tests the weights; when it offers
-#               birefnet-lite the wait also covers that model settling — it
-#               is preloaded after the default), device cuda|cpu,
-#               maxSeconds / maxFrames > 0, msPerFrame > 0 (jq only);
-#               capabilities features.matte true.
-#               Model for the pixel assertions: the cases below draw a
-#               synthetic cartoon figure, which the default isnet-anime
-#               ("Anime (fast)", trained on anime characters) does NOT detect
-#               (alpha ≈ 2 everywhere, no opaque pixel), while the general
-#               birefnet-lite ("General (precise)") does. Every Phase 5 recipe
-#               names its model ({"kind":"matte","params":{"model":…}}):
-#               birefnet-lite when GET /api/matte lists it "ready", else the
-#               sidecar's default model, and then the assertions that need a
-#               detected figure (frames > 1, opaque AND transparent pixels,
-#               corner alpha, report.hasAlpha, VP8X alpha, autocrop smaller
-#               than the source) are SKIPPED with a note (counted as skips),
-#               while the pipeline assertions (jobs finish, report.ok, the
-#               still's 202 → 200, the result cache, an autocrop PNG) still
-#               run — report.ok of such a render is a skip naming the rules
-#               when it fails (every frame is identical, so the animation
-#               collapses to one frame: webp.anim-flag fires on the WebP).
-#               EZLG_TEST_MATTE_PIXEL_MODEL=none forces this path.
-#               The CPU `matte` profile offers isnet-anime only (see
-#               MATTE_MODELS in compose.yaml), so the figure assertions need
-#               the `matte-gpu` profile or MATTE_MODELS=isnet-anime,birefnet-lite
-#   matte-gif / matte-webp / matte-apng
-#               a synthetic cartoon figure orbiting over a blue gradient (an
-#               opaque 2 s ProRes 4444 clip drawn in the test) with a matte op
-#               → emote GIF / chat WebP / sticker APNG: job done, report.ok,
-#               report.hasAlpha, frame 0 has transparent AND opaque pixels,
-#               corner pixel transparent (the background is a gradient, so
-#               only the AI matte can have keyed it) — exactly alpha 0 on the
-#               GIF (its alpha is thresholded at 128), ≤ 8 on the soft-alpha
-#               WebP / APNG / still PNG (the model's sigmoid floor leaves the
-#               background at alpha ~2, never 0; the opaque / transparent
-#               pixel counts use the same 8-step tolerance there); the APNG
-#               recipe adds a morph close after the matte (the 5a Edge
-#               cleanup on an AI matte)
-#   matte-still Phase 5c Compute-button semantics, sent BEFORE any pass exists
-#               for the clip: POST /api/still with the matte op and no
-#               "eager" → 202 {"pending":"matte","state":"idle",…} (a preview
-#               never starts a pass by itself; a 200 at once means the memo
-#               was already on disk — a long-lived EZLG_URL stack — and the
-#               idle check is skipped with a note); then the same still with
-#               "eager": true → 202 running/loading/downloading re-requested
-#               until 200 PNG (never idle again); corner pixel transparent
-#               (alpha ≤ 8)
-#   matte-settings Phase 5c device preference: PUT /api/matte/settings with a
-#               device the sidecar does not offer ("tpu") → 400; when
-#               GET /api/matte lists BOTH cuda and cpu in "devices": PUT cpu →
-#               200 whose device is cpu and whose defaultModel is
-#               defaultModels.cpu, GET /api/matte agrees; PUT "" → 200 with a
-#               device the sidecar offers (its default). The device in force
-#               before the case is restored at the end (a long-lived stack
-#               keeps its preference; the spawned server's data dir is
-#               throw-away anyway). Skipped with a note on a one-device sidecar
-#   matte-stabilise the GIF recipe with "stabilise":"light" (the Phase 5c
-#               temporal median over the matte sequence — a derived dir next
-#               to the mattes, no second pass) → job done, report.ok, the
-#               render.matte check's detail names "stabilise light", and the
-#               figure assertions of matte-gif (figure = 1 only)
-#   matte-keep  the GIF recipe with "keep":["3a7bd5"] (the figure's BODY
-#               colour, forced opaque — a union with the matte) → job done,
-#               report.ok, the render.matte detail names the keep colour, and
-#               the figure assertions run WHATEVER the model finds: the body
-#               rectangle comes back opaque even under isnet-anime (which
-#               detects nothing), the gradient never comes within similarity
-#               0.08 of 3a7bd5, so frame 0 has opaque AND transparent pixels,
-#               the corner is alpha 0 and the orbit gives > 1 frame
-#   matte-track Phase 5c guided mode: when GET /api/matte lists "sam2-tiny"
-#               (kind "tracker") ready, the GIF recipe with model sam2-tiny
-#               and ONE box prompt on frame 0 around the figure's known
-#               position (the sprite is at x 48..112, y 54..150 of the 160²
-#               frame at t = 0; its pixels span x 58..102, y 54..150 →
-#               box [0.33, 0.31, 0.67, 0.97] of the source frame, ~4 % loose)
-#               → job done, report.ok, the figure assertions of matte-gif
-#               (the tracker finds the figure whatever the edge model does —
-#               the gate keeps the tracker's mask where the edge model is
-#               blank) and the render.matte detail names sam2-tiny; skipped
-#               with a note when the tracker is not offered / not ready
-#   matte-prompt POST /api/matte/prompt with the sam2-tiny op, frame 0 and the
-#               same box → 200 image/png (202 while the tracker loads is
-#               re-requested): an 8-bit gray mask that is white (255) inside
-#               the box and black (0) at the corner; skipped like matte-track
-#   matte-prompt-mask the 5c follow-up's mask prompt through the same endpoint:
-#               the sam2-tiny op with "edge" naming the pixel model and the one
-#               prompt {"frame":0,"maskFrom":"edge","mask":true} (the SPA's
-#               wire shape: the recipe word plus the client flag) — no box: the
-#               frame's mask is the edge model's matte of it, which the server
-#               takes from its own memo (never sent by the browser). The idle half runs
-#               BEFORE any pass exists for the clip → 202 {"pending":"matte",
-#               "state":"idle",…} whose body names the reason (compute the
-#               edge model's matte first; a mask prompt never starts a pass —
-#               a 200 at once means the edge memo was already on disk, a
-#               long-lived EZLG_URL stack, and the half is skipped with a
-#               note); the PNG half runs AFTER the per-frame pass (matte-still's
-#               eager still / the GIF jobs put the pixel model's matte of the
-#               clip on disk) → 200 image/png, white (255) inside the figure
-#               and black (0) at the corner, a 202 idle then being a FAIL (the
-#               memo was not found). The idle half needs sam2-tiny ready, the
-#               PNG half a detected figure too (figure = 1: the mask is the
-#               pixel model's matte of frame 0, empty without one)
-#   matte-track-mask the GIF recipe with model sam2-tiny, "edge" = the pixel
-#               model and that one mask prompt on frame 0, submitted AFTER the
-#               per-frame jobs are done (General first, then track from its
-#               good frame — a render would run the edge pass itself anyway)
-#               → done, report.ok, the render.matte detail names sam2-tiny
-#               and the figure assertions of matte-gif (frame 0 has opaque AND
-#               transparent pixels); needs sam2-tiny ready and a detected
-#               figure, skipped with a note otherwise
-#   matte-unload POST /api/matte/unload → 204 (after every matte job is done;
-#               the sidecar releases its sessions, the next pass reloads)
-#   matte-cached the GIF recipe submitted again → done with "cached": true
-#               (the sidecar's weights identity is part of the recipe hash, so
-#               the second submit is answered from the result cache — this is
-#               the one cache hit the run expects and does not warn about)
-#   matte-autocrop trim 0–0.1 s + matte + autocrop (threshold 32: alpha at or
-#               above it is content, so the soft floor must stay below it) →
-#               PNG smaller than the 160×160 source (the crop found the
-#               figure, not the gradient)
-#   matte-api   also checks the Phase 5c status fields when the sidecar
-#               reports them: "devices" lists the effective "device",
-#               defaultModels[device] == defaultModel, sam2-tiny carries
-#               kind "tracker" when offered (a pre-5c sidecar without them is
-#               a skip with a note, not a failure). The wait also covers
-#               sam2-tiny settling when it is offered
 # Exit status is non-zero if anything fails; a summary is printed at the end.
 #
 #   EZLG_URL=http://localhost:8080 scripts/integration-test.sh
@@ -228,24 +91,6 @@
 #   # from the host, all in one go:
 #   docker compose -f compose.yaml -f compose.dev.yaml run --rm \
 #       -e EZLG_START_SERVER=1 app bash scripts/integration-test.sh
-#
-#   # with the AI matte cases (Phase 5): start a sidecar next to it first — the
-#   # GPU one offers birefnet-lite, which the figure assertions need (the CPU
-#   # `matte` profile ships isnet-anime only: the pipeline cases run, the
-#   # figure assertions are skipped with a note — except matte-keep, whose
-#   # body-colour union needs no detected figure, and matte-track, whose
-#   # tracker finds it from the box prompt). The Phase 5c cases (settings,
-#   # idle, stabilise, keep, track, prompt, unload, and the follow-up's
-#   # prompt-mask / track-mask) need a sidecar built from
-#   # this checkout (compose.dev.yaml build blocks), not the published tag.
-#   docker compose -f compose.yaml -f compose.dev.yaml --profile matte-gpu up -d matte-gpu
-#   docker compose -f compose.yaml -f compose.dev.yaml run --rm \
-#       -e EZLG_START_SERVER=1 -e EZLG_TEST_MATTE_URL=http://matte:9402 app bash scripts/integration-test.sh
-#   # (an ezlg-models volume that predates the image, or was made by hand, fails the sidecar's
-#   #  first download with EACCES; the documented repair needs the capability back — the
-#   #  service drops them all and chown(2) needs CAP_CHOWN even as root:
-#   #    docker compose run --rm --user root --cap-add CHOWN --entrypoint chown matte -R 1000:1000 /models
-#   #  — keep the --cap-add when touching this line, USAGE.md or sidecar/README.md)
 #
 # Env:
 #   EZLG_URL            server base URL (default http://localhost:8080)
@@ -266,36 +111,7 @@
 #   EZLG_TEST_TIMEOUT   seconds to wait for each job (default 120)
 #   EZLG_TEST_PHASE2    0 → run the Phase 1 checks only (default 1; also skips Phases 3 and 4)
 #   EZLG_TEST_PHASE3    0 → skip the Phase 3 checks (default 1; also skips Phase 4)
-#   EZLG_TEST_PHASE4    0 → skip the Phase 4 checks (default 1; also skips Phase 5)
-#   EZLG_TEST_PHASE5    0 → skip the Phase 5 checks (default 1)
-#   EZLG_TEST_MATTE_URL the matte sidecar, e.g. http://matte:9402 (the `matte`
-#                       profile up in the same compose network). Set → the
-#                       Phase 5 sidecar cases run: with EZLG_START_SERVER=1
-#                       the spawned server gets it as EZLG_MATTE_URL, with
-#                       EZLG_URL it only says "that server has a sidecar".
-#                       Unset → they are skipped with a note, and a spawned
-#                       server runs with EZLG_MATTE_URL empty whatever the
-#                       environment holds (the dev container inherits
-#                       compose.yaml's http://matte:9402), so features.matte
-#                       is deterministic either way
-#   EZLG_TEST_MATTE_WAIT seconds to wait for GET /api/matte to report the
-#                       default model ready (default 600 — a cold sidecar
-#                       downloads ~176 MB of weights and self-tests them;
-#                       the same deadline covers the pixel model and, when
-#                       offered, the sam2-tiny tracker settling)
-#   EZLG_TEST_TIMEOUT   (above) also bounds the Phase 5c tracker job: on a
-#                       CPU sidecar sam2-tiny runs fp32 and a 40-frame track
-#                       can take a minute — raise it there
-#   EZLG_TEST_MATTE_PIXEL_MODEL
-#                       the model the figure assertions use when GET /api/matte
-#                       lists it "ready" (default birefnet-lite — the only
-#                       shipped model that detects the synthetic figure). An id
-#                       the sidecar does not offer (e.g. none) forces the
-#                       fallback: the default model + the figure assertions
-#                       skipped — handy to exercise that path on a GPU sidecar
-#   EZLG_TEST_OFF_PORT  port of the second, sidecar-less server the matte-off
-#                       case starts when the main one has the feature on
-#                       (default 18089; EZLG_START_SERVER=1 only)
+#   EZLG_TEST_PHASE4    0 → skip the Phase 4 checks (default 1)
 #   EZLG_TEST_KEEP      1 → keep the temp dir (printed at the end)
 #   EZLG_FFMPEG / EZLG_FFPROBE / EZLG_GIFSICLE / EZLG_WEBPINFO / EZLG_AVIFDEC
 #                       tool overrides (avifdec, unzip and jq are optional:
@@ -309,7 +125,6 @@ timeout=${EZLG_TEST_TIMEOUT:-120}
 phase2=${EZLG_TEST_PHASE2:-1}
 phase3=${EZLG_TEST_PHASE3:-1}
 phase4=${EZLG_TEST_PHASE4:-1}
-phase5=${EZLG_TEST_PHASE5:-1}
 ffmpeg=${EZLG_FFMPEG:-ffmpeg}
 ffprobe=${EZLG_FFPROBE:-ffprobe}
 gifsicle=${EZLG_GIFSICLE:-gifsicle}
@@ -320,17 +135,14 @@ repo=$(cd "$here/.." && pwd)
 
 tmp=$(mktemp -d)
 server_pid=""
-server2_pid=""   # the sidecar-less server of the Phase 5 matte-off case
-pass=0; failn=0; skipn=0; cached_n=0
+pass=0; failn=0; cached_n=0
 results=()
 
 cleanup() {
-  local p
-  for p in "$server_pid" "$server2_pid"; do
-    [ -n "$p" ] || continue
-    kill "$p" 2>/dev/null || true
-    wait "$p" 2>/dev/null || true
-  done
+  if [ -n "$server_pid" ]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
   if [ "${EZLG_TEST_KEEP:-0}" = 1 ]; then
     echo "kept: $tmp"
   else
@@ -342,7 +154,7 @@ trap cleanup EXIT
 log()   { printf '[itest] %s\n' "$*"; }
 ok()    { pass=$((pass+1));  results+=("PASS  $*"); printf '[itest]   pass: %s\n' "$*"; }
 fail()  { failn=$((failn+1)); results+=("FAIL  $*"); printf '[itest]   FAIL: %s\n' "$*" >&2; }
-skip()  { skipn=$((skipn+1)); results+=("SKIP  $*"); printf '[itest]   skip: %s\n' "$*"; }
+skip()  { results+=("SKIP  $*"); printf '[itest]   skip: %s\n' "$*"; }
 abort() { summary; exit 1; }
 die()   { fail "$*"; abort; }
 summary() {
@@ -355,7 +167,7 @@ summary() {
       results+=("FAIL  $cached_n job(s) served from the result cache (EZLG_TEST_STRICT=1)")
     fi
   fi
-  echo "== integration test summary ($pass passed, $failn failed, $skipn skipped) =="
+  echo "== integration test summary ($pass passed, $failn failed) =="
   printf '  %s\n' "${results[@]}"
 }
 have()  { command -v "$1" >/dev/null 2>&1; }
@@ -483,178 +295,10 @@ primary_check_ok() { # primary_check_ok FILE RULE → true if the primary file's
     stripped "$1" | grep -qE "\"rule\":\"$2\",\"level\":\"[^\"]*\",\"ok\":true"
   fi
 }
-primary_failed_rules() { # primary_failed_rules FILE → the primary file's lint rules with ok false, one per line ("" when none)
-  if [ "$use_jq" = 1 ]; then
-    jq -r 'first(.result.files[]? | select((.kind // "") == "" or .kind == "output")) | .report.checks[]? | select(.ok == false) | .rule // empty' "$1" 2>/dev/null
-  else
-    # The primary file is listed first and its checks array ends at the
-    # report's own `],"ok":` (`null,"ok":` when empty), so cut the stripped
-    # manifest there and keep the failed rows (struct order: rule, level, ok).
-    local s; s=$(stripped "$1")
-    sed -E 's/(\]|null),"ok":(true|false).*$//' <<<"$s" | grep -oE '"rule":"[^"]*","level":"[^"]*","ok":false' | sed -E 's/^"rule":"//; s/",.*$//'
-  fi
-}
 input_lists() { # input_lists FILE NAME → true if GET /api/input lists the file name (exact)
   if [ "$use_jq" = 1 ]; then jq -e --arg n "$2" 'any(.files[]?; .name == $n)' "$1" >/dev/null 2>&1
   else grep -qF "\"name\":\"$2\"" "$1" # Go's encoder writes no spaces around ':'
   fi
-}
-# Phase 5 helpers (GET /api/matte: {"enabled","device","reason","gpu","defaultModel",
-# "models":{id:{"label","state","percent","msPerFrame",…}},"maxSeconds","maxFrames"}).
-matte_enabled() { # matte_enabled FILE → true if GET /api/matte says enabled == true
-  if [ "$use_jq" = 1 ]; then jq -e '.enabled == true' "$1" >/dev/null 2>&1
-  else stripped "$1" | grep -qF '"enabled":true' # no per-model object carries an "enabled" key
-  fi
-}
-matte_model_state() { # matte_model_state FILE MODEL → that model's "state" ("" when unlisted)
-  if [ "$use_jq" = 1 ]; then jq -r --arg m "$2" '.models[$m].state // empty' "$1" 2>/dev/null
-  else
-    # jobs.MatteModelStatus marshals in struct order: {"label":…,"kind":…,"state":…,…}
-    # (label and the Phase 5c kind omitted when empty).
-    stripped "$1" | grep -oE "\"$2\":\{(\"label\":\"[^\"]*\",)?(\"kind\":\"[^\"]*\",)?\"state\":\"[^\"]*\"" | head -n 1 | sed -E 's/.*"state":"//; s/"$//'
-  fi
-}
-matte_model_kind() { # matte_model_kind FILE MODEL → that model's Phase 5c "kind" ("" when absent = segmenter)
-  if [ "$use_jq" = 1 ]; then jq -r --arg m "$2" '.models[$m].kind // empty' "$1" 2>/dev/null
-  else stripped "$1" | grep -oE "\"$2\":\{(\"label\":\"[^\"]*\",)?\"kind\":\"[^\"]*\"" | head -n 1 | sed -E 's/.*"kind":"//; s/"$//'
-  fi
-}
-matte_devices_has() { # matte_devices_has FILE DEV → true when the top-level "devices" array (Phase 5c) lists DEV
-  if [ "$use_jq" = 1 ]; then jq -e --arg d "$2" '(.devices // []) | index($d) != null' "$1" >/dev/null 2>&1
-  else
-    # The top-level list is an ARRAY ("devices":[…]); the per-model Phase 5c maps are objects ("devices":{…}).
-    local s; s=$(stripped "$1" | grep -oE '"devices":\[[^]]*\]' | head -n 1)
-    grep -qF "\"$2\"" <<<"$s"
-  fi
-}
-matte_devices_text() { # matte_devices_text FILE → the top-level "devices" array as text ("" when absent)
-  stripped "$1" | grep -oE '"devices":\[[^]]*\]' | head -n 1 | sed -E 's/^"devices"://'
-}
-matte_default_model_for() { # matte_default_model_for FILE DEV → defaultModels[DEV] (Phase 5c; "" when absent)
-  if [ "$use_jq" = 1 ]; then jq -r --arg d "$2" '.defaultModels[$d] // empty' "$1" 2>/dev/null
-  else stripped "$1" | grep -oE '"defaultModels":\{[^}]*\}' | head -n 1 | grep -oE "\"$2\":\"[^\"]*\"" | head -n 1 | sed -E 's/^"[^"]+":"//; s/"$//'
-  fi
-}
-matte_model_ms() { # matte_model_ms FILE MODEL → that model's msPerFrame (jq only; "" otherwise)
-  [ "$use_jq" = 1 ] || { echo ""; return; }
-  jq -r --arg m "$2" '.models[$m].msPerFrame // empty' "$1" 2>/dev/null
-}
-matte_model_reason() { # matte_model_reason FILE MODEL → that model's "reason" ("" when none / unlisted)
-  if [ "$use_jq" = 1 ]; then jq -r --arg m "$2" '.models[$m].reason // empty' "$1" 2>/dev/null
-  else
-    # "reason" precedes the only nested object (the Phase 5c "devices" map, last in struct
-    # order; sizes is an array), so cutting at the first '}' keeps the model's own reason.
-    stripped "$1" | grep -oE "\"$2\":\{[^}]*\}" | head -n 1 | grep -oE '"reason":"[^"]*"' | head -n 1 | sed -E 's/^"reason":"//; s/"$//'
-  fi
-}
-matte_model_settled() { # matte_model_settled FILE MODEL → true when MODEL is not on its way: unlisted, ready, unavailable, or missing for a stated reason
-  # (loading / downloading, and missing with no reason yet = queued behind
-  # another model's load, are transient — the sidecar has one loader thread).
-  local st; st=$(matte_model_state "$1" "$2")
-  case "$st" in
-    ""|ready|unavailable) return 0 ;;
-    missing) [ -n "$(matte_model_reason "$1" "$2")" ] ;;
-    *) return 1 ;;
-  esac
-}
-matte_report_check() { # matte_report_check NAME → the primary report.ok of a Phase 5 render, naming the failed rules
-  # With a detected figure ($figure = 1) a failure is a FAIL. Without one the
-  # picture is undefined — every frame identical and (near) fully transparent —
-  # so the animation collapses to one frame and a structural rule can fail
-  # (webp.anim-flag: "ANIM flag set but the file has 1 frame"): that is the
-  # fixture, not the pipeline, and is a SKIP that still names the rules.
-  local name=$1 rules
-  if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"; return 0; fi
-  rules=$(primary_failed_rules "$tmp/poll_$name.json" | tr '\n' ' '); rules=${rules% }
-  if [ "$figure" = 1 ]; then fail "$name: primary report.ok != true (failed: ${rules:-?})"
-  else skip "$name: primary report.ok != true (failed: ${rules:-?}) — lint of a render without a detected figure (every frame identical, the animation collapses to one frame; $pmodel does not find the synthetic one)"
-  fi
-}
-still_pending_seen=0
-still_first_state=""   # the "state" of the first 202 still_png_wait saw ("" when none)
-still_png_wait() { # still_png_wait OUT JSON → 0 when POST /api/still answered 200 with a PNG; a 202 (AI matte pending) is re-requested until the job timeout
-  local out=$1 body=$2 code deadline=$((SECONDS + timeout))
-  still_first_state=""
-  while :; do
-    code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' --data "$body" "$url/api/still")
-    [ "$code" = 202 ] || break
-    still_pending_seen=1
-    [ -n "$still_first_state" ] || still_first_state=$(json_str "$out" '.state' state)
-    [ "$SECONDS" -lt "$deadline" ] || break
-    sleep 1
-  done
-  still_code=$code
-  [ "$code" = 200 ] && [ "$(magic_hex "$out" 8)" = "89504e470d0a1a0a" ]
-}
-still_once() { # still_once OUT JSON → prints the HTTP code of ONE POST /api/still (no re-request: the Phase 5c idle check)
-  curl -sS -o "$1" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' --data "$2" "$url/api/still"
-}
-prompt_png_wait() { # prompt_png_wait OUT JSON → 0 when POST /api/matte/prompt (Phase 5c) answered 200 with a PNG; 202 (tracker loading) is re-requested until the job timeout
-  local out=$1 body=$2 code deadline=$((SECONDS + timeout))
-  while :; do
-    code=$(curl -sS -o "$out" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' --data "$body" "$url/api/matte/prompt")
-    [ "$code" = 202 ] || break
-    [ "$SECONDS" -lt "$deadline" ] || break
-    sleep 1
-  done
-  prompt_code=$code
-  [ "$code" = 200 ] && [ "$(magic_hex "$out" 8)" = "89504e470d0a1a0a" ]
-}
-prompt_once() { # prompt_once OUT JSON → prints the HTTP code of ONE POST /api/matte/prompt (no re-request: the mask prompt's idle / after-pass checks judge each answer)
-  curl -sS -o "$1" -w '%{http_code}' --max-time 120 -H 'Content-Type: application/json' --data "$2" "$url/api/matte/prompt"
-}
-primary_check_detail() { # primary_check_detail FILE RULE → the primary file's lint-report detail for RULE ("" when absent)
-  if [ "$use_jq" = 1 ]; then
-    jq -r --arg r "$2" 'first(.result.files[]? | select((.kind // "") == "" or .kind == "output")) | first(.report.checks[]? | select(.rule == $r)) | .detail // empty' "$1" 2>/dev/null
-  else
-    # discordlint.Check marshals in struct order: {"rule":…,"level":…,"ok":…,"fixed":…,"detail":…};
-    # the primary file is listed first. Grep the raw file: the detail holds spaces.
-    grep -oE "\"rule\":\"$2\",\"level\":\"[^\"]*\",\"ok\":(true|false),\"fixed\":(true|false),\"detail\":\"[^\"]*\"" "$1" | head -n 1 | sed -E 's/.*"detail":"//; s/"$//'
-  fi
-}
-gray_counts() { # gray_counts FILE → "white black": pixels of frame 0 (decoded as 8-bit gray) at exactly 255 / exactly 0 — the Phase 5c prompt mask
-  local vals
-  vals=$("$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=gray" -f rawvideo -pix_fmt gray - 2>/dev/null \
-         | od -An -v -tu1 | tr -s ' \n' '\n' | grep -v '^$' || true)
-  awk 'NF && $1 == 255 { w++ } NF && $1 == 0 { b++ } END { printf "%d %d\n", w, b }' <<<"$vals"
-}
-gray_corner() { # gray_corner FILE → the gray value (0..255) of pixel (0,0) of frame 0
-  "$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=gray,crop=1:1:0:0" -f rawvideo -pix_fmt gray - 2>/dev/null \
-    | od -An -tu1 | awk '{print $1}'
-}
-gif_figure_checks() { # gif_figure_checks NAME RUN → the Phase 5 GIF figure assertions on out_file[NAME] (RUN = 1), else one skip naming why
-  # The GIF's alpha is thresholded at 128, so its background is exactly 0.
-  local name=$1 run=$2 f=${out_file[$1]} n n_op n_tr ca
-  if [ "$run" != 1 ]; then
-    skip "$name: figure assertions (frames > 1 — got $(gif_frames "$f"), hasAlpha, opaque AND transparent pixels, corner alpha) need a detected figure ($pmodel does not find the synthetic one)"
-    return 0
-  fi
-  n=$(gif_frames "$f")
-  if [ "${n:-0}" -gt 1 ]; then ok "$name: $n frames"; else fail "$name: '${n:-?}' frame(s), want > 1 (identical fully transparent frames merge into one)"; fi
-  if primary_has_alpha "$tmp/poll_$name.json"; then ok "$name: report.hasAlpha == true"; else fail "$name: report.hasAlpha != true (the matte produced no transparency)"; fi
-  read -r n_op n_tr <<<"$(alpha_counts "$f")"
-  if [ "${n_op:-0}" -gt 0 ] && [ "${n_tr:-0}" -gt 0 ]; then ok "$name: frame 0 has $n_op opaque and $n_tr transparent pixels"; else fail "$name: frame 0 has ${n_op:-0} opaque / ${n_tr:-0} transparent pixels, want both > 0"; fi
-  ca=$(corner_alpha "$f")
-  if [ "${ca:-255}" = 0 ]; then ok "$name: corner pixel transparent (alpha 0)"; else fail "$name: corner pixel alpha '${ca:-?}', want 0"; fi
-}
-make_matte_clip() { # make_matte_clip OUT.mov → a 2 s 160×160 30 fps OPAQUE ProRes 4444 clip for the matte op:
-  # a cartoon figure (brown hair, face, two eyes, blue body — flat colours, 64×96) orbiting
-  # once over a blue gradient. No colour key can separate it (the gradient spans the
-  # figure's colours), so transparency in the output can only come from the AI matte.
-  local eyes hair head body r g b a fig graph
-  eyes='(lt((X-24)^2+(Y-26)^2,9)+lt((X-40)^2+(Y-26)^2,9))'
-  hair='(lt((X-32)^2+(Y-20)^2,484)*lt(Y,20))'
-  head='lt((X-32)^2+(Y-24)^2,400)'
-  body='(between(X,14,49)*between(Y,44,95))'
-  r="if($eyes,32,if($hair,74,if($head,242,if($body,58,0))))"
-  g="if($eyes,32,if($hair,42,if($head,201,if($body,123,0))))"
-  b="if($eyes,32,if($hair,16,if($head,160,if($body,213,0))))"
-  a="255*gt($hair+$head+$body,0)"
-  fig="color=c=0x000000:s=64x96:r=30:d=2,format=gbrap,geq=r='$r':g='$g':b='$b':a='$a'"
-  graph="gradients=s=160x160:r=30:d=2:c0=0x1e2a4a:c1=0xa9c4e4:nb_colors=2:seed=7:speed=0.005:x0=0:y0=0:x1=159:y1=159[bg];"
-  graph+="${fig}[fig];[bg][fig]overlay=x='(W-w)/2+0.35*(W-w)*sin(2*PI*t/2)':y='(H-h)/2+0.35*(H-h)*cos(2*PI*t/2)',format=yuv444p10le"
-  "$ffmpeg" -hide_banner -loglevel error -nostdin -y -filter_complex "$graph" \
-    -c:v prores_ks -profile:v 4444 -pix_fmt yuv444p10le -vendor apl0 -movflags +faststart "$1"
 }
 moov_before_mdat() { # moov_before_mdat FILE → 0 when the first moov box precedes the first mdat (both present)
   # Captured first (house SIGPIPE rule); top-level boxes only ever contain
@@ -725,13 +369,11 @@ sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 # Pixel-level alpha checks (frame 0, decoded by ffmpeg as straight RGBA; the
 # gif / webp decoders report transparent pixels as alpha 0). Every pipeline
 # stage reads its whole input, so nothing here can die of SIGPIPE.
-alpha_counts() { # alpha_counts FILE [TOL] → "opaque transparent": pixels of frame 0 with alpha ≥ 255−TOL / ≤ TOL
-  # TOL defaults to 0 (exactly 255 / exactly 0). The Phase 5 soft-alpha outputs
-  # pass 8: an AI matte's sigmoid never reaches 0 (the background sits at ~2).
-  local tol=${2:-0} vals
+alpha_counts() { # alpha_counts FILE → "opaque transparent": pixels of frame 0 with alpha 255 / 0
+  local vals
   vals=$("$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=rgba,alphaextract" -f rawvideo -pix_fmt gray - 2>/dev/null \
          | od -An -v -tu1 | tr -s ' \n' '\n' | grep -v '^$' || true)
-  awk -v t="$tol" 'NF && $1 >= 255 - t { o++ } NF && $1 <= t { z++ } END { printf "%d %d\n", o, z }' <<<"$vals"
+  printf '%s %s\n' "$(grep -cx 255 <<<"$vals")" "$(grep -cx 0 <<<"$vals")"
 }
 corner_alpha() { # corner_alpha FILE → alpha (0..255) of pixel (0,0) of frame 0
   "$ffmpeg" -v error -nostdin -i "$1" -frames:v 1 -vf "format=rgba,crop=1:1:0:0" -f rawvideo -pix_fmt rgba - 2>/dev/null \
@@ -756,8 +398,8 @@ frames_match() { # frames_match A B → 0 when the two images are identical (sha
 }
 avif_frames() { # avif_frames FILE → frame count of an (animated) AVIF
   # ffmpeg's mov demuxer exposes an animated AVIF as up to four streams: the
-  # primary still item (colour + alpha, 1 frame each) and the animation tracks
-  # (colour + alpha, N frames), so "-select_streams v:0" always says 1. Take
+  # primary still item (color + alpha, 1 frame each) and the animation tracks
+  # (color + alpha, N frames), so "-select_streams v:0" always says 1. Take
   # avifdec's word when it is here, otherwise the largest nb_frames of any stream.
   local n=""
   if have "$avifdec"; then
@@ -866,11 +508,6 @@ if [ "${EZLG_START_SERVER:-0}" = 1 ]; then
   # the /input //output cases below can see what the server sees.
   export EZLG_INPUT="$tmp/inputdir" EZLG_OUTPUT="$tmp/outputdir"
   mkdir -p "$EZLG_INPUT" "$EZLG_OUTPUT"
-  # Phase 5: the spawned server's sidecar is EZLG_TEST_MATTE_URL — empty unless
-  # the caller opted in, overriding the compose.yaml EZLG_MATTE_URL the dev
-  # container inherits, so features.matte is deterministic: off → the matte-off
-  # case runs against this server; on → against a second one (see Phase 5).
-  export EZLG_MATTE_URL=${EZLG_TEST_MATTE_URL:-}
   log "building ezlg ..."
   (cd "$repo" && go build -o "$tmp/ezlg" ./cmd/ezlg) || die "go build failed"
   log "starting server (data=$EZLG_DATA, log=$tmp/server.log)"
@@ -1287,7 +924,7 @@ if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name gif; then
   fi
 fi
 
-# ---- colorkey: pick-a-colour key → chat WebP with alpha
+# ---- colorkey: pick-a-color key → chat WebP with alpha
 name=colorkey
 if [ -n "$green_hash" ] && finish_job $name && fetch_primary $name webp; then
   f=${out_file[$name]}
@@ -1664,514 +1301,6 @@ if [ "${EZLG_START_SERVER:-0}" = 1 ]; then
   fi
 else
   skip "input/output cases: EZLG_START_SERVER != 1 — a remote server's /input //output dirs are not visible from here (run with EZLG_START_SERVER=1 to cover GET /api/input, POST /api/sources/from-input and POST /api/results/{recipeHash}/save)"
-fi
-
-if [ "$phase5" != 1 ]; then
-  summary
-  [ "$failn" -eq 0 ]
-  exit
-fi
-
-# =============================================================================
-# Phase 5: AI background removal — the matte op and the matte sidecar
-# =============================================================================
-log "phase 5: AI matte (matte op, GET /api/matte)"
-
-# ---- matte-off: a matte op is refused with 400 while features.matte is false.
-# Against the server under test when its own feature is off; else (the binary is
-# here when EZLG_START_SERVER=1) against a second throw-away server started
-# WITHOUT EZLG_MATTE_URL on EZLG_TEST_OFF_PORT; else skipped — a remote server
-# with its sidecar up cannot be switched off from here.
-name=matte-off
-off_url=""; off_note=""
-code=$(curl -sS -o "$tmp/caps5.json" -w '%{http_code}' --max-time 30 "$url/api/capabilities")
-if [ "$code" != 200 ]; then
-  fail "GET /api/capabilities → $code"
-elif ! features_true "$tmp/caps5.json" matte; then
-  off_url=$url
-elif [ "${EZLG_START_SERVER:-0}" = 1 ]; then
-  off_port=${EZLG_TEST_OFF_PORT:-18089}
-  mkdir -p "$tmp/data-off"
-  log "starting a second server without EZLG_MATTE_URL on :$off_port (log=$tmp/server-off.log)"
-  EZLG_MATTE_URL="" EZLG_ADDR=":$off_port" EZLG_DATA="$tmp/data-off" "$tmp/ezlg" serve > "$tmp/server-off.log" 2>&1 &
-  server2_pid=$!
-  off_url="http://127.0.0.1:$off_port"
-  deadline=$((SECONDS + 30))
-  until curl -fsS --max-time 2 "$off_url/healthz" >/dev/null 2>&1; do
-    if ! kill -0 "$server2_pid" 2>/dev/null || [ "$SECONDS" -ge "$deadline" ]; then
-      cat "$tmp/server-off.log" >&2 || true
-      fail "$name: the second (sidecar-less) server on :$off_port did not become healthy"
-      off_url=""; break
-    fi
-    sleep 1
-  done
-else
-  off_note="this server has features.matte true and EZLG_START_SERVER != 1 — nothing here can switch its sidecar off (run with EZLG_START_SERVER=1: the case then starts a second server without EZLG_MATTE_URL)"
-fi
-if [ -n "$off_url" ]; then
-  # That server needs the source too (the same bytes dedupe to the Phase 1 hash).
-  code=$(curl -sS -o "$tmp/upload_off.json" -w '%{http_code}' --max-time 120 -F "file=@$tmp/src.mov" "$off_url/api/upload")
-  off_hash=$(json_str "$tmp/upload_off.json" '.hash' hash)
-  if [ "$code" = 200 ] && [[ "$off_hash" =~ ^[0-9a-f]{64}$ ]]; then
-    code=$(curl -sS -o "$tmp/job_$name.json" -w '%{http_code}' --max-time 30 -H 'Content-Type: application/json' \
-             --data '{"v":1,"sources":["'"$off_hash"'"],"ops":[{"kind":"matte"}],"output":{"format":"gif","preset":"custom","target":"attachment"}}' "$off_url/api/jobs")
-    # job_error's grep fallback reads whitespace-stripped JSON and stops at an
-    # escaped quote, so the check uses it and the message shows the raw body.
-    err=$(job_error "$tmp/job_$name.json"); raw=$(head -c 240 "$tmp/job_$name.json" | tr -d '\n')
-    if [ "$code" = 400 ] && grep -qi 'matte' <<<"$err"; then
-      ok "$name: matte op with features.matte false → 400 naming the matte profile ($raw)"
-    else
-      fail "$name: matte op with features.matte false → $code, want 400 naming the matte / matte-gpu profile ($raw)"
-    fi
-  else
-    fail "$name: could not upload the clip to $off_url ($code: $(head -c 200 "$tmp/upload_off.json"))"
-  fi
-elif [ -n "$off_note" ]; then
-  skip "$name: $off_note"
-fi
-
-# ---- the sidecar cases
-if [ -z "${EZLG_TEST_MATTE_URL:-}" ]; then
-  skip "matte sidecar cases: EZLG_TEST_MATTE_URL is not set — start a sidecar (docker compose -f compose.yaml -f compose.dev.yaml --profile matte up -d matte) and set EZLG_TEST_MATTE_URL=http://matte:9402 to cover GET /api/matte, the matte op (GIF / WebP / APNG / still / autocrop) and its result cache"
-else
-  # ---- matte-api: wait for the sidecar's default model (a cold start downloads
-  # the weights) and, when it is offered, for the pixel model to settle too —
-  # the sidecar preloads one model at a time, so birefnet-lite is still
-  # downloading / loading when the default turns ready.
-  pixel_model=${EZLG_TEST_MATTE_PIXEL_MODEL:-birefnet-lite}   # the model that detects the synthetic figure (see the header / Env)
-  matte_wait=${EZLG_TEST_MATTE_WAIT:-600}
-  log "phase 5: waiting up to ${matte_wait}s for GET /api/matte to report the default model ready (and '$pixel_model' settled when offered)"
-  deadline=$((SECONDS + matte_wait)); matte_ready=0; mmodel=""; mstate=""; pstate=""; code=""
-  while :; do
-    code=$(curl -sS -o "$tmp/matte.json" -w '%{http_code}' --max-time 30 "$url/api/matte")
-    if [ "$code" = 200 ]; then
-      mmodel=$(json_str "$tmp/matte.json" '.defaultModel' defaultModel)
-      mstate=$(matte_model_state "$tmp/matte.json" "$mmodel")
-      pstate=$(matte_model_state "$tmp/matte.json" "$pixel_model")
-      if matte_enabled "$tmp/matte.json" && [ "$mstate" = ready ]; then
-        matte_ready=1
-        # … and for the Phase 5c tracker (sam2-tiny) when it is offered: the
-        # matte-track / matte-prompt cases need it ready.
-        if matte_model_settled "$tmp/matte.json" "$pixel_model" && matte_model_settled "$tmp/matte.json" sam2-tiny; then break; fi
-      fi
-    fi
-    [ "$SECONDS" -lt "$deadline" ] || break
-    sleep 5
-  done
-  mdev=$(json_str "$tmp/matte.json" '.device' device)
-  # figure = 1 when the pixel model answers the Phase 5 recipes; 0 = the default
-  # model does, and the assertions that need a detected figure are skipped.
-  # tracker = 1 when the Phase 5c guided model (sam2-tiny) is ready.
-  figure=0; pmodel=""; fig_note=""; tracker=0
-  if [ "$matte_ready" = 1 ]; then
-    ok "GET /api/matte → enabled, default model '$mmodel' ready on '$mdev'"
-    case "$mdev" in cuda|cpu) ok "matte: device '$mdev'" ;; *) fail "matte: device '$mdev', want cuda or cpu" ;; esac
-    ms=$(json_num "$tmp/matte.json" '.maxSeconds' maxSeconds); mf=$(json_num "$tmp/matte.json" '.maxFrames' maxFrames)
-    if [ "${ms:-0}" -gt 0 ] 2>/dev/null && [ "${mf:-0}" -gt 0 ] 2>/dev/null; then ok "matte: maxSeconds $ms / maxFrames $mf"; else fail "matte: maxSeconds '${ms:-?}' / maxFrames '${mf:-?}', want both > 0"; fi
-    mspf=$(matte_model_ms "$tmp/matte.json" "$mmodel")
-    if [ "$use_jq" = 1 ]; then
-      if awk -v v="${mspf:-0}" 'BEGIN { exit !(v > 0) }'; then ok "matte: $mmodel msPerFrame $mspf (measured by the self-test)"; else fail "matte: $mmodel msPerFrame '${mspf:-?}', want > 0"; fi
-    fi
-    code=$(curl -sS -o "$tmp/caps5b.json" -w '%{http_code}' --max-time 30 "$url/api/capabilities")
-    if [ "$code" = 200 ] && features_true "$tmp/caps5b.json" matte; then ok "capabilities: features.matte == true"; else fail "capabilities: features.matte is not true ($code)"; fi
-    # Phase 5c status fields (a sidecar / server from before 5c has none — a skip, not a failure).
-    devs=$(matte_devices_text "$tmp/matte.json")
-    if [ -n "$devs" ]; then
-      if matte_devices_has "$tmp/matte.json" "$mdev"; then ok "matte: devices $devs lists the effective device '$mdev'"; else fail "matte: devices $devs does not list the effective device '$mdev'"; fi
-      dmd=$(matte_default_model_for "$tmp/matte.json" "$mdev")
-      if [ -n "$dmd" ] && [ "$dmd" = "$mmodel" ]; then ok "matte: defaultModels.$mdev == defaultModel ('$mmodel')"; else fail "matte: defaultModels.$mdev is '${dmd:-?}', defaultModel is '$mmodel' — want them equal (the default for the effective device)"; fi
-    else
-      skip "matte: Phase 5c status fields (devices, defaultModels) absent — a pre-5c sidecar or server"
-    fi
-    tstate=$(matte_model_state "$tmp/matte.json" sam2-tiny)
-    if [ -n "$tstate" ]; then
-      tk=$(matte_model_kind "$tmp/matte.json" sam2-tiny)
-      if [ "$tk" = tracker ]; then ok "matte: sam2-tiny carries kind 'tracker'"; else fail "matte: sam2-tiny kind '${tk:-}', want 'tracker'"; fi
-      if [ "$tstate" = ready ]; then tracker=1; ok "matte: the guided model sam2-tiny is ready — the matte-track / matte-prompt cases run"
-      else skip "matte-track / matte-prompt: sam2-tiny is '$tstate' on this sidecar$( r=$(matte_model_reason "$tmp/matte.json" sam2-tiny); [ -n "$r" ] && printf ' (%s)' "$r")"; fi
-    else
-      skip "matte-track / matte-prompt: sam2-tiny is not offered by this sidecar (MATTE_MODELS, or a pre-5c image)"
-    fi
-    if [ "$pstate" = ready ]; then
-      figure=1; pmodel=$pixel_model
-      ok "matte: pixel model '$pmodel' ready — the Phase 5 recipes name it and the figure assertions run"
-    else
-      pmodel=$mmodel
-      if [ -n "$pstate" ]; then pwhy="'$pixel_model' is '$pstate' on this sidecar$( r=$(matte_model_reason "$tmp/matte.json" "$pixel_model"); [ -n "$r" ] && printf ' (%s)' "$r")"
-      else pwhy="'$pixel_model' is not offered by this sidecar (MATTE_MODELS)"; fi
-      fig_note="$pwhy, so the recipes name the default model '$mmodel' — isnet-anime is trained on anime characters and does not detect the synthetic figure this test draws (alpha ~2 everywhere); the pixel checks need birefnet-lite (the matte-gpu profile, or MATTE_MODELS=isnet-anime,birefnet-lite)"
-      skip "matte figure assertions (frames > 1, opaque AND transparent pixels, corner alpha, report.hasAlpha, VP8X alpha, autocrop < source): $fig_note"
-    fi
-  else
-    fail "GET /api/matte → ${code:-?}: not ready after ${matte_wait}s (enabled: $(matte_enabled "$tmp/matte.json" && echo true || echo false), model '${mmodel:-?}' state '${mstate:-?}', device '${mdev:-?}', reason '$(json_str "$tmp/matte.json" '.reason' reason)')"
-  fi
-
-  # ---- matte-settings (Phase 5c): the server-side device preference behind the
-  # card's "Run on" select. Before any pass, so the switch disturbs nothing; the
-  # device in force before the case ($mdev) is restored at the end.
-  name=matte-settings
-  if [ "$matte_ready" = 1 ]; then
-    code=$(curl -sS -o "$tmp/settings_bad.json" -w '%{http_code}' --max-time 30 -X PUT -H 'Content-Type: application/json' --data '{"device":"tpu"}' "$url/api/matte/settings")
-    if [ "$code" = 400 ]; then ok "$name: PUT /api/matte/settings {\"device\":\"tpu\"} → 400 (not offered)"
-    else fail "$name: PUT /api/matte/settings {\"device\":\"tpu\"} → $code, want 400 for a device the sidecar does not offer: $(head -c 200 "$tmp/settings_bad.json")"; fi
-    if matte_devices_has "$tmp/matte.json" cuda && matte_devices_has "$tmp/matte.json" cpu; then
-      code=$(curl -sS -o "$tmp/settings_cpu.json" -w '%{http_code}' --max-time 30 -X PUT -H 'Content-Type: application/json' --data '{"device":"cpu"}' "$url/api/matte/settings")
-      sdev=$(json_str "$tmp/settings_cpu.json" '.device' device)
-      if [ "$code" = 200 ] && [ "$sdev" = cpu ]; then ok "$name: PUT {\"device\":\"cpu\"} → 200 with device 'cpu'"
-      else fail "$name: PUT {\"device\":\"cpu\"} → $code with device '${sdev:-?}', want 200 / cpu: $(head -c 200 "$tmp/settings_cpu.json")"; fi
-      dm=$(json_str "$tmp/settings_cpu.json" '.defaultModel' defaultModel); dmc=$(matte_default_model_for "$tmp/settings_cpu.json" cpu)
-      if [ -n "$dmc" ] && [ "$dm" = "$dmc" ]; then ok "$name: defaultModel '$dm' follows the device (== defaultModels.cpu)"
-      else fail "$name: defaultModel '${dm:-?}' vs defaultModels.cpu '${dmc:-?}' after switching to cpu — want them equal"; fi
-      code=$(curl -sS -o "$tmp/matte_cpu.json" -w '%{http_code}' --max-time 30 "$url/api/matte")
-      gdev=$(json_str "$tmp/matte_cpu.json" '.device' device)
-      if [ "$code" = 200 ] && [ "$gdev" = cpu ]; then ok "$name: GET /api/matte reflects device 'cpu'"; else fail "$name: GET /api/matte → $code with device '${gdev:-?}' after PUT cpu, want cpu"; fi
-      code=$(curl -sS -o "$tmp/settings_reset.json" -w '%{http_code}' --max-time 30 -X PUT -H 'Content-Type: application/json' --data '{"device":""}' "$url/api/matte/settings")
-      rdev=$(json_str "$tmp/settings_reset.json" '.device' device)
-      if [ "$code" = 200 ] && matte_devices_has "$tmp/settings_reset.json" "$rdev"; then ok "$name: PUT {\"device\":\"\"} → 200, back to the sidecar's default '$rdev'"
-      else fail "$name: PUT {\"device\":\"\"} → $code with device '${rdev:-?}', want 200 and an offered device: $(head -c 200 "$tmp/settings_reset.json")"; fi
-      # Restore what was in force before (a long-lived EZLG_URL stack keeps its preference).
-      if [ "$rdev" != "$mdev" ]; then
-        code=$(curl -sS -o "$tmp/settings_restore.json" -w '%{http_code}' --max-time 30 -X PUT -H 'Content-Type: application/json' --data '{"device":"'"$mdev"'"}' "$url/api/matte/settings")
-        if [ "$code" = 200 ]; then log "$name: restored the device preference '$mdev'"; else fail "$name: could not restore the device preference '$mdev' ($code)"; fi
-      fi
-    else
-      skip "$name: the device switch needs a sidecar offering cuda AND cpu (devices: ${devs:-none}) — the matte-gpu profile does"
-    fi
-  fi
-
-  # ---- the figure-over-gradient clip + the matte jobs (the Phase 5c idle /
-  # eager still first, then every job at once: the same clip at the same fps
-  # shares one pass through the single-flight)
-  char_hash=""
-  if [ "$matte_ready" = 1 ]; then
-    if make_matte_clip "$tmp/char.mov" 2>"$tmp/char.err" && [ -s "$tmp/char.mov" ]; then
-      if code=$(upload "$tmp/upload_char.json" -F "file=@$tmp/char.mov"); then ok "POST /api/upload (figure-over-gradient clip) → 200"; else fail "POST /api/upload (figure-over-gradient clip) → $code"; fi
-      char_hash=$(json_str "$tmp/upload_char.json" '.hash' hash)
-      [[ "$char_hash" =~ ^[0-9a-f]{64}$ ]] || { fail "figure clip upload response has no sha256 hash"; char_hash=""; }
-    else
-      fail "ffmpeg could not draw the figure-over-gradient clip: $(head -c 300 "$tmp/char.err")"
-    fi
-  fi
-  if [ -n "$char_hash" ]; then
-    # Every recipe names its model (the pixel model when ready, else the default — see matte-api).
-    mt='{"kind":"matte","params":{"model":"'"$pmodel"'"}}'
-    # The autocrop reads the matte's soft alpha (alpha ≥ threshold = content):
-    # 32 keeps the model's ~2 floor out of the box; the figure itself is 255.
-    recipe[matte-gif]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt"'],"output":{"format":"gif","width":128,"height":128,"fit":"contain","fps":20,"preset":"emote","target":"emote"}}'
-    recipe[matte-webp]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt"'],"output":{"format":"webp","quality":80,"preset":"chat","target":"attachment"}}'
-    recipe[matte-apng]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt"',{"kind":"morph","params":{"close":true}}],"output":{"format":"apng","colors":256,"width":320,"height":320,"fit":"contain","preset":"sticker","target":"sticker"}}'
-    recipe[matte-autocrop]='{"v":1,"sources":["'"$char_hash"'"],"ops":[{"kind":"trim","params":{"start":0,"end":0.1}},'"$mt"',{"kind":"autocrop","params":{"threshold":32}}],"output":{"format":"png","preset":"custom"}}'
-    # Phase 5c: the same emote GIF with the temporal median, with the figure's body
-    # colour kept, and (when the tracker is ready) guided by one box on frame 0.
-    mt_stab='{"kind":"matte","params":{"model":"'"$pmodel"'","stabilise":"light"}}'
-    mt_keep='{"kind":"matte","params":{"model":"'"$pmodel"'","keep":["3a7bd5"]}}'
-    # The sprite (64×96) is overlaid at x = 48 + 33.6·sin(πt), y = 54.4 + 22.4·cos(πt)
-    # (make_matte_clip): at t = 0 its pixels span x 58..102, y 54..150 of the 160²
-    # frame → [0.36, 0.34, 0.64, 0.94]; ~4 % looser on every side.
-    track_box='[0.33,0.31,0.67,0.97]'
-    mt_track='{"kind":"matte","params":{"model":"sam2-tiny","prompts":[{"frame":0,"box":'"$track_box"'}]}}'
-    gif_out='"output":{"format":"gif","width":128,"height":128,"fit":"contain","fps":20,"preset":"emote","target":"emote"}'
-    recipe[matte-stabilise]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt_stab"'],'"$gif_out"'}'
-    recipe[matte-keep]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt_keep"'],'"$gif_out"'}'
-    recipe[matte-track]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt_track"'],'"$gif_out"'}'
-    # The 5c follow-up's mask prompt: no box — frame 0's mask is the edge model's
-    # matte of it, which the server takes from that model's memo (the pass the
-    # eager still / the GIF jobs run on this clip at the same rate); "edge" names
-    # the pixel model explicitly so the mask is the matte that detects the figure
-    # (the device's default would be isnet-anime under a CPU preference: an empty mask).
-    mt_track_mask='{"kind":"matte","params":{"model":"sam2-tiny","edge":"'"$pmodel"'","prompts":[{"frame":0,"maskFrom":"edge"}]}}'
-    recipe[matte-track-mask]='{"v":1,"sources":["'"$char_hash"'"],"ops":['"$mt_track_mask"'],'"$gif_out"'}'
-    # POST /api/matte/prompt with it, in the shape the SPA puts on the wire: the
-    # recipe word maskFrom plus matte.FramePrompt's own flag "mask": true (the
-    # server reads either; a recipe carries maskFrom only).
-    pmask_body='{"src":"'"$char_hash"'","ops":['"$mt_track_mask"'],"output":{"format":"gif","fps":20},"frame":0,"prompts":[{"frame":0,"maskFrom":"edge","mask":true}]}'
-
-    # ---- matte-still (Phase 5c Compute-button semantics), BEFORE any pass exists
-    # for this clip: a plain still answers 202 "idle" and starts nothing; the same
-    # still with "eager": true (the Compute matte button) starts the pass and is
-    # re-requested through running / loading / downloading until the PNG arrives.
-    name=matte-still
-    still_body='{"src":"'"$char_hash"'","ops":['"$mt"'],"output":{"format":"gif","fps":20},"t":0.5,"maxW":160}'
-    st=""; code=$(still_once "$tmp/still_idle.json" "$still_body")
-    case "$code" in
-      202)
-        st=$(json_str "$tmp/still_idle.json" '.state' state)
-        if [ "$st" = idle ]; then ok "$name: POST /api/still without eager → 202 {\"state\":\"idle\"} (no pass started)"
-        else fail "$name: POST /api/still without eager → 202 state '${st:-?}', want idle (a preview must not start a pass by itself)"; fi ;;
-      200) skip "$name: idle check — the matte memo was already on disk (200 at once; a fresh data dir exercises it)" ;;
-      *)   fail "$name: POST /api/still without eager → $code: $(head -c 300 "$tmp/still_idle.json")" ;;
-    esac
-    if [ "$code" = 202 ] && [ "$st" = idle ]; then
-      # Still idle a second later: the first plain still really started nothing.
-      sleep 1
-      code2=$(still_once "$tmp/still_idle2.json" "$still_body"); st2=$(json_str "$tmp/still_idle2.json" '.state' state)
-      if [ "$code2" = 202 ] && [ "$st2" = idle ]; then ok "$name: a second plain still 1 s later is still idle"
-      else fail "$name: a second plain still → $code2 state '${st2:-}', want 202 idle (the first plain still started a pass)"; fi
-    fi
-    # ---- matte-prompt-mask, the idle half (5c follow-up), still BEFORE any pass
-    # exists for this clip: a mask prompt needs the edge model's matte of the frame
-    # on disk and never starts a pass, so the overlay answers 202 idle with the
-    # reason. A released tracker may answer loading / downloading first (nothing
-    # stays resident): those are re-requested, the first other answer is judged.
-    name=matte-prompt-mask
-    if [ "$tracker" = 1 ]; then
-      pcode=""; pst=""; deadline=$((SECONDS + timeout))
-      while :; do
-        pcode=$(prompt_once "$tmp/pmask_idle.json" "$pmask_body")
-        [ "$pcode" = 202 ] || break
-        pst=$(json_str "$tmp/pmask_idle.json" '.state' state)
-        case "$pst" in loading|downloading) ;; *) break ;; esac
-        [ "$SECONDS" -lt "$deadline" ] || break
-        sleep 1
-      done
-      case "$pcode" in
-        202)
-          if [ "$pst" = idle ]; then
-            ok "$name: POST /api/matte/prompt with {\"frame\":0,\"maskFrom\":\"edge\",\"mask\":true} before any pass → 202 {\"state\":\"idle\"} (the edge matte is not computed; no pass started)"
-            if grep -qiE 'comput|matte first' "$tmp/pmask_idle.json"; then ok "$name: the 202 names the reason (compute the edge model's matte first)"
-            else fail "$name: the 202 idle body carries no reason to show (want \"compute the General matte first\" or alike): $(head -c 300 "$tmp/pmask_idle.json")"; fi
-          else fail "$name: POST /api/matte/prompt with the mask prompt before any pass → 202 state '${pst:-?}', want idle (a mask prompt must not start a pass): $(head -c 300 "$tmp/pmask_idle.json")"; fi ;;
-        200) skip "$name: idle half — the edge model's matte was already on disk (200 at once; a fresh data dir exercises it)" ;;
-        *)   fail "$name: POST /api/matte/prompt with the mask prompt before any pass → $pcode: $(head -c 300 "$tmp/pmask_idle.json")" ;;
-      esac
-    else
-      skip "$name (idle half): needs the guided model sam2-tiny ready on the sidecar (see matte-api)"
-    fi
-
-    still_code=""; still_pending_seen=0
-    if still_png_wait "$tmp/still_matte.png" "${still_body%\}}"',"eager":true}'; then
-      if [ "$still_pending_seen" = 1 ]; then
-        if [ "$still_first_state" = idle ]; then fail "$name: the eager still answered 202 idle (eager must start the pass)"
-        else ok "$name: POST /api/still with \"eager\": true → 202 ${still_first_state:-pending}, then 200 PNG"; fi
-      else ok "$name: POST /api/still with \"eager\": true → 200 PNG (memo already on disk, no 202 seen)"; fi
-      if [ "$figure" = 1 ]; then
-        ca=$(corner_alpha "$tmp/still_matte.png")
-        if [ "${ca:-255}" -le 8 ] 2>/dev/null; then ok "$name: corner pixel transparent (alpha $ca ≤ 8, the soft matte's floor)"; else fail "$name: corner pixel alpha '${ca:-?}', want ≤ 8 (the matte did not key the gradient)"; fi
-      else
-        skip "$name: corner-alpha check needs a detected figure ($pmodel does not find the synthetic one)"
-      fi
-    else
-      fail "$name: POST /api/still with the matte op → ${still_code:-?} (want 200 PNG, after any 202s): $(head -c 300 "$tmp/still_matte.png")"
-    fi
-
-    # The jobs, all at once (the GIF ones share the still's memo; the tracker
-    # recipe only when sam2-tiny is ready).
-    for name in matte-gif matte-webp matte-apng matte-autocrop matte-stabilise matte-keep; do
-      submit_job $name || true
-    done
-    if [ "$tracker" = 1 ]; then submit_job matte-track || true; fi
-
-    # ---- matte-gif (emote)
-    name=matte-gif
-    if finish_job $name && fetch_primary $name gif; then
-      f=${out_file[$name]}
-      if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
-      matte_report_check $name
-      gif_figure_checks $name "$figure"
-    fi
-
-    # ---- matte-webp (chat)
-    name=matte-webp
-    if finish_job $name && fetch_primary $name webp; then
-      f=${out_file[$name]}
-      if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: webp decodes (ffmpeg)"; else fail "$name: webp does not decode"; fi
-      matte_report_check $name
-      if [ "$figure" = 1 ]; then
-        if primary_has_alpha "$tmp/poll_$name.json"; then ok "$name: report.hasAlpha == true"; else fail "$name: report.hasAlpha != true"; fi
-        if have "$webpinfo"; then
-          winfo=$("$webpinfo" "$f" 2>&1 || true)
-          va=$(awk '/Chunk VP8X/ {x=1} x && /Alpha:/ {print $2; exit}' <<<"$winfo")
-          if [ "$va" = 1 ]; then ok "$name: VP8X ALPHA flag set"; else fail "$name: VP8X ALPHA flag missing"; fi
-        fi
-        # Soft alpha: the model's sigmoid floor keeps the background at ~2, so ±8 counts.
-        read -r n_op n_tr <<<"$(alpha_counts "$f" 8)"
-        if [ "${n_op:-0}" -gt 0 ] && [ "${n_tr:-0}" -gt 0 ]; then ok "$name: frame 0 has $n_op opaque (≥ 247) and $n_tr transparent (≤ 8) pixels"; else fail "$name: frame 0 has ${n_op:-0} opaque (≥ 247) / ${n_tr:-0} transparent (≤ 8) pixels, want both > 0"; fi
-        ca=$(corner_alpha "$f")
-        if [ "${ca:-255}" -le 8 ] 2>/dev/null; then ok "$name: corner pixel transparent (alpha $ca ≤ 8)"; else fail "$name: corner pixel alpha '${ca:-?}', want ≤ 8"; fi
-      else
-        skip "$name: figure assertions (hasAlpha, VP8X alpha, opaque AND transparent pixels, corner alpha) need a detected figure ($pmodel does not find the synthetic one)"
-      fi
-    fi
-
-    # ---- matte-apng (sticker, + morph close after the matte)
-    name=matte-apng
-    if finish_job $name && fetch_primary $name png; then
-      f=${out_file[$name]}
-      if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: apng decodes (ffmpeg)"; else fail "$name: apng does not decode"; fi
-      if [ "$(png_chunks "$f" acTL)" -ge 1 ]; then ok "$name: animated (acTL chunk)"; else fail "$name: no acTL chunk — not an APNG"; fi
-      matte_report_check $name
-      if [ "$figure" = 1 ]; then
-        if primary_has_alpha "$tmp/poll_$name.json"; then ok "$name: report.hasAlpha == true"; else fail "$name: report.hasAlpha != true"; fi
-        # Soft alpha (indexed, but the palette keeps the ~2 floor): ±8 counts, as for the WebP.
-        read -r n_op n_tr <<<"$(alpha_counts "$f" 8)"
-        if [ "${n_op:-0}" -gt 0 ] && [ "${n_tr:-0}" -gt 0 ]; then ok "$name: frame 0 has $n_op opaque (≥ 247) and $n_tr transparent (≤ 8) pixels"; else fail "$name: frame 0 has ${n_op:-0} opaque (≥ 247) / ${n_tr:-0} transparent (≤ 8) pixels, want both > 0"; fi
-        ca=$(corner_alpha "$f")
-        if [ "${ca:-255}" -le 8 ] 2>/dev/null; then ok "$name: corner pixel transparent (alpha $ca ≤ 8)"; else fail "$name: corner pixel alpha '${ca:-?}', want ≤ 8"; fi
-      else
-        skip "$name: figure assertions (hasAlpha, opaque AND transparent pixels, corner alpha) need a detected figure ($pmodel does not find the synthetic one)"
-      fi
-    fi
-
-    # ---- matte-autocrop: the crop found the figure, not the gradient
-    name=matte-autocrop
-    if finish_job $name && fetch_primary $name png; then
-      f=${out_file[$name]}
-      d=$(dims_of "$f"); w=${d%x*}; h=${d#*x}
-      if [ "$figure" = 1 ]; then
-        if [ "${w:-0}" -gt 0 ] && [ "${h:-0}" -gt 0 ] && { [ "$w" -lt 160 ] || [ "$h" -lt 160 ]; }; then
-          ok "$name: cropped to $d (< 160x160 — the AI matte located the figure)"
-        else
-          fail "$name: dims '$d', want smaller than the 160x160 source"
-        fi
-      else
-        if [ "${w:-0}" -gt 0 ] && [ "${h:-0}" -gt 0 ]; then ok "$name: matte + autocrop rendered a ${d} PNG"; else fail "$name: dims '$d' — no readable PNG"; fi
-        skip "$name: crop smaller than the 160x160 source needs a detected figure ($pmodel does not find the synthetic one; got $d)"
-      fi
-    fi
-
-    # ---- matte-stabilise (Phase 5c): the emote GIF through the light temporal
-    # median — a derived sequence next to the mattes, no second pass; the
-    # render.matte check names it.
-    name=matte-stabilise
-    if finish_job $name && fetch_primary $name gif; then
-      f=${out_file[$name]}
-      if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
-      matte_report_check $name
-      d=$(primary_check_detail "$tmp/poll_$name.json" render.matte)
-      if grep -qiE 'stabilis(e|ed|ation)[^a-z0-9]{0,3}light' <<<"$d"; then ok "$name: render.matte names the stabilise mode ($d)"
-      else fail "$name: render.matte does not name \"stabilise light\": '${d:-<no render.matte check>}'"; fi
-      gif_figure_checks $name "$figure"
-    fi
-
-    # ---- matte-keep (Phase 5c): the figure's body colour kept — forced opaque as
-    # a union with the matte — so the figure assertions hold WHATEVER the model
-    # finds (the body rectangle orbits, the gradient never comes within 0.08 of it).
-    name=matte-keep
-    if finish_job $name && fetch_primary $name gif; then
-      f=${out_file[$name]}
-      if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
-      if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"
-      else fail "$name: primary report.ok != true (failed: $(primary_failed_rules "$tmp/poll_$name.json" | tr '\n' ' '))"; fi
-      d=$(primary_check_detail "$tmp/poll_$name.json" render.matte)
-      if grep -qi 'keep' <<<"$d"; then ok "$name: render.matte names the keep colour ($d)"
-      else fail "$name: render.matte does not mention the keep colour: '${d:-<no render.matte check>}'"; fi
-      gif_figure_checks $name 1
-    fi
-
-    # ---- matte-track (Phase 5c guided mode): one box on frame 0 around the
-    # figure's known position → the tracker finds it whatever the edge model does.
-    name=matte-track
-    if [ "$tracker" = 1 ]; then
-      if finish_job $name && fetch_primary $name gif; then
-        f=${out_file[$name]}
-        if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
-        if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"
-        else fail "$name: primary report.ok != true (failed: $(primary_failed_rules "$tmp/poll_$name.json" | tr '\n' ' '))"; fi
-        d=$(primary_check_detail "$tmp/poll_$name.json" render.matte)
-        if grep -qF 'sam2-tiny' <<<"$d"; then ok "$name: render.matte names the tracker ($d)"
-        else fail "$name: render.matte does not name sam2-tiny: '${d:-<no render.matte check>}'"; fi
-        gif_figure_checks $name 1
-      fi
-    else
-      skip "$name: needs the guided model sam2-tiny ready on the sidecar (see matte-api)"
-    fi
-
-    # ---- matte-prompt (Phase 5c): the live mask behind the Select-subject panel.
-    name=matte-prompt
-    if [ "$tracker" = 1 ]; then
-      prompt_code=""
-      pbody='{"src":"'"$char_hash"'","ops":['"$mt_track"'],"output":{"format":"gif","fps":20},"frame":0,"prompts":{"obj":1,"prompts":[{"frame":0,"box":'"$track_box"'}]}}'
-      if prompt_png_wait "$tmp/prompt_mask.png" "$pbody"; then
-        ok "$name: POST /api/matte/prompt (box on frame 0) → 200 PNG"
-        read -r n_w n_b <<<"$(gray_counts "$tmp/prompt_mask.png")"
-        if [ "${n_w:-0}" -gt 0 ] && [ "${n_b:-0}" -gt 0 ]; then ok "$name: mask has $n_w white and $n_b black pixels"; else fail "$name: mask has ${n_w:-0} white / ${n_b:-0} black pixels, want both > 0 (a binary 0/255 mask of the figure)"; fi
-        gc=$(gray_corner "$tmp/prompt_mask.png")
-        if [ "${gc:-255}" = 0 ]; then ok "$name: corner pixel outside the box is 0"; else fail "$name: corner pixel '${gc:-?}', want 0 (outside the box)"; fi
-      else
-        fail "$name: POST /api/matte/prompt → ${prompt_code:-?} (want 200 PNG, after any 202s): $(head -c 300 "$tmp/prompt_mask.png")"
-      fi
-    else
-      skip "$name: needs the guided model sam2-tiny ready on the sidecar (see matte-api)"
-    fi
-
-    # ---- matte-prompt-mask, the PNG half: the per-frame pass on this clip is on
-    # disk now (the eager still and the GIF jobs), so the same request answers the
-    # tracker's mask of frame 0 conditioned on the pixel model's matte of it.
-    name=matte-prompt-mask
-    if [ "$tracker" = 1 ] && [ "$figure" = 1 ]; then
-      pcode=""; pst=""; deadline=$((SECONDS + timeout))
-      while :; do
-        pcode=$(prompt_once "$tmp/pmask.png" "$pmask_body")
-        [ "$pcode" = 202 ] || break
-        pst=$(json_str "$tmp/pmask.png" '.state' state)
-        [ "$pst" != idle ] || break   # idle after the pass = the edge matte was not found: no point waiting
-        [ "$SECONDS" -lt "$deadline" ] || break
-        sleep 1
-      done
-      if [ "$pcode" = 200 ] && [ "$(magic_hex "$tmp/pmask.png" 8)" = "89504e470d0a1a0a" ]; then
-        ok "$name: POST /api/matte/prompt with the mask prompt after the per-frame pass → 200 PNG"
-        read -r n_w n_b <<<"$(gray_counts "$tmp/pmask.png")"
-        if [ "${n_w:-0}" -gt 0 ] && [ "${n_b:-0}" -gt 0 ]; then ok "$name: mask has $n_w white and $n_b black pixels"; else fail "$name: mask has ${n_w:-0} white / ${n_b:-0} black pixels, want both > 0 (a binary 0/255 mask of the figure)"; fi
-        gc=$(gray_corner "$tmp/pmask.png")
-        if [ "${gc:-255}" = 0 ]; then ok "$name: corner pixel outside the figure is 0"; else fail "$name: corner pixel '${gc:-?}', want 0 (outside the figure)"; fi
-      elif [ "$pcode" = 202 ] && [ "$pst" = idle ]; then
-        fail "$name: POST /api/matte/prompt with the mask prompt → 202 idle AFTER the per-frame pass of $pmodel on this clip: the edge matte of frame 0 was not found on disk (the mask prompt must read the memo the per-frame pass wrote): $(head -c 300 "$tmp/pmask.png")"
-      else
-        fail "$name: POST /api/matte/prompt with the mask prompt → ${pcode:-?} (want 200 PNG after the per-frame pass, after any loading 202s): $(head -c 300 "$tmp/pmask.png")"
-      fi
-    elif [ "$tracker" = 1 ]; then
-      skip "$name (PNG half): needs a detected figure — the mask is $pmodel's matte of frame 0, empty without one ($fig_note)"
-    else
-      skip "$name (PNG half): needs the guided model sam2-tiny ready on the sidecar (see matte-api)"
-    fi
-
-    # ---- matte-track-mask (5c follow-up): the guided recipe prompted with the
-    # pixel model's matte of frame 0 — submitted now, after the per-frame jobs,
-    # so "run General first, then track from the frame it got right" is the
-    # literal order (a render would run the edge pass itself anyway).
-    name=matte-track-mask
-    if [ "$tracker" = 1 ] && [ "$figure" = 1 ]; then
-      if submit_job $name && finish_job $name && fetch_primary $name gif; then
-        f=${out_file[$name]}
-        if "$ffmpeg" -v error -nostdin -i "$f" -f null - 2>/dev/null; then ok "$name: gif decodes (ffmpeg)"; else fail "$name: gif does not decode"; fi
-        if primary_report_ok "$tmp/poll_$name.json"; then ok "$name: primary report.ok == true"
-        else fail "$name: primary report.ok != true (failed: $(primary_failed_rules "$tmp/poll_$name.json" | tr '\n' ' '))"; fi
-        d=$(primary_check_detail "$tmp/poll_$name.json" render.matte)
-        if grep -qF 'sam2-tiny' <<<"$d"; then ok "$name: render.matte names the tracker ($d)"
-        else fail "$name: render.matte does not name sam2-tiny: '${d:-<no render.matte check>}'"; fi
-        if grep -qi 'mask' <<<"$d"; then ok "$name: render.matte notes the mask prompt ($d)"
-        else fail "$name: render.matte does not note the mask prompt (want \"mask from the edge matte\"): '${d:-<no render.matte check>}'"; fi
-        gif_figure_checks $name 1
-      fi
-    elif [ "$tracker" = 1 ]; then
-      skip "$name: needs a detected figure — the mask prompt is $pmodel's matte of frame 0, empty without one ($fig_note)"
-    else
-      skip "$name: needs the guided model sam2-tiny ready on the sidecar (see matte-api)"
-    fi
-
-    # ---- matte-cached: the same recipe again comes from the result cache (the
-    # sidecar's weights identity is in the recipe hash, so a hit is the contract
-    # here — this one is NOT counted in the cache-hit warning).
-    name=matte-cached
-    recipe[$name]=${recipe[matte-gif]}
-    if submit_job $name; then
-      state=$(wait_job $name)
-      case "$state" in
-        done)
-          if job_cached "$tmp/poll_$name.json"; then ok "$name: the matte GIF recipe again → done with \"cached\": true"
-          else fail "$name: the same matte recipe rendered again instead of being served from the result cache"; fi ;;
-        error)  fail "$name: second submit failed: $(job_error "$tmp/poll_$name.json")" ;;
-        http:*) fail "GET /api/jobs/${job_id[$name]} → ${state#http:}" ;;
-        *)      fail "$name: second submit still '$state' after ${timeout}s" ;;
-      esac
-    fi
-
-    # ---- matte-unload (Phase 5c): what the card sends when it leaves the AI
-    # mode — last, after every matte job, so no pass loses its session.
-    name=matte-unload
-    code=$(curl -sS -o "$tmp/unload.txt" -w '%{http_code}' --max-time 60 -X POST "$url/api/matte/unload")
-    if [ "$code" = 204 ]; then ok "$name: POST /api/matte/unload → 204"; else fail "$name: POST /api/matte/unload → $code, want 204: $(head -c 200 "$tmp/unload.txt")"; fi
-  fi
 fi
 
 summary

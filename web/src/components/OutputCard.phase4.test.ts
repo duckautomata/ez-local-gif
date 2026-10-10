@@ -77,7 +77,7 @@ describe('OutputCard Phase 4 (SSR)', () => {
     expect(tsel).not.toContain('value="sticker"');
     expect(tsel).toContain('value="attachment"');
     // matte stays (flattened onto it), the alpha-only knobs are gone
-    expect(out).toContain('flattened onto this colour');
+    expect(out).toContain('flattened onto this color');
     expect(out).not.toContain('Alpha threshold');
     expect(out).not.toContain('Trim fringe');
     expect(out).not.toContain('>Dither<');

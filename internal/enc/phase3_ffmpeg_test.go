@@ -286,7 +286,7 @@ func overlayPlanFor(t *testing.T, info recipe.ProbeInfo, c overlayCase) *graph.P
 	return p
 }
 
-// expectedOverlay returns the overlay colour the render shows at output slot
+// expectedOverlay returns the overlay color the render shows at output slot
 // k of a 30 fps base: numbered frame floor(k/3) (10 fps overlay), modulo the
 // frame count when looping, held at the last frame otherwise.
 func expectedOverlay(c overlayCase, k int) color.RGBA {
@@ -480,14 +480,14 @@ func TestProxyOfStillWithAnimatedOverlay(t *testing.T) {
 const tailFrames = 30
 
 // tailColor numbers the frames of TestProxyReversedTail's animations with
-// colours at least 40 apart per channel (six red levels by five blue levels):
+// colors at least 40 apart per channel (six red levels by five blue levels):
 // the proxy is lossy (-q:v 60, 4:2:0) and lands up to ~10 values off a flat
-// colour, which would blur frameColor's 8-apart red steps together.
+// color, which would blur frameColor's 8-apart red steps together.
 func tailColor(i int) color.RGBA {
 	return color.RGBA{R: uint8(20 + 40*(i%6)), G: 0, B: uint8(10 + 50*(i/6)), A: 255}
 }
 
-// nearestTail returns the tailColor frame whose colour is closest to c and
+// nearestTail returns the tailColor frame whose color is closest to c and
 // that distance (the sum of the per-channel differences).
 func nearestTail(c color.RGBA) (int, int) {
 	best, bestD := -1, math.MaxInt
@@ -532,7 +532,7 @@ func TestProxyReversedTail(t *testing.T) {
 		out        recipe.Output
 		maxSeconds float64
 		seek       bool // the proxy must seek (else it must not)
-		numbered   bool // frames are numbered: the tail is checked by colour
+		numbered   bool // frames are numbered: the tail is checked by color
 		needs9     bool
 	}{
 		{"png video at its 10 fps", movPath, movInfo, []recipe.Op{rev}, recipe.Output{Format: "gif"}, 1, true, true, false},
@@ -595,7 +595,7 @@ func TestProxyReversedTail(t *testing.T) {
 			for m, fr := range frames {
 				got, dist := nearestTail(rgbaAt(fr, p.Width, animBoxX+8, animBoxY+8))
 				if got != last-m || dist > 16 {
-					t.Errorf("proxy frame %d shows source frame %d (colour distance %d), want %d", m, got, dist, last-m)
+					t.Errorf("proxy frame %d shows source frame %d (color distance %d), want %d", m, got, dist, last-m)
 				}
 			}
 		})
@@ -872,7 +872,7 @@ const (
 	animBoxW, animBoxH = 32, 22
 )
 
-// frameColor is the box colour of numbered animation frame i: the red
+// frameColor is the box color of numbered animation frame i: the red
 // channel numbers the frame, the green keeps the box far above cropdetect's
 // black limit whatever the number.
 func frameColor(i int) color.RGBA { return color.RGBA{R: uint8(8 * (i + 1)), G: 200, B: 0, A: 255} }
@@ -890,8 +890,8 @@ func numberedAnimation(t *testing.T, path string, n int, delayCS func(i int) int
 	return coloredAnimation(t, path, n, delayCS, frameColor)
 }
 
-// coloredAnimation is numberedAnimation with the box colour of frame i given
-// by colorOf (every frame's colour must be distinct).
+// coloredAnimation is numberedAnimation with the box color of frame i given
+// by colorOf (every frame's color must be distinct).
 func coloredAnimation(t *testing.T, path string, n int, delayCS func(i int) int, colorOf func(i int) color.RGBA) (string, recipe.ProbeInfo) {
 	t.Helper()
 	pal := make(color.Palette, 0, n+1)
@@ -1165,7 +1165,7 @@ func TestSeekUnsafeWebPUntrimmed(t *testing.T) {
 	if got := len(pix) / frameBytes; got < 9 || got > 11 {
 		t.Errorf("proxy has %d frames, want about 10 (1 s at 10 fps)", got)
 	}
-	// Lossy yuva420p: the box colour survives within a few steps, and the
+	// Lossy yuva420p: the box color survives within a few steps, and the
 	// reversed first frame (29: R 240) is nowhere near frame 0 (R 8).
 	if got, want := rgbaAt(pix, rp.Width, 10, 10), frameColor(29); math.Abs(float64(got.R)-float64(want.R)) > 16 || math.Abs(float64(got.G)-float64(want.G)) > 16 {
 		t.Errorf("proxy frame 0 box pixel %v, want about source frame 29 (%v)", got, want)
@@ -1197,7 +1197,7 @@ func taggedMOV(t *testing.T, ff, src, path string, alpha bool) string {
 
 // commentGIF writes a 1 s, 10 fps opaque GIF (black with a white box) and
 // splices a GIF comment extension carrying tagComment right after the global
-// colour table — the gif demuxer exports the extension as the "comment" tag,
+// color table — the gif demuxer exports the extension as the "comment" tag,
 // so the app's primary input type echoes it exactly like a MOV does.
 func commentGIF(t *testing.T, path string, w, h int, box image.Rectangle) string {
 	t.Helper()
@@ -1224,7 +1224,7 @@ func commentGIF(t *testing.T, path string, w, h int, box image.Rectangle) string
 	}
 	cut := 13 // header + logical screen descriptor
 	if packed := b[10]; packed&0x80 != 0 {
-		cut += 3 << ((packed & 7) + 1) // global colour table
+		cut += 3 << ((packed & 7) + 1) // global color table
 	}
 	ext := append([]byte{0x21, 0xFE, byte(len(tagComment))}, tagComment...)
 	ext = append(ext, 0)

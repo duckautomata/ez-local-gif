@@ -20,7 +20,7 @@ import "fmt"
 // frame disposed the clip is exact. The transparency flag on the opaque
 // frames changes no pixel (it is only set when the frame's pixel data does
 // not use the index) — it is there for decoders that clear a disposed frame to
-// the opaque background colour unless the frame declares transparency
+// the opaque background color unless the frame declares transparency
 // (ffmpeg's own gif decoder, which the render's verify step runs).
 //
 // The caller asserts that every frame is a complete picture: a frame that
@@ -29,7 +29,7 @@ import "fmt"
 // lose its background — far worse than what this repairs. What can be checked
 // is: the file is left untouched (the input slice comes back, patched == 0)
 // unless every frame has exactly one canonical GCE, covers the whole
-// logical screen, uses the global colour table and keeps to disposal 0, 1 or
+// logical screen, uses the global color table and keeps to disposal 0, 1 or
 // 2, and at least one frame declares transparency — an opaque animation needs
 // nothing. Frames whose pixel data cannot be decoded, or uses the transparent
 // index, keep their flag as it is. Every other byte round-trips exactly; err

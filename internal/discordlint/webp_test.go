@@ -41,7 +41,7 @@ func vp8xChunk(flags byte, w, h int) []byte {
 }
 
 func animChunk(loop uint16) []byte {
-	p := []byte{0xFF, 0xFF, 0xFF, 0xFF} // background colour BGRA
+	p := []byte{0xFF, 0xFF, 0xFF, 0xFF} // background color BGRA
 	p = binary.LittleEndian.AppendUint16(p, loop)
 	return chunk("ANIM", p)
 }

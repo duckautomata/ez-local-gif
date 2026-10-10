@@ -18,7 +18,7 @@ type master struct {
 }
 
 // step is one row of a preset ladder table (DESIGN.md §5.4). Zero fps / px
-// mean "as the master"; zero colours mean "format default".
+// mean "as the master"; zero colors mean "format default".
 type step struct {
 	fps       float64
 	colors    int
@@ -49,7 +49,7 @@ var (
 		{fps: 12.5, px: 112, format: recipe.FormatWebP},
 		{fps: 10, px: 96, format: recipe.FormatWebP},
 	}
-	// stickerRGBASteps: the RGBA truecolour APNG probes of §5.4/§9a ("RGBA
+	// stickerRGBASteps: the RGBA truecolor APNG probes of §5.4/§9a ("RGBA
 	// APNG only when it fits at ≥ 12 fps"): 25 → 20 → 16.7 → 12.5 fps, each a
 	// single encode (truecolorKnob) that is skipped when over the target.
 	stickerRGBASteps = []step{
@@ -93,8 +93,8 @@ func buildLadder(m master, steps []step, showFormat bool) []Rung {
 // buildRung realises one step against the master: fps at or above the
 // master's becomes "master fps", a size at or above the master's longer
 // side becomes "master size", downscales are computed from the longer side.
-// Truecolour steps get the single-probe knob; indexed APNG/PNG steps get a
-// colour-step knob bounded by their own palette (floor 64, §5.4).
+// Truecolor steps get the single-probe knob; indexed APNG/PNG steps get a
+// color-step knob bounded by their own palette (floor 64, §5.4).
 func buildRung(m master, st step, showFormat bool) Rung {
 	r := Rung{Colors: st.colors, Dither: st.dither, Format: st.format, Truecolor: st.truecolor}
 	switch {
@@ -102,7 +102,7 @@ func buildRung(m master, st step, showFormat bool) Rung {
 		r.Colors = 0
 		r.Knob = truecolorKnob
 	case st.colors > 0 && (st.format == recipe.FormatAPNG || st.format == recipe.FormatPNG):
-		r.Knob = colourStepKnob(st.colors)
+		r.Knob = colorStepKnob(st.colors)
 	}
 	if st.fps > 0 && m.fps > 0 && st.fps < m.fps-fpsEpsilon {
 		r.FPS = st.fps
@@ -163,7 +163,7 @@ func genericLadder(format string, m master, keepSize, keepFPS bool) []Rung {
 
 // Filter applies the recipe's FitKeepSize / FitKeepFPS to a preset ladder:
 // with keepSize every rung keeps the master size (Width/Height 0), with
-// keepFPS every rung keeps the master fps (FPS 0); the colour/dither
+// keepFPS every rung keeps the master fps (FPS 0); the color/dither
 // progression of the ladder survives and rungs that collapse onto an earlier
 // one are dropped. Changed rungs get their label re-rendered with
 // masterFPS/w/h (pass the values the ladder was built with; 0 = unknown),
@@ -230,9 +230,9 @@ func dedupeRungs(rungs []Rung) []Rung {
 	return out
 }
 
-// labelFor renders "25 fps · 256 colours · 128 px" from the rung's effective
+// labelFor renders "25 fps · 256 colors · 128 px" from the rung's effective
 // values (master values fill the zero fields when known). showFormat
-// prefixes the upper-cased format for ladders that mix formats; truecolour
+// prefixes the upper-cased format for ladders that mix formats; truecolor
 // rungs carry "RGBA" ("APNG · RGBA · 25 fps · 320 px"). Dither is
 // deliberately left out (the template of §5.4 has none; Candidate.Rung
 // carries it).
@@ -252,7 +252,7 @@ func labelFor(r Rung, m master, showFormat bool) string {
 		parts = append(parts, fpsString(fps)+" fps")
 	}
 	if r.Colors > 0 {
-		parts = append(parts, fmt.Sprintf("%d colours", r.Colors))
+		parts = append(parts, fmt.Sprintf("%d colors", r.Colors))
 	}
 	w, h := r.Width, r.Height
 	if w == 0 && h == 0 {

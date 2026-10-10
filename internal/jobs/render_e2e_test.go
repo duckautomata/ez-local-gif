@@ -138,8 +138,8 @@ func runJob(t *testing.T, m *Manager, r recipe.Recipe) Job {
 	return evs[len(evs)-1].Job
 }
 
-// colourClass buckets a pixel as "red", "blue" or "other".
-func colourClass(c color.Color) string {
+// colorClass buckets a pixel as "red", "blue" or "other".
+func colorClass(c color.Color) string {
 	r, _, b, _ := c.RGBA()
 	switch {
 	case r > 0x8000 && b < 0x8000:
@@ -236,19 +236,19 @@ func TestRenderRotatedSource(t *testing.T) {
 	}
 	// Rows must be uniform (a wrong stride would interleave the halves) and
 	// the two halves must differ; skip the band around the boundary where
-	// chroma subsampling and dithering blend the colours.
+	// chroma subsampling and dithering blend the colors.
 	for y := 0; y < 160; y++ {
 		if y >= 70 && y < 90 {
 			continue
 		}
-		want := colourClass(fr.At(0, y))
+		want := colorClass(fr.At(0, y))
 		for x := 1; x < 90; x++ {
-			if got := colourClass(fr.At(x, y)); got != want {
+			if got := colorClass(fr.At(x, y)); got != want {
 				t.Fatalf("row %d is not uniform: x=0 %s, x=%d %s (stride scrambled?)", y, want, x, got)
 			}
 		}
 	}
-	top, bottom := colourClass(fr.At(45, 10)), colourClass(fr.At(45, 150))
+	top, bottom := colorClass(fr.At(45, 10)), colorClass(fr.At(45, 150))
 	if top == bottom || top == "other" || bottom == "other" {
 		t.Errorf("halves: top %s, bottom %s; want one red, one blue", top, bottom)
 	}
@@ -574,8 +574,8 @@ func TestRenderOneFrameMOV(t *testing.T) {
 		if b := img.Bounds(); b.Dx() != 64 || b.Dy() != 48 {
 			t.Errorf("still t=%v bounds = %dx%d", tt, b.Dx(), b.Dy())
 		}
-		if l, r := colourClass(img.At(10, 24)), colourClass(img.At(54, 24)); l != "red" || r != "blue" {
-			t.Errorf("still t=%v colours: left %s right %s", tt, l, r)
+		if l, r := colorClass(img.At(10, 24)), colorClass(img.At(54, 24)); l != "red" || r != "blue" {
+			t.Errorf("still t=%v colors: left %s right %s", tt, l, r)
 		}
 	}
 	entries, _ := os.ReadDir(filepath.Join(st.Scratch, stillsDir))
@@ -836,7 +836,7 @@ func opaqueFirstHoldsFlat(t *testing.T, opaque bool) []byte {
 // assertOpaqueFirstHolds checks a rendering of opaqueFirstHoldsGIF per the GIF
 // spec: three pictures of 1 s, the first fully opaque, the others showing the
 // background everywhere but on their pose — and, when exact, the very
-// animation of the source (colours included).
+// animation of the source (colors included).
 func assertOpaqueFirstHolds(t *testing.T, data []byte, exact bool) {
 	t.Helper()
 	g, err := gif.DecodeAll(bytes.NewReader(data))
@@ -1145,7 +1145,7 @@ func TestLintGIFRepairsUnsafeHolds(t *testing.T) {
 		assertOpaqueFirstHolds(t, flat, false)
 	})
 
-	// A local colour table makes gifsicle give up on the coalesce ("too
+	// A local color table makes gifsicle give up on the coalesce ("too
 	// complex to unoptimize", exit 0) while it still rewrites every disposal:
 	// the poses would vanish 4 cs early. The check refuses that result. For
 	// target none (where a local table is only a warning, so the --colors rung
@@ -1245,7 +1245,7 @@ func (m *Manager) jobMatrixForHolds(t *testing.T, ctx context.Context, st *store
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Exact (colours included) wherever nothing lossy ran.
+			// Exact (colors included) wherever nothing lossy ran.
 			check(t, data, c.out.Lossy == 0 && c.out.FitBytes == 0)
 			t.Logf("%s: %d bytes, desc %q", f.Name, len(data), f.Desc)
 			if _, merged, err := discordlint.MergeGIFHolds(data); err != nil || merged != 0 {
@@ -1262,7 +1262,7 @@ func (m *Manager) jobMatrixForHolds(t *testing.T, ctx context.Context, st *store
 	}
 }
 
-// nearHoldsPalette: index 0 is transparent; every pose colour is followed by
+// nearHoldsPalette: index 0 is transparent; every pose color is followed by
 // a neighbour one RGB unit away.
 var nearHoldsPalette = color.Palette{
 	color.RGBA{0, 0, 0, 0},
@@ -1274,7 +1274,7 @@ var nearHoldsPalette = color.Palette{
 // nearHoldsGIF builds a transparent 64x48 GIF of 72 full-canvas disposal-2
 // frames with NO identical neighbours — nothing for MergeGIFHolds to fold —
 // but with near-holds: per pose one base frame plus three frames in which
-// five pose pixels take the neighbour colour. Any gifsicle --lossy pass
+// five pose pixels take the neighbour color. Any gifsicle --lossy pass
 // flattens those into true holds and its optimiser then writes the clear-only
 // frames gif.noop-frame-disposal is about. Pixel positions come from a fixed
 // LCG: the fixture is the same on every run.

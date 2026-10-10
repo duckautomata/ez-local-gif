@@ -91,42 +91,6 @@ func (m *Manager) run(ctx context.Context, j *job) {
 
 // render is the pipeline proper. It returns the manifest on success.
 func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
-	m.mu.Lock()
-	r := j.snap.Recipe
-	hash := j.snap.RecipeHash
-	id := j.snap.ID
-	m.mu.Unlock()
-	format := strings.ToLower(r.Output.Format)
-	target := discordlint.Target(r.Output.Target)
-
-	// 1b. (Phase 5b) A recipe with a matte op resolves its AI mattes BEFORE
-	// taking a render slot: the pass can take minutes on CPU and waits on
-	// the serial sidecar, so it must not hold one of the EZLG_CONCURRENCY
-	// slots meanwhile (N queued AI renders would starve every plain
-	// render). The pre-stage needs the sources (probe stage) and skips a
-	// result that is already on disk, like the slot path below; the memo
-	// dirs stay protected from the sweeper to the end of the job.
-	var (
-		started time.Time
-		srcs    *sources
-		mattes  []resolvedMatte
-		err     error
-	)
-	if hasMatteOp(r.Ops) {
-		started = m.markStarted(j)
-		if srcs, err = m.probeSources(j, r); err != nil {
-			return nil, err
-		}
-		if res, ok := m.cachedResult(hash); ok {
-			return res, nil
-		}
-		var release func()
-		if mattes, release, err = m.renderMattes(ctx, j, srcs.main(), r); err != nil {
-			return nil, err
-		}
-		defer release()
-	}
-
 	// Wait for a render slot (cancellable while queued).
 	select {
 	case m.sem <- struct{}{}:
@@ -134,23 +98,37 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return nil, ctx.Err()
 	}
 	defer func() { <-m.sem }()
-	if started.IsZero() {
-		started = m.markStarted(j)
-	}
+
+	started := time.Now()
+	m.mu.Lock()
+	j.snap.Started = started
+	r := j.snap.Recipe
+	hash := j.snap.RecipeHash
+	id := j.snap.ID
+	m.mu.Unlock()
+	format := strings.ToLower(r.Output.Format)
+	target := discordlint.Target(r.Output.Target)
 
 	// 1. Sources.
-	if srcs == nil {
-		if srcs, err = m.probeSources(j, r); err != nil {
-			return nil, err
-		}
+	m.setStage(j, StageProbe, 0, "looking up sources")
+	if m.tools.FFmpeg == "" {
+		return nil, errors.New("ffmpeg is not available on this server")
+	}
+	srcs, err := m.resolveSources(r.Sources)
+	if err != nil {
+		return nil, err
 	}
 	src := srcs.main()
 
 	// Someone may have finished the same recipe while we were queued
 	// (Submit already served an existing result): checked before the
 	// compile so a cached recipe never pays for an autocrop detection.
-	if res, ok := m.cachedResult(hash); ok {
-		return res, nil
+	if m.st.HasResult(hash) {
+		if res, err := m.LoadResult(hash); err == nil {
+			res.Cached = true
+			res.RenderMS = 0
+			return res, nil
+		}
 	}
 
 	// The gifsicle-only optimiser never decodes: no plan, no master.
@@ -192,9 +170,8 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 		return m.deliver(ctx, j, started, r, hash, scratch, items)
 	}
 
-	// 2. Compile (autocrop resolved with the mattes, overlay inputs bound to
-	// their blobs, matte inputs to their memos).
-	plan, err := m.compileWith(ctx, srcs, r.Ops, r.Output, mattes)
+	// 2. Compile (autocrop resolved, overlay inputs bound to their blobs).
+	plan, err := m.compile(ctx, srcs, r.Ops, r.Output)
 	if err != nil {
 		return nil, err
 	}
@@ -259,14 +236,6 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The matte count check (spec §12): the master must hold exactly one
-	// frame per matte (doubled per bounce). Static renders are cut to one
-	// frame and skip it. A mismatch fails the render and keeps the memo.
-	if !static {
-		if err := checkMatteCount(plan, mattes, master.Frames); err != nil {
-			return nil, err
-		}
-	}
 
 	// 5./6. Encode + lint.
 	m.setStage(j, StageEncode, pctEncodeStart, "encoding "+format)
@@ -274,79 +243,7 @@ func (m *Manager) render(ctx context.Context, j *job) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range items {
-		applyMatteInfo(items[i].report, mattes)       // render.matte: which AI matte the file was made with
-		applyMatteRecipeNotes(items[i].report, r.Ops) // … and what the op asked beyond it (stabilise / keep / guided + edge)
-	}
 	return m.deliver(ctx, j, started, r, hash, scratch, items)
-}
-
-// renderMattes is the render's matte pre-stage (Phase 5b, StageMatte): the
-// recipe's mattes resolved in render mode — memo hits from the persisted
-// facts, else the pass, waited for under the job ctx with the pass's
-// progress on the job ("24/45 · GPU", "loading model", …; percent band
-// pctMatteStart → pctMatteEnd through the ctx's withMatteProgress
-// listener) — then checked against the identity Submit hashed into the
-// recipe (checkMatteResolved: a probe may have rewritten the facts since)
-// and protected from the sweeper until release is called. It takes no
-// render slot. A render ALWAYS runs the pass (Phase 5c: the explicit
-// intent the Compute matte button and Render share) — the idle state the
-// previews answer without MatteEager never applies here — and reads the
-// derived sequence the op asks for (stabilise / the tracker's edge gate,
-// resolved under the clip dir) exactly as the previews did, so the render
-// matches what was previewed.
-func (m *Manager) renderMattes(ctx context.Context, j *job, src *store.Blob, r recipe.Recipe) ([]resolvedMatte, func(), error) {
-	m.setStage(j, StageMatte, pctMatteStart, "resolving")
-	pctx := withMatteProgress(ctx, func(p ErrMattePending) {
-		m.progress(j, pctMatteStart+matteProgressFraction(p)*(pctMatteEnd-pctMatteStart), matteProgressMessage(p))
-	})
-	mattes, err := m.resolveMattes(pctx, src, r.Ops, r.Output, matteModeRender)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkMatteResolved(r.Ops, mattes); err != nil {
-		return nil, nil, err
-	}
-	release, err := protectMattes(m.st, mattes)
-	if err != nil {
-		return nil, nil, err
-	}
-	m.progress(j, pctMatteEnd, "ready")
-	return mattes, release, nil
-}
-
-// markStarted stamps the job's Started time (the render began: the matte
-// pre-stage or the slot, whichever comes first) and returns it.
-func (m *Manager) markStarted(j *job) time.Time {
-	started := time.Now()
-	m.mu.Lock()
-	j.snap.Started = started
-	m.mu.Unlock()
-	return started
-}
-
-// probeSources is the probe stage: the sources looked up and touched.
-func (m *Manager) probeSources(j *job, r recipe.Recipe) (*sources, error) {
-	m.setStage(j, StageProbe, 0, "looking up sources")
-	if m.tools.FFmpeg == "" {
-		return nil, errors.New("ffmpeg is not available on this server")
-	}
-	return m.resolveSources(r.Sources)
-}
-
-// cachedResult returns the result already on disk for hash, marked cached,
-// when its manifest is readable.
-func (m *Manager) cachedResult(hash string) (*Result, bool) {
-	if !m.st.HasResult(hash) {
-		return nil, false
-	}
-	res, err := m.LoadResult(hash)
-	if err != nil {
-		return nil, false
-	}
-	res.Cached = true
-	res.RenderMS = 0
-	return res, true
 }
 
 // encodeOutputs dispatches on the output format (and the fit engine) and
@@ -554,16 +451,7 @@ func short(h string) string {
 // (enc joins plan.InputPattern). oneFrame cuts the master to its first
 // frame (static outputs).
 func (m *Manager) renderMaster(ctx context.Context, j *job, srcPath string, plan *graph.Plan, scratch string, oneFrame bool) (enc.Master, error) {
-	// The master band starts where the job's counter is: at pctMasterStart
-	// for a plain render, where the matte pre-stage left it (pctMatteEnd)
-	// for an AI render — the percent never goes backwards.
-	from := pctMasterStart
-	m.mu.Lock()
-	if j.snap.Percent > from {
-		from = j.snap.Percent
-	}
-	m.mu.Unlock()
-	m.setStage(j, StageMaster, from, "decoding source")
+	m.setStage(j, StageMaster, pctMasterStart, "decoding source")
 	path := filepath.Join(scratch, "frames.rgba")
 	args := enc.MasterArgs(srcPath, plan, path)
 	if oneFrame {
@@ -578,7 +466,7 @@ func (m *Manager) renderMaster(ctx context.Context, j *job, srcPath string, plan
 		if p.Speed != "" {
 			msg += " (" + p.Speed + ")"
 		}
-		m.progress(j, from+frac*(pctMasterEnd-from), msg)
+		m.progress(j, pctMasterStart+frac*(pctMasterEnd-pctMasterStart), msg)
 	})
 	if err != nil {
 		return enc.Master{}, fmt.Errorf("master render: %w", err)
@@ -983,7 +871,7 @@ func (m *Manager) gifLadder(ctx context.Context, scratch, tag string, data []byt
 	// repair is also the generic structural re-encode, and a file that never
 	// had clear-only frames must not be described as repaired for them (the
 	// --colors rung can create them — it re-runs the optimiser — so this is
-	// the post-colours report, not the caller's).
+	// the post-colors report, not the caller's).
 	held := failsHoldRule(report)
 	cand, rep, err := m.repairGIFHolds(ctx, scratch, tag, data, target, enc.GifsicleOptions{Lossy: sopts.Lossy, Loop: sopts.Loop}, note)
 	if err != nil {
@@ -1078,8 +966,8 @@ func holdRepairOptions(sopts enc.GifsicleOptions) (coalesce, reopt enc.GifsicleO
 //	   declares and uses transparency, so a clip that shows the background
 //	   anywhere is given a transparent 1x1 lead-in frame
 //	   (discordlint.PrependTransparentFrame) that the frame selection "#1-"
-//	   drops again; and it silently gives up on local colour tables or more
-//	   than 256 colours per picture. The result is therefore CHECKED against
+//	   drops again; and it silently gives up on local color tables or more
+//	   than 256 colors per picture. The result is therefore CHECKED against
 //	   the input (discordlint.PlayGIF / GIFPlayback.Same): a coalesce that
 //	   changed the picture is an error, never a repair.
 //	B. gifsicle -O2 --careful (+ the caller's Lossy/Colors/Dither) over A:
@@ -1143,8 +1031,8 @@ func (m *Manager) repairGIFHolds(ctx context.Context, scratch, tag string, data 
 	if err := ffrun.Run(ctx, m.tools.Gifsicle, enc.GifsicleArgs(in, flat, coalesce)); err != nil {
 		return nil, discordlint.Report{}, fmt.Errorf("gifsicle coalesce: %w", err)
 	}
-	// The guard. gifsicle exits 0 on coalesces it got wrong: with local colour
-	// tables or more than 256 colours per picture it gives up ("too complex to
+	// The guard. gifsicle exits 0 on coalesces it got wrong: with local color
+	// tables or more than 256 colors per picture it gives up ("too complex to
 	// unoptimize") yet still rewrites every disposal. A file that no longer
 	// shows the input's animation is never a repair: the caller keeps what it
 	// had, with the failing check visible. A coalesced file that is merely too
@@ -1170,7 +1058,7 @@ func (m *Manager) repairGIFHolds(ctx context.Context, scratch, tag string, data 
 	} else if cand, rep, err := lintGIFFile(opt, target); err != nil {
 		log.Printf("jobs: hold repair: lint after gifsicle -O2: %v", err)
 	} else if !hasStructuralError(rep) {
-		// Without lossy / colour reduction step B must be exact as well.
+		// Without lossy / color reduction step B must be exact as well.
 		if ref == nil || reopt.Lossy > 0 || reopt.Colors > 0 {
 			return cand, rep, nil
 		}

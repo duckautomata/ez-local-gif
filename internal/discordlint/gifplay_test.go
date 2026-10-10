@@ -35,7 +35,7 @@ func TestSameGIFAnimation(t *testing.T) {
 		{rect: spriteRect, fill: 3, trans: ti(5), delay: 20, disposal: 2},
 		{rect: movedRect, fill: 3, delay: 30, disposal: 1},
 	})
-	// …and one with the colours in a local table in another order.
+	// …and one with the colors in a local table in another order.
 	local := encodeCv(t, []cvFrame{
 		{rect: cvFull, pix: func(x, y int) byte { return either(playSprite(x, y) == 3, 1, 0) }, trans: ti(0), delay: 20, disposal: 2,
 			local: color.Palette{color.RGBA{}, fxPalette[3]}},
@@ -48,7 +48,7 @@ func TestSameGIFAnimation(t *testing.T) {
 	}
 
 	// What gifsicle -U does to a clip whose first frame is opaque: the later
-	// frames lose their transparency (here: the background becomes colour 4).
+	// frames lose their transparency (here: the background becomes color 4).
 	mixed := []cvFrame{
 		{rect: cvFull, fill: 4, delay: 10, disposal: 2},
 		{rect: cvFull, pix: playSprite, trans: ti(5), delay: 10, disposal: 2},
@@ -57,8 +57,8 @@ func TestSameGIFAnimation(t *testing.T) {
 		{rect: cvFull, fill: 4, delay: 10, disposal: 1},
 		{rect: cvFull, pix: func(x, y int) byte { return either(playSprite(x, y) == 3, 3, 4) }, delay: 10, disposal: 1},
 	}
-	recoloured := []cvFrame{mixed[0], mixed[1]}
-	recoloured[0].fill = 3
+	recolored := []cvFrame{mixed[0], mixed[1]}
+	recolored[0].fill = 3
 	resprited := []cvFrame{mixed[0], mixed[1]}
 	resprited[1].pix = func(x, y int) byte { return either(playSprite(x, y) == 3, 6, 5) }
 	slower := []cvFrame{mixed[0], mixed[1]}
@@ -70,8 +70,8 @@ func TestSameGIFAnimation(t *testing.T) {
 		want  string
 	}{
 		"transparency lost": {flattened, "background pixels"},
-		"another colour":    {recoloured, "differs in colour"},
-		"a recoloured sprite on the transparent picture": {resprited, "differs in colour"},
+		"another color":     {recolored, "differs in color"},
+		"a recolored sprite on the transparent picture": {resprited, "differs in color"},
 		"another delay":    {slower, "shown for 10 cs vs 11 cs"},
 		"one picture more": {longer, "2 vs 3 distinct pictures"},
 	} {
@@ -189,12 +189,12 @@ func TestPrependTransparentFrame(t *testing.T) {
 		t.Errorf("GIF87a input: err %v, header %q", err, o[:6])
 	}
 
-	// Refused: no global colour table, garbage.
+	// Refused: no global color table, garbage.
 	g2, _ := parseGIF(in)
 	g2.lsdPacked &^= 0x80
 	g2.gct = nil
 	if _, err := PrependTransparentFrame(g2.encode()); err == nil {
-		t.Error("no global colour table: want an error")
+		t.Error("no global color table: want an error")
 	}
 	if _, err := PrependTransparentFrame([]byte("GIF89a nope")); err == nil {
 		t.Error("unparseable input: want an error")

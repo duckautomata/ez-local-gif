@@ -166,7 +166,7 @@ func bounceGIF(t *testing.T) ([]byte, recipe.ProbeInfo) {
 }
 
 // stillClass decodes a still PNG and classifies its center pixel as one of
-// bounceGIF's four frame colours.
+// bounceGIF's four frame colors.
 func stillClass(t *testing.T, data []byte) string {
 	t.Helper()
 	img, err := png.Decode(bytes.NewReader(data))
@@ -301,7 +301,7 @@ func TestFastPathE2E(t *testing.T) {
 			if x >= g.Config.Width {
 				break
 			}
-			if got := colourClass(fr.At(x, 7)); got != "red" {
+			if got := colorClass(fr.At(x, 7)); got != "red" {
 				t.Errorf("frame %d: pixel (%d, 7) = %s, want red (pixels must be untouched)", i, x, got)
 			}
 		}
@@ -410,13 +410,13 @@ func TestGifskiE2E(t *testing.T) {
 	}
 
 	// Fit candidates walk the same re-encode ladder as the single-output
-	// render above. gifski writes a local colour table on every frame and
+	// render above. gifski writes a local color table on every frame and
 	// marks unchanged pixels transparent from frame 1 on, so its raw output
 	// fails gif.frame0-transparency for ANY target, opaque clips included (the
 	// fixer cannot give a frame 0 with a local table its flag), and
 	// gif.global-palette for the Discord ones — without the ladder no
 	// loop-forever candidate ever passed. The rich sources carry far more
-	// than 256 colours over the clip, so no plain gifsicle rewrite (the
+	// than 256 colors over the clip, so no plain gifsicle rewrite (the
 	// loop-count pass) can globalise the palette by accident, as it does for
 	// the simple source; with a finite loop and target none that pass still
 	// let the old code find a candidate, but only at a halved size — hence
@@ -502,7 +502,7 @@ func TestGifskiE2E(t *testing.T) {
 }
 
 // richGIF builds a 12-frame 40x30 clip (gifSourceInfo's shape) whose frames
-// each use their own 216-colour cube — about 2600 colours over the clip, so
+// each use their own 216-color cube — about 2600 colors over the clip, so
 // no encoder can carry it in one palette without quantising and gifski's
 // per-frame local tables cannot be merged into a global one by a plain
 // gifsicle rewrite. With transparent, frame 0 is fully opaque and every later

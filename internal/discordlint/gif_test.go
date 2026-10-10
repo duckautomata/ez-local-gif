@@ -348,11 +348,11 @@ func TestLintGIFFrame0TransparencyUnfixable(t *testing.T) {
 	expectCheck(t, r, RuleGIFLSDBackground, true, false)
 	decodeGIF(t, out)
 
-	// Frame 0 with a local colour table is not fixable either.
+	// Frame 0 with a local color table is not fixable either.
 	lct := opaqueFrame0Anim()
 	data = encodeFxWithLocalPalette(t, lct, 0)
 	r, _ = lintFix(t, data, TargetNone)
-	if c := expectCheck(t, r, RuleGIFFrame0Transparent, false, false); !strings.Contains(c.Detail, "local colour table") {
+	if c := expectCheck(t, r, RuleGIFFrame0Transparent, false, false); !strings.Contains(c.Detail, "local color table") {
 		t.Errorf("detail: %s", c.Detail)
 	}
 }
@@ -377,7 +377,7 @@ func encodeFxWithLocalPalette(t *testing.T, a fxAnim, idx int) []byte {
 	}
 	frames, _ := g.frames()
 	if !frames[idx].image.hasLCT() {
-		t.Fatal("fixture frame has no local colour table")
+		t.Fatal("fixture frame has no local color table")
 	}
 	return buf.Bytes()
 }
@@ -689,24 +689,24 @@ func TestLintGIFGlobalPalette(t *testing.T) {
 	}{{TargetEmote, LevelError}, {TargetSticker, LevelError}, {TargetAttachment, LevelError}, {TargetNone, LevelWarn}} {
 		r, out := lintFix(t, data, tc.target)
 		c := expectCheck(t, r, RuleGIFGlobalPalette, false, false)
-		if c.Level != tc.level || !strings.Contains(c.Detail, "local colour table on frame 1 (1 of 3 frames)") {
+		if c.Level != tc.level || !strings.Contains(c.Detail, "local color table on frame 1 (1 of 3 frames)") {
 			t.Errorf("%s: %+v", tc.target, c)
 		}
 		if r.OK != (tc.level == LevelWarn) {
 			t.Errorf("%s: report OK=%v", tc.target, r.OK)
 		}
 		if !bytes.Equal(out, data) {
-			t.Errorf("%s: local colour tables are not fixable, bytes must be unchanged", tc.target)
+			t.Errorf("%s: local color tables are not fixable, bytes must be unchanged", tc.target)
 		}
 	}
-	// No global colour table and an opaque frame without a local one: error
+	// No global color table and an opaque frame without a local one: error
 	// even for TargetNone.
 	noGCT := mutateGIF(t, encodeFx(t, opaqueAnim()), func(g *gifFile) {
 		g.lsdPacked &^= 0x80
 		g.gct = nil
 	})
 	r := lintOnly(t, noGCT, TargetNone)
-	if c := expectCheck(t, r, RuleGIFGlobalPalette, false, false); c.Level != LevelError || !strings.Contains(c.Detail, "no global colour table") {
+	if c := expectCheck(t, r, RuleGIFGlobalPalette, false, false); c.Level != LevelError || !strings.Contains(c.Detail, "no global color table") {
 		t.Errorf("check: %+v", c)
 	}
 }

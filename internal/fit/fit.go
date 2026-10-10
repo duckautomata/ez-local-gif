@@ -1,5 +1,5 @@
 // Package fit implements the fit-to-size search of DESIGN.md §5.4: a ladder
-// of rungs (fps / colours / scale / dither, mildest first) each searched over
+// of rungs (fps / colors / scale / dither, mildest first) each searched over
 // one monotone quality knob with a secant search on log(size), run in
 // parallel, with a hard byte cap and a small margin. The winner is the
 // mildest rung that fits; the next rungs' best candidates are reported as
@@ -24,9 +24,9 @@ type Rung struct {
 	Colors int    // palette size for gif/apng rungs (0 = format default)
 	Dither string // "bayer" | "sierra2_4a" | "none" | "" (format default)
 	Format string // output format of this rung (a sticker ladder switches apng → gif); "" = request default
-	Label  string // human label, e.g. "25 fps · 256 colours · 128 px"
+	Label  string // human label, e.g. "25 fps · 256 colors · 128 px"
 
-	// Truecolor marks an RGBA truecolour probe rung (sticker APNG ladder,
+	// Truecolor marks an RGBA truecolor probe rung (sticker APNG ladder,
 	// DESIGN.md §5.4/§9a): the encoder must keep full RGBA instead of
 	// quantising, and Colors is ignored. Candidate.Desc carries no knob for
 	// such rungs (the knob changes nothing).
@@ -34,8 +34,8 @@ type Rung struct {
 
 	// Knob optionally overrides the search knob for this rung alone; it wins
 	// over Request.Knobs and Request.Knob and is normalised/validated like
-	// them. Ladder builders set it to bound the APNG/PNG colour-step knob by
-	// the rung's own palette (floor 64: a 64-colour rung becomes a
+	// them. Ladder builders set it to bound the APNG/PNG color-step knob by
+	// the rung's own palette (floor 64: a 64-color rung becomes a
 	// single-point probe) and to give RGBA probe rungs their single-probe
 	// knob. nil = no override.
 	Knob *Knob
@@ -44,7 +44,7 @@ type Rung struct {
 // Knob is the single monotone quality control searched per rung. Larger
 // values always mean "smaller file, lower quality" from the engine's point
 // of view (the caller maps it: gif → gifsicle --lossy 0..200; webp/avif →
-// 100-quality; apng → colour reduction steps; jpeg → 100-quality).
+// 100-quality; apng → color reduction steps; jpeg → 100-quality).
 type Knob struct {
 	Min, Max int // inclusive range (Min = mildest, Max = harshest)
 	Mild     int // first probe (mild); Min when 0
@@ -59,7 +59,7 @@ type Candidate struct {
 	Bytes  int64
 	Path   string // file written by Encode
 	Format string // effective format
-	Desc   string // binding knob description, e.g. "fit at 20 fps · 128 colours · lossy 60"
+	Desc   string // binding knob description, e.g. "fit at 20 fps · 128 colors · lossy 60"
 }
 
 // Request configures a search.
@@ -76,7 +76,7 @@ type Request struct {
 	Alternatives int
 
 	// Knobs optionally overrides Knob per rung format for ladders that mix
-	// formats (StickerAPNGThenGIF: "apng" rungs search colour steps, "gif"
+	// formats (StickerAPNGThenGIF: "apng" rungs search color steps, "gif"
 	// rungs search gifsicle lossy). Entries are looked up by a rung's
 	// effective format (Rung.Format, or Request.Format when that is ""); a
 	// rung whose effective format has no entry uses Knob. Optional; nil
@@ -180,7 +180,7 @@ func Search(ctx context.Context, req Request, encode EncodeFunc) (Result, error)
 // frames or pixels than the master has; downscales set both Width and
 // Height from the longer side so portrait masters are never upscaled; rungs
 // that collapse onto an earlier one are dropped; labels are rendered from
-// the effective values ("15 fps · 256 colours · 128 px" for a 15 fps
+// the effective values ("15 fps · 256 colors · 128 px" for a 15 fps
 // master, "128×64" for non-square sizes). Unknown master fps/size (0) is
 // treated as "keep the master's".
 
@@ -194,7 +194,7 @@ func EmoteWebP(masterFPS float64, w, h int) []Rung {
 	return buildLadder(master{masterFPS, w, h}, emoteWebPSteps, false)
 }
 
-// StickerAPNGThenGIF: RGBA truecolour APNG probes (25 → 20 → 16.7 → 12.5
+// StickerAPNGThenGIF: RGBA truecolor APNG probes (25 → 20 → 16.7 → 12.5
 // fps, DESIGN.md §5.4/§9a "RGBA APNG probe → indexed → GIF", ≥ 12 fps
 // floor), then indexed APNG rungs (25,256) → (20,256) → (16.7,256) →
 // (12.5,128) → (10,64), then GIF rungs with the lossy knob (Format "gif").
@@ -205,8 +205,8 @@ func EmoteWebP(masterFPS float64, w, h int) []Rung {
 // bounded by their own palette (floor 64). Stickers are never downscaled
 // (w, h only feed the labels). The GIF rungs are (25,256,bayer) → (20,128) →
 // (16.7,128) → (12.5,64,none) → (10,32). Labels carry the format
-// ("APNG · RGBA · 25 fps · 320 px", "APNG · 25 fps · 256 colours · 320 px")
-// since both halves share fps/colour values. Pair with Knob =
+// ("APNG · RGBA · 25 fps · 320 px", "APNG · 25 fps · 256 colors · 320 px")
+// since both halves share fps/color values. Pair with Knob =
 // KnobFor("apng") and Knobs = {"gif": KnobFor("gif")}; the per-rung knobs
 // win where set.
 func StickerAPNGThenGIF(masterFPS float64, w, h int) []Rung {
@@ -218,24 +218,24 @@ func StickerAPNGThenGIF(masterFPS float64, w, h int) []Rung {
 }
 
 // Generic: for "compress to X" on an arbitrary output — knob-only at the
-// master's settings first, then fps rungs (unless keepFPS), then colour
+// master's settings first, then fps rungs (unless keepFPS), then color
 // rungs (palette formats), then scale rungs (unless keepSize).
 //
 // fps rungs are 30 → 24 → 20 → 15 (those below the master fps; none for
-// static formats or an unknown fps); colour rungs 128 → 64 at the lowest fps
+// static formats or an unknown fps); color rungs 128 → 64 at the lowest fps
 // reached (gif/apng/png only); scale rungs 75 % → 50 % of the longer side at
-// the lowest fps and colours reached. Every rung carries Format = format.
+// the lowest fps and colors reached. Every rung carries Format = format.
 func Generic(format string, masterFPS float64, w, h int, keepSize, keepFPS bool) []Rung {
 	return genericLadder(format, master{masterFPS, w, h}, keepSize, keepFPS)
 }
 
 // KnobFor returns the Knob for a format: gif → lossy 0..200 (mild 30, harsh
 // 150); webp/avif → 100-quality, 5..90 (mild 20 = q80, harsh 70 = q30);
-// apng → colour halvings below the rung's colours, floored at 64 per
+// apng → color halvings below the rung's colors, floored at 64 per
 // DESIGN.md §5.4 (steps 0..2 = 256 → 128 → 64 for the default palette; mild
 // 0, harsh 2); jpeg → 100-quality 10..80.
 //
-// Additions: png (static, pngquant) shares the apng colour-step knob; jpeg
+// Additions: png (static, pngquant) shares the apng color-step knob; jpeg
 // probes mild 20 (q80) / harsh 60 (q40); mp4/webm (Phase 4) search the
 // encoder CRF itself — x264 12..40 (mild 18), vp9 15..55 (mild 30), the
 // value going verbatim into enc.MP4Options.CRF / enc.WebMOptions.CRF (a
@@ -243,7 +243,7 @@ func Generic(format string, masterFPS float64, w, h int, keepSize, keepFPS bool)
 // any other format gets a generic "level" knob 0..100 (mild 20, harsh 70).
 // Names are the Knob* constants.
 // Ladder-built APNG/PNG rungs with an explicit palette carry a per-rung
-// Rung.Knob override bounding the steps by their own colours (a 64-colour
+// Rung.Knob override bounding the steps by their own colors (a 64-color
 // rung is a single probe), so the search never quantises below 64.
 func KnobFor(format string) Knob {
 	return knobFor(format)

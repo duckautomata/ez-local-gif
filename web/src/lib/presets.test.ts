@@ -136,7 +136,7 @@ describe('presets', () => {
     expect(formatHint(p, 'webp')).toMatch(/soft edges.*verified on Discord/);
   });
 
-  it('Sticker: indexed APNG (256 colours), 320×320 contain, fit 512 KiB on, keep size, GIF as the fallback', () => {
+  it('Sticker: indexed APNG (256 colors), 320×320 contain, fit 512 KiB on, keep size, GIF as the fallback', () => {
     const o = applied('sticker');
     expect(o).toMatchObject({ format: 'apng', colors: 256, target: 'sticker', width: 320, height: 320, fit: 'contain', fitEnabled: true, fitKiB: 512, fitKeepSize: true });
     expect(o.fitKiB * 1024).toBe(LIMITS.sticker);

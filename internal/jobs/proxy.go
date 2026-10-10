@@ -46,13 +46,7 @@ const (
 	// only the tail they show (enc proxySeekFor; a plain seek on an
 	// animation source may land a frame off) and single-frame plans with an
 	// animated overlay drop the fps=15 stage (they failed before).
-	// 2026-10-08.1: Phase 5a — the compiler keys chromakey recipes against
-	// the limited-range YUV colour (yuv=1 after an rgba pass) and the
-	// chroma/colour default similarities changed (0.2 → 0.1 / 0.1 → 0.08),
-	// so the memoised proxies of keyed recipes show the off-range key and
-	// the old defaults. Phase 5c needs no bump (see stillMemoVersion): its
-	// matte params are new op text.
-	proxyMemoVersion = "2026-10-08.1"
+	proxyMemoVersion = "2026-08-22.1"
 )
 
 // Proxy renders the animated low-resolution preview (enc.ProxyArgs: first
@@ -81,21 +75,13 @@ const (
 // memo key share one run; a memo hit waits for neither.
 func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64) ([]byte, error) {
 	maxW, maxSeconds = proxyBounds(maxW, maxSeconds)
-	ops = stripMatteResolved(stripAutoCropResolved(ops))
+	ops = stripAutoCropResolved(ops)
 	s, err := m.resolveSources(srcs)
 	if err != nil {
 		return nil, err
 	}
 	subset := stillOutput(out)
-	// Phase 5b: the stack's mattes are resolved inside compile (preview
-	// mode — a matte not on disk yet is *ErrMattePending, which the server
-	// maps to 202) and fold into the key. Phase 5c: Play behaves like a
-	// still — with no memo, no pass in flight and no eager mark on ctx the
-	// state is MattePendingIdle and no pass starts (the SPA shows the "not
-	// computed — Compute" pill on the proxy too); the Compute matte button
-	// alone sends the eager mark that starts it. The error is handed up
-	// before any memo, slot or ffmpeg work.
-	plan, mattes, err := m.compile(ctx, s, ops, subset)
+	plan, err := m.compile(ctx, s, ops, subset)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +98,7 @@ func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out
 			return nil, err
 		}
 	}
-	key, err := proxyKeyFor(srcs, ops, subset, maxW, maxSeconds, mattes)
+	key, err := proxyKey(srcs, ops, subset, maxW, maxSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidRecipe, err)
 	}
@@ -133,11 +119,6 @@ func (m *Manager) Proxy(ctx context.Context, srcs []string, ops []recipe.Op, out
 			return nil, err
 		}
 		defer release()
-		unprotect, err := protectMattes(m.st, mattes) // the matte memo stays for the run
-		if err != nil {
-			return nil, err
-		}
-		defer unprotect()
 		ctx, cancel := context.WithTimeout(ctx, ProxyTimeout)
 		defer cancel()
 		dir, cleanup, err := m.st.ScratchDir("proxy-" + store.RandomID(8))
@@ -241,24 +222,13 @@ func proxySeekStart(args []string) (float64, bool) {
 }
 
 // proxyKey hashes (proxyMemoVersion, sources, canonical ops, geometry
-// output, maxW, maxSeconds) for a stack without AI mattes.
+// output, maxW, maxSeconds).
 func proxyKey(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64) (string, error) {
-	return proxyKeyFor(srcs, ops, out, maxW, maxSeconds, nil)
-}
-
-// proxyKeyFor is proxyKey with the stack's resolved mattes folded in (their
-// clip keys, like stillKeyFor); unchanged for a stack without a matte op.
-func proxyKeyFor(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64, mattes []resolvedMatte) (string, error) {
-	return proxyKeyVM(srcs, ops, out, maxW, maxSeconds, proxyMemoVersion, mattes)
+	return proxyKeyV(srcs, ops, out, maxW, maxSeconds, proxyMemoVersion)
 }
 
 // proxyKeyV is proxyKey with an explicit version salt.
 func proxyKeyV(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64, version string) (string, error) {
-	return proxyKeyVM(srcs, ops, out, maxW, maxSeconds, version, nil)
-}
-
-// proxyKeyVM is proxyKeyFor with an explicit version salt.
-func proxyKeyVM(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, maxSeconds float64, version string, mattes []resolvedMatte) (string, error) {
 	canon, err := recipe.Recipe{Sources: srcs, Ops: ops, Output: out}.Canonical()
 	if err != nil {
 		return "", err
@@ -266,6 +236,6 @@ func proxyKeyVM(srcs []string, ops []recipe.Op, out recipe.Output, maxW int, max
 	h := sha256.New()
 	h.Write([]byte("proxy|" + version + "\n"))
 	h.Write(canon)
-	h.Write([]byte("|w=" + strconv.Itoa(maxW) + "|s=" + strconv.FormatFloat(maxSeconds, 'f', 3, 64) + matteKeySuffix(mattes)))
+	h.Write([]byte("|w=" + strconv.Itoa(maxW) + "|s=" + strconv.FormatFloat(maxSeconds, 'f', 3, 64)))
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

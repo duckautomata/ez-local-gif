@@ -1,11 +1,9 @@
 <script lang="ts">
-  // The colour rows shared by the Background card's Colour mode (colours
-  // to remove: one colorkey op each) and the AI mode's Keep colours
-  // (Phase 5c: colours forced opaque on the matte): per row an eyedropper
-  // button (the editor; batch has no preview — typed hex only), a swatch,
-  // a hex field and a remove button, then "+ add colour". Row state and
-  // the eyedropper arming live in lib/state; this component only renders
-  // and forwards.
+  // The color rows of the Background card's Color mode (colors to remove:
+  // one colorkey op each): per row an eyedropper button (the editor; batch
+  // has no preview — typed hex only), a swatch, a hex field and a remove
+  // button, then "+ add color". Row state and the eyedropper arming live in
+  // lib/state; this component only renders and forwards.
   interface Props {
     /** RRGGBB per row ('' = waiting for a pick) */
     colors: readonly string[];
@@ -15,17 +13,17 @@
     armedRow: number;
     /** the row cap */
     max: number;
-    /** the field's caption above the rows ("Colour to remove", "Keep colour") — pluralised by the caller */
+    /** the field's caption above the rows ("Color to remove") — pluralised by the caller */
     caption: string;
-    /** the aria-label stem of the hex fields: "Colour {i} to remove (hex)" / "Keep colour {i} (hex)" — {i} is the 1-based row */
+    /** the aria-label stem of the hex fields: "Color {i} to remove (hex)" — {i} is the 1-based row */
     hexLabel: string;
-    /** the aria-label stem of the remove buttons: "Remove colour {i}" / "Remove keep colour {i}" */
+    /** the aria-label stem of the remove buttons: "Remove color {i}" */
     removeLabel: string;
-    /** the "+ add colour" tooltip */
+    /** the "+ add color" tooltip */
     addTitle: string;
-    /** shown next to "+ add colour" while no row carries a colour */
+    /** shown next to "+ add color" while no row carries a color */
     emptyHint: string;
-    /** the remove button's tooltip when the row is the only one (the Colour mode clears it instead of removing) */
+    /** the only row is cleared instead of removed (its remove button then reads "Clear this color") */
     clearOnly?: boolean;
     onPick: (i: number) => void;
     onHex: (i: number, value: string) => boolean;
@@ -48,24 +46,24 @@
   }
 </script>
 
-<span class="field colours">
+<span class="field colors">
   <span>{caption}</span>
   {#each colors as c, i (i)}
-    <span class="row tight colour-row">
+    <span class="row tight color-row">
       {#if picker}
-        <button type="button" class="sm" class:primary={armedRow === i} aria-pressed={armedRow === i} onclick={() => onPick(i)} title="Then click the colour on the preview">
+        <button type="button" class="sm" class:primary={armedRow === i} aria-pressed={armedRow === i} onclick={() => onPick(i)} title="Then click the color on the preview">
           {armedRow === i ? 'Click the preview…' : c ? 'Pick again' : 'Pick from preview'}
         </button>
       {/if}
       <span class="swatch" class:empty={!c} style:background={c ? '#' + c : undefined} aria-hidden="true"></span>
       <input type="text" class="hex mono" value={c ? '#' + c : ''} placeholder="#rrggbb" onchange={(e) => hex(i, e)} maxlength="7" spellcheck="false" aria-label={label(i)} />
       {#if colors.length > 1 || c || !clearOnly}
-        <button type="button" class="sm ghost" onclick={() => onRemove(i)} aria-label={removeName(i)} title={clearOnly && colors.length === 1 ? 'Clear this colour' : 'Remove this colour'}>×</button>
+        <button type="button" class="sm ghost" onclick={() => onRemove(i)} aria-label={removeName(i)} title={clearOnly && colors.length === 1 ? 'Clear this color' : 'Remove this color'}>×</button>
       {/if}
     </span>
   {/each}
   <span class="row tight">
-    <button type="button" class="sm" onclick={onAdd} disabled={colors.length >= max} title={addTitle}>+ add colour</button>
+    <button type="button" class="sm" onclick={onAdd} disabled={colors.length >= max} title={addTitle}>+ add color</button>
     {#if !picked.length}<span class="hint">{emptyHint}</span>{/if}
   </span>
 </span>
@@ -75,10 +73,10 @@
     gap: 6px;
     flex-wrap: nowrap;
   }
-  .field.colours {
+  .field.colors {
     gap: 6px;
   }
-  .field.colours > .row + .row {
+  .field.colors > .row + .row {
     margin-top: 0;
   }
   .hex {

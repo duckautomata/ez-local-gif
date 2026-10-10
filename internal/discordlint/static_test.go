@@ -14,8 +14,8 @@ func TestLintStaticFixtures(t *testing.T) {
 		alpha        bool
 		desc         string // substring of static.format
 	}{
-		{"ff_still.png", "png", 64, 64, true, "PNG 64x64, RGBA 8-bit (colour type 6), alpha"},
-		{"ff_still_opaque.png", "png", 64, 64, false, "PNG 64x64, RGB 8-bit (colour type 2), no alpha"},
+		{"ff_still.png", "png", 64, 64, true, "PNG 64x64, RGBA 8-bit (color type 6), alpha"},
+		{"ff_still_opaque.png", "png", 64, 64, false, "PNG 64x64, RGB 8-bit (color type 2), no alpha"},
 		{"ff_still.jpg", "jpeg", 64, 64, false, "JPEG 64x64, baseline, 8-bit YCbCr (3 components), no alpha"},
 		{"ff_still.webp", "webp", 64, 64, false, "WebP 64x64, VP8, no alpha"},
 		{"ff_still_alpha.webp", "webp", 64, 64, true, "WebP 64x64, VP8L, alpha"},

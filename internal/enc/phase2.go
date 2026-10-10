@@ -232,7 +232,7 @@ func plays(loop int) int {
 // --- APNG -------------------------------------------------------------------
 
 // APNGOptions controls the APNG encoders. Zero values: Pred "mixed",
-// Loop 0 (forever), Colors 0 = RGBA (truecolour); Colors 2..256 = indexed
+// Loop 0 (forever), Colors 0 = RGBA (truecolor); Colors 2..256 = indexed
 // path (tile → pngquant → untile: TileGrid/TileArgs → PngquantArgs(colors)
 // → UntileAPNGArgs → OxipngArgs; Colors itself is consumed by the caller
 // when it builds that chain, APNGArgs ignores it).
@@ -269,7 +269,7 @@ func apngTail(o APNGOptions, pal8 bool, outPath string) []string {
 	)
 }
 
-// APNGArgs encodes the master as a truecolour RGBA APNG:
+// APNGArgs encodes the master as a truecolor RGBA APNG:
 // [RawInputArgs] [-filter_complex variant -map [v]] -c:v apng -pred mixed
 // -plays P -f apng outPath   (P = 0 for Loop 0, else Loop+1).
 func APNGArgs(m Master, o APNGOptions, outPath string) []string {
@@ -588,7 +588,7 @@ func JPEGStillArgs(m Master, o StillOptions, outPath string) []string {
 }
 
 // PngquantFileArgs is PngquantArgs specialised for a static output (quality
-// range instead of colour count): pngquant --quality MIN-MAX --speed 3 --force -o out in.
+// range instead of color count): pngquant --quality MIN-MAX --speed 3 --force -o out in.
 // Both bounds 0 = the §4.2 default 70-100; otherwise each is clamped to
 // 0..100 (MAX 0 = 100) and MIN is lowered to MAX when it exceeds it.
 // pngquant exits 99 and writes nothing when MIN cannot be reached — the
@@ -610,7 +610,7 @@ func PngquantFileArgs(in, out string, minQ, maxQ int) []string {
 // --- GIF → GIF ------------------------------------------------------------------
 
 // GifsicleOptimizeOptions drives the no-decode GIF → GIF optimiser
-// (ezgif "optimize" parity): lossy, colour reduction, drop every Nth frame
+// (ezgif "optimize" parity): lossy, color reduction, drop every Nth frame
 // with delays merged into the kept frames, resize (lossless timing edits
 // only — never resizes quantised transparent GIFs, DESIGN §4.2), loop.
 type GifsicleOptimizeOptions struct {

@@ -3,8 +3,7 @@
 // Framework-free so it can be unit tested (still.test.ts); Preview.svelte
 // hands it a $state object as the view, so every mutation is reactive.
 
-import { isAbortError, isMattePending, messageOf, type MattePending, type StillRequest } from './api';
-import { matteRetryMs, nextPending, type PendingView } from './matte';
+import { isAbortError, messageOf, type StillRequest } from './api';
 
 /** StillView is what the component renders; the scheduler mutates it in place. */
 export interface StillView {
@@ -14,14 +13,6 @@ export interface StillView {
   loading: boolean;
   /** last load/decode failure for the current state ('' = none) */
   error: string;
-  /**
-   * Phase 5b: the last answer was 202 — the recipe's AI matte is being
-   * computed / idle (not started: Phase 5c) / waits on the model
-   * (lib/matte.mattePendingPill words it). The still on screen stays; the
-   * scheduler re-requests after matteRetryMs(state). Cleared by the next
-   * picture, error or null request.
-   */
-  pending: PendingView | null;
 }
 
 export interface StillDeps {
@@ -30,8 +21,6 @@ export interface StillDeps {
   revokeURL: (url: string) => void;
   /** debounce before a request is sent (default 150 ms) */
   debounceMs?: number;
-  /** called with every 202 answer (the component installs the status it carries, lib/matte.svelte notePending) */
-  onPending?: (p: MattePending) => void;
 }
 
 export const DECODE_ERROR = 'The preview image could not be decoded';
@@ -85,14 +74,7 @@ export function stillMaxW(opts: { overlay: boolean; zoomed: boolean; wide: boole
  *   (no flash of a broken image);
  * - while paused (the still is off the stage because the proxy plays)
  *   nothing is fetched and the parked URLs are released; resuming fetches
- *   the latest state once (setPaused);
- * - a 202 answer (Phase 5b: the AI matte is pending) keeps the still on
- *   screen, sets view.pending and re-requests the same state after
- *   matteRetryMs — the poll jobs' abandon grace expects (an idle matte
- *   retries at the slow cadence only) — unless a newer request, a pause or
- *   a null request supersedes it; the Compute matte button (computeNow)
- *   re-requests with `eager` so the pass starts, and keeps `eager` on that
- *   state's retries until a picture arrives.
+ *   the latest state once (setPaused).
  */
 export class StillScheduler {
   private readonly view: StillView;
@@ -100,10 +82,6 @@ export class StillScheduler {
   private readonly debounceMs: number;
 
   private timer: ReturnType<typeof setTimeout> | undefined;
-  /** the re-request of a pending (202) state */
-  private retryTimer: ReturnType<typeof setTimeout> | undefined;
-  /** the key "Compute now" was pressed for: its retries carry `eager` ('' = none) */
-  private eagerKey = '';
   private ctrl: AbortController | null = null;
   /** key of the still currently on screen (set on success only) */
   private lastKey = '';
@@ -131,28 +109,7 @@ export class StillScheduler {
   request(r: StillRequest | null): void {
     this.current = r;
     this.currentKey = StillScheduler.key(r);
-    if (this.eagerNextKey && r && this.currentKey !== this.eagerNextKey) {
-      // computeNext: the state that follows the one it was pressed in
-      // (the guided panel closing) is the one to start the pass for.
-      this.eagerKey = this.currentKey;
-      this.eagerNextKey = '';
-    }
     this.schedule(this.currentKey, r);
-  }
-
-  /** the key computeNext was pressed in: the NEXT different request carries `eager` ('' = none) */
-  private eagerNextKey = '';
-
-  /**
-   * computeNext is the Compute matte button pressed while the stage shows
-   * a state WITHOUT the matte (the guided model's Select subject panel:
-   * its still is the unkeyed source frame): the caller closes the panel,
-   * and the next different request — the keyed still — is loaded with
-   * `eager: true` as computeNow would. Nothing happens until it arrives.
-   */
-  computeNext(): void {
-    if (!this.current) return;
-    this.eagerNextKey = this.currentKey;
   }
 
   /** The still on screen belongs to this key ('' = none). */
@@ -163,15 +120,10 @@ export class StillScheduler {
   private schedule(key: string, r: StillRequest | null): void {
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
-    // A newer state supersedes the re-request of a pending one: the new
-    // request's own answer says whether the matte is still pending.
-    this.clearRetry();
-    if (key !== this.eagerKey) this.eagerKey = '';
     if (!r) {
       this.abortInFlight();
       this.lastKey = '';
       this.clearError();
-      this.view.pending = null;
       this.swapUrl(null);
       return;
     }
@@ -181,29 +133,10 @@ export class StillScheduler {
       // correct frame) and the error a superseded state may have left behind.
       this.abortInFlight();
       if (this.errorKey !== key) this.clearError();
-      this.view.pending = null;
       return;
     }
     if (this.paused) return; // remembered in `current`; setPaused(false) schedules it
-    this.timer = setTimeout(() => void this.load(key, r, this.eagerKey === key), this.debounceMs);
-  }
-
-  /**
-   * computeNow is the Compute matte button (Phase 5c; the 5b "Compute now"
-   * of a deferred pass): the current state is re-requested at once with
-   * `eager: true`, which starts the pass, and every retry of that state
-   * carries it too until a picture arrives. A no-op while paused (the
-   * proxy owns the stage: its own computeNow applies) or without a state.
-   */
-  computeNow(): void {
-    const r = this.current;
-    if (!r || this.paused) return;
-    const key = this.currentKey;
-    this.eagerKey = key;
-    if (this.timer !== undefined) clearTimeout(this.timer);
-    this.timer = undefined;
-    this.clearRetry();
-    void this.load(key, r, true);
+    this.timer = setTimeout(() => void this.load(key, r), this.debounceMs);
   }
 
   /**
@@ -222,8 +155,6 @@ export class StillScheduler {
     if (paused) {
       if (this.timer !== undefined) clearTimeout(this.timer);
       this.timer = undefined;
-      this.clearRetry();
-      this.view.pending = null; // the proxy on the stage shows its own
       this.abortInFlight();
       this.releaseParked();
       return;
@@ -231,57 +162,27 @@ export class StillScheduler {
     if (this.current) this.schedule(this.currentKey, this.current);
   }
 
-  private async load(key: string, r: StillRequest, eager = false): Promise<void> {
+  private async load(key: string, r: StillRequest): Promise<void> {
     this.ctrl?.abort();
-    this.clearRetry();
     const c = new AbortController();
     this.ctrl = c;
     this.view.loading = true;
     try {
-      const blob = await this.deps.fetch(eager ? { ...r, eager: true } : r, c.signal);
+      const blob = await this.deps.fetch(r, c.signal);
       if (c.signal.aborted) return;
       this.lastKey = key;
       this.clearError();
-      this.view.pending = null;
-      if (this.eagerKey === key) this.eagerKey = '';
       this.swapUrl(this.deps.createURL(blob));
     } catch (e) {
       if (isAbortError(e) || c.signal.aborted) return;
-      if (isMattePending(e)) {
-        this.pendingAnswer(key, r, e);
-        return;
-      }
       this.view.error = messageOf(e);
       this.errorKey = key;
-      this.view.pending = null;
     } finally {
       if (this.ctrl === c) {
         this.view.loading = false;
         this.ctrl = null;
       }
     }
-  }
-
-  /**
-   * pendingAnswer handles a 202: the picture on screen stays (the view's
-   * url is untouched), the pending fields are shown and the same state is
-   * re-requested after matteRetryMs(state) unless superseded meanwhile
-   * (schedule / setPaused / dispose clear the timer; a key change bails).
-   */
-  private pendingAnswer(key: string, r: StillRequest, e: MattePending): void {
-    this.view.pending = nextPending(this.view.pending, e.info, Date.now());
-    this.deps.onPending?.(e);
-    this.clearRetry();
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = undefined;
-      if (this.paused || this.currentKey !== key) return;
-      void this.load(key, r, this.eagerKey === key);
-    }, matteRetryMs(e.state));
-  }
-
-  private clearRetry(): void {
-    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
-    this.retryTimer = undefined;
   }
 
   private abortInFlight(): void {
@@ -326,7 +227,6 @@ export class StillScheduler {
   /** retry forgets the displayed still and the error and re-requests the current state. */
   retry(): void {
     this.clearError();
-    this.view.pending = null;
     this.lastKey = '';
     if (this.current) this.schedule(this.currentKey, this.current);
   }
@@ -335,8 +235,6 @@ export class StillScheduler {
   dispose(): void {
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
-    this.clearRetry();
-    this.view.pending = null;
     this.abortInFlight();
     if (this.view.url) this.deps.revokeURL(this.view.url);
     this.view.url = null;

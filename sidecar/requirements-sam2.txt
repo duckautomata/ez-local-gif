@@ -1,8 +1,0 @@
-# SAM 2 (github.com/facebookresearch/sam2) pinned at commit 2b90b9f5ceec907a1c18123530e92e794ad901a4 (2024-12-15), the
-# commit the prototype measured. Installed on its own, after requirements-{cpu,cuda}.txt, with
-#   SAM2_BUILD_CUDA=0 pip install --require-hashes --no-deps --no-build-isolation -r requirements-sam2.txt
-# (no CUDA extension: the connected-components kernel is replaced by scipy in matte.py; its dependencies — torch,
-# torchvision, numpy, tqdm, hydra-core, iopath, pillow — are pinned in the main lock, setuptools comes with torch).
-# The archive is GitHub's tarball of that commit; pip verifies its sha256 before the build.
-SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz \
-    --hash=sha256:1f2fbfad3ffa38110368abac76c6ef9df9c282a66d5c2807bc94abf4d2fb30f8

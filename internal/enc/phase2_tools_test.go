@@ -183,7 +183,7 @@ func TestAPNGArgsRGBA(t *testing.T) {
 	}
 	info := parseAPNG(t, data)
 	if info.colorType != 6 {
-		t.Errorf("RGBA APNG colour type %d, want 6", info.colorType)
+		t.Errorf("RGBA APNG color type %d, want 6", info.colorType)
 	}
 	if !info.hasACTL || info.frames != 10 || info.plays != 3 {
 		t.Errorf("acTL frames=%d plays=%d (present %v), want 10/3", info.frames, info.plays, info.hasACTL)
@@ -619,7 +619,7 @@ func TestGifsicleOptimizeArgsOnDisk(t *testing.T) {
 		})
 	}
 
-	t.Run("lossy, colours, dither, loop", func(t *testing.T) {
+	t.Run("lossy, colors, dither, loop", func(t *testing.T) {
 		out := filepath.Join(dir, "lossy.gif")
 		runTool(t, gs, enc.GifsicleOptimizeArgs(opt, out, delays, enc.GifsicleOptimizeOptions{Lossy: 40, Colors: 4, Dither: "o8", Loop: 3, Careful: true}))
 		g := readGIF(t, out)
@@ -639,7 +639,7 @@ func TestGifsicleOptimizeArgsOnDisk(t *testing.T) {
 		}
 	})
 
-	t.Run("dropping plus colours and a loop count", func(t *testing.T) {
+	t.Run("dropping plus colors and a loop count", func(t *testing.T) {
 		out := filepath.Join(dir, "both.gif")
 		runTool(t, gs, enc.GifsicleOptimizeArgs(opt, out, delays, enc.GifsicleOptimizeOptions{DropEveryN: 2, Colors: 8, Lossy: 20, Loop: 1, Careful: true}))
 		g := readGIF(t, out)
@@ -686,7 +686,7 @@ func poseHoldGIF(t *testing.T, dir string) string {
 }
 
 // compositeGIF renders g per the GIF spec and returns the canvas shown
-// during each frame (row-major; a cleared pixel is the zero colour).
+// during each frame (row-major; a cleared pixel is the zero color).
 func compositeGIF(g *gif.GIF) [][]color.RGBA {
 	w, h := g.Config.Width, g.Config.Height
 	canvas := make([]color.RGBA, w*h)
@@ -799,7 +799,7 @@ func TestPngquantFileAndOxipng(t *testing.T) {
 			t.Errorf("oxipng grew %d → %d", len(qd), len(od))
 		}
 		if oi := parseAPNG(t, od); oi.colorType != 3 {
-			t.Errorf("oxipng changed the colour type to %d", oi.colorType)
+			t.Errorf("oxipng changed the color type to %d", oi.colorType)
 		}
 		run(t, ff, enc.VerifyDecodeArgs(quant))
 	}

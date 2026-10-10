@@ -220,7 +220,7 @@ func TestRenderFitStickerAPNG(t *testing.T) {
 		if p.Name != "out.png" || p.Report.Format != "apng" {
 			t.Errorf("apng primary = %+v", p)
 		}
-		// An "APNG · RGBA" winner must actually be truecolour bytes and an
+		// An "APNG · RGBA" winner must actually be truecolor bytes and an
 		// indexed winner indexed — the desc and the file must agree.
 		truecolor := strings.Contains(p.Desc, "RGBA")
 		var indexed bool
@@ -260,8 +260,8 @@ func TestRenderFitStickerAPNG(t *testing.T) {
 }
 
 // gradientSequence stores n 320x320 PNG frames with far more than 256
-// colours (smooth RGB + alpha gradients, shifting per frame): heavy in
-// colours but light in bytes, so a truecolour APNG of it easily fits the
+// colors (smooth RGB + alpha gradients, shifting per frame): heavy in
+// colors but light in bytes, so a truecolor APNG of it easily fits the
 // sticker budget while pngquant-style indexing could never be lossless.
 func gradientSequence(t *testing.T, st *store.Store, tools ffrun.Tools, n, delayMS int) *store.Blob {
 	t.Helper()
@@ -301,8 +301,8 @@ func gradientSequence(t *testing.T, st *store.Store, tools ffrun.Tools, n, delay
 	return blob
 }
 
-// TestRenderFitStickerRGBAAPNG: a sticker whose RGBA truecolour probe fits
-// must deliver real truecolour bytes — before the fix the RGBA-labelled rung
+// TestRenderFitStickerRGBAAPNG: a sticker whose RGBA truecolor probe fits
+// must deliver real truecolor bytes — before the fix the RGBA-labelled rung
 // silently went through the pngquant pipeline, so the winner said
 // "APNG · RGBA" while its bytes were indexed.
 func TestRenderFitStickerRGBAAPNG(t *testing.T) {
@@ -466,7 +466,7 @@ func TestRenderAPNG(t *testing.T) {
 		}
 	}
 	if !indexed {
-		t.Errorf("colours 64 did not yield an indexed apng: %+v", p.Report.Checks)
+		t.Errorf("colors 64 did not yield an indexed apng: %+v", p.Report.Checks)
 	}
 }
 
@@ -915,7 +915,7 @@ func TestRenderOptimize(t *testing.T) {
 	fin = mustRender(t, m, rf)
 	logFiles(t, fin.Result)
 	p = fin.Result.Files[0]
-	if p.Frames != 12 || !strings.HasPrefix(p.Desc, "fit at all frames · source colours · lossy") || p.Report == nil || !p.Report.OK {
+	if p.Frames != 12 || !strings.HasPrefix(p.Desc, "fit at all frames · source colors · lossy") || p.Report == nil || !p.Report.OK {
 		t.Errorf("optimize fit = %+v", p)
 	}
 	if len(fin.Result.Files) < 2 || fin.Result.Files[1].Kind != FileKindAlternative {
@@ -998,7 +998,7 @@ func TestRenderAVIFSource(t *testing.T) {
 	ab := putProbed(t, st, tools, anim)
 	t.Logf("animated avif probe: %+v", ab.Info)
 	// ffmpeg's mov demuxer lists the one-frame primary item (v:0, alpha
-	// v:1) before the animation track (colour v:2, alpha v:3); the probe
+	// v:1) before the animation track (color v:2, alpha v:3); the probe
 	// must point the graph at the track.
 	if ab.Info.Kind != recipe.KindAnimation || ab.Info.Frames != 10 || ab.Info.ColorStream != 2 || ab.Info.AlphaStream != 3 {
 		t.Errorf("animated avif probe: %+v", ab.Info)

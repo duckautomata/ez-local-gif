@@ -205,7 +205,7 @@ export interface OutputCfg {
   fit: FitMode;
   fps: number; // 0 = source fps (snapped per format)
   // gif / apng
-  colors: number; // gif 2..256; apng 0 = RGBA truecolour, 2..256 = indexed 8-bit alpha
+  colors: number; // gif 2..256; apng 0 = RGBA truecolor, 2..256 = indexed 8-bit alpha
   dither: Dither;
   lossy: number; // gifsicle --lossy 0..200
   alphaThreshold: number; // 1..255; TRIM_FRINGE_THRESHOLD = "trim fringe"
@@ -375,7 +375,7 @@ export const PRESETS: PresetDef[] = [
     target: 'sticker',
     usesOps: true,
     formatHints: {
-      apng: 'Indexed 8-bit-alpha APNG — best sticker quality, verified at 25 fps; the fit ladder walks 256 → 128 → 64 colours.',
+      apng: 'Indexed 8-bit-alpha APNG — best sticker quality, verified at 25 fps; the fit ladder walks 256 → 128 → 64 colors.',
       gif: '1-bit alpha, plays everywhere — verified as a sticker.',
       png: 'Static sticker: pngquant palette + oxipng.',
     },
@@ -386,7 +386,7 @@ export const PRESETS: PresetDef[] = [
       o.height = 320;
       o.fit = 'contain';
       o.fps = 25;
-      o.colors = 256; // indexed 8-bit-alpha APNG (0 would be RGBA truecolour)
+      o.colors = 256; // indexed 8-bit-alpha APNG (0 would be RGBA truecolor)
       o.dither = 'bayer';
       o.lossy = 0;
       setFit(o, true, FIT_KIB.sticker, true); // stickers are never downscaled
@@ -422,7 +422,7 @@ export const PRESETS: PresetDef[] = [
   {
     id: 'optimize',
     label: 'Optimize',
-    hint: 'GIF → GIF with gifsicle only — no decode, no re-quantisation: lossy, colours, dither, frame drop, optional fit.',
+    hint: 'GIF → GIF with gifsicle only — no decode, no re-quantisation: lossy, colors, dither, frame drop, optional fit.',
     locksSize: true,
     formats: ['gif'],
     target: '',

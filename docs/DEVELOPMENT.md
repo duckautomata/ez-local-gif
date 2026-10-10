@@ -186,14 +186,14 @@ an animated AVIF with alpha. `output/testkit/README.md` opens with a "results so
 file where to upload it (attachment /
 Server Settings › Emoji / Server Settings › Stickers), lists the client matrix (desktop, web,
 iOS, Android × dark/light theme × autoplay on/off, reduced motion), what to look for (alpha
-survives, no black background, no colour flicker, first-frame still, loops forever, timing) and a
+survives, no black background, no color flicker, first-frame still, loops forever, timing) and a
 sizes table with the fit rung used.
 
 Checklist for sign-off (per client and theme):
 
 1. Attachments **a, b, d, e, e2, f**: transparent over both themes, no black box, no per-frame
-   colour changes, loop forever, still frame with autoplay off is a real frame (e vs e2: note any
-   difference in soft-edge colour or size — that decides the lossy WebP input format).
+   color changes, loop forever, still frame with autoplay off is a real frame (e vs e2: note any
+   difference in soft-edge color or size — that decides the lossy WebP input format).
 2. Emote **h1** (GIF) and **h2** (WebP): upload accepted, animate inline / jumbo / reaction /
    picker, transparent.
 3. Sticker **i3** (indexed 8-bit-alpha APNG — the default), **i1** (GIF fallback), **i2** (RGBA
@@ -214,7 +214,7 @@ in [`DESIGN.md`](DESIGN.md) §9a. Rules the linter enforces are versioned in
 |---|---|
 | `scripts/go.ps1`, `scripts/go.sh` | Run `go …` in `golang:1.26-trixie` with the repo mounted (host has no Go) |
 | `scripts/check-tools.sh` | Print + assert every bundled tool, ffmpeg capability (encoders incl. `libx264`/`libvpx-vp9` for the Phase 4 video exports, decoders incl. the libvpx VP8 decoder for VP8-alpha overlays, every filter the graph emits — Phase 3: `tpad`, `reverse`, `lagfun`, `bbox`, `colorchannelmixer`, `setparams`, `blend`, `gblur` (feather), `trim`, `setpts`; Phase 4: `concat` (bounce) — demuxers, muxers incl. `mp4`/`webm`) and font family (DejaVu, Noto; `/fonts` on the scan path; drawtext paints), plus functional smoke encodes (gif/webp/apng/drawtext, and Phase 4: mp4 with `+faststart`, webm, a 2-frame gifski run) — runs at image build, so a build lacking something the pipeline relies on fails there, not at render time |
-| `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`), GIF, animated AVIF with alpha (`.avif`: avifenc, or ffmpeg's colour + alpha stream pair without it), `seq OUTDIR N` = N straight-alpha PNG frames for an image-sequence upload, or `green OUT.mov|OUT.mp4` = an opaque 4:4:4 green-screen clip (a bordered square orbiting over `0x00ff00`) for the keying ops; premultiplied or straight alpha |
+| `scripts/make-test-clip.sh` | Synthesise a transparent test clip: ProRes 4444 (`.mov`), VP9 alpha (`.webm`), GIF, animated AVIF with alpha (`.avif`: avifenc, or ffmpeg's color + alpha stream pair without it), `seq OUTDIR N` = N straight-alpha PNG frames for an image-sequence upload, or `green OUT.mov|OUT.mp4` = an opaque 4:4:4 green-screen clip (a bordered square orbiting over `0x00ff00`) for the keying ops; premultiplied or straight alpha |
 | `scripts/discord-testkit.sh` | Emit the Discord render-test matrix + README (see above) |
 | `scripts/testkit-test.sh` | Self-test for the test kit: OUTDIR guard + hint, synthetic clip at the master rate, resample warning, every variant produced, the app's yuva alpha head (native-depth unpremultiply, one rgba conversion, transparent corner pixel at alpha 0), /dev/shm scratch (full checks need the toolchain image) |
 | `scripts/integration-test.sh` | End-to-end API test against a running server (`EZLG_START_SERVER=1` starts one on a throw-away data dir): the 18 Phase 1 checks (ProRes → emote GIF + chat WebP), the Phase 2 cases (fit-to-size + alternatives, indexed APNG sticker, AVIF, PNG/JPEG, frames + zip, image sequence, optimise, from-result) and the Phase 3 cases (chromakey / colorkey on a green-screen clip with pixel-level alpha checks, chromakey + feather (the WebP's edge carries intermediate alpha, the unfeathered render (almost) none), text overlay, PNG + looping GIF overlays from a second source (`/api/still` pixel checks: the GIF overlay is painted and loops rather than holding its last frame), reverse vs the forward frames export, autocrop, trim on an animated WebP source built from the ProRes clip (exactly 10 frames — FFmpeg 9's `webp_anim` demuxer decodes nothing after an input seek, so the server trims such sources in the filtergraph), `POST /api/proxy`, `GET /api/fonts`, capability flags) and the Phase 4 cases (attachment MP4: h264/yuv420p, even dims from an odd request, moov-before-mdat via the `video.faststart` lint row; WebM: vp9/yuv420p; bounce: exactly 2× the forward frame count, first == last frame; gifski encoder: desc names gifski, emote target refused; lossless gifsicle fast path: desc; `/input` picker + `/output` save against temp dirs — start-server runs only, skipped with a note otherwise); `EZLG_TEST_PHASE2=0` for Phase 1 only, `EZLG_TEST_PHASE3=0` to skip Phases 3+4, `EZLG_TEST_PHASE4=0` to skip Phase 4; jobs answered from the server's result cache are warned about (`EZLG_TEST_STRICT=1` fails on them) |

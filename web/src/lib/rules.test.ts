@@ -48,10 +48,9 @@ const APNG = [
 const STATIC = ['static.size-limit', 'static.emote-dims', 'static.sticker', 'static.format'];
 // Phase 4: internal/discordlint video.go (mp4/webm structural lint)
 const VIDEO = ['video.container', 'video.faststart', 'video.codec', 'video.dims', 'video.duration', 'video.size-limit', 'video.attachment-only'];
-// internal/jobs: the render pipeline's alpha check, the Phase 5b AI matte
-// info check (which model / weights produced the file) and the fit engine's
+// internal/jobs: the render pipeline's alpha check and the fit engine's
 // fit.target (RuleFitTarget) — the one rule users hit when a fit fails.
-const JOBS = ['render.alpha', 'render.matte', 'fit.target'];
+const JOBS = ['render.alpha', 'fit.target'];
 
 describe('ruleLabel', () => {
   it('has a friendly label for every known rule id', () => {

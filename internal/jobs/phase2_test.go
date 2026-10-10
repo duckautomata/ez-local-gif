@@ -190,7 +190,7 @@ func TestKnobMapping(t *testing.T) {
 	if qualityFromKnob(20) != 80 || qualityFromKnob(0) != 100 || qualityFromKnob(150) != 1 {
 		t.Error("qualityFromKnob")
 	}
-	// The APNG colour search is floored at 64 (§5.4); explicit user bases
+	// The APNG color search is floored at 64 (§5.4); explicit user bases
 	// below 64 are kept as-is instead of halved further.
 	r := fit.Rung{Colors: 256}
 	for knob, want := range map[int]int{0: 256, 1: 128, 2: 64, 3: 64, 9: 64} {
@@ -219,11 +219,11 @@ func TestKnobMapping(t *testing.T) {
 	if got := knobDesc("webp", r, recipe.Output{}, 30); got != "q 70" {
 		t.Errorf("webp desc = %q", got)
 	}
-	// png: 0 = keep full colour; the first step of a full-colour rung drops
+	// png: 0 = keep full color; the first step of a full-color rung drops
 	// to the default palette, later steps halve.
 	for knob, want := range map[int]int{0: 0, 1: 256, 2: 128, 3: 64} {
 		if got := pngColors(fit.Rung{}, recipe.Output{}, knob); got != want {
-			t.Errorf("pngColors(full colour, %d) = %d, want %d", knob, got, want)
+			t.Errorf("pngColors(full color, %d) = %d, want %d", knob, got, want)
 		}
 	}
 	if got := pngColors(fit.Rung{Colors: 128}, recipe.Output{}, 1); got != 64 {
@@ -238,17 +238,17 @@ func TestKnobMapping(t *testing.T) {
 	if got := knobDesc("png", fit.Rung{}, recipe.Output{}, 0); got != "" {
 		t.Errorf("png desc at step 0 = %q, want none", got)
 	}
-	if got := knobDesc("png", fit.Rung{}, recipe.Output{}, 1); got != "full colour → 256" {
-		t.Errorf("png full-colour desc = %q", got)
+	if got := knobDesc("png", fit.Rung{}, recipe.Output{}, 1); got != "full color → 256" {
+		t.Errorf("png full-color desc = %q", got)
 	}
 	if got := knobDesc("png", fit.Rung{Colors: 128}, recipe.Output{}, 1); got != "palette 128 → 64" {
 		t.Errorf("png palette desc = %q", got)
 	}
-	if knobName("gif", recipe.Output{}) != "lossy" || knobName("apng", recipe.Output{}) != "colour step" ||
-		knobName("png", recipe.Output{}) != "colour step" || knobName("avif", recipe.Output{}) != "quality knob" {
+	if knobName("gif", recipe.Output{}) != "lossy" || knobName("apng", recipe.Output{}) != "color step" ||
+		knobName("png", recipe.Output{}) != "color step" || knobName("avif", recipe.Output{}) != "quality knob" {
 		t.Error("knobName")
 	}
-	// A truecolour probe rung (RGBA APNG, lossless WebP) carries no knob desc.
+	// A truecolor probe rung (RGBA APNG, lossless WebP) carries no knob desc.
 	if got := knobDesc("webp", fit.Rung{Truecolor: true}, recipe.Output{}, 0); got != "" {
 		t.Errorf("truecolor webp desc = %q, want none", got)
 	}
@@ -332,7 +332,7 @@ func TestFitLadderSelection(t *testing.T) {
 		t.Errorf("sticker ladder order: first %q, last %q", effectiveFormat(stick[0], "apng"), effectiveFormat(stick[len(stick)-1], "apng"))
 	}
 	knobs := knobsFor(stick, "apng", recipe.Output{Lossy: 40})
-	if knobs["apng"].Name != fit.KnobColourStep || knobs["gif"].Name != fit.KnobLossy {
+	if knobs["apng"].Name != fit.KnobColorStep || knobs["gif"].Name != fit.KnobLossy {
 		t.Errorf("sticker knobs = %+v", knobs)
 	}
 	if knobs["gif"].Mild != 40 {
@@ -381,7 +381,7 @@ func TestFitLadderSelection(t *testing.T) {
 		t.Error("jpeg ladder empty")
 	}
 	// Static PNG fit (a supported format): the generic ladder with the
-	// colour-step knob and no fps rungs.
+	// color-step knob and no fps rungs.
 	if !fitFormats["png"] {
 		t.Error("png must be a fit format")
 	}
@@ -394,7 +394,7 @@ func TestFitLadderSelection(t *testing.T) {
 			t.Errorf("png ladder has an fps rung: %+v", r)
 		}
 	}
-	if knobs := knobsFor(pngLadder, "png", recipe.Output{}); knobs["png"].Name != fit.KnobColourStep {
+	if knobs := knobsFor(pngLadder, "png", recipe.Output{}); knobs["png"].Name != fit.KnobColorStep {
 		t.Errorf("png knob = %+v", knobs)
 	}
 
@@ -433,24 +433,24 @@ func TestFitLadderSelection(t *testing.T) {
 	}
 }
 
-// TestFitLadderClampsGenericColours: the generic ladder never quantises to
-// MORE colours than the user asked for — colour rungs at or above
+// TestFitLadderClampsGenericColors: the generic ladder never quantises to
+// MORE colors than the user asked for — color rungs at or above
 // Output.Colors collapse onto "as requested", palettes strictly below it
 // survive, so the ladder stays monotone.
-func TestFitLadderClampsGenericColours(t *testing.T) {
+func TestFitLadderClampsGenericColors(t *testing.T) {
 	master := enc.Master{Width: 480, Height: 270, FPS: 30, Frames: 90}
 	clamped := fitLadder("gif", recipe.Output{Format: "gif", FitBytes: 1, Colors: 64}, master)
 	for _, r := range clamped {
 		if r.Colors != 0 {
-			t.Errorf("rung %q keeps %d colours although the user asked for 64", r.Label, r.Colors)
+			t.Errorf("rung %q keeps %d colors although the user asked for 64", r.Label, r.Colors)
 		}
-		if strings.Contains(r.Label, "colours") {
+		if strings.Contains(r.Label, "colors") {
 			t.Errorf("label %q still names a palette", r.Label)
 		}
 	}
 	free := fitLadder("gif", recipe.Output{Format: "gif", FitBytes: 1}, master)
 	if len(clamped) >= len(free) {
-		t.Errorf("clamped ladder has %d rungs, unclamped %d — the pure colour rungs must collapse", len(clamped), len(free))
+		t.Errorf("clamped ladder has %d rungs, unclamped %d — the pure color rungs must collapse", len(clamped), len(free))
 	}
 	// A palette strictly below the user's is a real degrade step and stays.
 	mid := fitLadder("apng", recipe.Output{Format: "apng", FitBytes: 1, Colors: 100}, master)
@@ -460,14 +460,14 @@ func TestFitLadderClampsGenericColours(t *testing.T) {
 		case 64:
 			has64 = true
 			if r.Knob == nil {
-				t.Errorf("kept colour rung lost its own colour-step knob: %+v", r)
+				t.Errorf("kept color rung lost its own color-step knob: %+v", r)
 			}
 		case 128:
 			has128 = true
 		}
 	}
 	if !has64 || has128 {
-		t.Errorf("colours 100: ladder = %+v (want the 64 rung, not the 128 one)", mid)
+		t.Errorf("colors 100: ladder = %+v (want the 64 rung, not the 128 one)", mid)
 	}
 }
 
@@ -515,10 +515,10 @@ func TestFitDeliverables(t *testing.T) {
 		cands.add(c)
 		return c
 	}
-	win := mk("c0001.gif", 900, fit.Rung{Label: "25 fps · 256 colours"}, 40, okRep)
+	win := mk("c0001.gif", 900, fit.Rung{Label: "25 fps · 256 colors"}, 40, okRep)
 	winPath := win.path
-	a1 := mk("c0002.gif", 800, fit.Rung{Label: "20 fps · 128 colours"}, 30, okRep)
-	a2 := mk("c0003.gif", 700, fit.Rung{Label: "16.7 fps · 128 colours"}, 20, okRep)
+	a1 := mk("c0002.gif", 800, fit.Rung{Label: "20 fps · 128 colors"}, 30, okRep)
+	a2 := mk("c0003.gif", 700, fit.Rung{Label: "16.7 fps · 128 colors"}, 20, okRep)
 	mk("c0004.gif", 600, fit.Rung{Label: "12.5 fps"}, 10, okRep) // not delivered
 	describe := func(c *fitCandidate) string { return "fit at " + c.rung.Label + fmt.Sprintf(" · lossy %d", c.knob) }
 
@@ -531,7 +531,7 @@ func TestFitDeliverables(t *testing.T) {
 	if len(items) != 3 {
 		t.Fatalf("items = %d, want primary + 2 alternatives", len(items))
 	}
-	if items[0].name != "out.gif" || items[0].kind != FileKindOutput || items[0].index != 0 || items[0].desc != "fit at 25 fps · 256 colours · lossy 40" {
+	if items[0].name != "out.gif" || items[0].kind != FileKindOutput || items[0].index != 0 || items[0].desc != "fit at 25 fps · 256 colors · lossy 40" {
 		t.Errorf("primary = %+v", items[0])
 	}
 	if items[1].name != "alt1.gif" || items[1].kind != FileKindAlternative || items[1].index != 1 || !strings.HasPrefix(items[1].desc, "fit at 20 fps") {
@@ -562,7 +562,7 @@ func TestFitDeliverables(t *testing.T) {
 	os.MkdirAll(fitDir2, 0o755)
 	overRep := discordlint.Report{Format: "gif", Target: "emote", Checks: []discordlint.Check{{Rule: "gif.size-limit", Level: discordlint.LevelError, OK: false}}}
 	big := &fitCandidate{path: fakeCandidateFile(t, fitDir2, "x1.gif", 5000), format: "gif", bytes: 5000, report: overRep, rung: fit.Rung{Label: "25 fps"}, knob: 100}
-	small := &fitCandidate{path: fakeCandidateFile(t, fitDir2, "x2.gif", 3000), format: "gif", bytes: 3000, report: overRep, rung: fit.Rung{Label: "10 fps · 32 colours"}, knob: 200}
+	small := &fitCandidate{path: fakeCandidateFile(t, fitDir2, "x2.gif", 3000), format: "gif", bytes: 3000, report: overRep, rung: fit.Rung{Label: "10 fps · 32 colors"}, knob: 200}
 	cands2.add(big)
 	cands2.add(small)
 	items, err = m.fitDeliverables(context.Background(), cands2, nil, nil, 1024, []string{"25 fps", "20 fps"}, nil, scratch, enc.Master{}, describe)
@@ -576,7 +576,7 @@ func TestFitDeliverables(t *testing.T) {
 	if fi, _ := os.Stat(p.path); fi == nil || fi.Size() != 3000 {
 		t.Errorf("no-fit primary is not the smallest attempt: %+v", p)
 	}
-	for _, want := range []string{"cannot fit under 1 KiB", "smallest attempt is 2.9 KiB", "10 fps · 32 colours", "lossy 200", "2 rungs skipped"} {
+	for _, want := range []string{"cannot fit under 1 KiB", "smallest attempt is 2.9 KiB", "10 fps · 32 colors", "lossy 200", "2 rungs skipped"} {
 		if !strings.Contains(p.desc, want) {
 			t.Errorf("desc %q lacks %q", p.desc, want)
 		}
@@ -694,7 +694,7 @@ func TestParseGIFFacts(t *testing.T) {
 		wantColors = max(wantColors, len(fr.Palette))
 	}
 	if facts.frames != len(dec.Image) || facts.colors != wantColors {
-		t.Errorf("facts = %+v, want %d frames, %d colours", facts, len(dec.Image), wantColors)
+		t.Errorf("facts = %+v, want %d frames, %d colors", facts, len(dec.Image), wantColors)
 	}
 	if fmt.Sprint(facts.delays) != fmt.Sprint(dec.Delay) {
 		t.Errorf("delays = %v, want %v", facts.delays, dec.Delay)
@@ -871,14 +871,14 @@ func TestDropEveryNAndOptimizeLadder(t *testing.T) {
 	if o.Lossy != 30 || o.Colors != 64 || o.Dither != "o8" || o.DropEveryN != 2 || o.Loop != 2 || !o.Careful {
 		t.Errorf("options = %+v", o)
 	}
-	if d := optimizeDesc(o, 12); !strings.Contains(d, "lossy 30") || !strings.Contains(d, "64 colours") || !strings.Contains(d, "every 2nd frame dropped (6 of 12 kept)") {
+	if d := optimizeDesc(o, 12); !strings.Contains(d, "lossy 30") || !strings.Contains(d, "64 colors") || !strings.Contains(d, "every 2nd frame dropped (6 of 12 kept)") {
 		t.Errorf("desc = %q", d)
 	}
 	if d := optimizeDesc(enc.GifsicleOptimizeOptions{}, 12); d != "gifsicle -O2 (lossless)" {
 		t.Errorf("lossless desc = %q", d)
 	}
 
-	// Ladder: base drop first, then harsher drops; source colours first.
+	// Ladder: base drop first, then harsher drops; source colors first.
 	facts := gifFacts{frames: 12, colors: 256}
 	rungs, drops := optimizeLadder(0, 0, facts, false)
 	var labels []string
@@ -894,27 +894,27 @@ func TestDropEveryNAndOptimizeLadder(t *testing.T) {
 		}
 	}
 	// A base drop of 2 (the user asked for half the fps) leaves only harsher
-	// colour rungs; 64 user colours remove the 128 rung.
+	// color rungs; 64 user colors remove the 128 rung.
 	rungs, drops = optimizeLadder(2, 64, facts, false)
 	labels = labels[:0]
 	for _, r := range rungs {
 		labels = append(labels, fmt.Sprintf("%d/%d", drops[r.Label], r.Colors))
 	}
 	if strings.Join(labels, " ") != "2/64" {
-		t.Errorf("ladder(base 2, 64 colours) = %v", labels)
+		t.Errorf("ladder(base 2, 64 colors) = %v", labels)
 	}
 	rungs, _ = optimizeLadder(3, 0, facts, false)
 	if len(rungs) != 6 {
 		t.Errorf("ladder(base 3) = %d rungs", len(rungs))
 	}
-	// A source with a small palette gets no colour rungs at all.
+	// A source with a small palette gets no color rungs at all.
 	rungs, _ = optimizeLadder(0, 0, gifFacts{frames: 12, colors: 4}, false)
 	if len(rungs) != 3 {
-		t.Errorf("ladder(4-colour source) = %d rungs, want the 3 drop rungs", len(rungs))
+		t.Errorf("ladder(4-color source) = %d rungs, want the 3 drop rungs", len(rungs))
 	}
 	rungs, _ = optimizeLadder(0, 0, gifFacts{frames: 12, colors: 100}, false)
 	if len(rungs) != 6 {
-		t.Errorf("ladder(100-colour source) = %d rungs, want 3 drops x (src, 64)", len(rungs))
+		t.Errorf("ladder(100-color source) = %d rungs, want 3 drops x (src, 64)", len(rungs))
 	}
 	// FitKeepFPS: no frame-drop rungs beyond what the user asked for.
 	rungs, drops = optimizeLadder(0, 0, facts, true)

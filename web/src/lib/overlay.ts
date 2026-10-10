@@ -238,10 +238,10 @@ export function selectionAfterToggle(selected: number, id: number, open: boolean
 }
 
 /**
- * pickerColor is the colour a card stores when <input type="color"> (which
+ * pickerColor is the color a card stores when <input type="color"> (which
  * only handles RRGGBB) picks `picked` for a field currently holding
  * `previous`: the picked RGB with the alpha suffix of the previous value,
- * if it had one, so an RRGGBBAA colour keeps its alpha across picks.
+ * if it had one, so an RRGGBBAA color keeps its alpha across picks.
  */
 export function pickerColor(picked: string, previous: string): string {
   return picked.trim().replace(/^#/, '').toLowerCase() + previous.slice(6);

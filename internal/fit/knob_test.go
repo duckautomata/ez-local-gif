@@ -10,8 +10,8 @@ func TestKnobFor(t *testing.T) {
 		{"gif", Knob{Min: 0, Max: 200, Mild: 30, Harsh: 150, Name: KnobLossy}},
 		{"webp", Knob{Min: 5, Max: 90, Mild: 20, Harsh: 70, Name: KnobQuality}},
 		{"avif", Knob{Min: 5, Max: 90, Mild: 20, Harsh: 70, Name: KnobQuality}},
-		{"apng", Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}},
-		{"png", Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}},
+		{"apng", Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColorStep}},
+		{"png", Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColorStep}},
 		{"jpeg", Knob{Min: 10, Max: 80, Mild: 20, Harsh: 60, Name: KnobQuality}},
 		{"mp4", Knob{Min: 12, Max: 40, Mild: 18, Harsh: 40, Name: KnobCRF}},
 		{"webm", Knob{Min: 15, Max: 55, Mild: 30, Harsh: 55, Name: KnobCRF}},
@@ -34,40 +34,40 @@ func TestKnobFor(t *testing.T) {
 	}
 }
 
-// TestColourStepKnob pins the per-rung colour-step bound: halvings below
-// the rung's palette, floored at 64 (DESIGN.md §5.4 "APNG: colours 256→64"),
+// TestColorStepKnob pins the per-rung color-step bound: halvings below
+// the rung's palette, floored at 64 (DESIGN.md §5.4 "APNG: colors 256→64"),
 // with the harsh probe at most two halvings.
-func TestColourStepKnob(t *testing.T) {
+func TestColorStepKnob(t *testing.T) {
 	cases := []struct {
 		colors int
 		want   Knob
 	}{
-		{256, Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColourStep}},
-		{128, Knob{Min: 0, Max: 1, Mild: 0, Harsh: 1, Name: KnobColourStep}},
-		{64, Knob{Min: 0, Max: 0, Mild: 0, Harsh: 0, Name: KnobColourStep}},
+		{256, Knob{Min: 0, Max: 2, Mild: 0, Harsh: 2, Name: KnobColorStep}},
+		{128, Knob{Min: 0, Max: 1, Mild: 0, Harsh: 1, Name: KnobColorStep}},
+		{64, Knob{Min: 0, Max: 0, Mild: 0, Harsh: 0, Name: KnobColorStep}},
 		// Below the floor there is nothing to halve: a single-point probe.
-		{32, Knob{Min: 0, Max: 0, Mild: 0, Harsh: 0, Name: KnobColourStep}},
-		{1024, Knob{Min: 0, Max: 4, Mild: 0, Harsh: 2, Name: KnobColourStep}},
+		{32, Knob{Min: 0, Max: 0, Mild: 0, Harsh: 0, Name: KnobColorStep}},
+		{1024, Knob{Min: 0, Max: 4, Mild: 0, Harsh: 2, Name: KnobColorStep}},
 	}
 	for _, c := range cases {
-		k := colourStepKnob(c.colors)
+		k := colorStepKnob(c.colors)
 		if *k != c.want {
-			t.Errorf("colourStepKnob(%d) = %+v, want %+v", c.colors, *k, c.want)
+			t.Errorf("colorStepKnob(%d) = %+v, want %+v", c.colors, *k, c.want)
 		}
 		// Every override must survive normalisation (Search validates them).
 		n, err := normalizeKnob(*k)
 		if err != nil {
-			t.Errorf("colourStepKnob(%d) does not normalise: %v", c.colors, err)
+			t.Errorf("colorStepKnob(%d) does not normalise: %v", c.colors, err)
 		}
 		// No knob in [Min, Max] may take the palette below 64 (unless the
 		// rung itself is already below the floor).
 		for v := n.Min; v <= n.Max; v++ {
 			if got := c.colors >> v; got < 64 && got < c.colors {
-				t.Errorf("colourStepKnob(%d): step %d reaches %d colours (< 64)", c.colors, v, got)
+				t.Errorf("colorStepKnob(%d): step %d reaches %d colors (< 64)", c.colors, v, got)
 			}
 		}
 	}
-	// The truecolour probe knob is a single point too.
+	// The truecolor probe knob is a single point too.
 	if n, err := normalizeKnob(*truecolorKnob); err != nil || n.Mild != n.Harsh {
 		t.Errorf("truecolorKnob normalised to %+v, %v", n, err)
 	}
@@ -109,7 +109,7 @@ func TestDescribeKnob(t *testing.T) {
 		{KnobFor("gif"), 60, "lossy 60"},
 		{KnobFor("webp"), 20, "quality 80"},
 		{KnobFor("jpeg"), 60, "quality 40"},
-		{KnobFor("apng"), 2, "colour step 2"},
+		{KnobFor("apng"), 2, "color step 2"},
 		{KnobFor("mp4"), 28, "crf 28"},
 		{KnobFor("webm"), 45, "crf 45"},
 		{KnobFor("mov"), 50, "level 50"},

@@ -5,7 +5,7 @@
   import { fmtBytes, fmtKiB, fmtNum, fmtSeconds } from '../lib/format';
   import { fitsFormat } from '../lib/presets';
   import { startRender } from '../lib/render.svelte';
-  import { descLine, groupFiles, isFramesResult, isImageFormat, matteLine, sizeState } from '../lib/result';
+  import { descLine, groupFiles, isFramesResult, isImageFormat, sizeState } from '../lib/result';
   import { app } from '../lib/state.svelte';
   import { toast } from '../lib/toast.svelte';
   import BackdropToggle from './BackdropToggle.svelte';
@@ -39,13 +39,6 @@
   // The primary's desc gets the bold 'Fit:' label only when a fit actually
   // ran; a non-fit desc (Optimize's "gifsicle: …") shows as neutral settings.
   const line = $derived(descLine(primary, fitRequested));
-  // Phase 5b: the render.matte info check names the AI matte the file was
-  // made with (model, precision, size, weights, matte count, cleanup, and —
-  // Phase 5c — the device, stabilise mode and keep count) — one line at a
-  // glance, so a result always says which model produced it; the check
-  // lists with the others too. What the recipe's matte op asked for
-  // (guided + edge, stabilise, keep) is appended when the detail lacks it.
-  const matteText = $derived(primary ? matteLine(primary.report, result.recipe) : null);
   const toolList = $derived(Object.entries(result.tools ?? {}).sort(([a], [b]) => a.localeCompare(b)));
   // Loop count the recipe asked for (0 = forever, N = play N+1 times). With no
   // Discord target a finite count is a legitimate choice, not a warning.
@@ -172,15 +165,12 @@
       {:else if fitRequested}
         <p class="fitline muted">Fit search ran; the primary is the mildest rung that fits.</p>
       {/if}
-      {#if matteText}
-        <p class="fitline matte" title="The render.matte check of the Discord report"><span class="muted">AI matte:</span> {matteText}</p>
-      {/if}
 
       {#if f.limit > 0 && f.bytes > f.limit}
         <p class="note error">
           {fmtBytes(f.bytes - f.limit)} over the {fmtKiB(f.limit)} KiB limit.
           {#if fitRequested}Even the harshest fit rung was too big — shorten the clip, lower the fps or allow downscaling.{:else}Turn on
-            “Fit to ≤ … KiB” in the Output card, or try lossy / fewer colours / lower fps.{/if}
+            “Fit to ≤ … KiB” in the Output card, or try lossy / fewer colors / lower fps.{/if}
         </p>
       {/if}
 

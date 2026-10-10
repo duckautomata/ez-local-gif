@@ -332,7 +332,7 @@ func TestSearch_SecantStopsWhenBracketHasNoInteriorInteger(t *testing.T) {
 	// APNG-style knob 0..3 (mild 0, harsh 2): only knob 1 can be probed.
 	model := func(_, knob int) int64 { return []int64{300000, 200000, 50000, 10000}[knob] }
 	f := newFake(ladder, model)
-	req := Request{Target: 100000, Ladder: ladder, Knob: Knob{Min: 0, Max: 3, Harsh: 2, Name: KnobColourStep}, MaxIter: 10}
+	req := Request{Target: 100000, Ladder: ladder, Knob: Knob{Min: 0, Max: 3, Harsh: 2, Name: KnobColorStep}, MaxIter: 10}
 	res := mustSearch(t, req, f)
 	if got := f.knobs(0); len(got) != 3 || got[2] != 1 {
 		t.Errorf("probes = %v, want [0 2 1]", got)
@@ -340,7 +340,7 @@ func TestSearch_SecantStopsWhenBracketHasNoInteriorInteger(t *testing.T) {
 	if res.Best.Knob != 2 || res.Best.Bytes != 50000 {
 		t.Errorf("Best = %+v, want knob 2 / 50000 B", res.Best)
 	}
-	if res.Best.Desc != "fit at r0 · colour step 2" {
+	if res.Best.Desc != "fit at r0 · color step 2" {
 		t.Errorf("Desc = %q", res.Best.Desc)
 	}
 }
@@ -859,11 +859,11 @@ func TestSearch_DescAndFormat(t *testing.T) {
 		want   string
 		wantF  string
 	}{
-		{"gif label", Rung{Label: "20 fps · 128 colours · 128 px", Format: "gif"}, KnobFor("gif"), "", "fit at 20 fps · 128 colours · 128 px · lossy 30", "gif"},
+		{"gif label", Rung{Label: "20 fps · 128 colors · 128 px", Format: "gif"}, KnobFor("gif"), "", "fit at 20 fps · 128 colors · 128 px · lossy 30", "gif"},
 		{"webp quality inverted", Rung{Label: "25 fps · 128 px", Format: "webp"}, KnobFor("webp"), "", "fit at 25 fps · 128 px · quality 80", "webp"},
-		{"apng colour step", Rung{Label: "APNG · 25 fps · 256 colours", Format: "apng"}, KnobFor("apng"), "", "fit at APNG · 25 fps · 256 colours · colour step 0", "apng"},
+		{"apng color step", Rung{Label: "APNG · 25 fps · 256 colors", Format: "apng"}, KnobFor("apng"), "", "fit at APNG · 25 fps · 256 colors · color step 0", "apng"},
 		{"unnamed knob", Rung{Label: "x"}, Knob{Min: 1, Max: 9, Mild: 4}, "avif", "fit at x · knob 4", "avif"},
-		{"label from fields", Rung{FPS: 12.5, Width: 112, Height: 112, Colors: 64, Format: "gif"}, KnobFor("gif"), "", "fit at GIF · 12.5 fps · 64 colours · 112 px · lossy 30", "gif"},
+		{"label from fields", Rung{FPS: 12.5, Width: 112, Height: 112, Colors: 64, Format: "gif"}, KnobFor("gif"), "", "fit at GIF · 12.5 fps · 64 colors · 112 px · lossy 30", "gif"},
 		{"bare rung", Rung{}, KnobFor("gif"), "gif", "fit at master settings · lossy 30", "gif"},
 	}
 	for _, c := range cases {
@@ -883,7 +883,7 @@ func TestSearch_DescAndFormat(t *testing.T) {
 }
 
 func TestSearch_PerFormatKnobOverrides(t *testing.T) {
-	// A sticker-style ladder: apng rungs (colour steps) that never fit, then
+	// A sticker-style ladder: apng rungs (color steps) that never fit, then
 	// gif rungs searched over lossy.
 	ladder := []Rung{
 		{FPS: 25, Colors: 256, Format: "apng", Label: "r0"},
@@ -1045,8 +1045,8 @@ func TestSearch_EncoderPanicRepanicsInCaller(t *testing.T) {
 // and skips; an invalid override fails validation before anything encodes.
 func TestSearch_PerRungKnobOverride(t *testing.T) {
 	ladder := []Rung{
-		{Colors: 128, Format: "apng", Label: "r0", Knob: &Knob{Min: 0, Max: 1, Name: KnobColourStep}},
-		{Colors: 64, Format: "apng", Label: "r1", Knob: &Knob{Min: 0, Max: 0, Name: KnobColourStep}},
+		{Colors: 128, Format: "apng", Label: "r0", Knob: &Knob{Min: 0, Max: 1, Name: KnobColorStep}},
+		{Colors: 64, Format: "apng", Label: "r1", Knob: &Knob{Min: 0, Max: 0, Name: KnobColorStep}},
 		{Colors: 256, Format: "apng", Label: "r2"}, // falls back to Request.Knob
 	}
 	// r0 and r1 never fit; r2 fits at its harsh probe.
@@ -1090,7 +1090,7 @@ func TestSearch_PerRungKnobOverride(t *testing.T) {
 // ---- sticker RGBA probes -------------------------------------------------------
 
 // TestSearch_StickerLadderRGBAProbes drives the real sticker ladder through
-// a fake encoder: the RGBA truecolour rungs are probed exactly once each
+// a fake encoder: the RGBA truecolor rungs are probed exactly once each
 // (mildest first), win with a knob-less Desc when they fit, and otherwise
 // skip so the indexed rungs take over (DESIGN.md §5.4/§9a).
 func TestSearch_StickerLadderRGBAProbes(t *testing.T) {
@@ -1119,7 +1119,7 @@ func TestSearch_StickerLadderRGBAProbes(t *testing.T) {
 		t.Fatalf("Best = %+v", res.Best)
 	}
 	if res.Best.Desc != "fit at APNG · RGBA · 25 fps · 320 px" {
-		t.Errorf("Desc = %q (a truecolour rung carries no knob clause)", res.Best.Desc)
+		t.Errorf("Desc = %q (a truecolor rung carries no knob clause)", res.Best.Desc)
 	}
 	if f.count(0) != 1 {
 		t.Errorf("winning RGBA rung encoded %d times, want 1", f.count(0))
@@ -1134,7 +1134,7 @@ func TestSearch_StickerLadderRGBAProbes(t *testing.T) {
 		return 400000
 	})
 	res = mustSearch(t, req(), f)
-	if res.Best.Rung.Truecolor || res.Best.Rung.Label != "APNG · 25 fps · 256 colours · 320 px" {
+	if res.Best.Rung.Truecolor || res.Best.Rung.Label != "APNG · 25 fps · 256 colors · 320 px" {
 		t.Fatalf("Best = %+v", res.Best)
 	}
 	for i, r := range ladder {

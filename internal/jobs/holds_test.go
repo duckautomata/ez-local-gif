@@ -249,7 +249,7 @@ func coalescedHoldsGIF(t *testing.T) []byte {
 	return encodeTestGIF(t, g)
 }
 
-// unsafeHoldsLocalPaletteGIF is unsafeHoldsGIF with a local colour table on
+// unsafeHoldsLocalPaletteGIF is unsafeHoldsGIF with a local color table on
 // its last frame: holds AND gif.global-palette fail for a Discord target, so
 // the ladder's --colors rung is worth running.
 func unsafeHoldsLocalPaletteGIF(t *testing.T) []byte {
@@ -573,8 +573,8 @@ func TestGifLadderTagged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A local colour table (its third entry differs from the global one, so
-	// image/gif writes it) that shows the global colours: the picture is the
+	// A local color table (its third entry differs from the global one, so
+	// image/gif writes it) that shows the global colors: the picture is the
 	// canned flat file's, which the repair checks.
 	localOnly.Image[2].Palette = color.Palette{holdsPalette[0], holdsPalette[1], color.RGBA{1, 2, 3, 255}}
 	for _, c := range []struct {
@@ -585,10 +585,10 @@ func TestGifLadderTagged(t *testing.T) {
 		steps  string
 		want   ladderOutcome
 	}{
-		{"the colours rung is enough", encodeTestGIF(t, localOnly), 64, map[string][]byte{"colors.gif": flat}, "colors", ladderOutcome{replaced: true}},
-		{"colours, then the hold repair", unsafeHoldsLocalPaletteGIF(t), 0, map[string][]byte{"U.gif": flat}, "colors U O", ladderOutcome{replaced: true, holds: true}},
+		{"the colors rung is enough", encodeTestGIF(t, localOnly), 64, map[string][]byte{"colors.gif": flat}, "colors", ladderOutcome{replaced: true}},
+		{"colors, then the hold repair", unsafeHoldsLocalPaletteGIF(t), 0, map[string][]byte{"U.gif": flat}, "colors U O", ladderOutcome{replaced: true, holds: true}},
 		// The repair doubles as the generic re-encode: it rescues a file the
-		// colours rung could not, but a file without clear-only frames must
+		// colors rung could not, but a file without clear-only frames must
 		// not be described as repaired for them.
 		{"the repair rescues a file without holds", encodeTestGIF(t, localOnly), 0, map[string][]byte{"colors.fail": nil, "U.gif": flat}, "colors U O", ladderOutcome{replaced: true}},
 		{"every rung fails", unsafeHoldsLocalPaletteGIF(t), 0, map[string][]byte{"colors.fail": nil, "U.fail": nil}, "colors U", ladderOutcome{}},
@@ -600,7 +600,7 @@ func TestGifLadderTagged(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !hasStructuralError(first) || !ladderTriesColors(first) {
-				t.Fatalf("fixture: no structural failure for the colours rung: %+v", first.Checks)
+				t.Fatalf("fixture: no structural failure for the colors rung: %+v", first.Checks)
 			}
 			tools, dir := fakeGifsicle(t, c.ctl)
 			m := NewManager(newTestStore(t), tools, Options{Concurrency: 1})
@@ -628,7 +628,7 @@ func TestGifLadderTagged(t *testing.T) {
 						want = enc.DefaultColors
 					}
 					if i := slices.Index(argv, "--colors"); i < 0 || i+1 >= len(argv) || argv[i+1] != strconv.Itoa(want) {
-						t.Errorf("colours rung argv = %q, want --colors %d", argv, want)
+						t.Errorf("colors rung argv = %q, want --colors %d", argv, want)
 					}
 				}
 			}
@@ -662,19 +662,19 @@ func TestFitEncodeGifskiLadderCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A local colour table (its third entry differs from the global one, so
-	// image/gif writes it) that shows the global colours: the picture is the
+	// A local color table (its third entry differs from the global one, so
+	// image/gif writes it) that shows the global colors: the picture is the
 	// canned flat file's, which the repair checks.
 	localOnly.Image[2].Palette = color.Palette{holdsPalette[0], holdsPalette[1], color.RGBA{1, 2, 3, 255}}
-	raw := encodeTestGIF(t, localOnly) // what "gifski" writes: a local colour table
+	raw := encodeTestGIF(t, localOnly) // what "gifski" writes: a local color table
 	for _, c := range []struct {
 		name      string
 		ctl       map[string][]byte
 		passes    int // ladder passes per candidate
 		wantHolds bool
 	}{
-		{"the colours rung fixes it", map[string][]byte{"gifski.gif": raw, "colors.gif": flat}, 1, false},
-		{"the colours pass makes clear-only frames", map[string][]byte{"gifski.gif": raw, "colors.gif": unsafeHoldsGIF(t), "U.gif": flat}, 3, true},
+		{"the colors rung fixes it", map[string][]byte{"gifski.gif": raw, "colors.gif": flat}, 1, false},
+		{"the colors pass makes clear-only frames", map[string][]byte{"gifski.gif": raw, "colors.gif": unsafeHoldsGIF(t), "U.gif": flat}, 3, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			tools, dir := fakeGifsicle(t, c.ctl)
@@ -724,7 +724,7 @@ func TestFitEncodeGifskiLadderCall(t *testing.T) {
 						t.Errorf("ladder argv = %q, want no --lossy and --loopcount=3", argv)
 					}
 					if i := slices.Index(argv, "--colors"); fakeGifsicleStep(argv) == "colors" && (i+1 >= len(argv) || argv[i+1] != "64") {
-						t.Errorf("colours rung argv = %q, want --colors 64 (Output.Colors)", argv)
+						t.Errorf("colors rung argv = %q, want --colors 64 (Output.Colors)", argv)
 					}
 				}
 				if ladder != c.passes {
@@ -775,7 +775,7 @@ func TestLintGIFLadderRungs(t *testing.T) {
 			for _, argv := range calls {
 				steps = append(steps, fakeGifsicleStep(argv))
 				if i := slices.Index(argv, "--colors"); steps[len(steps)-1] == "colors" && (i+1 >= len(argv) || argv[i+1] != "64" || !hasArg(argv, "--lossy=30")) {
-					t.Errorf("colours rung argv = %q, want --colors 64 (Output.Colors) and --lossy=30", argv)
+					t.Errorf("colors rung argv = %q, want --colors 64 (Output.Colors) and --lossy=30", argv)
 				}
 			}
 			if got := strings.Join(steps, " "); got != c.steps {
@@ -932,7 +932,7 @@ func TestEncodeGIFAtReencodesMixedClips(t *testing.T) {
 
 // TestRepairGIFHoldsChecksThePicture pins the two halves of the repair's
 // safety net without real tools. gifsicle decides from the FIRST frame whether
-// the canvas is transparent at all, and gives up on local colour tables — both
+// the canvas is transparent at all, and gives up on local color tables — both
 // at exit 0 — so (1) a clip that shows the background anywhere is handed over
 // with a transparent 1x1 lead-in frame that the frame selection "#1-" drops
 // again, and (2) whatever comes back is played and compared with the input: a
@@ -984,7 +984,7 @@ func TestRepairGIFHoldsChecksThePicture(t *testing.T) {
 	t.Run("an opaque clip gets no lead-in frame", func(t *testing.T) {
 		tools, dir := fakeGifsicle(t, nil)
 		m := &Manager{tools: tools}
-		// With a global colour table, so that it is the ShowsBackground gate
+		// With a global color table, so that it is the ShowsBackground gate
 		// that keeps the lead-in out, not PrependTransparentFrame's refusal.
 		og, err := gif.DecodeAll(bytes.NewReader(opaqueGIF(t)))
 		if err != nil {
@@ -1072,8 +1072,8 @@ func reserveLastDisposal(t *testing.T, data []byte) []byte {
 // TestRepairGIFHoldsUncheckable pins the edges of the check: an input that
 // cannot be played is repaired unchecked (with the lead-in frame — nothing
 // says it is opaque), a RESULT that cannot be played is refused, a file
-// without a global colour table gets no lead-in frame but is still judged,
-// and a result that differs in colour only is refused like any other.
+// without a global color table gets no lead-in frame but is still judged,
+// and a result that differs in color only is refused like any other.
 func TestRepairGIFHoldsUncheckable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1119,7 +1119,7 @@ func TestRepairGIFHoldsUncheckable(t *testing.T) {
 		assertNoHoldScratch(t, scratch)
 	})
 
-	t.Run("no global colour table: no lead-in frame, still judged", func(t *testing.T) {
+	t.Run("no global color table: no lead-in frame, still judged", func(t *testing.T) {
 		g, err := gif.DecodeAll(bytes.NewReader(mixed))
 		if err != nil {
 			t.Fatal(err)
@@ -1150,7 +1150,7 @@ func TestRepairGIFHoldsUncheckable(t *testing.T) {
 		}
 	})
 
-	t.Run("a result that differs in colour only is refused", func(t *testing.T) {
+	t.Run("a result that differs in color only is refused", func(t *testing.T) {
 		g, err := gif.DecodeAll(bytes.NewReader(good))
 		if err != nil {
 			t.Fatal(err)
@@ -1163,8 +1163,8 @@ func TestRepairGIFHoldsUncheckable(t *testing.T) {
 		}
 		tools, _ := fakeGifsicle(t, map[string][]byte{"U.gif": encodeTestGIF(t, g)})
 		m := &Manager{tools: tools}
-		if _, _, err := m.repairGIFHolds(ctx, t.TempDir(), "", mixed, target, enc.GifsicleOptions{}, nil); err == nil || !strings.Contains(err.Error(), "differs in colour") {
-			t.Errorf("err = %v, want the recoloured coalesce refused", err)
+		if _, _, err := m.repairGIFHolds(ctx, t.TempDir(), "", mixed, target, enc.GifsicleOptions{}, nil); err == nil || !strings.Contains(err.Error(), "differs in color") {
+			t.Errorf("err = %v, want the recolored coalesce refused", err)
 		}
 	})
 }

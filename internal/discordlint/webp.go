@@ -33,7 +33,7 @@ const (
 // ANMF flag bits.
 const (
 	anmfFlagNoBlend = 0x02 // 1 = overwrite, 0 = alpha-blend onto the canvas
-	anmfFlagDispose = 0x01 // 1 = dispose to background colour after display
+	anmfFlagDispose = 0x01 // 1 = dispose to background color after display
 )
 
 // Frame-duration thresholds for webp.min-delay. Browsers (Blink and Gecko

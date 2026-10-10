@@ -8,8 +8,7 @@ import { render } from 'svelte/server';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ProbeInfo, Source } from '../lib/api';
 import { resetFeatures, setFeatures } from '../lib/capabilities.svelte';
-import { defaultOutput, presetById } from '../lib/presets';
-import { app, defaultAi, defaultOps, setSource, stillRequest } from '../lib/state.svelte';
+import { app, setSource } from '../lib/state.svelte';
 import Preview from './Preview.svelte';
 
 const gifInfo: ProbeInfo = {
@@ -214,30 +213,6 @@ describe('Preview (SSR)', () => {
     expect(out).not.toContain('Crop mode: full frame shown');
   });
 
-  it('eyedropper (Phase 5a): the meta line names the Colour row the armed pick lands in when there are several, the colour otherwise', () => {
-    setSource(gifSrc);
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'colour', colors: ['313338', ''] };
-    app.ui.pickColor = true;
-    app.ui.pickRow = 1;
-    let out = html();
-    expect(out).toContain('Eyedropper: click colour 2 to remove (the still is shown unkeyed)');
-    expect(out).toContain('<kbd>Esc</kbd> cancels');
-    app.ui.pickRow = 0;
-    expect(html()).toContain('Eyedropper: click colour 1 to remove');
-    app.ops.background.colors = [''];
-    out = html();
-    expect(out).toContain('Eyedropper: click the colour to remove (the still is shown unkeyed)');
-    // Play is off while the eyedropper is armed (the still must be on the stage), crop mode wins over it
-    expect(out.match(/<button[^>]*aria-label="Play an animated preview"[^>]*>/)?.[0]).toContain('disabled');
-    app.ui.cropOpen = true;
-    out = html();
-    expect(out).not.toContain('Eyedropper:');
-    expect(out).toContain('Crop mode: full frame shown');
-    app.ui.cropOpen = false;
-    app.ui.pickColor = false;
-    expect(html()).not.toContain('Eyedropper:');
-  });
-
   it('disables Play (with the reason) on a server without /api/proxy — features.proxy off', () => {
     setSource(gifSrc);
     const play = (out: string) => out.match(/<button[^>]*aria-label="Play an animated preview"[^>]*>/)?.[0] ?? '';
@@ -256,84 +231,5 @@ describe('Preview (SSR)', () => {
     tag = play(html());
     expect(tag).not.toContain('disabled');
     expect(tag).toContain('rendered on demand');
-  });
-
-  it('still request (Phase 5a, spec §6.1): crop mode cuts the stack before crop and drops the geometry but keeps the fps — the same frame grid as the normal still', () => {
-    const out = defaultOutput();
-    out.preset = 'emote';
-    presetById('emote').apply(out); // 128×128 contain at 25 fps
-    const src30: Source = { ...gifSrc, info: { ...gifInfo, fps: 30, duration: 2, frames: 60 } };
-    const ops = defaultOps(src30.info);
-    ops.crop = { enabled: true, x: 10, y: 20, w: 100, h: 50 };
-    ops.background = { ...ops.background, enabled: true, mode: 'colour', colors: ['313338'] };
-    const normal = stillRequest(src30, ops, out, { cropMode: false, picking: false, t: 0.5, maxW: 480 });
-    const crop = stillRequest(src30, ops, out, { cropMode: true, picking: false, t: 0.5, maxW: 8192 });
-    expect(normal?.output).toEqual({ format: 'gif', width: 128, height: 128, fit: 'contain', fps: 25 });
-    expect(crop?.output).toEqual({ format: 'gif', fps: 25 });
-    expect(crop?.output.fps).toBe(normal?.output.fps);
-    // the stack: the normal still carries the key, its morph and the crop; crop mode stops before the crop
-    expect(normal?.ops.map((o) => o.kind)).toEqual(['colorkey', 'morph', 'crop']);
-    expect(crop?.ops.map((o) => o.kind)).toEqual(['colorkey', 'morph']);
-    expect(crop?.sources).toEqual([src30.hash]);
-    expect(crop).toMatchObject({ src: src30.hash, t: 0.5, maxW: 8192 });
-    expect(normal).toMatchObject({ src: src30.hash, sources: [src30.hash], t: 0.5, maxW: 480 });
-    // the eyedropper armed: the Background card's ops are left out
-    expect(stillRequest(src30, ops, out, { cropMode: false, picking: true, t: 0.5, maxW: 480 })?.ops.map((o) => o.kind)).toEqual(['crop']);
-    // without Output.fps neither carries one (the server falls back to the fps op or the source rate on both)
-    const noFps = { ...out, fps: 0 };
-    expect(stillRequest(src30, ops, noFps, { cropMode: true, picking: false, t: 0.5, maxW: 8192 })?.output).toEqual({ format: 'gif' });
-    // no source, no request
-    expect(stillRequest(null, ops, out, { cropMode: false, picking: false, t: 0, maxW: 480 })).toBeNull();
-  });
-
-  it('prompt mode (Phase 5c): the guided model with its panel open shows the source frame as a prompt canvas — Play off, the meta line says how; crop mode and the eyedropper win', () => {
-    setSource(gifSrc);
-    app.ops.background = { ...app.ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'sam2-tiny', modelChosen: true } };
-    const play = (out: string) => out.match(/<button[^>]*aria-label="Play an animated preview"[^>]*>/)?.[0] ?? '';
-    // the panel closed: an ordinary preview
-    let out = html();
-    expect(out).not.toContain('Select subject:');
-    expect(play(out)).not.toContain('disabled');
-    app.ui.promptOpen = true;
-    out = html();
-    expect(out).toContain('Select subject: drag a box around it, click to keep (+)');
-    expect(out).toContain('click a marker to');
-    expect(out).toContain('0 prompted frames');
-    expect(play(out)).toContain('disabled');
-    expect(out).not.toContain('Crop mode:');
-    app.ops.background.ai.prompts = [{ frame: 0, box: [0, 0, 1, 1], points: [] }];
-    expect(html()).toContain('1 prompted frame');
-    // a per-frame model: no prompt mode even with the flag on
-    app.ops.background.ai.model = 'birefnet-lite';
-    out = html();
-    expect(out).not.toContain('Select subject:');
-    expect(play(out)).not.toContain('disabled');
-    app.ops.background.ai.model = 'sam2-tiny';
-    // crop mode wins over the panel; the armed eyedropper too
-    app.ui.cropOpen = true;
-    out = html();
-    expect(out).toContain('Crop mode: full frame shown');
-    expect(out).not.toContain('Select subject:');
-    app.ui.cropOpen = false;
-    app.ui.pickColor = true;
-    app.ui.pickTarget = 'keep';
-    app.ui.pickRow = 0;
-    out = html();
-    expect(out).toContain('Eyedropper:');
-    expect(out).not.toContain('Select subject:');
-    app.ui.pickColor = false;
-    app.ui.promptOpen = false;
-    // the still request of prompt mode: the source frame unkeyed, the main source alone, format + fps only
-    const out1 = defaultOutput();
-    out1.preset = 'emote';
-    presetById('emote').apply(out1);
-    const ops = defaultOps(gifInfo);
-    ops.background = { ...ops.background, enabled: true, mode: 'ai', ai: { ...defaultAi(), model: 'sam2-tiny', prompts: [{ frame: 0, box: [0, 0, 1, 1], points: [] }] } };
-    ops.crop = { enabled: true, x: 10, y: 20, w: 100, h: 50 };
-    const r = stillRequest(gifSrc, ops, out1, { cropMode: false, picking: false, promptMode: true, t: 0.02, maxW: 480 });
-    expect(r?.ops).toEqual([]);
-    expect(r?.sources).toEqual([gifSrc.hash]);
-    expect(r?.output).toEqual({ format: 'gif', fps: 25 });
-    expect(stillRequest(gifSrc, ops, out1, { cropMode: false, picking: false, t: 0.02, maxW: 480 })?.ops.map((o) => o.kind)).toEqual(['matte', 'morph', 'crop']);
   });
 });

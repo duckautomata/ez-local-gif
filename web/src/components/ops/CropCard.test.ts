@@ -92,8 +92,8 @@ describe('CropCard (SSR)', () => {
     out = html(opaque, true);
     expect(out).toContain('alpha threshold 32');
     expect(out).toContain('aria-label="Auto-crop alpha threshold"');
-    // a Colour mode with nothing picked yet emits no op: no fold
-    app.ops.background = { ...app.ops.background, mode: 'colour', colors: [''] };
+    // a Color mode with nothing picked yet emits no op: no fold
+    app.ops.background = { ...app.ops.background, mode: 'color', colors: [''] };
     expect(html(opaque, true)).not.toContain('alpha threshold');
   });
 
@@ -113,10 +113,10 @@ describe('CropCard (SSR)', () => {
     out = html(opaque, true);
     expect(out).toContain('Non-black borders are trimmed; with a Background op on it crops to what is left after background removal');
     expect(out).not.toContain(keyedText);
-    // keyed: greenscreen, or a picked colour
+    // keyed: greenscreen, or a picked color
     app.ops.background = { ...app.ops.background, enabled: true, mode: 'screen' };
     expect(html(opaque, true)).toContain(keyedText);
-    app.ops.background = { ...app.ops.background, mode: 'colour', colors: ['00ff00'] };
+    app.ops.background = { ...app.ops.background, mode: 'color', colors: ['00ff00'] };
     expect(html(opaque, true)).toContain(keyedText);
     setSource(gifSrc);
     app.ops.autocrop = { enabled: true, padding: 0, threshold: 1 };

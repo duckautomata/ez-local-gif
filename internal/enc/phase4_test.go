@@ -71,7 +71,7 @@ func TestMP4Args_MatteAndCRF(t *testing.T) {
 }
 
 // TestMP4Args_Variant: a fit rung (fps drop + downscale) is baked in before
-// the flatten, and the matte colour source / pad follow the variant's
+// the flatten, and the matte color source / pad follow the variant's
 // size and rate. The pad keeps ODD variant sizes encodable (161 → 162).
 func TestMP4Args_Variant(t *testing.T) {
 	m := testMaster()

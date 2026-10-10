@@ -47,7 +47,7 @@ var ErrNotImplementedSequence = errors.New("probe: sequence probing not implemen
 //     few frames sampled from those whose header can carry transparency
 //     ffmpeg would decode — NRGBA/translucent-palette models, every GIF
 //     frame (the transparent index hides in each frame's GCE), PNG
-//     truecolour/gray with a tRNS colour key, or the first frame when its
+//     truecolor/gray with a tRNS color key, or the first frame when its
 //     ffprobe pix_fmt admits alpha.
 //   - Premultiplied false.
 //
@@ -96,15 +96,15 @@ var ffmpegPrefix = []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "erro
 //     exports premultiplied); false otherwise.
 //   - AVIF (mov demuxer, brand avif/avis): libavif writes the primary
 //     image item(s) and, for animations, separate tracks, so ffprobe lists
-//     [colour item, (alpha item,) colour track, (alpha track)]. The main
+//     [color item, (alpha item,) color track, (alpha track)]. The main
 //     stream is the video stream with the most frames (the track for an
 //     animation, the item for a still); AlphaStream is the video-stream
 //     index ("v:N") of the matching single-plane (gray) stream with the
 //     same size and frame count, 0 when the file has no alpha. HasAlpha
-//     follows from that (the colour stream's own pix_fmt is opaque).
-//     Monochrome (yuv400) AVIFs report gray for every stream, colour ones
+//     follows from that (the color stream's own pix_fmt is opaque).
+//     Monochrome (yuv400) AVIFs report gray for every stream, color ones
 //     included; there the most-frames rule runs over the streams not
-//     titled "Alpha" (ties to the first, the colour track precedes its
+//     titled "Alpha" (ties to the first, the color track precedes its
 //     alpha track), so a gray animation is still described by its track.
 //
 // maxScanFrames <= 0 means 60.
@@ -414,8 +414,8 @@ func derive(out ffOutput) (derived, error) {
 		info.HasAlpha = strings.TrimSpace(vs.Tags["alpha_mode"]) == "1"
 	case cont == cAVIF || cont == cAVIS:
 		// The mov demuxer exposes AVIF alpha as an auxiliary single-plane
-		// video stream next to the colour stream, which itself reports an
-		// opaque pix_fmt. For animations the colour track is not the first
+		// video stream next to the color stream, which itself reports an
+		// opaque pix_fmt. For animations the color track is not the first
 		// video stream (the one-frame primary item is), so record its v:N
 		// index for the graph.
 		info.ColorStream = videoStreamIndex(out.Streams, vs)
@@ -462,7 +462,7 @@ func pickVideoStream(streams []ffStream) *ffStream {
 	return first
 }
 
-// pickAVIFColorStream returns the AVIF colour stream: among the video
+// pickAVIFColorStream returns the AVIF color stream: among the video
 // streams that are not single-plane alpha, the one with the most frames
 // (libavif writes the primary still item before the animation track, so
 // the first video stream of an animated AVIF holds one frame), ties going
@@ -471,10 +471,10 @@ func pickAVIFColorStream(streams []ffStream) *ffStream {
 	best := mostFrames(streams, func(s *ffStream) bool { return !isAlphaPlane(s) })
 	if best == nil {
 		// Monochrome (yuv400) AVIF: every stream is gray, so pix_fmt cannot
-		// tell colour from alpha. Most frames still wins (primary item = 1
+		// tell color from alpha. Most frames still wins (primary item = 1
 		// frame, animation track = N); an "Alpha"-titled item never wins and
 		// ties go to the first stream (libavif and ffmpeg's avif muxer both
-		// write the colour track before its alpha track — the alpha TRACK of
+		// write the color track before its alpha track — the alpha TRACK of
 		// an animation carries no title and default=1, so position is the
 		// only tell).
 		best = mostFrames(streams, func(s *ffStream) bool { return !hasAlphaTitle(s) })
@@ -519,9 +519,9 @@ func videoStreamIndex(streams []ffStream, s *ffStream) int {
 }
 
 // avifAlphaStream returns the video-stream index ("v:N") of the alpha plane
-// that belongs to the colour stream main: a single-plane stream of the same
+// that belongs to the color stream main: a single-plane stream of the same
 // size and frame count; 0 when there is none. The alpha item/track follows
-// its colour stream in libavif's layout, but any matching stream is
+// its color stream in libavif's layout, but any matching stream is
 // accepted.
 func avifAlphaStream(streams []ffStream, main *ffStream) int {
 	mainFrames := parseIntFlex(string(main.NbFrames))

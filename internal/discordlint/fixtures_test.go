@@ -15,7 +15,7 @@ import (
 // encoder) plus targeted byte surgery. The base palette has 8 entries and
 // index 5 is opaque black; the "transparent" palette variant is identical
 // except entry 5 has alpha 0. Both serialise to the same RGB bytes, so every
-// frame shares the single global colour table regardless of which variant
+// frame shares the single global color table regardless of which variant
 // it uses.
 
 const (
@@ -127,7 +127,7 @@ func encodeFx(t testing.TB, a fxAnim) []byte {
 // fxHeaderLen is the length of header + LSD + the 8-entry GCT.
 const fxHeaderLen = 13 + 3*8
 
-// insertAfterGCT splices raw bytes right after the global colour table.
+// insertAfterGCT splices raw bytes right after the global color table.
 func insertAfterGCT(data, ext []byte) []byte {
 	out := append([]byte(nil), data[:fxHeaderLen]...)
 	out = append(out, ext...)

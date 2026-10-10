@@ -20,10 +20,10 @@ import (
 )
 
 // The GIF → GIF optimiser (Output.Preset "optimize", DESIGN.md §4.2 last
-// row): the source GIF goes through gifsicle only — lossy, colour
+// row): the source GIF goes through gifsicle only — lossy, color
 // reduction, frame dropping with merged delays — never through a decode, so
 // its palette and timing survive untouched. With FitBytes > 0 a small
-// ladder (frame drop × colours) is searched over the lossy knob.
+// ladder (frame drop × colors) is searched over the lossy knob.
 
 const (
 	// optimizeMinDrop/MaxDrop bound GifsicleOptimizeOptions.DropEveryN.
@@ -119,7 +119,7 @@ func describeSource(b *store.Blob) string {
 }
 
 // gifsicleOptimizeOptions maps Output (+ the chosen knob/rung values) onto
-// the optimiser options. Ordered dither goes with a colour reduction unless
+// the optimiser options. Ordered dither goes with a color reduction unless
 // the user asked for none / an error-diffusion method.
 func gifsicleOptimizeOptions(out recipe.Output, lossy, colors, drop int) enc.GifsicleOptimizeOptions {
 	o := enc.GifsicleOptimizeOptions{Lossy: lossy, Colors: colors, DropEveryN: drop, Loop: out.Loop, Careful: true}
@@ -131,7 +131,7 @@ func gifsicleOptimizeOptions(out recipe.Output, lossy, colors, drop int) enc.Gif
 
 // optimizeRepairOptions maps the optimiser's options onto the post-pass
 // options of the hold repair (repairGIFHolds), which re-optimises with the
-// same lossy / colours / dither / loop. Frame dropping is not repeated: the
+// same lossy / colors / dither / loop. Frame dropping is not repeated: the
 // repair works on the already-dropped frames. Known limitation: the repair's
 // input already carries this lossy pass, so the repaired file is
 // second-generation lossy while its description names a single "lossy N"
@@ -159,7 +159,7 @@ func optimizeDesc(o enc.GifsicleOptimizeOptions, srcFrames int) string {
 		parts = append(parts, fmt.Sprintf("lossy %d", o.Lossy))
 	}
 	if o.Colors > 0 {
-		parts = append(parts, fmt.Sprintf("%d colours", o.Colors))
+		parts = append(parts, fmt.Sprintf("%d colors", o.Colors))
 	}
 	if o.DropEveryN > 0 {
 		parts = append(parts, fmt.Sprintf("every %s frame dropped (%d of %d kept)", ordinal(o.DropEveryN), keptFrames(srcFrames, o.DropEveryN), srcFrames))
@@ -215,7 +215,7 @@ func readGIFFacts(path string) (gifFacts, error) {
 
 // parseGIFFacts walks the GIF block structure without decoding any pixel
 // data (no LZW): delays come from each frame's graphic control extension,
-// the palette size from the global and local colour tables. Odd-but-valid
+// the palette size from the global and local color tables. Odd-but-valid
 // files Go's strict image/gif rejects (frame rects outside the logical
 // screen, undecodable frame data) still parse — gifsicle handles them fine,
 // so the optimiser does not need a full decode to refuse or accept them.
@@ -226,7 +226,7 @@ func parseGIFFacts(data []byte) (gifFacts, error) {
 	}
 	var f gifFacts
 	pos := 13
-	if data[10]&0x80 != 0 { // global colour table
+	if data[10]&0x80 != 0 { // global color table
 		f.colors = 2 << (data[10] & 7)
 		pos += 3 * f.colors
 	}
@@ -275,11 +275,11 @@ func parseGIFFacts(data []byte) (gifFacts, error) {
 			}
 			packed := data[pos+8]
 			pos += 9
-			if packed&0x80 != 0 { // local colour table
+			if packed&0x80 != 0 { // local color table
 				n := 2 << (packed & 7)
 				f.colors = max(f.colors, n)
 				if pos+3*n > len(data) {
-					return gifFacts{}, errors.New("truncated local colour table")
+					return gifFacts{}, errors.New("truncated local color table")
 				}
 				pos += 3 * n
 			}
@@ -331,7 +331,7 @@ func dropEveryNTol(srcFPS, wantFPS, tol float64) (int, error) {
 		srcFPS, wantFPS, strings.Join(options, ", "))
 }
 
-// optimizeFit searches a small ladder — frame drop × colours, mildest first
+// optimizeFit searches a small ladder — frame drop × colors, mildest first
 // — over the lossy knob, all through gifsicle. baseDrop (from Output.FPS)
 // is the mildest drop tried; Output.Colors the user's palette size.
 func (m *Manager) optimizeFit(ctx context.Context, j *job, scratch, src string, facts gifFacts, baseDrop int, out recipe.Output, target discordlint.Target) ([]produced, error) {
@@ -405,7 +405,7 @@ func (m *Manager) optimizeFit(ctx context.Context, j *job, scratch, src string, 
 // optimizeLadder builds the optimiser's rungs — for each drop (the base
 // first, then the harsher standard drops; FitKeepFPS keeps the base drop
 // only, so the search never drops frames the user did not ask for) every
-// colour rung (the user's palette size first, 0 = source palette; rungs at
+// color rung (the user's palette size first, 0 = source palette; rungs at
 // or above the source's own palette change nothing and are skipped) — and
 // the DropEveryN of each rung by label (fit.Rung has no field for it;
 // labels are unique).
@@ -437,9 +437,9 @@ func optimizeLadder(baseDrop, baseColors int, facts gifFacts, keepFPS bool) ([]f
 				parts = append(parts, "all frames")
 			}
 			if c > 0 {
-				parts = append(parts, fmt.Sprintf("%d colours", c))
+				parts = append(parts, fmt.Sprintf("%d colors", c))
 			} else {
-				parts = append(parts, "source colours")
+				parts = append(parts, "source colors")
 			}
 			r := fit.Rung{Colors: c, Format: recipe.FormatGIF, Label: strings.Join(parts, " · ")}
 			rungs = append(rungs, r)

@@ -1,13 +1,10 @@
 <script lang="ts">
   // Batch mode (Phase 4): only the geometry-independent global ops are
-  // editable — fps, speed (+ reverse / bounce), background removal (AI /
-  // Colour / Screen — the AI matte is per source anyway: every row's render
-  // runs its own pass, one at a time through the sidecar, and its SSE shows
-  // the "AI matte" stage) and feather; unpremultiply is per row (auto from
-  // each probe). Trim / crop / auto-crop / resize / flip / rotate / overlays
-  // are per-source and stay out of every batch recipe (lib/batch
-  // batchOpsCfg) — "Open in editor" on a row seeds the normal single view
-  // for those.
+  // editable — fps, speed (+ reverse / bounce), background keying (+ its
+  // Edges cleanup) and feather; unpremultiply is per row (auto from each probe). Trim / crop /
+  // auto-crop / resize / flip / rotate / overlays are per-source and stay
+  // out of every batch recipe (lib/batch batchOpsCfg) — "Open in editor" on
+  // a row seeds the normal single view for those.
   import { phase4OpsOffered } from '../lib/capabilities.svelte';
   import { fmtNum } from '../lib/format';
   import { app } from '../lib/state.svelte';
@@ -111,15 +108,13 @@
     {/if}
   </OpCard>
 
-  <!-- No preview in batch: the Background card's Colour mode (and the AI mode's Keep colours) take typed hex only (no eyedropper);
-       the AI controls are as in the editor minus Compute matte (every row's render runs its pass) and the guided model (it needs
-       the preview to select the subject); Screen is unchanged. -->
+  <!-- No preview in batch: the Background card's Color mode takes typed hex only (no eyedropper) and the Screen key color is not
+       matched from a preview (the Green / Blue presets, or a typed hex). -->
   <BackgroundCard picker={false} />
   <FeatherCard />
   <p class="hint eyedrop">
-    In batch there is no preview to pick a colour from — type the hex values in the Background card’s Colour mode instead, or
-    use its AI mode (every row gets its own matte, computed one row at a time when it renders; the guided model needs the
-    editor).
+    In batch there is no preview to pick a color from — type the hex values in the Background card’s Color mode instead (Screen
+    uses the pure green / blue preset or a typed key color).
   </p>
 </div>
 

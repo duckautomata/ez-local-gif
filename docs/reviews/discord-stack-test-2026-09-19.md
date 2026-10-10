@@ -11,7 +11,7 @@
 A transparent GIF rendered by the shipped pipeline (ffmpeg `palettegen`/`paletteuse` →
 `gifsicle -O2 --careful` → `discordlint.LintGIF` fix) composites correctly in a spec decoder but
 **"stacked" on Discord** as a chat attachment: each new pose was drawn on top of the previous
-one, and the old pose was never cleared. The render (146×134, colour-keyed, 256 colours,
+one, and the old pose was never cleared. The render (146×134, color-keyed, 256 colors,
 `sierra2_4a`, 354 cs) holds several poses for 0.1–1 s; the 2026-08-19 test-kit clip
 ([`discord-testkit-results.md`](discord-testkit-results.md)) never holds a pose, and its GIFs
 rendered fine.
@@ -85,8 +85,8 @@ clear never happens and the next pose is drawn over the old one.
 ## The rule (`gif.noop-frame-disposal`)
 
 Simulate the GIF per spec on a canvas where 0 = background/cleared and any drawn pixel is an
-opaque colour value: pixels equal to the frame's transparent index (GCE transparency flag set)
-are skipped; colours come from the frame's local table, else the global one; disposal 2 clears
+opaque color value: pixels equal to the frame's transparent index (GCE transparency flag set)
+are skipped; colors come from the frame's local table, else the global one; disposal 2 clears
 the frame's rect to 0; disposal 0/1 leave it; disposal 3 restores the rect to what it was before
 the frame was drawn. Let P[k] be the canvas after drawing frame k and D[k] the canvas after then
 applying frame k's disposal. Nothing is clipped: a frame whose rect sticks out of the logical

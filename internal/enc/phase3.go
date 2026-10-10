@@ -355,9 +355,7 @@ func validFontFamily(name string) bool {
 // --- multi-input plans ---------------------------------------------------------
 
 // planUsable reports whether the builders can emit argv for p: a non-nil
-// plan with every drawtext placeholder bound and every extra input located
-// (a matte input, ExtraInput.Matte, counts like any other: no Path until
-// jobs resolved the memo, no argv).
+// plan with every drawtext placeholder bound and every extra input located.
 func planUsable(p *graph.Plan) bool {
 	if p == nil || strings.Contains(p.Filter, textPlaceholderPrefix) {
 		return false
@@ -376,10 +374,12 @@ func planUsable(p *graph.Plan) bool {
 }
 
 // extraInputArgs returns "[Args...] -i Path" for every extra input, in
-// order (ffmpeg input index = position + 1); a matte input (Phase 5b) as
-// its full sequence from frame 1 — the form of MasterArgs and
-// CropDetectPlanArgs. Builders that seek pass their own matte form through
-// extraInputArgsFor (matte.go).
+// order (ffmpeg input index = position + 1).
 func extraInputArgs(p *graph.Plan) []string {
-	return extraInputArgsFor(p, matteArgs{})
+	var args []string
+	for _, e := range p.ExtraInputs {
+		args = append(args, e.Args...)
+		args = append(args, "-i", e.Path)
+	}
+	return args
 }

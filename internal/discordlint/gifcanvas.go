@@ -12,10 +12,10 @@ import (
 // Canvas simulation. gif.noop-frame-disposal and MergeGIFHolds need to know
 // which frames leave the composited picture unchanged, so the animation is
 // played per spec on a canvas where 0 means "background / cleared" and any
-// drawn pixel is an opaque colour value:
+// drawn pixel is an opaque color value:
 //
 //   - pixels equal to the frame's transparent index (GCE transparency flag
-//     set) are skipped; colours come from the frame's local table, else the
+//     set) are skipped; colors come from the frame's local table, else the
 //     global one, so two frames with different tables compare by RGB;
 //   - disposal 2 clears the frame's rectangle to 0, disposal 3 restores it
 //     to what it held before the frame was drawn, 0/1 leave it;
@@ -281,8 +281,8 @@ func (c *gifCanvas) zeroOutside(r, not image.Rectangle) bool {
 	return true
 }
 
-// palette returns the canvas values of img's colour table. Indices beyond
-// the table get a value no real colour has, distinct per index.
+// palette returns the canvas values of img's color table. Indices beyond
+// the table get a value no real color has, distinct per index.
 func (c *gifCanvas) palette(img *gifImage) *[256]uint32 {
 	fill := func(pal *[256]uint32, table []byte) {
 		n := len(table) / 3
