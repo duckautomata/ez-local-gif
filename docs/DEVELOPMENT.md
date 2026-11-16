@@ -8,7 +8,7 @@ and phase plan live in [`DESIGN.md`](DESIGN.md).
 
 ## Development loop
 
-Go is **not** required on the host: everything runs in the `dev` image (tools + Go 1.26 + Node 22)
+Go is **not** required on the host: everything runs in the `dev` image (tools + Go 1.26 + Node 26)
 with the repo bind-mounted at `/src`.
 
 ```sh

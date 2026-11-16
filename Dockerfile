@@ -2,7 +2,7 @@
 #
 # ez-local-gif — multi-stage build (BuildKit required).
 #
-#   web      node:22-alpine       builds the Svelte SPA          → /app/web/dist
+#   web      node:26-alpine       builds the Svelte SPA          → /app/web/dist
 #   gobuild  golang:1.26-trixie   builds the static Go binary    → /out/ezlg (SPA embedded)
 #   tools    debian:trixie-slim   FFmpeg 9.0.1 + gifsicle + libwebp + libavif + pngquant
 #                                 + oxipng + gifski + fonts + tini, all version-checked
@@ -37,11 +37,11 @@ ARG GIFSKI_SHA256=b9b6591aa163123d737353d9c8581efdf3234d28eeaa45329b31da905cd5a9
 # oxipng 10.2.0 (static musl build).
 ARG OXIPNG_URL=https://github.com/oxipng/oxipng/releases/download/v10.2.0/oxipng-10.2.0-x86_64-unknown-linux-musl.tar.gz
 ARG OXIPNG_SHA256=a27ecb29faab9da1549f4a243bab12f1e43e4ed8ae6a2a2186a543dc9ffd3956
-# Go 1.26.6 and Node 22.23.2 (dev stage only).
+# Go 1.26.6 and Node 26.13.1 (dev stage only).
 ARG GO_URL=https://go.dev/dl/go1.26.6.linux-amd64.tar.gz
 ARG GO_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
-ARG NODE_URL=https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz
-ARG NODE_SHA256=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
+ARG NODE_URL=https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.xz
+ARG NODE_SHA256=5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864
 
 # ---------------------------------------------------------------------------
 # web: build the Svelte SPA

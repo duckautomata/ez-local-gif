@@ -5,7 +5,7 @@
   "description": "Svelte 5 single-page UI for ez-local-gif (embedded into the Go binary from web/dist)",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=26"
   },
   "scripts": {
     "dev": "vite",

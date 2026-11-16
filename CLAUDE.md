@@ -32,7 +32,7 @@ of truth for architecture, Discord rules, encoder commands and the phase plan.
 - gifsicle / gifski / libwebp CLI / libavif / pngquant / oxipng are NOT on the
   host. The authoritative toolchain is the Docker runtime image — integration
   tests run there: `docker compose build && docker compose run --rm app …`.
-- Node 22 / npm are on the host for `web/`.
+- Node 26 (npm 12) is on the host for `web/`.
 
 ## Rules
 

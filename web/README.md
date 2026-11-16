@@ -4,7 +4,7 @@ Svelte 5 (runes) + Vite + TypeScript single-page app. No component library,
 hand-rolled dark CSS. The production build lands in `web/dist` and is embedded
 into the Go binary by `web/embed.go`.
 
-## Commands (Node 22)
+## Commands (Node 26)
 
     npm ci              # install (lockfile committed)
     npm run dev         # Vite dev server on http://localhost:5173

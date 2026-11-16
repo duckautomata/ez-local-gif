@@ -34,7 +34,7 @@ Docs: [`docs/DESIGN.md`](docs/DESIGN.md) (architecture, Discord rules, encoder c
 
 ## Developing and running locally
 
-The dev stack runs everything in a container (tools + Go 1.26 + Node 22) with the repo
+The dev stack runs everything in a container (tools + Go 1.26 + Node 26) with the repo
 bind-mounted — no Go or ffmpeg needed on the host:
 
 ```sh
